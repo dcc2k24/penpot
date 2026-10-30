@@ -126,12 +126,11 @@
 
    :tasks-timing
    {::mdef/name "penpot_tasks_timing"
-    ;; Deprecated: superseded by `penpot_jobs_execution_ms`, which adds a
-    ;; queue label. Kept only for existing dashboards and alerts. The help
-    ;; text is what someone reading /metrics sees, so it is where the
-    ;; redirect belongs: the name and the labels stay untouched, so no
-    ;; panel or alert breaks.
-    ::mdef/help "Deprecated: use penpot_jobs_execution_ms, which adds a queue label."
+    ;; Deprecated: superseded by `penpot_jobs_execution_ms`. Kept only for
+    ;; existing dashboards and alerts. The help text is what someone reading
+    ;; /metrics sees, so it is where the redirect belongs: the name and the
+    ;; labels stay untouched, so no panel or alert breaks.
+    ::mdef/help "Deprecated: use penpot_jobs_execution_ms. Kept for existing dashboards and alerts."
     ::mdef/labels ["name"]
     ::mdef/buckets mtx/default-tasks-histogram-buckets
     ::mdef/type :histogram}

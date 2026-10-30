@@ -529,9 +529,9 @@
                           (metrics/record-submitted cfg job-name)
                           (metrics/record-refreshed cfg job-name)))
                       (l/trc :hint "submit"
+                             :outcome (if created? "created" "refreshed")
                              :name job-name
                              :job-id (str (:id result))
-                             :refreshed (not created?)
                              :tenant tenant
                              :queue queue
                              :label label
@@ -543,12 +543,16 @@
                     (do
                       (db/after-commit
                        #(metrics/record-skipped cfg job-name))
-                      (l/trc :hint "submit skipped, a pending job covers the key"
+                      (l/trc :hint "submit"
+                             :outcome "skipped"
                              :name job-name
                              :tenant tenant
                              :queue queue
                              :label label
-                             :skipped true)
+                             :dedupe (boolean dedupe)
+                             :debounce (boolean debounce)
+                             :exclusive (boolean skip-if-active)
+                             :delay (ct/format-duration delay))
                       nil))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

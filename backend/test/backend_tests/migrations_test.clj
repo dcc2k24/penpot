@@ -135,7 +135,8 @@
   (t/is (contains? (table-indexes "job") "job__dispatcher__idx"))
   (t/is (contains? (table-indexes "job") "job__orphan__idx"))
   (t/is (contains? (table-indexes "job") "job__profile__idx"))
-  (t/is (contains? (table-indexes "job") "job__live_exclusive__uniq")))
+  (t/is (contains? (table-indexes "job") "job__live_exclusive__uniq"))
+  (t/is (contains? (table-indexes "job") "job__new_dedupe__uniq")))
 
 (t/deftest audit-log-has-a-consumer-cursor
   (t/testing "the position columns and their covering index exist"

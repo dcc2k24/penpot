@@ -20,19 +20,25 @@
 -- duplicates is needed. The label stays a label.
 
 ALTER TABLE job
-    ADD COLUMN dedupe boolean NOT NULL DEFAULT false;
+    ADD COLUMN IF NOT EXISTS dedupe boolean NOT NULL DEFAULT false;
 
 CREATE UNIQUE INDEX IF NOT EXISTS job__new_dedupe__uniq
     ON job (tenant, name, queue, label)
     WHERE dedupe
       AND status = 'new';
 
--- NOTE: on instances with a large `job` table, run the statement above out
--- of band, before deploying, with CONCURRENTLY instead: this migration runs
--- inside a transaction, and a plain CREATE INDEX locks the table against
+-- NOTE: on an instance with a large `job` table, apply this migration out of
+-- band before deploying, building the index with CONCURRENTLY: this migration
+-- runs inside a transaction, and a plain CREATE INDEX locks the table against
 -- writes for the whole build (in Penpot every webhook-producing file save
--- inserts a job), while CONCURRENTLY does not. Run it on its own, not inside
--- a transaction block:
+-- inserts a job), while CONCURRENTLY does not. Adding a column with a
+-- constant DEFAULT is metadata-only since PostgreSQL 11, so the column is
+-- cheap and the index is the only slow part. Run both statements on their
+-- own, not inside a transaction block, and in this order (the index needs
+-- the column):
+--
+--   ALTER TABLE job
+--       ADD COLUMN IF NOT EXISTS dedupe boolean NOT NULL DEFAULT false;
 --
 --   CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS job__new_dedupe__uniq
 --       ON job (tenant, name, queue, label)
@@ -44,7 +50,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS job__new_dedupe__uniq
 --
 --   SELECT indexdef FROM pg_indexes
 --    WHERE indexname = 'job__new_dedupe__uniq';
---   SELECT indisvalid FROM pg_index
+--   SELECT indisvalid, indisunique FROM pg_index
 --    WHERE indexrelid = 'job__new_dedupe__uniq'::regclass;
 --
--- Once the index exists, this migration finds it and does nothing.
+-- Both statements are IF NOT EXISTS, so this migration finds the column and
+-- the index and does nothing.

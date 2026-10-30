@@ -82,6 +82,15 @@
          ;; assertions use, and (= 0 0.0) is false in Clojure
          (reduce + 0.0))))
 
+(defn- echo-defs
+  "The minimal job-def the tests submit and drive through the lifecycle."
+  []
+  {:echo {::jobs/name      :echo
+          ::jobs/schema    [:map]
+          ::jobs/handler   (fn [_context params] params)
+          ::jobs/decoder   identity
+          ::jobs/validator (constantly true)}})
+
 (t/deftest default-metrics-cover-the-jobs-observability-contract
   (doseq [id metric-ids]
     (let [definition (get main/default-metrics id)]
@@ -92,15 +101,15 @@
   (t/is (= ["name" "outcome"]
            (::mdef/labels (:jobs-total-timing main/default-metrics))))
   (t/is (= ["name"]
-           (::mdef/labels (:jobs-claim-wait-timing main/default-metrics)))))
+           (::mdef/labels (:jobs-claim-wait-timing main/default-metrics))))
+  (t/testing "one submit family and one terminal counter, with no twin ids"
+    (t/is (not (contains? main/default-metrics :jobs-submitted)))
+    (t/is (not (contains? main/default-metrics :jobs-skipped)))
+    (t/is (not (contains? main/default-metrics :jobs-orphaned)))))
 
 (t/deftest submit-metric-is-not-recorded-when-the-outer-transaction-rolls-back
   (let [metrics (make-metrics)
-        defs    {:echo {::jobs/name      :echo
-                        ::jobs/schema    [:map]
-                        ::jobs/handler   (fn [_context params] params)
-                        ::jobs/decoder   identity
-                        ::jobs/validator (constantly true)}}
+        defs    (echo-defs)
         cfg     {::jobs/defs   defs
                  ::db/pool     th/*pool*
                  ::mtx/metrics metrics}]
@@ -115,11 +124,7 @@
 
 (t/deftest submit-and-terminal-writers-record-production-events
   (let [metrics (make-metrics)
-        defs    {:echo {::jobs/name      :echo
-                        ::jobs/schema    [:map]
-                        ::jobs/handler   (fn [_context params] params)
-                        ::jobs/decoder   identity
-                        ::jobs/validator (constantly true)}}
+        defs    (echo-defs)
         cfg     {::jobs/defs  defs
                  ::db/pool    th/*pool*
                  ::mtx/metrics metrics}
@@ -131,11 +136,7 @@
 
 (t/deftest skip-if-active-records-skipped-metric
   (let [metrics (make-metrics)
-        defs    {:echo {::jobs/name      :echo
-                        ::jobs/schema    [:map]
-                        ::jobs/handler   (fn [_context params] params)
-                        ::jobs/decoder   identity
-                        ::jobs/validator (constantly true)}}
+        defs    (echo-defs)
         cfg     {::jobs/defs   defs
                  ::db/pool     th/*pool*
                  ::mtx/metrics metrics}
@@ -151,14 +152,6 @@
     (t/is (= 1.0 (counter-value metrics :jobs-submit ["echo" "skipped"])))
     (t/is (= 1.0 (counter-value metrics :jobs-submit ["echo" "created"]))
           "the withheld submit records no creation")))
-
-(defn- echo-defs
-  []
-  {:echo {::jobs/name      :echo
-          ::jobs/schema    [:map]
-          ::jobs/handler   (fn [_context params] params)
-          ::jobs/decoder   identity
-          ::jobs/validator (constantly true)}})
 
 (t/deftest dedupe-skip-is-counted-apart-from-a-creation
   (let [metrics  (make-metrics)
@@ -215,10 +208,7 @@
       (t/is (= 1.0 (histogram-count metrics :jobs-total-timing ["echo" "completed"])))
       (t/is (= 1.0 (histogram-count metrics :jobs-total-timing ["echo" "failed"])))
       (t/is (= 1.0 (histogram-count metrics :jobs-total-timing ["echo" "cancelled"])))
-      (t/is (= 0.0 (histogram-count metrics :jobs-total-timing ["echo" "aborted"]))))
-
-    (t/testing "and the orphan sweep pins the fourth: see the dispatcher test"
-      (t/is (not (contains? main/default-metrics :jobs-orphaned))))))
+      (t/is (= 0.0 (histogram-count metrics :jobs-total-timing ["echo" "aborted"]))))))
 
 (t/deftest the-submit-log-names-the-row-the-statement-wrote
   (let [metrics  (make-metrics)
@@ -239,7 +229,7 @@
       (jobs/submit cfg options))
     (t/testing "the line names the refreshed row, not the candidate uuid"
       (t/is (= (str id) (:job-id @captured)))
-      (t/is (true? (:refreshed @captured))))))
+      (t/is (= "refreshed" (:outcome @captured))))))
 
 (t/deftest lifecycle-helpers-use-labels-as-is
   (let [metrics (make-metrics)
@@ -300,11 +290,7 @@
   (let [metrics (make-metrics)
         cfg     {::db/pool th/*pool*
                  ::mtx/metrics metrics}
-        defs    {:echo {::jobs/name      :echo
-                        ::jobs/schema    [:map]
-                        ::jobs/handler   (fn [_context params] params)
-                        ::jobs/decoder   identity
-                        ::jobs/validator (constantly true)}}
+        defs    (echo-defs)
         cfg2    (assoc cfg ::jobs/defs defs)
         job-id  (jobs/submit cfg2 {::jobs/name :echo ::jobs/params {}})]
     (jobs/claim cfg2 job-id (:scheduled-at (jobs/get-job cfg2 job-id)))
@@ -318,11 +304,7 @@
 
 (t/deftest event-counter-follows-a-lifecycle-write-that-outlives-the-caller
   (let [metrics (make-metrics)
-        defs    {:echo {::jobs/name      :echo
-                        ::jobs/schema    [:map]
-                        ::jobs/handler   (fn [_context params] params)
-                        ::jobs/decoder   identity
-                        ::jobs/validator (constantly true)}}
+        defs    (echo-defs)
         cfg     {::jobs/defs   defs
                  ::db/pool     th/*pool*
                  ::mtx/metrics metrics}
@@ -346,11 +328,7 @@
 
 (t/deftest progress-counter-follows-the-report-that-outlives-the-caller
   (let [metrics (make-metrics)
-        defs    {:echo {::jobs/name      :echo
-                        ::jobs/schema    [:map]
-                        ::jobs/handler   (fn [_context params] params)
-                        ::jobs/decoder   identity
-                        ::jobs/validator (constantly true)}}
+        defs    (echo-defs)
         cfg     {::jobs/defs   defs
                  ::db/pool     th/*pool*
                  ::mtx/metrics metrics}
