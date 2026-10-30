@@ -276,7 +276,7 @@
 
    :jobs-skipped
    {::mdef/name "penpot_jobs_skipped_total"
-    ::mdef/help "Total number of durable job submissions skipped by skip-if-active."
+    ::mdef/help "Total number of durable job submissions skipped by skip-if-active or dedupe."
     ::mdef/labels ["name" "queue"]
     ::mdef/type :counter}
 
