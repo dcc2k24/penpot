@@ -429,10 +429,10 @@
   skipped (and `nil` returned) when there is already one. The decision
   is the unique index `job__live_exclusive__uniq`, so it holds across
   backends and does not depend on a check racing an insert. A skip
-  inserts nothing and records a skipped metric instead of a submitted
-  one, so dashboards can tell withheld work apart from new work. The
-  option needs an explicit non-blank `::label`, otherwise it raises:
-  the label is the key of the exclusion.
+  inserts nothing and records the submit with `outcome=\"skipped\"`
+  instead of `created`, so dashboards can tell withheld work apart from
+  new work. The option needs an explicit non-blank `::label`, otherwise
+  it raises: the label is the key of the exclusion.
 
   The exclusion is between the jobs that asked for it: a live job that
   was not submitted as exclusive (a webhook delivery, a notification)
@@ -450,8 +450,10 @@
   skipping, refreshes the pending row: it moves `scheduled_at` to
   `now + delay`, stores the new params and returns the id the row already
   had. That is the sliding window of a batch job, where the last event is
-  the one worth delivering. Both options need an explicit non-blank
-  `::label` and are mutually exclusive.
+  the one worth delivering. A refresh is not a new job, so the submit
+  records it with `outcome=\"refreshed\"`, apart from the ones that created
+  a row. Both options need an explicit non-blank `::label` and are
+  mutually exclusive.
 
   Only the jobs submitted with `::dedupe` or `::debounce` are part of
   that key, so a plain job never blocks a deduplicated one, and two plain
@@ -506,46 +508,48 @@
                        dedupe         sql:conflict-dedupe
                        :else          nil)
         sql          (str/join " " [sql:insert-new-job
-                                    (or conflict sql:returning-id)])
-        insert!      (fn [conn]
-                       (l/trc :hint "submit"
-                              :name job-name
-                              :job-id (str id)
-                              :tenant tenant
-                              :queue queue
-                              :label label
-                              :dedupe (boolean dedupe)
-                              :debounce (boolean debounce)
-                              :exclusive (boolean skip-if-active)
-                              :delay (ct/format-duration delay))
-                       (db/exec-one! conn [sql id job-name tenant payload queue
-                                           label priority max-retries
-                                           profile-id resource-id expires-at
-                                           now now scheduled-at
-                                           (boolean skip-if-active)
-                                           (boolean (or dedupe debounce))]))]
+                                    (or conflict sql:returning-id)])]
     ;; The insert runs inside db/tx-run!: joined to the caller's
     ;; transaction when the cfg provides a connection, wrapped in its own
-    ;; otherwise. The insert is what decides: a conflicting one affects no
-    ;; row (the skip) or refreshes the pending row (the debounce) and
-    ;; answers with its id.
+    ;; otherwise. The statement is what decides: a conflicting one affects
+    ;; no row (the skip) or refreshes the pending row (the debounce) and
+    ;; answers with its id, so the row it names is always a real one.
     (db/tx-run! cfg
                 (fn [{:keys [::db/conn]}]
-                  (if-let [result (insert! conn)]
-                    (do (db/after-commit
-                         #(metrics/record-submitted cfg job-name queue))
-                        ;; A debounce answers with the id of the row it
-                        ;; refreshed: the caller gets a job, not a new one.
-                        (:id result))
-                    (do (db/after-commit
-                         #(metrics/record-skipped cfg job-name queue))
-                        (l/trc :hint "submit skipped, a pending job covers the key"
-                               :name job-name
-                               :tenant tenant
-                               :queue queue
-                               :label label
-                               :skipped true)
-                        nil))))))
+                  (if-let [result
+                           (db/exec-one! conn [sql id job-name tenant payload
+                                               queue label priority max-retries
+                                               profile-id resource-id expires-at
+                                               now now scheduled-at
+                                               (boolean skip-if-active)
+                                               (boolean (or dedupe debounce))])]
+                    (let [created? (= id (:id result))]
+                      (db/after-commit
+                       #(if created?
+                          (metrics/record-submitted cfg job-name)
+                          (metrics/record-refreshed cfg job-name)))
+                      (l/trc :hint "submit"
+                             :name job-name
+                             :job-id (str (:id result))
+                             :refreshed (not created?)
+                             :tenant tenant
+                             :queue queue
+                             :label label
+                             :dedupe (boolean dedupe)
+                             :debounce (boolean debounce)
+                             :exclusive (boolean skip-if-active)
+                             :delay (ct/format-duration delay))
+                      (:id result))
+                    (do
+                      (db/after-commit
+                       #(metrics/record-skipped cfg job-name))
+                      (l/trc :hint "submit skipped, a pending job covers the key"
+                             :name job-name
+                             :tenant tenant
+                             :queue queue
+                             :label label
+                             :skipped true)
+                      nil))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; JOB API
@@ -1029,18 +1033,18 @@
   "Record the total time of a terminal outcome. Runs after the commit
   that made the job terminal, so a rolled back transition is never
   counted. The histogram `_count` is the terminal total per outcome:
-  no separate counter. Takes the cfg and resolves the metrics
-  instance from it, so the callback is not tied to an instance read
-  at registration time."
+  no separate counter, and `outcome=\"aborted\"` is the orphan count.
+  The row always carries `created_at` (`NOT NULL` in the table, and every
+  caller reads it), so there is no guard: a caller that forgets it fails
+  in `db/after-commit`, which logs it. Takes the cfg and resolves the
+  metrics instance from it, so the callback is not tied to an instance
+  read at registration time."
   [cfg job outcome]
-  (when job
-    (when (ct/inst? (:created-at job))
-      (metrics/record-total
-       cfg
-       (:name job)
-       (:queue job)
-       outcome
-       (- (inst-ms (ct/now)) (inst-ms (:created-at job)))))))
+  (metrics/record-total
+   cfg
+   (:name job)
+   outcome
+   (- (inst-ms (ct/now)) (inst-ms (:created-at job)))))
 
 (def schema:job-error
   "Structured error of a job that did not complete. `type` and `code` are
@@ -1148,7 +1152,6 @@
                       (db/after-commit
                        #(metrics/record-retry tx-cfg
                                               (:name job)
-                                              (:queue job)
                                               reason))
                       1)
                     0)))))

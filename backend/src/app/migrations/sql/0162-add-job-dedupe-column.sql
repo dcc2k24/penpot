@@ -22,7 +22,29 @@
 ALTER TABLE job
     ADD COLUMN dedupe boolean NOT NULL DEFAULT false;
 
-CREATE UNIQUE INDEX job__new_dedupe__uniq
+CREATE UNIQUE INDEX IF NOT EXISTS job__new_dedupe__uniq
     ON job (tenant, name, queue, label)
     WHERE dedupe
       AND status = 'new';
+
+-- NOTE: on instances with a large `job` table, run the statement above out
+-- of band, before deploying, with CONCURRENTLY instead: this migration runs
+-- inside a transaction, and a plain CREATE INDEX locks the table against
+-- writes for the whole build (in Penpot every webhook-producing file save
+-- inserts a job), while CONCURRENTLY does not. Run it on its own, not inside
+-- a transaction block:
+--
+--   CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS job__new_dedupe__uniq
+--       ON job (tenant, name, queue, label)
+--    WHERE dedupe
+--      AND status = 'new';
+--
+-- A CONCURRENTLY build interrupted midway leaves the index INVALID: drop it
+-- and retry. Verify with:
+--
+--   SELECT indexdef FROM pg_indexes
+--    WHERE indexname = 'job__new_dedupe__uniq';
+--   SELECT indisvalid FROM pg_index
+--    WHERE indexrelid = 'job__new_dedupe__uniq'::regclass;
+--
+-- Once the index exists, this migration finds it and does nothing.
