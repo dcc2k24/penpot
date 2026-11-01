@@ -16,6 +16,7 @@
    [app.worker.index]
    [app.worker.messages :as wm]
    [app.worker.thumbnails]
+   [app.worker.upload :as upload]
    [beicon.v2.core :as rx]
    [promesa.core :as p]))
 
@@ -149,14 +150,16 @@
 (defn- on-message
   [event]
   (when (nil? (.-source event))
-    (let [message (.-data event)
-          transfer (obj/get message "transfer")
-          message (cond-> (wm/decode message)
-                    (some? transfer)
-                    (assoc :transfer transfer))]
-      (if (:buffer? message)
-        (rx/push! buffer message)
-        (handle-message message)))))
+    (if (unchecked-get (.-data event) "penpotUpload")
+      (upload/handle! (.-data event))
+      (let [message (.-data event)
+            transfer (obj/get message "transfer")
+            message (cond-> (wm/decode message)
+                      (some? transfer)
+                      (assoc :transfer transfer))]
+        (if (:buffer? message)
+          (rx/push! buffer message)
+          (handle-message message))))))
 
 (.addEventListener js/self "message" on-message)
 

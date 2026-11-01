@@ -58,6 +58,7 @@
    [app.main.ui.workspace.viewport.viewport-ref :as vp-ref :refer [create-viewport-ref]]
    [app.main.ui.workspace.viewport.widgets :as widgets]
    [app.render-wasm.api :as wasm.api]
+   [app.render-wasm.page-cache :as page-cache]
    [app.render-wasm.rulers-state :as rs]
    [app.util.debug :as dbg]
    [app.util.text-editor :as ted]
@@ -230,7 +231,6 @@
         hover-disabled?      (mf/use-state false)
         hover-top-frame-id   (mf/use-state nil)
         frame-hover          (mf/use-state nil)
-        active-frames        (mf/use-state #{})
         canvas-init?         (mf/use-state false)
         initialized?         (mf/use-state false)
         dragging-guide-id*   (mf/use-state nil)
@@ -495,7 +495,9 @@
             (vreset! unmounted? true)
             (when-let [timeout-id @timeout-id-ref]
               (js/clearTimeout timeout-id))
-            (wasm.api/clear-canvas)))))
+            ;; Keep this page's shapes in WASM, so switching back to it
+            ;; skips the upload (see `app.render-wasm.page-cache`).
+            (wasm.api/clear-canvas {:stash-page? true})))))
 
     (mf/with-effect [show-text-editor? workspace-editor-state edition @canvas-init? @initialized?]
       (let [active-editor-state (get workspace-editor-state edition)]
@@ -504,6 +506,9 @@
                             (ted/get-editor-current-content)
                             (ted/export-content))]
             (wselect/use-shape edition)
+            ;; The edit reaches WASM before it is committed, so WASM may hold
+            ;; text the file never gets: do not stash this page.
+            (page-cache/taint-resident!)
             (wasm.api/set-shape-text-content edition content)
             (let [dimension (wasm.api/get-text-dimensions)]
               (st/emit! (dwt/resize-text-editor edition dimension))
@@ -542,6 +547,9 @@
             ;; is set.
             (wasm.api/initialize-viewport base-objects zoom vbox
                                           :background background
+                                          :page-id page-id
+                                          ;; The page cache only holds unfiltered pages.
+                                          :page-cache? (empty? focus)
                                           :on-shapes-ready
                                           (fn []
                                             ;; The target page's shapes are now loaded; arm
@@ -552,7 +560,10 @@
             (reset! initialized? true))
 
           (when (and (some? vern) (not= vern (mf/ref-val last-vern-ref)))
-            (wasm.api/initialize-viewport base-objects zoom vbox :background background)
+            (wasm.api/initialize-viewport base-objects zoom vbox
+                                          :background background
+                                          :page-id page-id
+                                          :page-cache? (empty? focus))
             (mf/set-ref-val! last-vern-ref vern)))))
 
     (mf/with-effect [focus]
@@ -646,9 +657,8 @@
     (hooks/setup-cursor cursor alt? mod? space? panning drawing-tool path-drawing? path-editing? (get path-bar-state :drag-cursor) z? read-only? can-alt-duplicate?)
     (hooks/setup-keyboard alt? mod? space? z? shift?)
     (hooks/setup-hover-shapes page-id move-stream base-objects selected mod? hover measure-hover
-                              hover-ids hover-top-frame-id @hover-disabled? focus zoom show-measures? read-only? transform)
+                              hover-ids hover-top-frame-id (or @hover-disabled? panning) focus zoom show-measures? read-only? transform)
     (hooks/setup-shortcuts path-editing? path-drawing? text-editing? grid-editing?)
-    (hooks/setup-active-frames base-objects hover-ids selected active-frames zoom transform vbox)
 
     (mf/with-effect [path-editing? edition @initialized?]
       (when (and path-editing? edition @initialized?)

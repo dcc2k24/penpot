@@ -24,6 +24,7 @@
    [app.common.transit :as t]
    [app.common.types.component :as ctc]
    [app.common.types.components-list :as ctkl]
+   [app.common.types.objects-hints :as ohints]
    [app.common.types.shape :as cts]
    [app.common.types.tokens-lib :as ctob]
    [app.common.types.variant :as ctv]
@@ -79,6 +80,7 @@
    [app.main.router :as rt]
    [app.render-wasm :as wasm]
    [app.render-wasm.api :as wasm.api]
+   [app.render-wasm.page-cache :as page-cache]
    [app.util.dom :as dom]
    [app.util.globals :as ug]
    [app.util.http :as http]
@@ -220,24 +222,40 @@
      (watch [it state _]
        (let [file-id (or file-id (:current-file-id state))
              page-id (or page-id (:current-page-id state))
+             objects (dsh/lookup-page-objects state file-id page-id)
+             hints   (ohints/hints objects)
+
+             position-change
+             (fn [shape]
+               {:type :mod-obj
+                :id (:id shape)
+                :page-id page-id
+                :operations
+                [{:type :set
+                  :attr :position-data
+                  :val (wasm.api/calculate-position-data shape)
+                  :ignore-touched true
+                  :ignore-geometry true}]})
+
+             ;; With hints, only the texts that the hints mark as having no
+             ;; position data are read.
              changes
-             (reduce-kv
-              (fn [result _ shape]
-                (if (and (cfh/text-shape? shape)
-                         (nil? (:position-data shape)))
-                  (conj result
-                        {:type :mod-obj
-                         :id (:id shape)
-                         :page-id page-id
-                         :operations
-                         [{:type :set
-                           :attr :position-data
-                           :val (wasm.api/calculate-position-data shape)
-                           :ignore-touched true
-                           :ignore-geometry true}]})
-                  result))
-              []
-              (dsh/lookup-page-objects state file-id page-id))]
+             (if (some? hints)
+               (into []
+                     (comp (keep #(get objects %))
+                           (map position-change))
+                     (ohints/select-ids objects hints
+                                        #(get-in hints [:texts % :no-position-data?])
+                                        #(and (cfh/text-shape? %)
+                                              (nil? (:position-data %)))))
+               (reduce-kv
+                (fn [result _ shape]
+                  (if (and (cfh/text-shape? shape)
+                           (nil? (:position-data shape)))
+                    (conj result (position-change shape))
+                    result))
+                []
+                objects))]
          (if (d/not-empty? changes)
            (rx/of (dch/commit-changes
                    {:redo-changes changes :undo-changes []
@@ -342,7 +360,12 @@
       (let [file (restore-pending-changes state file)]
         (-> state
             (assoc :thumbnails (d/update-vals thumbnails (fn [uri] {:uri uri :rendered-at nil})))
-            (update :files assoc file-id file))))))
+            (update :files assoc file-id file))))
+
+    ptk/EffectEvent
+    (effect [_ _ _]
+      ;; Fresh file data: no page kept in WASM matches it any more.
+      (page-cache/clear!))))
 
 (defn zoom-to-frame
   []
@@ -620,6 +643,11 @@
           (update :workspace-global dissoc :read-only? :preview-id :default-font)
           (assoc-in [:workspace-global :options-mode] :design)
           (update :files d/update-vals #(dissoc % :data))))
+
+    ptk/EffectEvent
+    (effect [_ _ _]
+      ;; Free the pages kept in WASM for this file.
+      (page-cache/clear!))
 
     ptk/WatchEvent
     (watch [_ state _]

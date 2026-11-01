@@ -74,9 +74,7 @@
                    ;; to its default dash pattern when no override is stored.
                    dash      (or (:stroke-dash stroke) -1)
                    gap       (or (:stroke-gap stroke) -1)
-                   offset    (mem/alloc types.fills.impl/FILL-U8-SIZE)
-                   heap      (mem/get-heap-u8)
-                   dview     (js/DataView. (.-buffer heap))]
+                   offset    (mem/alloc types.fills.impl/FILL-U8-SIZE)]
                (case align
                  :inner (h/call wasm/internal-module "_add_shape_inner_stroke" width style cap-start cap-end dash gap)
                  :outer (h/call wasm/internal-module "_add_shape_outer_stroke" width style cap-start cap-end dash gap)
@@ -92,21 +90,25 @@
                  (when-not (= top right bottom left)
                    (h/call wasm/internal-module "_set_shape_stroke_sides" top right bottom left)))
 
-               (cond
-                 (some? gradient)
-                 (do (types.fills.impl/write-gradient-fill offset dview opacity gradient)
-                     (h/call wasm/internal-module "_add_shape_stroke_fill")
-                     nil)
+               ;; The stroke calls above may have grown the memory: take the
+               ;; view only now, right before the fill records are written.
+               (let [heap  (mem/get-heap-u8)
+                     dview (js/DataView. (.-buffer heap))]
+                 (cond
+                   (some? gradient)
+                   (do (types.fills.impl/write-gradient-fill offset dview opacity gradient)
+                       (h/call wasm/internal-module "_add_shape_stroke_fill")
+                       nil)
 
-                 (some? image)
-                 (do (types.fills.impl/write-image-fill offset dview opacity image)
-                     (h/call wasm/internal-module "_add_shape_stroke_fill")
-                     (get image :id))
+                   (some? image)
+                   (do (types.fills.impl/write-image-fill offset dview opacity image)
+                       (h/call wasm/internal-module "_add_shape_stroke_fill")
+                       (get image :id))
 
-                 (some? color)
-                 (do (types.fills.impl/write-solid-fill offset dview opacity color)
-                     (h/call wasm/internal-module "_add_shape_stroke_fill")
-                     nil))))))
+                   (some? color)
+                   (do (types.fills.impl/write-solid-fill offset dview opacity color)
+                       (h/call wasm/internal-module "_add_shape_stroke_fill")
+                       nil)))))))
         strokes))
 
 (defn- get-string-length
@@ -154,14 +156,26 @@
   [masked]
   (h/call wasm/internal-module "_set_shape_masked_group" masked))
 
-(defn set-shape-svg-attrs
+(defn svg-attrs-values
+  "Computes the four values `_set_shape_svg_attrs` takes, in call order.
+  Returns a JS array: [fill-rule stroke-linecap stroke-linejoin fill-none]."
   [attrs]
   (let [style (:style attrs)
         fill-rule       (-> (or (:fillRule style) (:fillRule attrs)) sr/translate-fill-rule)
         stroke-linecap  (-> (or (:strokeLinecap style) (:strokeLinecap attrs)) sr/translate-stroke-linecap)
         stroke-linejoin (-> (or (:strokeLinejoin style) (:strokeLinejoin attrs)) sr/translate-stroke-linejoin)
         fill-none       (= "none" (or (:fill style) (:fill attrs)))]
-    (h/call wasm/internal-module "_set_shape_svg_attrs" fill-rule stroke-linecap stroke-linejoin fill-none)))
+    #js [fill-rule stroke-linecap stroke-linejoin fill-none]))
+
+(defn set-shape-svg-attrs-values
+  "Sets the SVG attributes from a JS array made by `svg-attrs-values`."
+  [^js v]
+  (h/call wasm/internal-module "_set_shape_svg_attrs"
+          (aget v 0) (aget v 1) (aget v 2) (aget v 3)))
+
+(defn set-shape-svg-attrs
+  [attrs]
+  (set-shape-svg-attrs-values (svg-attrs-values attrs)))
 
 (defn set-shape-svg-raw-content
   [content]
@@ -170,24 +184,38 @@
     (h/call wasm/internal-module "stringToUTF8" content offset size)
     (h/call wasm/internal-module "_set_shape_svg_raw_content")))
 
-(defn set-shape-path-content
-  "Upload path content in chunks to WASM."
+(defn encode-path-content
+  "Encodes path content into a Uint8Array, padded to a multiple of 4 bytes."
   [content]
-  (let [chunk-size (quot MAX_BUFFER_CHUNK_SIZE 4)
-        buffer-size (path/get-byte-size content)
+  (let [buffer-size (path/get-byte-size content)
         padded-size (* 4 (mth/ceil (/ buffer-size 4)))
         buffer (js/Uint8Array. padded-size)]
     (path/write-to content (.-buffer buffer) 0)
+    buffer))
+
+(defn upload-path-bytes!
+  "Uploads encoded path bytes to WASM in chunks. `u8` may be a view with a
+  non-zero (8-byte aligned) byte offset into a larger buffer."
+  [^js u8]
+  (let [chunk-size  (quot MAX_BUFFER_CHUNK_SIZE 4)
+        padded-size (.-byteLength u8)]
     (h/call wasm/internal-module "_start_shape_path_buffer")
-    (let [heapu32 (mem/get-heap-u32)]
-      (loop [offset 0]
-        (when (< offset padded-size)
-          (let [end (min padded-size (+ offset (* chunk-size 4)))
-                chunk (.subarray buffer offset end)
-                chunk-u32 (js/Uint32Array. chunk.buffer chunk.byteOffset (quot (.-length chunk) 4))
-                offset-size (.-length chunk-u32)
-                heap-offset (mem/alloc->offset-32 (* 4 offset-size))]
-            (.set heapu32 chunk-u32 heap-offset)
-            (h/call wasm/internal-module "_set_shape_path_chunk_buffer")
-            (recur end)))))
+    (loop [offset 0]
+      (when (< offset padded-size)
+        (let [end (min padded-size (+ offset (* chunk-size 4)))
+              chunk (.subarray u8 offset end)
+              chunk-u32 (js/Uint32Array. (.-buffer chunk) (.-byteOffset chunk) (quot (.-length chunk) 4))
+              offset-size (.-length chunk-u32)
+              heap-offset (mem/alloc->offset-32 (* 4 offset-size))
+              ;; Take the view after the allocation: it may grow the memory,
+              ;; which detaches any view taken before it.
+              heapu32 (mem/get-heap-u32)]
+          (.set heapu32 chunk-u32 heap-offset)
+          (h/call wasm/internal-module "_set_shape_path_chunk_buffer")
+          (recur end))))
     (h/call wasm/internal-module "_set_shape_path_buffer")))
+
+(defn set-shape-path-content
+  "Upload path content in chunks to WASM."
+  [content]
+  (upload-path-bytes! (encode-path-content content)))

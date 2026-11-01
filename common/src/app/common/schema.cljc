@@ -321,38 +321,56 @@
   ([registry s] (schema (mr/schema registry s))))
 
 (defn check-fn
-  "Create a predefined check function"
+  "Create a predefined check function.
+
+  On CLJS the schema is compiled on the first check, not when the check
+  function is created: most check functions are created at namespace load,
+  and compiling them all there delays the application start. Called with no
+  arguments, the check function compiles its validator now and returns nil
+  (see `warm-check-fn!`)."
   [s & {:keys [hint type code]}]
   (let [s          #?(:clj
                       (schema s)
                       :cljs
-                      (try
-                        (schema s)
-                        (catch :default cause
-                          (let [data (ex-data cause)]
-                            (if (= :malli.core/invalid-schema (:type data))
-                              (throw (ex-info
-                                      (str "Invalid schema\n"
-                                           (pp/pprint-str (:data data)))
-                                      {}))
-                              (throw cause))))))
+                      (delay
+                        (try
+                          (schema s)
+                          (catch :default cause
+                            (let [data (ex-data cause)]
+                              (if (= :malli.core/invalid-schema (:type data))
+                                (throw (ex-info
+                                        (str "Invalid schema\n"
+                                             (pp/pprint-str (:data data)))
+                                        {}))
+                                (throw cause)))))))
 
-        validator* (delay (m/validator s))
-        explainer* (delay (m/explainer s))
+        validator* (delay (m/validator #?(:clj s :cljs @s)))
+        explainer* (delay (m/explainer #?(:clj s :cljs @s)))
         hint       (or ^boolean hint "check error")
         type       (or ^boolean type :assertion)
         code       (or ^boolean code :data-validation)]
 
-    (fn [value]
-      (let [validate-fn @validator*]
-        (when-not ^boolean (validate-fn value)
-          (let [explain-fn @explainer*
-                explain    (explain-fn value)]
-            (throw (ex-info hint {:type type
-                                  :code code
-                                  :hint hint
-                                  ::explain explain}))))
-        value))))
+    (fn
+      ([]
+       @validator*
+       nil)
+      ([value]
+       (let [validate-fn @validator*]
+         (when-not ^boolean (validate-fn value)
+           (let [explain-fn @explainer*
+                 explain    (explain-fn value)]
+             (throw (ex-info hint {:type type
+                                   :code code
+                                   :hint hint
+                                   ::explain explain}))))
+         value)))))
+
+(defn warm-check-fn!
+  "Compiles now the validator of `f`, a function made by `check-fn`, so its
+  first check does not pay for it. The explainer, only needed on invalid
+  data, stays lazy. Returns nil."
+  [f]
+  (f))
 
 (defn coercer
   [schema & {:as opts}]

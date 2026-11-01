@@ -392,10 +392,11 @@ pub extern "C" fn update_shape_text_layout() {
 pub extern "C" fn update_shape_text_layout_for(a: u32, b: u32, c: u32, d: u32) {
     with_state!(state, {
         let shape_id = uuid_from_u32_quartet(a, b, c, d);
+        // Touch first, so the extent before the new layout is the one recorded.
+        state.touch_shape(shape_id);
         if let Some(shape) = state.shapes.get_mut(&shape_id) {
             update_text_layout(shape, false);
         }
-        state.touch_shape(shape_id);
     });
 }
 
@@ -403,10 +404,11 @@ pub extern "C" fn update_shape_text_layout_for(a: u32, b: u32, c: u32, d: u32) {
 pub extern "C" fn force_update_shape_text_layout_for(a: u32, b: u32, c: u32, d: u32) {
     with_state!(state, {
         let shape_id = uuid_from_u32_quartet(a, b, c, d);
+        // Touch first, so the extent before the new layout is the one recorded.
+        state.touch_shape(shape_id);
         if let Some(shape) = state.shapes.get_mut(&shape_id) {
             update_text_layout(shape, true);
         }
-        state.touch_shape(shape_id);
     });
 }
 

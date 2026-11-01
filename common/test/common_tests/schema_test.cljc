@@ -283,3 +283,36 @@
 
     (t/testing "generate"
       (t/is (true? (sm/validate ::sm/user-provided-uuid (sg/generate ::sm/user-provided-uuid)))))))
+
+(t/deftest test-check-fn
+  (let [check (sm/check-fn [:map [:a ::sm/int]] :hint "invalid thing")]
+    (t/testing "returns valid values"
+      (t/is (= {:a 1} (check {:a 1}))))
+
+    (t/testing "throws on invalid values, with the given hint and an explain"
+      (let [data (try
+                   (check {:a "1"})
+                   nil
+                   (catch #?(:clj Exception :cljs :default) cause
+                     (ex-data cause)))]
+        (t/is (= :assertion (:type data)))
+        (t/is (= :data-validation (:code data)))
+        (t/is (= "invalid thing" (:hint data)))
+        (t/is (some? (::sm/explain data))))))
+
+  #?(:cljs
+     (t/testing "compiles the schema on the first check, not on creation"
+       (let [check (sm/check-fn [:map [:a ::not-registered]])]
+         (t/is (fn? check))
+         (t/is (thrown? :default (check {:a 1}))))))
+
+  (t/testing "warm-check-fn! compiles the validator ahead of the first check"
+    (let [check (sm/check-fn [:map [:a ::sm/int]])]
+      (t/is (nil? (sm/warm-check-fn! check)))
+      (t/is (= {:a 1} (check {:a 1})))
+      (t/is (thrown? #?(:clj Exception :cljs :default) (check {:a "1"})))))
+
+  #?(:cljs
+     (t/testing "warm-check-fn! surfaces an invalid schema at once"
+       (let [check (sm/check-fn [:map [:a ::not-registered]])]
+         (t/is (thrown? :default (sm/warm-check-fn! check)))))))

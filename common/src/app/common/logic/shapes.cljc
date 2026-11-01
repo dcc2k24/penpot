@@ -72,14 +72,17 @@
 
         check-shape
         (fn [changes mod-obj-change]
-          (let [shape (get objects (:id mod-obj-change))
-                attrs (into []
-                            (comp (filter #(= (:type %) :set))
-                                  (map :attr))
-                            (:operations mod-obj-change))]
-            (reduce (partial check-attr shape)
-                    changes
-                    attrs)))]
+          (let [shape (get objects (:id mod-obj-change))]
+            ;; Without applied tokens there is nothing to unapply
+            (if (empty? (:applied-tokens shape))
+              changes
+              (let [attrs (into []
+                                (comp (filter #(= (:type %) :set))
+                                      (map :attr))
+                                (:operations mod-obj-change))]
+                (reduce (partial check-attr shape)
+                        changes
+                        attrs)))))]
 
     (reduce check-shape changes mod-obj-changes)))
 

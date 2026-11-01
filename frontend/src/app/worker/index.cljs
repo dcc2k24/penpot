@@ -13,6 +13,7 @@
    [app.common.geom.rect :as grc]
    [app.common.logging :as log]
    [app.common.time :as ct]
+   [app.common.types.objects-map :as omap]
    [app.worker.impl :as impl]
    [app.worker.selection :as selection]
    [app.worker.snap :as snap]
@@ -23,12 +24,16 @@
 (defonce state (l/atom {:pages-index {}}))
 
 (defmethod impl/handler :index/initialize
-  [{:keys [page] :as message}]
+  [{:keys [page raw] :as message}]
   (let [tpoint (ct/tpoint-ms)]
     (try
-      (swap! state update :pages-index assoc (:id page) page)
-      (swap! state update ::selection selection/add-page page)
-      (swap! state update ::snap snap/add-page page)
+      ;; Rebuild the page objects from the raw strings sent beside the page.
+      (let [page (cond-> page
+                   (some? raw)
+                   (assoc :objects (omap/from-raw-entries raw)))]
+        (swap! state update :pages-index assoc (:id page) page)
+        (swap! state update ::selection selection/add-page page)
+        (swap! state update ::snap snap/add-page page))
 
       (finally
         (let [elapsed (tpoint)]

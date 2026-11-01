@@ -18,6 +18,7 @@
    [app.main.data.workspace :as dw]
    [app.main.data.workspace.pages :as dwpg]
    [app.main.data.workspace.thumbnails :as th]
+   [app.main.data.workspace.tokens.propagation :as dwtp]
    [app.main.features :as features]
    [app.main.repo :as rp]
    [app.util.i18n :refer [tr]]
@@ -67,9 +68,12 @@
       (let [label   (ct/format-inst (ct/now) :localized-date)
             file-id (:current-file-id state)]
 
+        ;; Finish a running token propagation first, so the version does not
+        ;; hold a file with only some pages updated.
         ;; Force persist before creating snapshot, otherwise we could loss changes
         (rx/concat
-         (rx/of ::dwp/force-persist
+         (rx/of (dwtp/finish-propagation)
+                ::dwp/force-persist
                 (ev/event {::ev/name "create-version"}))
 
          (->> (dwp/wait-persisted-or-error)
@@ -216,7 +220,8 @@
     (watch [_ state _]
       (let [file-id (:current-file-id state)]
         (rx/concat
-         (rx/of ::dwp/force-persist
+         (rx/of (dwtp/finish-propagation)
+                ::dwp/force-persist
                 (dw/remove-layout-flag :document-history))
 
          (->> (dwp/wait-persisted-or-error)
@@ -362,7 +367,8 @@
         ;; Force persist before creating snapshot, otherwise we could loss changes
         (->> (rx/concat
               (when (= file-id current-file-id)
-                (rx/of ::dwp/force-persist))
+                (rx/of (dwtp/finish-propagation)
+                       ::dwp/force-persist))
 
               (->> (if (= file-id current-file-id)
                      (dwp/wait-persisted-or-error)
@@ -391,7 +397,8 @@
     ptk/WatchEvent
     (watch [_ _ _]
       (->> (rx/concat
-            (rx/of (ev/event {::ev/name "restore-version"
+            (rx/of (dwtp/finish-propagation)
+                   (ev/event {::ev/name "restore-version"
                               ::ev/origin "plugins"})
                    ::dwp/force-persist)
 

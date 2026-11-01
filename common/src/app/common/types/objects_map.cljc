@@ -18,6 +18,7 @@
   (:require
    #?(:clj [app.common.fressian :as fres])
    #?(:clj [clojure.data.json :as json])
+   #?(:cljs [app.common.uuid :as uuid])
    [app.common.transit :as t]
    [clojure.core :as c]
    [clojure.core.protocols :as cp])
@@ -35,6 +36,7 @@
 (defprotocol IObjectsMap
   (^:no-doc compact [this])
   (^:no-doc get-data [this] "retrieve internal data")
+  (^:no-doc -raw-data [this] "the internal id -> encoded value map, without compacting")
   (^:no-doc -hash-for-key [this key] "retrieve a hash for a key"))
 
 #?(:cljs
@@ -197,6 +199,9 @@
 
      (get-data [this]
        (compact this)
+       data)
+
+     (-raw-data [_]
        data)
 
      (-hash-for-key [this key]
@@ -366,6 +371,9 @@
        (compact this)
        data)
 
+     (-raw-data [_]
+       data)
+
      (-hash-for-key [this key]
        (if (contains? cache key)
          (c/hash (get cache key))
@@ -485,6 +493,19 @@
   [o]
   (instance? ObjectsMap o))
 
+(defn raw-data
+  "Returns the id -> encoded value map of an objects map, without
+  compacting it. A value is nil when the entry was set after the map was
+  decoded. Returns nil for anything that is not an objects map."
+  [o]
+  (when (objects-map? o)
+    (-raw-data o)))
+
+(defn raw-value
+  "Returns the encoded value of the entry `k`, as stored in the raw data."
+  [o k]
+  (get (raw-data o) k))
+
 (defn create
   ([] (from-data {}))
   ([other]
@@ -519,3 +540,36 @@
   :class ObjectsMap
   :wfn get-data
   :rfn from-data})
+
+#?(:cljs
+   (do
+     (defn raw-entries
+       "Return the raw ids and encoded strings of `o` as `#js {:ids :strs}`.
+       Entries with no raw string yet are encoded here."
+       [o]
+       (let [^js ids  #js []
+             ^js strs #js []]
+         (reduce-kv
+          (fn [_ id s]
+            (.push ids (str id))
+            (.push strs (or s (t/encode-str (get o id))))
+            nil)
+          nil
+          (raw-data o))
+         #js {:ids ids :strs strs}))
+
+     (defn from-raw-entries
+       "Build an ObjectsMap from the `#js {:ids :strs}` made by `raw-entries`.
+       The strings stay encoded until a shape is read."
+       [^js raw]
+       (let [^js ids  (.-ids raw)
+             ^js strs (.-strs raw)
+             data     (loop [i    0
+                             data (transient {})]
+                        (if (< i (.-length ids))
+                          (recur (inc i)
+                                 (assoc! data
+                                         (uuid/uuid (aget ids i))
+                                         (aget strs i)))
+                          (persistent! data)))]
+         (from-data data)))))

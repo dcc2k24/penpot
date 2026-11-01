@@ -135,15 +135,15 @@ pub(crate) fn render_direct_frame_drop_shadow(
     let margin = state.surfaces.margins().width as f32;
     let sigma_device = radius_to_sigma(shadow.blur) * scale;
     if sigma_device <= margin / 3.0 {
-        render_inline_frame_shadow(state, frame, shadow, scale)
+        render_inline_frame_shadow(state, frame, shadow)
     } else {
         render_cached_filter_frame_shadow(state, frame, shape_bounds, shadow, scale)
     }
 }
 
-fn frame_shadow_antialias(state: &RenderState, frame: &Shape, scale: f32) -> bool {
+fn frame_shadow_antialias(state: &RenderState, frame: &Shape) -> bool {
     !state.options.is_fast_mode()
-        && frame.should_use_antialias(scale, state.options.antialias_threshold)
+        && frame.should_use_antialias(state.decision_scale(), state.options.antialias_threshold)
 }
 
 fn spread_outset(spread: f32) -> Option<f32> {
@@ -213,6 +213,31 @@ fn shadow_world_offset(frame: &Shape, shadow: &Shadow) -> (f32, f32) {
     (mapped.x, mapped.y)
 }
 
+/// Rect that holds every pixel a drop-shadow pass can paint for an element. The element's own
+/// silhouette and its children's silhouettes lie inside `extrect`; each shadow moves them by its
+/// offset and grows them by spread and blur (Skia blur reaches 3 sigma). Children map the offset
+/// through their own transform, so the offset is applied as a symmetric outset of its L1 length,
+/// which covers any rotation or flip. `layer_blur_sigma` adds the container layer blur that
+/// child silhouettes inherit.
+pub(crate) fn drop_shadow_reach_rect<'a>(
+    extrect: Rect,
+    shadows: impl IntoIterator<Item = &'a Shadow>,
+    transform: &skia::Matrix,
+    layer_blur_sigma: f32,
+) -> Rect {
+    let mut reach = extrect;
+    for shadow in shadows {
+        let blur = 3.0 * radius_to_sigma(shadow.blur);
+        let spread = shadow.spread.max(0.0);
+        let mapped = transform.map_vector((shadow.offset.0, shadow.offset.1));
+        let offset =
+            (shadow.offset.0.abs() + shadow.offset.1.abs()).max(mapped.x.abs() + mapped.y.abs());
+        let outset = blur + spread + offset + 3.0 * layer_blur_sigma.max(0.0);
+        reach.join(extrect.with_outset((outset, outset)));
+    }
+    reach
+}
+
 /// When bounds fit in the filter surface, skip blur downscale to avoid banding
 /// at high zoom. The tile cache makes a single full-res pass affordable.
 fn blur_downscale_for_frame_shadow(
@@ -267,9 +292,8 @@ fn render_inline_frame_shadow(
     state: &mut RenderState,
     frame: &Shape,
     shadow: &Shadow,
-    scale: f32,
 ) -> Result<()> {
-    let antialias = frame_shadow_antialias(state, frame, scale);
+    let antialias = frame_shadow_antialias(state, frame);
     let layer_paint = blur_layer_paint(shadow.blur, 1.0);
     let draw_matrix = frame_shadow_draw_matrix(frame, shadow);
 
@@ -317,7 +341,7 @@ fn render_cached_filter_frame_shadow(
         return Ok(());
     };
 
-    let antialias = frame_shadow_antialias(state, frame, scale);
+    let antialias = frame_shadow_antialias(state, frame);
     let (filter_w, filter_h) = state.surfaces.filter_size();
     let blur_downscale = blur_downscale_for_frame_shadow(
         shadow.blur,
@@ -375,7 +399,7 @@ pub fn render_fill_inner_shadows(
     if !shape.has_fills() || shape.is_masked_group() || render_state.should_skip_drop_shadows() {
         return;
     }
-    let scale = render_state.get_scale();
+    let scale = render_state.decision_scale();
     let recursive = shape.is_recursive();
     for shadow in shape.inner_shadows_visible() {
         if !shadow.is_perceptible_at_scale_for(scale, recursive) {
@@ -406,7 +430,7 @@ pub fn render_stroke_inner_shadows(
     if shape.has_fills() || render_state.should_skip_drop_shadows() {
         return Ok(());
     }
-    let scale = render_state.get_scale();
+    let scale = render_state.decision_scale();
     let recursive = shape.is_recursive();
     for shadow in shape.inner_shadows_visible() {
         if !shadow.is_perceptible_at_scale_for(scale, recursive) {
@@ -617,5 +641,86 @@ mod tests {
         let pixels = cached.image.peek_pixels().unwrap();
         assert_eq!(pixels.get_color((5, 6)), skia::Color::RED);
         assert_eq!(pixels.get_color((0, 0)), skia::Color::TRANSPARENT);
+    }
+
+    fn reach_shadow(offset: (f32, f32), blur: f32, spread: f32) -> Shadow {
+        Shadow::new(
+            skia::Color::BLACK,
+            blur,
+            spread,
+            offset,
+            crate::shapes::ShadowStyle::Drop,
+            false,
+        )
+    }
+
+    /// True when `outer` covers every edge of `inner`.
+    fn covers(outer: Rect, inner: Rect) -> bool {
+        outer.left <= inner.left
+            && outer.top <= inner.top
+            && outer.right >= inner.right
+            && outer.bottom >= inner.bottom
+    }
+
+    fn shifted(rect: Rect, dx: f32, dy: f32) -> Rect {
+        Rect::from_ltrb(
+            rect.left + dx,
+            rect.top + dy,
+            rect.right + dx,
+            rect.bottom + dy,
+        )
+    }
+
+    #[test]
+    fn drop_shadow_reach_without_shadows_is_the_extrect() {
+        let extrect = Rect::from_xywh(100.0, 50.0, 40.0, 30.0);
+        let identity = skia::Matrix::new_identity();
+        let reach = drop_shadow_reach_rect(extrect, std::iter::empty::<&Shadow>(), &identity, 0.0);
+
+        assert!(covers(reach, extrect) && covers(extrect, reach));
+    }
+
+    #[test]
+    fn drop_shadow_reach_covers_the_offset_copy() {
+        let extrect = Rect::from_xywh(100.0, 50.0, 40.0, 30.0);
+        let identity = skia::Matrix::new_identity();
+        let shadow = reach_shadow((10.0, 0.0), 0.0, 0.0);
+        let reach = drop_shadow_reach_rect(extrect, std::iter::once(&shadow), &identity, 0.0);
+
+        assert!(covers(reach, extrect));
+        assert!(covers(reach, shifted(extrect, 10.0, 0.0)));
+    }
+
+    #[test]
+    fn drop_shadow_reach_covers_rotated_offset_either_way() {
+        let extrect = Rect::from_xywh(100.0, 50.0, 40.0, 30.0);
+        let rotated = skia::Matrix::rotate_deg(90.0);
+        let shadow = reach_shadow((10.0, 0.0), 0.0, 0.0);
+        let reach = drop_shadow_reach_rect(extrect, std::iter::once(&shadow), &rotated, 0.0);
+
+        assert!(covers(reach, extrect));
+        assert!(covers(reach, shifted(extrect, 0.0, 10.0)));
+        assert!(covers(reach, shifted(extrect, 0.0, -10.0)));
+    }
+
+    #[test]
+    fn drop_shadow_reach_adds_blur_and_spread() {
+        let extrect = Rect::from_xywh(100.0, 50.0, 40.0, 30.0);
+        let identity = skia::Matrix::new_identity();
+        let shadow = reach_shadow((0.0, 0.0), 4.0, 2.0);
+        let reach = drop_shadow_reach_rect(extrect, std::iter::once(&shadow), &identity, 0.0);
+
+        let outset = 3.0 * radius_to_sigma(4.0) + 2.0;
+        assert!(covers(reach, extrect.with_outset((outset, outset))));
+    }
+
+    #[test]
+    fn drop_shadow_reach_adds_layer_blur() {
+        let extrect = Rect::from_xywh(100.0, 50.0, 40.0, 30.0);
+        let identity = skia::Matrix::new_identity();
+        let shadow = reach_shadow((0.0, 0.0), 0.0, 0.0);
+        let reach = drop_shadow_reach_rect(extrect, std::iter::once(&shadow), &identity, 5.0);
+
+        assert!(covers(reach, extrect.with_outset((15.0, 15.0))));
     }
 }

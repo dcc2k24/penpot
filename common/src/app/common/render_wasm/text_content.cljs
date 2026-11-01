@@ -166,17 +166,11 @@
      offset
      spans)))
 
-(defn write-shape-text!
-  "Writes one paragraph's spans + text into WASM and appends it to the current
-  shape via `_set_shape_text_content`.
+(defn encode-paragraph
+  "Encodes one paragraph's spans and text into a new Uint8Array, in the layout
+  `_set_shape_text_content` reads: [num-spans][paragraph attrs][span attrs][text].
 
-  `opts` injects host-specific font handling:
-   - `:normalize-font-id` (string font-id -> wasm uuid) defaults to the shared
-     `cfnt/font-id->uuid`, which is what both hosts want — a host only
-     overrides it if it keys its font store some other way,
-   - `:normalize-paragraph`/`:normalize-span` — font-variant normalization from a
-     fonts DB (workspace); default to identity (the exporter resolves variants
-     differently / not at all)."
+  `opts` takes the same keys as `write-shape-text!`."
   [spans paragraph text {:keys [normalize-font-id normalize-paragraph normalize-span]
                          :or   {normalize-font-id   cfnt/font-id->uuid
                                 normalize-paragraph identity
@@ -190,12 +184,34 @@
         text-buffer   (encode-text text)
         text-size     (mem/size text-buffer)
         total-size    (+ 4 metadata-size text-size)
-        heapu8        (mem/get-heap-u8)
-        dview         (mem/get-data-view)
-        offset        (mem/alloc total-size)]
-    (-> offset
+        buffer        (js/ArrayBuffer. total-size)
+        dview         (js/DataView. buffer)
+        u8            (js/Uint8Array. buffer)]
+    (-> 0
         (mem/write-u32 dview num-spans)
         (write-paragraph dview paragraph)
         (write-spans dview spans paragraph normalize-font-id)
-        (mem/write-buffer heapu8 text-buffer))
+        (mem/write-buffer u8 text-buffer))
+    u8))
+
+(defn upload-paragraph-bytes!
+  "Copies encoded paragraph bytes into the WASM heap and appends them to the
+  current shape via `_set_shape_text_content`."
+  [^js u8]
+  (let [offset (mem/alloc (.-byteLength u8))]
+    (.set (mem/get-heap-u8) u8 offset)
     (h/call wasm/internal-module "_set_shape_text_content")))
+
+(defn write-shape-text!
+  "Writes one paragraph's spans + text into WASM and appends it to the current
+  shape via `_set_shape_text_content`. Encodes the paragraph, then uploads it.
+
+  `opts` injects host-specific font handling:
+   - `:normalize-font-id` (string font-id -> wasm uuid) defaults to the shared
+     `cfnt/font-id->uuid`, which is what both hosts want — a host only
+     overrides it if it keys its font store some other way,
+   - `:normalize-paragraph`/`:normalize-span` — font-variant normalization from a
+     fonts DB (workspace); default to identity (the exporter resolves variants
+     differently / not at all)."
+  [spans paragraph text opts]
+  (upload-paragraph-bytes! (encode-paragraph spans paragraph text opts)))

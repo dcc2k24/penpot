@@ -1,8 +1,9 @@
 use crate::render::Surfaces;
 use crate::uuid::Uuid;
 use crate::view::Viewbox;
+use rustc_hash::FxHashMap;
 use skia_safe as skia;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
 pub struct Tile(pub i32, pub i32);
 
@@ -315,15 +316,15 @@ pub fn tile_atlas_compose_scale(slot_size: i32) -> f32 {
 
 // This structure is useful to keep all the shape uuids by shape id.
 pub struct TileHashMap {
-    grid: HashMap<Tile, HashSet<Uuid>>,
-    index: HashMap<Uuid, HashSet<Tile>>,
+    grid: FxHashMap<Tile, HashSet<Uuid>>,
+    index: FxHashMap<Uuid, HashSet<Tile>>,
 }
 
 impl TileHashMap {
     pub fn new() -> Self {
         TileHashMap {
-            grid: HashMap::new(),
-            index: HashMap::new(),
+            grid: FxHashMap::default(),
+            index: FxHashMap::default(),
         }
     }
 
@@ -500,6 +501,25 @@ pub fn join_nonempty(mut acc: skia::Rect, rect: skia::Rect) -> skia::Rect {
     }
 }
 
+/// Pixels of the tile at `tile_rect` (doc space, drawn at `scale`) that `dirty` reaches,
+/// one pixel wider on every side for antialiasing and clamped to the tile, in tile pixel
+/// coordinates (`0..TILE_SIZE`). `None` when `dirty` reaches no pixel of the tile.
+pub fn tile_dirty_pixels(
+    dirty: skia::Rect,
+    tile_rect: skia::Rect,
+    scale: f32,
+) -> Option<skia::IRect> {
+    if dirty.is_empty() {
+        return None;
+    }
+    let size = TILE_SIZE as i32;
+    let left = (((dirty.left - tile_rect.left) * scale).floor() as i32 - 1).max(0);
+    let top = (((dirty.top - tile_rect.top) * scale).floor() as i32 - 1).max(0);
+    let right = (((dirty.right - tile_rect.left) * scale).ceil() as i32 + 1).min(size);
+    let bottom = (((dirty.bottom - tile_rect.top) * scale).ceil() as i32 + 1).min(size);
+    (left < right && top < bottom).then(|| skia::IRect::from_ltrb(left, top, right, bottom))
+}
+
 /// old ∪ new ∪ indexed tile coverage for post-edit cache eviction.
 pub fn union_edit_dirty_rect(
     old: Option<skia::Rect>,
@@ -593,5 +613,68 @@ mod tests {
         let dirty = union_edit_dirty_rect(Some(old), new, indexed);
         assert!(dirty.intersects(left_wing));
         assert!(dirty.intersects(right_wing));
+    }
+
+    fn pixel_bounds(px: skia::IRect) -> (i32, i32, i32, i32) {
+        (px.left, px.top, px.right, px.bottom)
+    }
+
+    #[test]
+    fn tile_dirty_pixels_outsets_the_dirty_rect_by_one_pixel() {
+        let tile = skia::Rect::from_xywh(0.0, 0.0, TILE_SIZE, TILE_SIZE);
+        let dirty = skia::Rect::from_ltrb(10.2, 20.7, 30.1, 40.0);
+
+        let px = tile_dirty_pixels(dirty, tile, 1.0).expect("dirty pixels");
+
+        assert_eq!(pixel_bounds(px), (9, 19, 32, 41));
+    }
+
+    #[test]
+    fn tile_dirty_pixels_halves_coordinates_at_half_scale() {
+        let tile = skia::Rect::from_xywh(0.0, 0.0, 1024.0, 1024.0);
+        let dirty = skia::Rect::from_ltrb(100.0, 200.0, 300.0, 400.0);
+
+        let px = tile_dirty_pixels(dirty, tile, 0.5).expect("dirty pixels");
+
+        assert_eq!(pixel_bounds(px), (49, 99, 151, 201));
+    }
+
+    #[test]
+    fn tile_dirty_pixels_is_relative_to_the_tile_origin() {
+        let tile = skia::Rect::from_xywh(TILE_SIZE, TILE_SIZE, TILE_SIZE, TILE_SIZE);
+        let dirty = skia::Rect::from_ltrb(520.2, 530.7, 540.1, 550.0);
+
+        let px = tile_dirty_pixels(dirty, tile, 1.0).expect("dirty pixels");
+
+        assert_eq!(pixel_bounds(px), (7, 17, 30, 39));
+    }
+
+    #[test]
+    fn tile_dirty_pixels_clamps_to_the_tile() {
+        let tile = skia::Rect::from_xywh(0.0, 0.0, TILE_SIZE, TILE_SIZE);
+        let dirty = skia::Rect::from_ltrb(-100.0, -100.0, 2000.0, 2000.0);
+
+        let px = tile_dirty_pixels(dirty, tile, 1.0).expect("dirty pixels");
+
+        assert_eq!(pixel_bounds(px), (0, 0, 512, 512));
+    }
+
+    #[test]
+    fn tile_dirty_pixels_ignores_a_rect_beyond_the_tile() {
+        let tile = skia::Rect::from_xywh(0.0, 0.0, TILE_SIZE, TILE_SIZE);
+
+        let right = skia::Rect::from_ltrb(600.0, 600.0, 700.0, 700.0);
+        let left = skia::Rect::from_ltrb(-50.0, 10.0, -20.0, 20.0);
+
+        assert!(tile_dirty_pixels(right, tile, 1.0).is_none());
+        assert!(tile_dirty_pixels(left, tile, 1.0).is_none());
+    }
+
+    #[test]
+    fn tile_dirty_pixels_ignores_an_empty_rect() {
+        let tile = skia::Rect::from_xywh(0.0, 0.0, TILE_SIZE, TILE_SIZE);
+        let dirty = skia::Rect::from_ltrb(10.0, 10.0, 10.0, 20.0);
+
+        assert!(tile_dirty_pixels(dirty, tile, 1.0).is_none());
     }
 }

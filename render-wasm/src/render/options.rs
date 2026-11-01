@@ -3,6 +3,21 @@ const DEBUG_VISIBLE: u32 = 0x01;
 const PROFILE_REBUILD_TILES: u32 = 0x02;
 const TEXT_EDITOR_V3: u32 = 0x04;
 const SHOW_WASM_INFO: u32 = 0x08;
+/// Turns off root-board imposters (cached textures for small boards).
+const DISABLE_IMPOSTERS: u32 = 0x10;
+
+// Level-of-detail defaults. Sizes are device pixels unless stated otherwise.
+const MIN_VISIBLE_DEVICE_PX: f32 = 2.0;
+const SUBPIXEL_LEAF_DEVICE_PX: f32 = 0.5;
+const IMPOSTER_MAX_SCREEN_PX: f32 = 256.0;
+const IMPOSTER_MAX_SCALE: f32 = 0.5;
+const IMPOSTER_MIN_DESCENDANTS: u32 = 24;
+/// GPU bytes of captured board pixels. The large bench file at fit (with the interest ring)
+/// holds 12.8 MB.
+const IMPOSTER_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+const IMPOSTER_MAX_ENTRIES: usize = 2048;
+/// Distinct (scale, background) views whose captures are kept.
+const IMPOSTER_MAX_VIEWS: usize = 3;
 
 // Render performance options
 // This is the extra area used for tile rendering (tiles beyond viewport).
@@ -10,6 +25,10 @@ const SHOW_WASM_INFO: u32 = 0x08;
 const VIEWPORT_INTEREST_AREA_THRESHOLD: i32 = 1;
 const MIN_DPR_VIEWPORT_INTEREST_AREA_THRESHOLD: i32 = 2;
 const MAX_BLOCKING_TIME_MS: i32 = 32;
+/// Total time a progressive slice should take (walk + GPU drain + present).
+const TARGET_FRAME_MS: i32 = 16;
+/// Lower bound for the adaptive tile-walk budget so each slice still makes progress.
+pub const MIN_WALK_BUDGET_MS: i32 = 4;
 const NODE_BATCH_THRESHOLD: i32 = 3;
 /// Soft-drain GPU every N walker nodes on progressive Partials. Keeps ops
 /// buffers bounded when many shapes paint cheaply to Current (release packs
@@ -32,12 +51,31 @@ pub struct RenderOptions {
     pub viewport_interest_area_threshold: i32,
     pub dpr_viewport_interest_area_threshold: i32,
     pub max_blocking_time_ms: i32,
+    /// Total time a progressive slice should take, covering the tile walk plus
+    /// the GPU drain and present that follow it. The walk budget adapts so the
+    /// whole slice fits this target.
+    pub target_frame_ms: i32,
     pub node_batch_threshold: i32,
     /// Soft-flush GPU every N nodes during progressive tile walks (see
     /// [`PARTIAL_GPU_DRAIN_EVERY_N`]).
     pub partial_gpu_drain_every_n: i32,
     pub blur_downscale_threshold: f32,
     pub capture_frames: i32,
+    /// Shapes whose extrect is under this many device px on both axes are skipped by the viewport walk.
+    pub min_visible_device_px: f32,
+    /// Leaf (non-container) shapes whose extrect's largest side is under this many device px are skipped by the viewport walk.
+    pub subpixel_leaf_device_px: f32,
+    /// Root boards whose extrect's largest side is under this many device px are copied back from pixels captured in an earlier render of the tile (imposter). 0 disables imposters.
+    pub imposter_max_screen_px: f32,
+    /// Imposters are only used at workspace scales up to this value; closer in,
+    /// boards are walked so they stay sharp.
+    pub imposter_max_scale: f32,
+    /// Boards with fewer visible descendants than this are walked: drawing them is
+    /// cheaper than keeping a texture.
+    pub imposter_min_descendants: u32,
+    pub imposter_budget_bytes: usize,
+    pub imposter_max_entries: usize,
+    pub imposter_max_views: usize,
 }
 
 impl Default for RenderOptions {
@@ -51,10 +89,19 @@ impl Default for RenderOptions {
             viewport_interest_area_threshold: VIEWPORT_INTEREST_AREA_THRESHOLD,
             dpr_viewport_interest_area_threshold: VIEWPORT_INTEREST_AREA_THRESHOLD,
             max_blocking_time_ms: MAX_BLOCKING_TIME_MS,
+            target_frame_ms: TARGET_FRAME_MS,
             node_batch_threshold: NODE_BATCH_THRESHOLD,
             partial_gpu_drain_every_n: PARTIAL_GPU_DRAIN_EVERY_N,
             blur_downscale_threshold: BLUR_DOWNSCALE_THRESHOLD,
             capture_frames: 0,
+            min_visible_device_px: MIN_VISIBLE_DEVICE_PX,
+            subpixel_leaf_device_px: SUBPIXEL_LEAF_DEVICE_PX,
+            imposter_max_screen_px: IMPOSTER_MAX_SCREEN_PX,
+            imposter_max_scale: IMPOSTER_MAX_SCALE,
+            imposter_min_descendants: IMPOSTER_MIN_DESCENDANTS,
+            imposter_budget_bytes: IMPOSTER_BUDGET_BYTES,
+            imposter_max_entries: IMPOSTER_MAX_ENTRIES,
+            imposter_max_views: IMPOSTER_MAX_VIEWS,
         }
     }
 }
@@ -120,5 +167,10 @@ impl RenderOptions {
 
     pub fn show_wasm_info(&self) -> bool {
         self.flags & SHOW_WASM_INFO == SHOW_WASM_INFO
+    }
+
+    /// Imposters are on unless the frontend sets DISABLE_IMPOSTERS.
+    pub fn imposters_enabled(&self) -> bool {
+        self.flags & DISABLE_IMPOSTERS == 0 && self.imposter_max_screen_px > 0.0
     }
 }

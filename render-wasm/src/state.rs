@@ -1,9 +1,11 @@
 use skia_safe::{self as skia, textlayout::FontCollection, Path, Point};
 use std::collections::HashMap;
 
+mod page_cache;
 mod shapes_pool;
 mod text_editor;
 mod ui;
+pub use page_cache::PageCache;
 pub use shapes_pool::{ShapesPool, ShapesPoolMutRef, ShapesPoolRef};
 pub use text_editor::*;
 pub use ui::RulerState;
@@ -12,7 +14,7 @@ pub use ui::UIState;
 use crate::error::{Error, Result};
 use crate::render::raster::RasterFormat;
 use crate::render::FrameType;
-use crate::shapes::{grid_layout::grid_cell_data, FontFamily, Shape};
+use crate::shapes::{grid_layout::grid_cell_data, FontFamily, Shape, Type};
 use crate::uuid::Uuid;
 use crate::{get_render_state, get_resources, has_render_state, tiles};
 
@@ -204,6 +206,58 @@ impl State {
         self.shapes.initialize(capacity);
     }
 
+    /// Moves the shapes pool into `cache` under `page_id`, leaving an empty
+    /// pool. Returns false, keeping the pool, while shapes are loading, while
+    /// a temporary pool is active, when the pool has no root shape or when it
+    /// does not fit in the cache.
+    pub fn stash_page(&mut self, page_id: Uuid, cache: &mut PageCache) -> bool {
+        if self.loading
+            || self.saved_shapes.is_some()
+            || !self.shapes.has(&Uuid::nil())
+            || !cache.accepts_pool(&self.shapes)
+        {
+            return false;
+        }
+
+        let mut pool = std::mem::take(&mut self.shapes);
+        // Modifiers only preview a gesture: the committed geometry is in the
+        // shapes themselves, which is what a fresh upload would contain.
+        pool.clean_all();
+        // Cached text paints may hold image shaders bound to this renderer's
+        // GL context, which `clean_up` is about to drop.
+        for shape in pool.iter_mut() {
+            if let Type::Text(content) = &mut shape.shape_type {
+                // Decided by what the cached layout was built with: the
+                // current fills may differ from it.
+                if content.layout_has_image_shaders() {
+                    content.detach_paint_cache();
+                }
+            }
+        }
+        self.current_id = None;
+        cache.stash(page_id, pool)
+    }
+
+    /// Replaces the shapes pool with the pool `cache` holds for `page_id`.
+    /// Returns false, changing nothing, when the page is not cached, while
+    /// shapes are loading or while a temporary pool is active.
+    pub fn restore_page(&mut self, page_id: &Uuid, cache: &mut PageCache) -> bool {
+        if self.loading || self.saved_shapes.is_some() {
+            return false;
+        }
+
+        let Some(pool) = cache.take(page_id) else {
+            return false;
+        };
+        self.shapes = pool;
+        // Imposters belong to the previous pool.
+        if has_render_state() {
+            get_render_state().clear_imposters();
+        }
+        self.current_id = None;
+        true
+    }
+
     pub fn use_shape(&mut self, id: Uuid) {
         if !self.shapes.has(&id) {
             self.shapes.add_shape(id);
@@ -227,6 +281,7 @@ impl State {
             // headless export path has none, so skip it there.
             if has_render_state() {
                 let render_state = get_render_state();
+                render_state.mark_imposter_dirty(parent_id);
                 // Do NOT use `get_tiles_for_shape` (interest-clipped). Evict by
                 // document coverage so cached tiles outside the interest area
                 // cannot keep pixels of the deleted shape.
@@ -241,9 +296,10 @@ impl State {
                     .fold(shape.extrect(&self.shapes, 1.0), |acc, tile| {
                         tiles::join_nonempty(acc, tiles::get_tile_rect(*tile, scale))
                     });
-                render_state
-                    .surfaces
-                    .invalidate_cached_tiles_intersecting(dirty);
+                render_state.surfaces.invalidate_cached_tiles_intersecting(
+                    dirty,
+                    !render_state.options.is_interactive_transform(),
+                );
                 for tile in indexed_tiles {
                     render_state.tiles.remove_shape_at(tile, shape.id);
                 }
@@ -300,7 +356,16 @@ impl State {
             return;
         }
 
+        let old_parent = shape.parent_id;
         shape.set_parent(id);
+
+        if has_render_state() {
+            let render_state = get_render_state();
+            if let Some(old) = old_parent {
+                render_state.mark_imposter_dirty(old);
+            }
+            render_state.mark_imposter_dirty(id);
+        }
 
         // Note: We don't call parent.add_child() here because we are
         // asuming the parent is updating its children list via set_children() calls.
@@ -384,6 +449,11 @@ impl State {
             (id, deleted)
         };
 
+        // The children list changed: the old board of a moved-out child loses its imposter.
+        if has_render_state() {
+            get_render_state().mark_imposter_dirty(parent_id);
+        }
+
         for id in &entries {
             self.touch_shape(*id);
             if let Some(children_shape) = self.shapes.get_mut(id) {
@@ -415,5 +485,267 @@ impl State {
             .get(&id)
             .map(|shape| shape.extrect(&self.shapes, 1.0));
         get_render_state().mark_touched_with_prev(id, prev);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::Rect;
+    use crate::shapes::{
+        Fill, FontStyle, GrowType, ImageFill, Paragraph, TextAlign, TextContent, TextDirection,
+        TextSpan,
+    };
+    use std::rc::Rc;
+
+    fn state_with_page(child: Uuid) -> State {
+        let mut state = State::new();
+        state.init_shapes_pool(2);
+        state.shapes.add_shape(Uuid::nil());
+        state.shapes.add_shape(child);
+        state
+    }
+
+    #[test]
+    fn stash_then_restore_round_trip() {
+        let page = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut cache = PageCache::new();
+
+        let mut state = state_with_page(child);
+        assert!(state.stash_page(page, &mut cache));
+        assert_eq!(state.shapes.len(), 0);
+        assert!(cache.contains(&page));
+
+        let mut other = State::new();
+        assert!(other.restore_page(&page, &mut cache));
+        assert!(other.shapes.has(&child));
+        assert!(other.shapes.has(&Uuid::nil()));
+        assert!(!cache.contains(&page));
+    }
+
+    #[test]
+    fn restore_unknown_page_keeps_pool() {
+        let child = Uuid::new_v4();
+        let mut cache = PageCache::new();
+
+        let mut state = state_with_page(child);
+        assert!(!state.restore_page(&Uuid::new_v4(), &mut cache));
+        assert!(state.shapes.has(&child));
+    }
+
+    #[test]
+    fn stash_refused_while_loading() {
+        let page = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut cache = PageCache::new();
+
+        let mut state = state_with_page(child);
+        state.loading = true;
+        assert!(!state.stash_page(page, &mut cache));
+        assert!(state.shapes.has(&child));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn stash_refused_with_temp_pool() {
+        let page = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut cache = PageCache::new();
+
+        let mut state = state_with_page(child);
+        state.start_temp_objects().unwrap();
+        assert!(!state.stash_page(page, &mut cache));
+        assert!(cache.is_empty());
+
+        state.end_temp_objects().unwrap();
+        assert!(state.shapes.has(&child));
+    }
+
+    #[test]
+    fn stash_refused_without_root() {
+        let page = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut cache = PageCache::new();
+
+        let mut state = State::new();
+        state.init_shapes_pool(1);
+        state.shapes.add_shape(child);
+        assert!(!state.stash_page(page, &mut cache));
+        assert!(state.shapes.has(&child));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn stash_refused_when_pool_does_not_fit() {
+        let page = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut cache = PageCache::with_limits(3, 1, 1);
+
+        let mut state = state_with_page(child);
+        assert!(!state.stash_page(page, &mut cache));
+        assert!(state.shapes.has(&child));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn stash_refused_when_page_too_heavy() {
+        let page = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        // Root (1) + text (8) = weight 9 > 5.
+        let mut cache = PageCache::with_limits(3, 5, 100);
+
+        let mut state = state_with_page(child);
+        state
+            .shapes
+            .get_mut(&child)
+            .unwrap()
+            .set_shape_type(Type::Text(TextContent::default()));
+        assert!(!state.stash_page(page, &mut cache));
+        assert!(state.shapes.has(&child));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn stash_drops_modifiers() {
+        let page = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut cache = PageCache::new();
+
+        let mut state = state_with_page(child);
+        let modifiers = HashMap::from([(child, skia::Matrix::translate((10.0, 0.0)))]);
+        state.shapes.set_modifiers(modifiers);
+        assert!(state.shapes.has_pending_modifiers());
+        assert!(state.stash_page(page, &mut cache));
+
+        let mut other = State::new();
+        assert!(other.restore_page(&page, &mut cache));
+        assert!(!other.shapes.has_pending_modifiers());
+    }
+
+    #[test]
+    fn restore_refused_while_loading() {
+        let page = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut cache = PageCache::new();
+
+        let mut source = state_with_page(child);
+        assert!(source.stash_page(page, &mut cache));
+
+        let mut state = State::new();
+        state.loading = true;
+        assert!(!state.restore_page(&page, &mut cache));
+        assert!(cache.contains(&page));
+    }
+
+    /// Text whose only span has an image fill and whose cached layout matches.
+    fn text_with_image_span() -> TextContent {
+        let image = Fill::Image(ImageFill::new(Uuid::nil(), 255, 100, 100, true));
+        let span = TextSpan::new(
+            "image".to_string(),
+            FontFamily::new(Uuid::nil(), 400, FontStyle::Normal),
+            14.0,
+            1.2,
+            0.0,
+            None,
+            None,
+            TextDirection::LTR,
+            400,
+            Uuid::nil(),
+            vec![image],
+        );
+        let paragraph = Paragraph::new(
+            TextAlign::Left,
+            TextDirection::LTR,
+            None,
+            None,
+            1.2,
+            0.0,
+            vec![span],
+        );
+        let mut content =
+            TextContent::new(Rect::from_xywh(0.0, 0.0, 200.0, 100.0), GrowType::Fixed);
+        // Pushed directly so the content version stays 0, the same as the layout
+        // version of a new content. The cached layout then matches.
+        content.paragraphs.push(paragraph);
+        content.layout.paragraphs = Rc::new(vec![vec![]]);
+        // The layout stands for one built with the image fill.
+        content.layout.has_image_shaders = true;
+        content
+    }
+
+    fn text_cache_matches(shape: &Shape) -> bool {
+        match &shape.shape_type {
+            Type::Text(content) => content.layout_cache_versions_match(),
+            _ => panic!("expected a text shape"),
+        }
+    }
+
+    #[test]
+    fn stash_detaches_text_image_paint_cache() {
+        let page = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut cache = PageCache::new();
+
+        let mut state = state_with_page(child);
+        let text = Type::Text(text_with_image_span());
+        state.shapes.get_mut(&child).unwrap().set_shape_type(text);
+        assert!(text_cache_matches(state.shapes.get(&child).unwrap()));
+
+        assert!(state.stash_page(page, &mut cache));
+
+        let mut other = State::new();
+        assert!(other.restore_page(&page, &mut cache));
+        assert!(!text_cache_matches(other.shapes.get(&child).unwrap()));
+    }
+
+    #[test]
+    fn stash_keeps_text_cache_built_without_image_shaders() {
+        let page = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut cache = PageCache::new();
+
+        let mut state = state_with_page(child);
+        let mut content = text_with_image_span();
+        content.layout.has_image_shaders = false;
+        state
+            .shapes
+            .get_mut(&child)
+            .unwrap()
+            .set_shape_type(Type::Text(content));
+        assert!(text_cache_matches(state.shapes.get(&child).unwrap()));
+
+        assert!(state.stash_page(page, &mut cache));
+
+        let mut other = State::new();
+        assert!(other.restore_page(&page, &mut cache));
+        assert!(text_cache_matches(other.shapes.get(&child).unwrap()));
+    }
+
+    #[test]
+    fn stash_detaches_by_layout_flag_not_current_fills() {
+        let page = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut cache = PageCache::new();
+
+        let mut state = state_with_page(child);
+        // The image fill is gone, but the cached layout was built with it.
+        // Fields are used directly so the content version stays unchanged.
+        let mut content = text_with_image_span();
+        content.paragraphs[0].children_mut()[0].fills =
+            vec![Fill::Solid(crate::shapes::SolidColor(skia::Color::BLACK))];
+        assert!(!content.has_image_fills());
+        state
+            .shapes
+            .get_mut(&child)
+            .unwrap()
+            .set_shape_type(Type::Text(content));
+        assert!(text_cache_matches(state.shapes.get(&child).unwrap()));
+
+        assert!(state.stash_page(page, &mut cache));
+
+        let mut other = State::new();
+        assert!(other.restore_page(&page, &mut cache));
+        assert!(!text_cache_matches(other.shapes.get(&child).unwrap()));
     }
 }

@@ -471,8 +471,8 @@
 (def ^:dynamic *touched-changes*
   "A dynamic var that used for track changes that touch shapes on
   first processing phase of changes. Should be set to a hash-set
-  instance and will contain changes that caused the touched
-  modification."
+  instance and will contain the `touched-key` of each change that
+  caused the touched modification."
   nil)
 
 (def ^:dynamic *state*
@@ -495,6 +495,14 @@
               :page-id page-id
               :shape-id id
               ::sm/explain (cts/explain-shape shape))))
+
+(defn- touched-key
+  "The part of `change` that `process-touched-change` reads. Tracking it
+  instead of the whole change avoids hashing every operation value."
+  [change]
+  {:id           (:id change)
+   :page-id      (:page-id change)
+   :component-id (:component-id change)})
 
 (defn- process-touched-change
   [data {:keys [id page-id component-id]}]
@@ -631,7 +639,7 @@
       ;; the ::ctn/touched metadata on shapes, in this case we
       ;; need to report them for to be used in the second
       ;; phase of changes procesing
-      (when touched? (some-> *touched-changes* (vswap! conj change)))
+      (when touched? (some-> *touched-changes* (vswap! conj (touched-key change))))
 
       (when (and *state* page-id)
         (swap! *state* collect-shape-media-refs shape page-id))
@@ -667,7 +675,7 @@
 
         (if (not= old-shapes new-shapes)
           (do
-            (some-> *touched-changes* (vswap! conj change))
+            (some-> *touched-changes* (vswap! conj (touched-key change)))
             (update objects parent-id assoc :shapes new-shapes))
           objects)))
 
@@ -1127,11 +1135,11 @@
 
 (defmethod process-operation :set
   [shape op]
-  (ctn/set-shape-attr shape
-                      (:attr op)
-                      (:val op)
-                      :ignore-touched (:ignore-touched op)
-                      :ignore-geometry (:ignore-geometry op)))
+  (ctn/set-shape-attr* shape
+                       (:attr op)
+                       (:val op)
+                       (:ignore-touched op)
+                       (:ignore-geometry op)))
 
 (defmethod process-operation :set-touched
   [shape op]

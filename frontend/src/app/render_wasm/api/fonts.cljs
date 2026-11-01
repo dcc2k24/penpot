@@ -44,6 +44,37 @@
   [font-data]
   (select-keys font-data [:font-id :weight :style :emoji?]))
 
+;; --- Per-chunk memo for the bulk shape upload
+;;
+;; A page load uploads thousands of texts that share a handful of faces.
+;; Without a memo every text resolves the same faces again (font DB lookups,
+;; URL building, `_is_font_uploaded`, `_store_font_url`). `call-with-batch-memo`
+;; binds a memo for one synchronous upload chunk only: font fetches finish
+;; asynchronously, after the chunk, so neither the font DB nor the WASM font
+;; store change while it is alive. Outside a chunk the var is nil and every
+;; call takes the uncached path.
+(def ^:dynamic *batch-memo* nil)
+
+(defn call-with-batch-memo
+  "Calls `f` with font lookups memoized for its synchronous extent."
+  [f]
+  (binding [*batch-memo* (volatile! {})]
+    (f)))
+
+(defn- batch-memo
+  "Returns the value memoized under `k` in the bound batch memo, computing it
+  with `compute-fn` on a miss. Calls `compute-fn` directly when no batch memo
+  is bound."
+  [k compute-fn]
+  (if-let [memo *batch-memo*]
+    (let [cache @memo]
+      (if (contains? cache k)
+        (get cache k)
+        (let [v (compute-fn)]
+          (vswap! memo assoc k v)
+          v)))
+    (compute-fn)))
+
 (defn- clear-font-storage-failure!
   [font-data]
   (swap! failed-font-data-keys disj (font-data-key font-data)))
@@ -60,12 +91,15 @@
 
 (defn- font-db-data
   [font-id font-variant-id font-weight-fallback font-style-fallback]
-  (let [font (fonts/get-font-data font-id)
-        closest-variant (fonts/find-closest-variant font font-weight-fallback font-style-fallback)
-        variant (fonts/get-variant font font-variant-id)]
-    (if (or (nil? closest-variant) (= closest-variant variant))
-      variant
-      closest-variant)))
+  (batch-memo
+   [::font-db-data font-id font-variant-id font-weight-fallback font-style-fallback]
+   (fn []
+     (let [font (fonts/get-font-data font-id)
+           closest-variant (fonts/find-closest-variant font font-weight-fallback font-style-fallback)
+           variant (fonts/get-variant font font-variant-id)]
+       (if (or (nil? closest-variant) (= closest-variant variant))
+         variant
+         closest-variant)))))
 
 (defn uuid->font-id
   [font-uuid]
@@ -404,7 +438,7 @@
     "regular"
     font-variant-id))
 
-(defn make-font-data
+(defn- make-font-data*
   [font]
   (let [font-id (get font :font-id)
         font-variant-id (get font :font-variant-id)
@@ -436,10 +470,22 @@
      :fallback? fallback?
      :asset-id asset-id}))
 
+(defn make-font-data
+  [font]
+  (batch-memo [::font-data font] #(make-font-data* font)))
+
 (defn store-font
   [font]
   (let [{:keys [asset-id emoji? fallback?] :as font-data} (make-font-data font)]
-    (store-font-id font-data asset-id emoji? fallback?)))
+    (if-let [memo *batch-memo*]
+      ;; Store each face once per chunk. Repeating `store-font-id` for the
+      ;; same face only registers the same URL again, joins the fetch already
+      ;; pending or announces a stored face again: no new effect.
+      (let [k [::stored font-data]]
+        (when-not (contains? @memo k)
+          (vswap! memo assoc k true)
+          (store-font-id font-data asset-id emoji? fallback?)))
+      (store-font-id font-data asset-id emoji? fallback?))))
 
 ;; FIXME: This is a temporary function to load the fallback fonts for the editor.
 ;; Once we render the editor content within wasm, we can remove this function.
@@ -470,6 +516,37 @@
                             :font-style (or (:style font-data) font-style-fallback)}]
               (conj result font-ref)))
           #{}))))
+
+(defn text-fallback-fonts
+  "Fallback faces (emoji, Noto, ...) that the text of `content` needs. Pure."
+  [content]
+  (let [paragraph-set (first (get content :children))
+        paragraphs    (get paragraph-set :children)
+        total         (count paragraphs)]
+    (loop [index  0
+           emoji? false
+           langs  #{}]
+
+      (if (< index total)
+        (let [paragraph (nth paragraphs index)
+              spans    (get paragraph :children)]
+          (if (empty? (seq spans))
+            (recur (inc index)
+                   emoji?
+                   langs)
+
+            (let [text   (apply str (map :text spans))
+                  emoji? (if emoji? emoji? (cfnt/contains-emoji? text))
+                  langs  (cfnt/collect-used-languages langs text)]
+
+              (recur (inc index)
+                     emoji?
+                     langs))))
+
+        (let [updated-fonts (-> #{}
+                                (cond-> ^boolean emoji? (cfnt/add-emoji-font))
+                                (cfnt/add-noto-fonts langs))]
+          (filter #(get % :is-fallback) updated-fonts))))))
 
 (defn store-fonts
   [fonts]

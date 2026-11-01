@@ -134,36 +134,41 @@
           (rx/map #(dwt/update-text-with-function % transform options)))
      (rx/of (dwsh/update-shapes shape-ids transform options)))))
 
+(defn color->fill
+  "The fill that `transform-fill` makes from `color`."
+  [color]
+  (cond-> {}
+    (contains? color :color)
+    (assoc :fill-color (:color color))
+
+    (contains? color :ref-id)
+    (assoc :fill-color-ref-id (:ref-id color))
+
+    (contains? color :ref-file)
+    (assoc :fill-color-ref-file (:ref-file color))
+
+    (contains? color :gradient)
+    (assoc :fill-color-gradient (:gradient color))
+
+    (contains? color :opacity)
+    (assoc :fill-opacity (:opacity color))
+
+    (contains? color :image)
+    (assoc :fill-image (:image color))
+
+    :always
+    (d/without-nils)
+
+    :always
+    (types.fills/check-fill)))
+
 (defn transform-fill
   "A low level function that creates a shape fill transformations stream"
   ([state ids color transform]
    (transform-fill state ids color transform nil))
   ([state ids color transform options]
    (let [fill
-         (cond-> {}
-           (contains? color :color)
-           (assoc :fill-color (:color color))
-
-           (contains? color :ref-id)
-           (assoc :fill-color-ref-id (:ref-id color))
-
-           (contains? color :ref-file)
-           (assoc :fill-color-ref-file (:ref-file color))
-
-           (contains? color :gradient)
-           (assoc :fill-color-gradient (:gradient color))
-
-           (contains? color :opacity)
-           (assoc :fill-opacity (:opacity color))
-
-           (contains? color :image)
-           (assoc :fill-image (:image color))
-
-           :always
-           (d/without-nils)
-
-           :always
-           (types.fills/check-fill))
+         (color->fill color)
 
          transform-attrs
          #(transform % fill)]

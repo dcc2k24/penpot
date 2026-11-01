@@ -5,6 +5,7 @@ mod fonts;
 pub mod gpu_state;
 pub mod grid_layout;
 mod images;
+pub(crate) mod lod;
 mod options;
 pub mod pdf;
 pub mod raster;
@@ -18,12 +19,13 @@ pub mod text;
 pub mod text_editor;
 mod ui;
 mod vector;
+pub(crate) mod warmup;
 
 use skia_safe::{self as skia, Matrix, RRect, Rect};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use options::RenderOptions;
+use options::{RenderOptions, MIN_WALK_BUDGET_MS};
 pub(crate) use strokes::per_side_stroke_outline;
 pub use surfaces::{SurfaceId, Surfaces};
 
@@ -315,6 +317,11 @@ impl FocusMode {
         self.depth > 0
     }
 
+    /// True when focus mode restricts rendering to a list of shapes.
+    pub fn has_filter(&self) -> bool {
+        !self.shapes.is_empty()
+    }
+
     pub fn reset(&mut self) {
         self.depth = 0;
     }
@@ -414,6 +421,152 @@ impl RenderStats {
     }
 }
 
+/// Per-render-cycle counters for attributing slow frames. Plain integer adds only.
+/// Reset at the top of `start_render_loop`; partial frames add up within a cycle.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct RenderCounters {
+    /// Tiles whose walk started this cycle (not served from the tile cache).
+    pub tiles_rendered: u32,
+    /// Tiles skipped because a cached tile surface already covers them.
+    pub tiles_from_cache: u32,
+    /// Shapes popped from the pending stack by the tile walk.
+    pub node_visits: u32,
+    /// Shapes that reached the fill/stroke drawing step in `render_shape`.
+    pub shapes_drawn: u32,
+    /// `save_layer` calls issued from this file.
+    pub save_layers: u32,
+    /// Frames that yielded as Partial.
+    pub partial_frames: u32,
+    /// Full frames completed.
+    pub full_frames: u32,
+    /// Calls to `render_from_cache`.
+    pub render_from_cache_calls: u32,
+    /// Total milliseconds spent inside the tile walk (get_time resolution).
+    pub walk_ms: f64,
+    /// Root boards copied from captured pixels instead of walked (per tile).
+    pub imposters_drawn: u32,
+    /// Root boards whose pixels were captured from a tile this cycle.
+    pub imposters_built: u32,
+    /// Leaf shapes skipped by the viewport walk because they are below the size thresholds.
+    pub culled_leaves: u32,
+    /// Tiles repainted only where they changed (see [`PartialTile`]).
+    pub partial_tiles: u32,
+}
+
+/// Serializes `counters` as 56 little-endian bytes: the eight u32 fields in
+/// declaration order, then `walk_ms` as f64, then the imposter, culling and
+/// partial-tile u32 fields. Read by `get_render_counters`.
+pub fn counters_to_bytes(counters: &RenderCounters) -> Vec<u8> {
+    let mut out = Vec::with_capacity(56);
+    for value in [
+        counters.tiles_rendered,
+        counters.tiles_from_cache,
+        counters.node_visits,
+        counters.shapes_drawn,
+        counters.save_layers,
+        counters.partial_frames,
+        counters.full_frames,
+        counters.render_from_cache_calls,
+    ] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(&counters.walk_ms.to_le_bytes());
+    for value in [
+        counters.imposters_drawn,
+        counters.imposters_built,
+        counters.culled_leaves,
+        counters.partial_tiles,
+    ] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+/// Bench hook: size of the captured board pixels. `which == 0` returns the GPU KiB they hold,
+/// any other value the number of captures.
+#[no_mangle]
+pub extern "C" fn get_imposter_cache_stats(which: u32) -> u32 {
+    if !crate::globals::has_render_state() {
+        return 0;
+    }
+    let imposters = &crate::globals::get_render_state().imposters;
+    if which == 0 {
+        (imposters.bytes() / 1024) as u32
+    } else {
+        imposters.len() as u32
+    }
+}
+
+/// A stale tile being repainted only in `dirty_px` (pixels of the `Current`
+/// drawable). The rest of the tile is copied back from `slot`, which holds the
+/// tile as it was before the change, once the walk is done.
+struct PartialTile {
+    slot: surfaces::TileAtlasTextureRef,
+    dirty_px: skia::IRect,
+}
+
+/// Outcome of [`RenderState::begin_partial_tile`].
+enum PartialStart {
+    /// Not a stale tile, or one that must be repainted whole.
+    No,
+    /// The change does not reach the tile's pixels: it is cached again as it was.
+    Restored,
+    /// Repaint the shapes that reach this doc rect.
+    Started(Rect),
+}
+
+/// How far (doc units) the glyphs of a text may paint outside its laid-out lines: its
+/// largest font size covers accents, descenders and italic overhang.
+fn text_ink_reach(shape: &Shape) -> f32 {
+    let Type::Text(content) = &shape.shape_type else {
+        return 0.0;
+    };
+    let max_font_size = content
+        .paragraphs()
+        .iter()
+        .flat_map(|paragraph| paragraph.children().iter())
+        .map(|span| span.font_size)
+        .fold(0.0, f32::max);
+    max_font_size
+}
+
+/// Device pixels that antialiasing may paint past a shape's bounds.
+const AA_REACH_PX: f32 = 2.0;
+
+/// What a partial tile repaint needs to know about the subtree of a root shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RootPaint {
+    /// Holds a shape that only a whole-tile repaint draws right.
+    whole_tiles: bool,
+    /// Largest `text_ink_reach` of its texts.
+    text_reach: f32,
+}
+
+impl RootPaint {
+    /// Scans the subtree of `id`: a visible background blur samples pixels around the
+    /// change, and raw SVG content may paint outside its bounds.
+    fn of(id: &Uuid, tree: ShapesPoolRef) -> Self {
+        let mut paint = Self::default();
+        let mut stack = vec![*id];
+        while let Some(shape_id) = stack.pop() {
+            let Some(shape) = tree.get(&shape_id) else {
+                continue;
+            };
+            if shape.visible_background_blur().is_some()
+                || matches!(shape.shape_type, Type::SVGRaw(_))
+            {
+                paint.whole_tiles = true;
+            }
+            paint.text_reach = paint.text_reach.max(text_ink_reach(shape));
+            stack.extend(shape.children.iter().copied());
+        }
+        paint
+    }
+}
+
+/// Above this share of the tile area a stale tile is repainted whole.
+const PARTIAL_TILE_MAX_AREA: f32 = 0.75;
+
 pub(crate) struct RenderState {
     pub options: RenderOptions,
     stats: RenderStats,
@@ -477,9 +630,18 @@ pub(crate) struct RenderState {
     /// (e.g. adding a rect) so the workspace stays visible while only affected
     /// tiles are re-rendered asynchronously.
     pub preserve_target_during_render: bool,
-    /// GPU crops from `Backbuffer` or tile atlas keyed by shape id. Filled on full-frame completion; during
-    /// drag, entries for the moved top-level selection are ensured here
+    /// Set by `set_view_end` after a pan or zoom gesture. The next render then
+    /// yields progressively instead of drawing all newly exposed tiles in one frame.
+    pub view_moved_since_render: bool,
+    /// GPU crops from `Backbuffer` or tile atlas keyed by shape id. Cleared on full-frame
+    /// completion and rebuilt by `ensure_backbuffer_crop_cache` when an interactive transform
+    /// starts (`set_modifiers_start`).
     pub backbuffer_crop_cache: HashMap<Uuid, InteractiveDragCrop>,
+    /// The crop cache was invalidated by a full-quality frame and has not been rebuilt yet.
+    backbuffer_crop_cache_stale: bool,
+    /// True only while `Backbuffer` holds the output of a complete, non-fast Full frame. The crop
+    /// cache can be built from the backbuffer only in that state.
+    backbuffer_is_full_quality: bool,
     /// Extrect of each moved shape at the previous interactive frame; reset per gesture.
     pub moving_extrects: HashMap<Uuid, Rect>,
     /// Whether we've already forced a GPU flush+submit before a tile-atlas
@@ -496,6 +658,39 @@ pub(crate) struct RenderState {
     /// Visible tiles were already presented this pass; interest-ring fill may
     /// still be running. Final Full should not re-present.
     pub viewport_presented: bool,
+    /// Max ms the tile walk may run in the current slice, measured from the slice start.
+    walk_deadline_ms: i32,
+    /// Moving average of post-walk ms (GPU drain, compose, present) over progressive slices
+    /// outside interactive transforms. Carries across renders and sizes `walk_deadline_ms`.
+    post_walk_ema_ms: f32,
+    /// Per-render-cycle counters. Reset in `start_render_loop`.
+    pub counters: RenderCounters,
+    /// Root-board pixels captured from tiles, see `lod` and [`Self::try_draw_board_imposter`].
+    pub imposters: lod::ImposterCache<skia::Image>,
+    /// Shapes changed since the last render; their root boards lose their imposters.
+    imposter_dirty: HashSet<Uuid>,
+    /// Root shapes painted in the current tile and boards to capture when it ends.
+    imposter_tile: lod::TileImposters,
+    /// Per root shape, how far it may paint past its extrect (`None`: anywhere), see
+    /// [`lod::subtree_paint_reach`]. Dropped with the root's imposters.
+    imposter_reach: HashMap<Uuid, Option<f32>>,
+    /// Root shapes that are, or hold, a shape with a pending modifier. Computed once per frame
+    /// by the first walk that needs them (imposters, interactive crops). Reset at the start of
+    /// `render_shape_tree_partial`.
+    modified_roots: Option<HashSet<Uuid>>,
+    /// The stale tile being repainted in part, see [`PartialTile`].
+    partial_tile: Option<PartialTile>,
+    /// Largest `text_ink_reach` of the texts under the roots of the partial tile: how far a
+    /// container may paint glyphs outside its extrect.
+    partial_text_reach: f32,
+    /// Whether the subtree of a root shape holds a shape that needs its tiles repainted
+    /// whole, and the reach of its glyphs (see [`RootPaint`]).
+    whole_tile_roots: HashMap<Uuid, RootPaint>,
+    /// Drop-shadow path last seen for containers whose shadow depends on their children,
+    /// see [`RenderState::switched_shadow_containers`].
+    shadow_paths: HashMap<Uuid, (bool, bool)>,
+    /// Shapes changed since the last render; their roots leave `whole_tile_roots`.
+    whole_tile_dirty: HashSet<Uuid>,
 }
 
 #[derive(Clone)]
@@ -509,6 +704,42 @@ pub struct InteractiveDragCrop {
     pub capture_src_left: i32,
     pub capture_src_top: i32,
     pub image: skia::Image,
+}
+
+/// Where the shapes moved by an interactive transform were and are (document space, scale 1),
+/// for the crop reuse checks of one tile walk.
+#[derive(Debug)]
+struct MovedCoverage {
+    /// Extrect of each moved shape before its modifier.
+    before: Vec<Rect>,
+    /// Extrect of each moved shape with its modifier.
+    after: Vec<Rect>,
+    /// False when a moved top-level shape is drawn from a crop that is not opaque
+    /// (see [`Shape::is_opaque_for_drag_crop`]).
+    crops_opaque: bool,
+}
+
+/// Whether the crop of a stationary top-level shape, covering `crop_area`, may be drawn this
+/// frame while the shapes in `moved` move.
+///
+/// - Never when the shape holds a modified shape (`node_modified`): its pixels changed.
+/// - Never when a moved shape lay inside the crop before moving: its old pixels are in it.
+/// - Always when no moved shape overlaps the crop now.
+/// - Otherwise only when this crop and every moved crop are opaque (`node_opaque` is asked
+///   only then), so drawing the crops in z-order gives the pixels of a live render.
+fn stationary_crop_usable(
+    crop_area: Rect,
+    moved: &MovedCoverage,
+    node_modified: bool,
+    node_opaque: impl FnOnce() -> bool,
+) -> bool {
+    if node_modified || moved.before.iter().any(|r| r.intersects(crop_area)) {
+        return false;
+    }
+    if !moved.after.iter().any(|r| r.intersects(crop_area)) {
+        return true;
+    }
+    moved.crops_opaque && node_opaque()
 }
 
 /// Chooses a window inside the full workspace-pixel crop `[0, out_w) × [0, out_h)` with each side
@@ -554,26 +785,63 @@ fn drag_crop_snapshot_window_px(
     (ox, oy, win_w, win_h)
 }
 
+/// Walk deadline for one progressive slice, in ms from the slice start. The slice should end
+/// `target_frame_ms` after the frame began, so subtract the time the frame spent before the
+/// slice and the expected post-walk cost. Never below `min_ms` so each slice makes progress.
+fn progressive_walk_deadline_ms(
+    target_frame_ms: i32,
+    post_walk_ema_ms: f32,
+    pre_slice_ms: i32,
+    min_ms: i32,
+    max_ms: i32,
+) -> i32 {
+    let post_walk_ms = post_walk_ema_ms.max(0.0).round() as i32;
+    let deadline = target_frame_ms - post_walk_ms - pre_slice_ms.max(0);
+    deadline.max(min_ms).min(max_ms)
+}
+
+/// Whether a render may yield between animation frames. A render that keeps the last frame
+/// on screen over an unchanged view (a shape edit, a text-editor keystroke, `SyncTiles`)
+/// runs to the end in one call: yielding would delay the caret overlay and let the next
+/// edit restart the render before it presents. Pan/zoom ends and interactive transforms
+/// still yield.
+fn progressive_render_allowed(
+    preserve_target: bool,
+    view_moved: bool,
+    zoom_changed: bool,
+    interactive_transform: bool,
+) -> bool {
+    !preserve_target || view_moved || zoom_changed || interactive_transform
+}
+
+/// Folds one post-walk sample (ms) into the moving average. Clamps outliers to `max_ms`.
+fn next_post_walk_ema_ms(prev_ms: f32, sample_ms: i32, max_ms: i32) -> f32 {
+    let sample = sample_ms.max(0).min(max_ms.max(0)) as f32;
+    0.7 * prev_ms + 0.3 * sample
+}
+
 impl RenderState {
     /// Decide whether a top-level node can be served from `backbuffer_crop_cache` during an
     /// interactive transform (drag/resize/rotate).
     ///
-    /// We only reuse cached pixels when it is safe and visually correct:
     /// - **Top-level only**: cache entries are built for direct children of the root.
-    /// - **Moved node**: only allow cache reuse for *pure translations* (no scale/rotate/skew),
-    ///   because other transforms would require resampling and can diverge from the live render.
-    /// - **Other cached nodes**: if the moving bounds overlap this cached crop, invalidate it so
-    ///   we don't show stale content while something moves over/inside it.
+    /// - **Moved node**: see [`Self::moved_shape_uses_crop`].
+    /// - **Stationary node**: see [`stationary_crop_usable`]. With nothing moving (e.g. a text
+    ///   edit reflows inside the board) the crop predates the edit, so render live.
     fn should_use_cached_top_level_during_interactive(
-        &mut self,
+        &self,
         node_id: Uuid,
         tree: ShapesPoolRef,
         moved_ids: &[Uuid],
-        moved_bounds: Option<Rect>,
+        moved: Option<&MovedCoverage>,
     ) -> bool {
-        if !self.backbuffer_crop_cache.contains_key(&node_id) {
+        let Some(crop_area) = self
+            .backbuffer_crop_cache
+            .get(&node_id)
+            .map(|crop| crop.src_doc_bounds)
+        else {
             return false;
-        }
+        };
         let Some(raw) = tree.get_raw(&node_id) else {
             return false;
         };
@@ -581,51 +849,67 @@ impl RenderState {
             return false;
         }
 
-        // If this top-level shape itself is being moved, always allow using its cached pixels.
-        // BUT only for pure translations. For non-translation transforms (scale/rotate/skew),
-        // cached pixels won't match the live result (and may require resampling), so render live.
         if moved_ids.contains(&node_id) {
-            let Some(m) = tree.get_modifier(&node_id) else {
-                return false;
-            };
-            // Only allow using the cached pixels for pure translations.
-            // For non-translation transforms (scale/rotate/skew), cached pixels won't match.
-            // If the transform is the identity means a reflow, we need to redraw as well.
-            if math::identitish(m) || !math::is_move_only_matrix(m) {
-                return false;
-            }
-
-            if !self.backbuffer_crop_cache.contains_key(&node_id) {
-                return false;
-            }
-
-            // Additionally require this node to be safe to serve from a rectangular backbuffer
-            // crop while moving; otherwise it must be rendered live (e.g. text, overflow frames).
-            return tree
-                .get(&node_id)
-                .is_some_and(|s| s.is_safe_for_drag_crop_cache(tree));
+            return self.moved_shape_uses_crop(&node_id, tree);
         }
 
-        match moved_bounds {
-            // Something is actually moving/resizing. If the moving content overlaps this
-            // cached crop, do not use the cached pixels for this frame. We intentionally
-            // keep the cache entry: overlap is typically transient during drag, and once
-            // the moving content leaves the area the crop becomes valid again (stationary
-            // shape unchanged).
-            Some(moved) => {
-                let intersects = self
-                    .backbuffer_crop_cache
-                    .get(&node_id)
-                    .is_some_and(|crop| moved.intersects(crop.src_doc_bounds));
-                !intersects
-            }
+        let Some(moved) = moved else {
+            return false;
+        };
+        let node_modified = self
+            .modified_roots
+            .as_ref()
+            .is_some_and(|roots| roots.contains(&node_id));
+        stationary_crop_usable(crop_area, moved, node_modified, || {
+            tree.get(&node_id)
+                .is_some_and(|shape| shape.is_opaque_for_drag_crop(tree))
+        })
+    }
 
-            // Interactive-transform mode is active but nothing is moving (no modifiers):
-            // e.g. editing a text shape inside this board reflows its content without
-            // changing geometry. The cached crop was captured before the edit, so blitting
-            // it would paint stale pixels over the freshly rendered tiles. Render live.
-            None => false,
+    /// Whether a moved top-level shape is drawn from its crop: only for a pure, non-identity
+    /// translation (other transforms would need resampling, the identity means a reflow) of a
+    /// shape that is safe to serve from a rectangular crop (not text, not an overflowing board).
+    fn moved_shape_uses_crop(&self, node_id: &Uuid, tree: ShapesPoolRef) -> bool {
+        if !self.backbuffer_crop_cache.contains_key(node_id) {
+            return false;
         }
+        if tree.get_raw(node_id).map(|shape| shape.parent_id) != Some(Some(Uuid::nil())) {
+            return false;
+        }
+        let Some(m) = tree.get_modifier(node_id) else {
+            return false;
+        };
+        if math::identitish(m) || !math::is_move_only_matrix(m) {
+            return false;
+        }
+        tree.get(node_id)
+            .is_some_and(|shape| shape.is_safe_for_drag_crop_cache(tree))
+    }
+
+    /// Before and after extrects of the shapes moved by the interactive transform, and whether
+    /// every moved top-level shape drawn from its crop has an opaque crop.
+    fn moved_coverage(&mut self, tree: ShapesPoolRef, moved_ids: &[Uuid]) -> MovedCoverage {
+        let mut coverage = MovedCoverage {
+            before: Vec::with_capacity(moved_ids.len()),
+            after: Vec::with_capacity(moved_ids.len()),
+            crops_opaque: true,
+        };
+        for id in moved_ids {
+            if let Some(shape) = tree.get(id) {
+                coverage
+                    .after
+                    .push(self.get_cached_extrect(shape, tree, 1.0));
+                if self.moved_shape_uses_crop(id, tree) && !shape.is_opaque_for_drag_crop(tree) {
+                    coverage.crops_opaque = false;
+                }
+            }
+            if let Some(raw) = tree.get_raw(id) {
+                coverage
+                    .before
+                    .push(self.get_cached_extrect(raw, tree, 1.0));
+            }
+        }
+        coverage
     }
 
     pub fn try_new(width: i32, height: i32) -> Result<RenderState> {
@@ -683,12 +967,32 @@ impl RenderState {
             current_tile_had_shapes: false,
             interactive_target_seeded: false,
             preserve_target_during_render: false,
+            view_moved_since_render: false,
             backbuffer_crop_cache: HashMap::default(),
+            backbuffer_crop_cache_stale: false,
+            backbuffer_is_full_quality: false,
             moving_extrects: HashMap::default(),
             tile_atlas_flushed: false,
             drop_shadows_ops_warmed: false,
             drop_shadow_filter_cache: shadows::DropShadowFilterCache::new(),
             viewport_presented: false,
+            walk_deadline_ms: options.max_blocking_time_ms,
+            post_walk_ema_ms: 0.0,
+            counters: RenderCounters::default(),
+            imposters: lod::ImposterCache::new(
+                options.imposter_budget_bytes,
+                options.imposter_max_entries,
+                options.imposter_max_views,
+            ),
+            imposter_reach: HashMap::default(),
+            imposter_dirty: HashSet::default(),
+            imposter_tile: lod::TileImposters::default(),
+            modified_roots: None,
+            partial_tile: None,
+            partial_text_reach: 0.0,
+            shadow_paths: HashMap::default(),
+            whole_tile_roots: HashMap::default(),
+            whole_tile_dirty: HashSet::default(),
         })
     }
 
@@ -836,7 +1140,8 @@ impl RenderState {
         self.surfaces.canvas(target_surface).save();
 
         if let Some(clips) = clip_bounds {
-            let antialias = shape.should_use_antialias(scale, self.options.antialias_threshold);
+            let antialias =
+                shape.should_use_antialias(self.decision_scale(), self.options.antialias_threshold);
             self.clip_target_surface_to_stack(clips, target_surface, scale, antialias);
         }
 
@@ -867,6 +1172,7 @@ impl RenderState {
                 .backdrop(&blur_filter)
                 .backdrop_tile_mode(skia::TileMode::Clamp);
 
+            self.counters.save_layers += 1;
             canvas.save_layer(&layer_rec);
 
             // Reset
@@ -878,6 +1184,7 @@ impl RenderState {
             let mut mask_paint = skia::Paint::default();
             mask_paint.set_blend_mode(skia::BlendMode::DstIn);
             let mask_layer_rec = skia::canvas::SaveLayerRec::default().paint(&mask_paint);
+            self.counters.save_layers += 1;
             canvas.save_layer(&mask_layer_rec);
 
             text::paint_text_mask(canvas, shape);
@@ -946,6 +1253,7 @@ impl RenderState {
             .backdrop(&blur_filter)
             .backdrop_tile_mode(skia::TileMode::Clamp)
             .paint(&paint);
+        self.counters.save_layers += 1;
         canvas.save_layer(&layer_rec);
 
         // Two restores are required, balancing two separate pushes:
@@ -974,6 +1282,9 @@ impl RenderState {
 
     pub fn set_debug_flags(&mut self, debug: u32) {
         self.options.flags = debug;
+        if !self.options.imposters_enabled() {
+            self.clear_imposters();
+        }
     }
 
     pub fn set_dpr(&mut self, dpr: f32) -> Result<()> {
@@ -983,6 +1294,8 @@ impl RenderState {
         // canvas backing store is set, so we do not resize here with a
         // stale CSS size (that desyncs Skia vs the GL framebuffer).
         if self.options.set_dpr(dpr) {
+            // The backbuffer was drawn at the old pixel scale, so it cannot back a crop.
+            self.backbuffer_is_full_quality = false;
             self.viewbox.set_dpr(dpr);
             self.tile_viewbox
                 .set_interest(self.options.dpr_viewport_interest_area_threshold);
@@ -993,8 +1306,14 @@ impl RenderState {
     }
 
     pub fn ensure_tile_atlas_layout(&mut self) {
-        self.surfaces
+        let repacked = self
+            .surfaces
             .ensure_tile_atlas_layout(self.tile_viewbox.interest_rect.len().max(1) as usize);
+        if repacked && self.partial_tile.take().is_some() {
+            // The old slot and its pixels went with the old layout: nothing to release, and
+            // the tile being repainted cannot be finished. The next render starts over.
+            self.preserve_target_during_render = true;
+        }
     }
 
     pub fn set_background_color(&mut self, color: skia::Color) {
@@ -1029,6 +1348,8 @@ impl RenderState {
             self.set_dpr(effective_dpr)?;
         }
         self.surfaces.resize(dpr_width, dpr_height)?;
+        // Resizing recreates the backbuffer, so its old contents no longer hold a frame.
+        self.backbuffer_is_full_quality = false;
         self.viewbox.set_wh(css_w, css_h);
         self.tile_viewbox.update(&self.viewbox);
         self.ensure_tile_atlas_layout();
@@ -1129,6 +1450,7 @@ impl RenderState {
     }
 
     pub fn reset_canvas(&mut self) {
+        self.backbuffer_is_full_quality = false;
         self.surfaces.reset(self.background_color);
         self.surfaces.clear_backbuffer(self.background_color);
         self.surfaces.clear_target(self.background_color);
@@ -1136,6 +1458,7 @@ impl RenderState {
 
     /// Drop cached tile textures before a one-shot `render_sync_shape` render.
     pub fn prepare_sync_shape_render(&mut self) {
+        self.backbuffer_is_full_quality = false;
         self.surfaces.clear_tile_atlas();
         self.surfaces.invalidate_tile_cache();
 
@@ -1148,6 +1471,7 @@ impl RenderState {
     /// This is currently not being used, but it's set there for testing purposes on
     /// upcoming tasks
     pub fn render_loading_overlay(&mut self) {
+        self.backbuffer_is_full_quality = false;
         let canvas = self.surfaces.canvas(SurfaceId::Backbuffer);
         let skia::ISize { width, height } = canvas.base_layer_size();
 
@@ -1234,6 +1558,8 @@ impl RenderState {
         if self.tile_atlas_flushed {
             crate::get_gpu_state().context.flush_and_submit();
         }
+        // After the flush above, so captured text has its glyphs.
+        self.capture_tile_imposters();
 
         self.surfaces.draw_current_tile_into_tile_atlas(
             &self.tile_viewbox,
@@ -1362,7 +1688,7 @@ impl RenderState {
     }
 
     fn get_inherited_drop_shadows(&self) -> Option<Vec<skia_safe::Paint>> {
-        let scale = self.get_scale();
+        let scale = self.decision_scale();
         let drop_shadows: Vec<&Shadow> = self
             .nested_shadows
             .iter()
@@ -1481,7 +1807,7 @@ impl RenderState {
         // gestures + pan/zoom). AA edge sampling is per-pixel and adds
         // up across many shapes; reverts to full quality on commit.
         let antialias = !fast_mode
-            && shape.should_use_antialias(self.get_scale(), self.options.antialias_threshold);
+            && shape.should_use_antialias(self.decision_scale(), self.options.antialias_threshold);
         let skip_effects = fast_mode;
 
         let has_nested_fills = self
@@ -1510,13 +1836,14 @@ impl RenderState {
         // Only perceptible shadows need the layered Fills/Strokes path. Use the
         // same footprint LOD as when painting drop and inner shadows.
         let scale = self.get_scale();
+        let lod_scale = self.decision_scale();
         let shadows_need_layered = !skip_drop_shadows
             && (shape
                 .drop_shadows_visible()
-                .any(|s| s.is_perceptible_at_scale_for(scale, shape.is_recursive()))
+                .any(|s| s.is_perceptible_at_scale_for(lod_scale, shape.is_recursive()))
                 || shape
                     .inner_shadows_visible()
-                    .any(|s| s.is_perceptible_at_scale_for(scale, shape.is_recursive())));
+                    .any(|s| s.is_perceptible_at_scale_for(lod_scale, shape.is_recursive())));
 
         // Clip is allowed: we apply the same stack on Current after scale+translate.
         // Opacity < 1 with SrcOver is OK: render_shape_enter already opened a
@@ -1604,6 +1931,7 @@ impl RenderState {
                     )?;
                 }
             } else {
+                self.counters.shapes_drawn += 1;
                 fills::render(self, shape, &shape.fills, antialias, target_surface, None)?;
 
                 // Clipped frames draw strokes in render_shape_exit over children.
@@ -1748,7 +2076,7 @@ impl RenderState {
                         || (shape.blur.is_none()
                             && !shape
                                 .drop_shadows_visible()
-                                .any(|s| s.is_perceptible_at_scale(self.get_scale()))
+                                .any(|s| s.is_perceptible_at_scale(self.decision_scale()))
                             && shape.inner_shadow_paints().is_empty()));
                 if !(can_use_layout_cache
                     && text::try_paint_from_layout_cache(
@@ -1857,7 +2185,7 @@ impl RenderState {
                             );
                         }
                     } else {
-                        let shape_scale = self.get_scale();
+                        let shape_scale = self.decision_scale();
                         let mut drop_shadows = if skip_drop_shadows {
                             Vec::new()
                         } else {
@@ -2079,18 +2407,23 @@ impl RenderState {
                     let mut layer_paint = skia::Paint::default();
                     layer_paint.set_image_filter(filter.clone());
                     let layer_rec = skia::canvas::SaveLayerRec::default().paint(&layer_paint);
+                    self.counters.save_layers += 1;
                     self.surfaces
                         .canvas(fills_surface_id)
                         .save_layer(&layer_rec);
+                    self.counters.save_layers += 1;
                     self.surfaces
                         .canvas(strokes_surface_id)
                         .save_layer(&layer_rec);
+                    self.counters.save_layers += 1;
                     self.surfaces
                         .canvas(innershadows_surface_id)
                         .save_layer(&layer_rec);
                 }
 
                 let shape = &shape;
+
+                self.counters.shapes_drawn += 1;
 
                 if shape.inherits_fills() {
                     if let Some(fills_to_render) = self.nested_fills.last() {
@@ -2389,7 +2722,24 @@ impl RenderState {
         }
     }
 
+    /// Builds `backbuffer_crop_cache` when an interactive transform starts (`set_modifiers_start`)
+    /// after a full-quality frame. Skips the build, leaving the cache empty so interactive frames
+    /// render live, when the backbuffer no longer holds a full-quality frame or when the pool may
+    /// differ from what that frame drew (shapes touched since, or modifiers already set).
+    pub fn ensure_backbuffer_crop_cache(&mut self, tree: ShapesPoolRef) {
+        if self.backbuffer_crop_cache_stale
+            && self.backbuffer_is_full_quality
+            && self.touched_ids.is_empty()
+            && !tree.has_pending_modifiers()
+        {
+            self.rebuild_backbuffer_crop_cache(tree);
+            self.backbuffer_crop_cache_stale = false;
+        }
+    }
+
     pub fn render_from_cache(&mut self, shapes: ShapesPoolRef) {
+        self.backbuffer_is_full_quality = false;
+        self.counters.render_from_cache_calls += 1;
         let _start = performance::begin_timed_log!("render_from_cache");
         performance::begin_measure!("render_from_cache");
         self.surfaces.draw_combined_atlas_to_backbuffer(
@@ -2429,6 +2779,146 @@ impl RenderState {
         Ok(())
     }
 
+    /// Drops every imposter texture and pending invalidation.
+    pub fn clear_imposters(&mut self) {
+        self.imposters.clear();
+        self.imposter_dirty.clear();
+        // A capture pending for the current tile may hold pixels of the old pool.
+        self.imposter_tile.reset();
+        self.imposter_reach.clear();
+        // Same lifetime: these describe the subtrees of the current pool.
+        self.whole_tile_roots.clear();
+        self.shadow_paths.clear();
+        self.whole_tile_dirty.clear();
+    }
+
+    /// Records that `id` changed (content, geometry or children), so the imposters of its root
+    /// board must go before the next render uses them.
+    pub fn mark_imposter_dirty(&mut self, id: Uuid) {
+        if !self.imposters.is_empty() || !self.imposter_reach.is_empty() {
+            self.imposter_dirty.insert(id);
+        }
+        if !self.whole_tile_roots.is_empty() {
+            self.whole_tile_dirty.insert(id);
+        }
+    }
+
+    /// Drops the whole-tile answer of the roots that hold a changed shape.
+    fn flush_whole_tile_invalidations(&mut self, tree: ShapesPoolRef) {
+        for id in std::mem::take(&mut self.whole_tile_dirty) {
+            match lod::root_child_of(tree, &id) {
+                Some(root) => {
+                    self.whole_tile_roots.remove(&root);
+                }
+                // Unknown ancestry: forget every answer.
+                None if !id.is_nil() => self.whole_tile_roots.clear(),
+                None => {}
+            }
+        }
+    }
+
+    /// Whether the subtree of the root shape `id` holds a shape that only a whole-tile
+    /// repaint draws right: a visible background blur samples pixels around the change,
+    /// and raw SVG content may paint outside its bounds.
+    fn root_paint(&mut self, id: &Uuid, tree: ShapesPoolRef) -> RootPaint {
+        *self
+            .whole_tile_roots
+            .entry(*id)
+            .or_insert_with(|| RootPaint::of(id, tree))
+    }
+
+    /// True when a stale tile may be repainted in part in the current render.
+    fn partial_repaint_allowed(&self) -> bool {
+        !self.options.is_interactive_transform()
+            && !self.options.is_fast_mode()
+            && self.export_context.is_none()
+            && self.include_filter.is_none()
+            && !self.preview_mode
+            && self.surfaces.tile_slots_are_full_size()
+    }
+
+    /// Prepares the repaint of the stale tile `tile` (the current tile) where it changed.
+    /// `tile_root_ids` are the root shapes indexed on the tile.
+    fn begin_partial_tile(
+        &mut self,
+        tile: tiles::Tile,
+        tile_root_ids: &[Uuid],
+        tree: ShapesPoolRef,
+    ) -> PartialStart {
+        let scale = self.get_scale();
+        let Some(dirty) = self.surfaces.stale_tile_dirty_rect(tile, scale) else {
+            return PartialStart::No;
+        };
+        if !self.partial_repaint_allowed()
+            || tile_root_ids
+                .iter()
+                .any(|id| self.root_paint(id, tree).whole_tiles)
+        {
+            return PartialStart::No;
+        }
+
+        let Some(px) = tiles::tile_dirty_pixels(dirty, self.render_area, scale) else {
+            self.surfaces.restore_stale_tile(tile, scale);
+            return PartialStart::Restored;
+        };
+        let size = tiles::TILE_SIZE;
+        if (px.width() * px.height()) as f32 > PARTIAL_TILE_MAX_AREA * size * size {
+            return PartialStart::No;
+        }
+
+        let Some(slot) = self.surfaces.take_stale_tile(tile, scale) else {
+            return PartialStart::No;
+        };
+        self.partial_text_reach = tile_root_ids
+            .iter()
+            .map(|id| self.root_paint(id, tree).text_reach)
+            .fold(0.0, f32::max);
+        let area = Rect::from_ltrb(
+            self.render_area.left + px.left as f32 / scale,
+            self.render_area.top + px.top as f32 / scale,
+            self.render_area.left + px.right as f32 / scale,
+            self.render_area.top + px.bottom as f32 / scale,
+        );
+        let margins = self.surfaces.margins();
+        self.partial_tile = Some(PartialTile {
+            slot,
+            dirty_px: px.with_offset((margins.width, margins.height)),
+        });
+        // Only the shapes that reach the changed pixels are walked; antialiasing reaches
+        // them from just outside.
+        let aa = AA_REACH_PX / scale;
+        let area = area.with_outset((aa, aa));
+        self.render_area_with_margins = area;
+        PartialStart::Started(area)
+    }
+
+    /// Evicts the imposters of the root boards that contain a changed shape.
+    fn flush_imposter_invalidations(&mut self, tree: ShapesPoolRef) {
+        if self.imposter_dirty.is_empty() {
+            return;
+        }
+        // A board walked earlier in the current tile may have changed since: its pixels in the
+        // tile are stale, so nothing of this tile is captured.
+        self.imposter_tile.drop_candidates();
+        let roots: HashSet<Uuid> = std::mem::take(&mut self.imposter_dirty)
+            .iter()
+            .filter_map(|id| lod::root_child_of(tree, id))
+            .collect();
+        for root in roots {
+            self.imposters.evict_board(&root);
+            self.imposter_reach.remove(&root);
+        }
+    }
+
+    /// How far root shape `element` may paint past its extrect (`None`: anywhere). Cached
+    /// until the root changes.
+    fn imposter_paint_reach(&mut self, element: &Shape, tree: ShapesPoolRef) -> Option<f32> {
+        *self
+            .imposter_reach
+            .entry(element.id)
+            .or_insert_with(|| lod::subtree_paint_reach(tree, element, text_ink_reach))
+    }
+
     /// Clears all the necessary vecs and hashmaps.
     /// Also garbage collects surfaces.
     fn clear(&mut self, tree: ShapesPoolRef) {
@@ -2450,6 +2940,11 @@ impl RenderState {
         self.nested_shadows.clear();
         self.masked_group_reach.clear();
 
+        // A partial repaint cut short leaves the tile uncached.
+        if let Some(partial) = self.partial_tile.take() {
+            self.surfaces.release_tile_slot(partial.slot);
+        }
+
         // reorder by distance to the center.
         self.current_tile = None;
         self.drop_shadow_filter_cache.clear();
@@ -2463,12 +2958,21 @@ impl RenderState {
         timestamp: i32,
         sync_render: bool,
     ) -> Result<FrameType> {
+        self.counters = RenderCounters::default();
+        self.backbuffer_is_full_quality = false;
         self.clear(tree);
+        self.imposter_tile.reset();
+        self.flush_imposter_invalidations(tree);
+        self.flush_whole_tile_invalidations(tree);
+        self.imposters.begin_cycle();
 
         let _start = performance::begin_timed_log!("start_render_loop");
         let scale = self.get_scale();
 
         self.tile_viewbox.update(&self.viewbox);
+        // Stale tiles that this render cannot repaint only hold atlas slots.
+        self.surfaces
+            .gc_stale_tiles(scale, self.tile_viewbox.interest_rect);
         self.focus_mode.reset();
 
         performance::begin_measure!("render");
@@ -2483,6 +2987,8 @@ impl RenderState {
         self.cache_cleared_this_render = false;
         let preserve_target = self.preserve_target_during_render;
         self.preserve_target_during_render = false;
+        let view_moved = self.view_moved_since_render;
+        self.view_moved_since_render = false;
 
         if preserve_target && self.options.is_fast_mode() {
             self.rebuild_tile_index(tree);
@@ -2555,11 +3061,18 @@ impl RenderState {
         let mut frame_type = FrameType::None;
         if sync_render {
             frame_type = self.render_shape_tree_sync(base_object, tree, timestamp)?;
+            if matches!(frame_type, FrameType::Full) {
+                self.counters.full_frames += 1;
+            }
         } else {
-            // Keep progressive yielding, except for a localized shape edit on a
-            // stable viewbox (e.g. recoloring) which renders in one frame.
-            let allow_stop =
-                !preserve_target || self.zoom_changed() || self.options.is_interactive_transform();
+            // Progressive renders yield between frames, except a render that keeps the
+            // presented frame on screen over an unchanged view (see `progressive_render_allowed`).
+            let allow_stop = progressive_render_allowed(
+                preserve_target,
+                view_moved,
+                self.zoom_changed(),
+                self.options.is_interactive_transform(),
+            );
             frame_type = self.continue_render_loop(base_object, tree, timestamp, allow_stop)?;
 
             // This is an option to debug frames.
@@ -2622,10 +3135,35 @@ impl RenderState {
         timestamp: i32,
         allow_stop: bool,
     ) -> Result<FrameType> {
+        // A tile that continues in fast mode or under an interactive transform is not full
+        // quality, so its pixels are not captured.
+        if self.options.is_fast_mode() || self.options.is_interactive_transform() {
+            self.imposter_tile.drop_candidates();
+        }
+        self.flush_imposter_invalidations(tree);
+        let slice_start = performance::get_time();
+        self.backbuffer_is_full_quality = false;
         performance::begin_measure!("continue_render_loop");
-        let timestamp = self.render_budget_start(timestamp);
+        let frame_start = self.render_budget_start(timestamp);
+        // Progressive slices measure the walk from the slice start; the deadline already
+        // subtracts the time the frame spent before it. Other renders keep the old budget.
+        let walk_start = if allow_stop {
+            self.walk_deadline_ms = progressive_walk_deadline_ms(
+                self.options.target_frame_ms,
+                self.post_walk_ema_ms,
+                slice_start - frame_start,
+                MIN_WALK_BUDGET_MS,
+                self.options.max_blocking_time_ms,
+            );
+            slice_start
+        } else {
+            self.walk_deadline_ms = self.options.max_blocking_time_ms;
+            frame_start
+        };
+
         let frame_type =
-            self.render_shape_tree_partial(base_object, tree, timestamp, allow_stop)?;
+            self.render_shape_tree_partial(base_object, tree, walk_start, allow_stop)?;
+        let walk_end = performance::get_time();
 
         // `draw_atlas` needs a snapshot of the tile atlas. Partial frames are not
         // presented (only flushed), so defer composition until the viewport is
@@ -2658,6 +3196,7 @@ impl RenderState {
                 panic!("FrameType::None");
             }
             FrameType::Partial => {
+                self.counters.partial_frames += 1;
                 // Final soft drain for this yield (mid-walk also drains; see
                 // `drain_partial_gpu_soft`). Full still submits via present_frame.
                 Self::drain_partial_gpu_soft();
@@ -2673,22 +3212,44 @@ impl RenderState {
                 Self::drain_partial_gpu_soft();
             }
             FrameType::Full => {
+                self.counters.full_frames += 1;
+                let full_quality =
+                    !self.options.is_fast_mode() && !self.options.is_interactive_transform();
                 if !self.viewport_presented {
                     // A full-quality frame is now complete (no early viewport
-                    // present). Rebuild crop cache and present.
-                    if !self.options.is_fast_mode() && !self.options.is_interactive_transform() {
-                        self.rebuild_backbuffer_crop_cache(tree);
+                    // present). Drop the crop cache; it is rebuilt lazily from
+                    // the backbuffer when the next interactive transform starts.
+                    if full_quality {
+                        self.backbuffer_crop_cache_stale = true;
+                        self.backbuffer_crop_cache.clear();
                     }
                     self.present_frame(tree);
+                    self.backbuffer_is_full_quality = full_quality;
                     wapi::notify_tiles_render_complete!();
-                } else if !self.options.is_fast_mode() && !self.options.is_interactive_transform() {
+                } else if full_quality {
                     // Interest fill finished after ViewportReady. Backbuffer
-                    // still holds the viewport compose; rebuild crop cache
-                    // off the sharp-snap frame.
-                    self.rebuild_backbuffer_crop_cache(tree);
+                    // still holds the viewport compose, so the crop cache can
+                    // be rebuilt lazily from it.
+                    self.backbuffer_crop_cache_stale = true;
+                    self.backbuffer_crop_cache.clear();
+                    self.backbuffer_is_full_quality = true;
                 }
                 performance::end_measure!("render");
             }
+        }
+
+        // Learn the post-walk cost of progressive slices. Skip Full frames (their final present
+        // is not representative) and interactive transforms (they flush every frame).
+        if allow_stop
+            && !self.options.is_interactive_transform()
+            && matches!(frame_type, FrameType::Partial | FrameType::ViewportReady)
+        {
+            let post_walk_ms = performance::get_time() - walk_end;
+            self.post_walk_ema_ms = next_post_walk_ema_ms(
+                self.post_walk_ema_ms,
+                post_walk_ms,
+                self.options.max_blocking_time_ms,
+            );
         }
         performance::end_measure!("continue_render_loop");
         Ok(frame_type)
@@ -2700,6 +3261,7 @@ impl RenderState {
         tree: ShapesPoolRef,
         timestamp: i32,
     ) -> Result<FrameType> {
+        self.backbuffer_is_full_quality = false;
         let timestamp = self.render_budget_start(timestamp);
         self.render_shape_tree_partial(base_object, tree, timestamp, false)?;
 
@@ -2728,6 +3290,215 @@ impl RenderState {
         timestamp: i32,
         format: raster::RasterFormat,
     ) -> Result<(Vec<u8>, i32, i32)> {
+        let Some(image) = self.render_shape_to_export_image(
+            id,
+            tree,
+            scale,
+            None,
+            timestamp,
+            format.clear_color(),
+            format.opaque_background(),
+            true,
+        )?
+        else {
+            // FIXME
+            return Ok((Vec::new(), 0, 0));
+        };
+        let data = image
+            .encode(
+                Some(&mut get_gpu_state().context),
+                format.encoded(),
+                format.quality(),
+            )
+            .unwrap_or_else(|| panic!("{format:?} encode failed"));
+        let skia::ISize { width, height } = image.dimensions();
+
+        Ok((data.as_bytes().to_vec(), width, height))
+    }
+
+    /// Draws root board `element` into the current tile by copying back the pixels a previous
+    /// full-quality walk of this board left in this tile (same scale and background). The copy
+    /// is bit-identical to walking the board: it is used only when nothing painted earlier in
+    /// the tile touches the board's pixels, and pixels are captured only when no other root
+    /// shape touches them (see [`Self::capture_tile_imposters`]).
+    ///
+    /// `reach` is how far the board paints past `board_extrect` (`None`: anywhere, never
+    /// captured). Returns false when the caller must walk the board. With `may_capture`, a
+    /// walked board is noted so its pixels can be captured when the tile ends.
+    #[allow(clippy::too_many_arguments)]
+    fn try_draw_board_imposter(
+        &mut self,
+        element: &Shape,
+        board_extrect: Rect,
+        reach: Option<f32>,
+        tree: ShapesPoolRef,
+        target_surface: SurfaceId,
+        may_capture: bool,
+    ) -> Result<bool> {
+        let scale = self.get_scale();
+        if !lod::fits_imposter(
+            board_extrect,
+            scale,
+            self.options.imposter_max_screen_px,
+            self.options.imposter_max_scale,
+        ) || self
+            .modified_roots
+            .as_ref()
+            .is_some_and(|roots| roots.contains(&element.id))
+            || self.imposters.eligibility(&element.id) == Some(false)
+        {
+            return Ok(false);
+        }
+
+        let Some(tile) = self.current_tile else {
+            return Ok(false);
+        };
+        let translation = self
+            .surfaces
+            .get_render_context_translation(self.render_area, scale);
+        let surface_size = self.surfaces.canvas(target_surface).base_layer_size();
+        let surface = skia::IRect::from_wh(surface_size.width, surface_size.height);
+        // The capture must hold every pixel the board paints, including glyph overhang and
+        // miter joins of unclipped content; raw SVG may paint anywhere.
+        let Some(reach) = reach else {
+            return Ok(false);
+        };
+        let paint_rect = board_extrect.with_outset((reach, reach));
+        let Some(rect) = lod::capture_irect(paint_rect, translation, scale, surface) else {
+            return Ok(false);
+        };
+        // The copy replaces the pixels below it, so it must not land on anything painted earlier.
+        if self.imposter_tile.painted_below(rect, element.id) {
+            return Ok(false);
+        }
+
+        match self.imposters.eligibility(&element.id) {
+            Some(true) => {}
+            Some(false) => return Ok(false),
+            None => {
+                if self.imposters.is_incomplete(&element.id) {
+                    return Ok(false);
+                }
+                let min_descendants = self.options.imposter_min_descendants as usize;
+                match lod::board_subtree_check(tree, element, min_descendants) {
+                    lod::SubtreeCheck::Safe => self.imposters.set_eligibility(element.id, true),
+                    lod::SubtreeCheck::Unsafe | lod::SubtreeCheck::TooSimple => {
+                        self.imposters.set_eligibility(element.id, false);
+                        return Ok(false);
+                    }
+                    lod::SubtreeCheck::Incomplete => {
+                        self.imposters.set_incomplete(element.id);
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
+        let background = self.background_color;
+        let key = lod::ImposterKey {
+            board: element.id,
+            tile: (tile.x(), tile.y()),
+            scale_bits: scale.to_bits(),
+            background: (u32::from(background.a()) << 24)
+                | (u32::from(background.r()) << 16)
+                | (u32::from(background.g()) << 8)
+                | u32::from(background.b()),
+        };
+
+        // Pixels captured for other geometry are stale in every tile.
+        if self
+            .imposters
+            .peek(key)
+            .is_some_and(|entry| entry.board_extrect != board_extrect || entry.rect != rect)
+        {
+            self.imposters.evict_board(&element.id);
+        }
+
+        if let Some(entry) = self.imposters.get(key) {
+            let image = entry.payload.clone();
+            lod::draw_imposter(self.surfaces.canvas(target_surface), &image, rect);
+            self.counters.imposters_drawn += 1;
+            return Ok(true);
+        }
+
+        // A partial tile repaint walks only part of the tile, so its pixels are incomplete.
+        if may_capture && self.partial_tile.is_none() {
+            if self.imposters.budget() != self.options.imposter_budget_bytes {
+                self.imposters
+                    .set_budget(self.options.imposter_budget_bytes);
+            }
+            let bytes = rect.width().max(0) as usize * rect.height().max(0) as usize * 4;
+            if self.imposters.can_fit(key, bytes) {
+                self.imposter_tile.add_candidate(lod::CaptureCandidate {
+                    key,
+                    rect,
+                    board_extrect,
+                });
+            }
+        }
+        Ok(false)
+    }
+
+    /// Records where root shape `element` paints in the current tile, for the overlap tests of
+    /// [`Self::try_draw_board_imposter`] and [`Self::capture_tile_imposters`].
+    /// `reach` is how far it paints past `extrect`; `None` counts as the whole tile.
+    fn record_imposter_painted(&mut self, element: &Shape, extrect: Rect, reach: Option<f32>) {
+        let rect = match reach {
+            Some(reach) => {
+                let scale = self.get_scale();
+                let translation = self
+                    .surfaces
+                    .get_render_context_translation(self.render_area, scale);
+                lod::surface_irect(
+                    extrect.with_outset((reach, reach)),
+                    translation,
+                    scale,
+                    lod::IMPOSTER_PAD_PX,
+                )
+            }
+            None => skia::IRect::from_ltrb(-(1 << 28), -(1 << 28), 1 << 28, 1 << 28),
+        };
+        self.imposter_tile.record_painted(element.id, rect);
+    }
+
+    /// Copies out of `Current` the pixels of the boards walked in the finished tile that no
+    /// other root shape touches, so later renders of this tile at this scale draw them back
+    /// instead of walking them. Call after the text flush that precedes the tile composite.
+    fn capture_tile_imposters(&mut self) {
+        for candidate in self.imposter_tile.take_capturable() {
+            let Some(image) = self
+                .surfaces
+                .get_mut(SurfaceId::Current)
+                .image_snapshot_with_bounds(candidate.rect)
+            else {
+                continue;
+            };
+            let bytes = image.width().max(0) as usize * image.height().max(0) as usize * 4;
+            if self.imposters.insert(
+                candidate.key,
+                lod::ImposterEntry::new(image, candidate.rect, candidate.board_extrect, bytes),
+            ) {
+                self.counters.imposters_built += 1;
+            }
+        }
+    }
+
+    /// Renders `id` and its subtree into `SurfaceId::Export` at `scale` and returns a snapshot.
+    /// `area` is the doc rect to cover (default: the shape extrect at `scale`); its top-left
+    /// lands on pixel (0, 0). The workspace render state is saved and restored, so this may run
+    /// between nodes of a viewport walk. Returns `None` when the shape is not in the pool.
+    #[allow(clippy::too_many_arguments)]
+    fn render_shape_to_export_image(
+        &mut self,
+        id: &Uuid,
+        tree: ShapesPoolRef,
+        scale: f32,
+        area: Option<Rect>,
+        timestamp: i32,
+        clear_color: skia::Color,
+        opaque_background: Option<skia::Color>,
+        always_flush: bool,
+    ) -> Result<Option<skia::Image>> {
         let target_surface = SurfaceId::Export;
 
         // `render_shape_pixels` is used by the workspace to render thumbnails using the
@@ -2750,65 +3521,69 @@ impl RenderState {
         let saved_masked_group_reach = std::mem::take(&mut self.masked_group_reach);
         let saved_ignore_nested_blurs = self.ignore_nested_blurs;
         let saved_preview_mode = self.preview_mode;
+        let saved_drop_shadows_ops_warmed = self.drop_shadows_ops_warmed;
+        let saved_tile_atlas_flushed = self.tile_atlas_flushed;
+        self.tile_atlas_flushed = false;
 
         // Reset focus mode so all shapes in the export tree are rendered.
         // Without this, leftover focus_mode state from the workspace could
         // cause shapes (and their background blur) to be skipped.
         self.focus_mode.clear();
 
-        self.surfaces
-            .canvas(target_surface)
-            .clear(format.clear_color());
+        self.surfaces.canvas(target_surface).clear(clear_color);
 
+        let mut found = true;
+        let mut walk_result: Result<()> = Ok(());
         if tree.len() != 0 {
-            let Some(shape) = tree.get(id) else {
-                // FIXME
-                return Ok((Vec::new(), 0, 0));
-            };
-            self.nested_fills.push(shape.inherited_fills(tree));
-            let mut extrect = shape.extrect(tree, scale);
-            self.export_context = Some((extrect, scale));
-            let margins = self.surfaces.margins;
-            extrect.offset((margins.width as f32 / scale, margins.height as f32 / scale));
+            if let Some(shape) = tree.get(id) {
+                self.nested_fills.push(shape.inherited_fills(tree));
+                let mut extrect = area.unwrap_or_else(|| shape.extrect(tree, scale));
+                self.export_context = Some((extrect, scale));
+                let margins = self.surfaces.margins;
+                extrect.offset((margins.width as f32 / scale, margins.height as f32 / scale));
 
-            self.surfaces.resize_export_surface(scale, extrect);
-            self.render_area = extrect;
-            self.render_area_with_margins = extrect;
-            self.surfaces.update_render_context(extrect, scale);
+                self.surfaces.resize_export_surface(scale, extrect);
+                self.render_area = extrect;
+                self.render_area_with_margins = extrect;
+                self.surfaces.update_render_context(extrect, scale);
 
-            // `resize_export_surface` swaps in a brand-new (zeroed, i.e.
-            // transparent) surface whenever the dimensions change, discarding
-            // the clear above — so an opaque backdrop has to be laid down again
-            // here, after the resize.
-            if let Some(background) = format.opaque_background() {
-                self.surfaces.canvas(target_surface).clear(background);
+                // `resize_export_surface` swaps in a brand-new (zeroed, i.e.
+                // transparent) surface whenever the dimensions change, discarding
+                // the clear above — so an opaque backdrop has to be laid down again
+                // here, after the resize.
+                if let Some(background) = opaque_background {
+                    self.surfaces.canvas(target_surface).clear(background);
+                }
+
+                self.pending_nodes.push(NodeRenderState {
+                    id: *id,
+                    visited_children: false,
+                    clip_bounds: None,
+                    visited_mask: false,
+                    mask: false,
+                    flattened: false,
+                });
+                walk_result = self
+                    .render_shape_tree_partial_uncached(tree, timestamp, false, true)
+                    .map(|_| ());
+            } else {
+                found = false;
             }
-
-            self.pending_nodes.push(NodeRenderState {
-                id: *id,
-                visited_children: false,
-                clip_bounds: None,
-                visited_mask: false,
-                mask: false,
-                flattened: false,
-            });
-            self.render_shape_tree_partial_uncached(tree, timestamp, false, true)?;
         }
 
         // Clear export context so get_scale() returns to workspace zoom.
         self.export_context = None;
 
-        self.surfaces.flush_and_submit(target_surface);
-
-        let image = self.surfaces.snapshot(target_surface);
-        let data = image
-            .encode(
-                Some(&mut get_gpu_state().context),
-                format.encoded(),
-                format.quality(),
-            )
-            .unwrap_or_else(|| panic!("{format:?} encode failed"));
-        let skia::ISize { width, height } = image.dimensions();
+        let image = if found && walk_result.is_ok() {
+            // Text glyph uploads must land before the snapshot is sampled.
+            if always_flush || self.tile_atlas_flushed {
+                self.surfaces.flush_and_submit(target_surface);
+            }
+            Some(self.surfaces.snapshot(target_surface))
+        } else {
+            None
+        };
+        let text_drawn = self.tile_atlas_flushed;
 
         // Restore the workspace render state.
         self.focus_mode = saved_focus_mode;
@@ -2823,6 +3598,8 @@ impl RenderState {
         self.masked_group_reach = saved_masked_group_reach;
         self.ignore_nested_blurs = saved_ignore_nested_blurs;
         self.preview_mode = saved_preview_mode;
+        self.drop_shadows_ops_warmed = saved_drop_shadows_ops_warmed;
+        self.tile_atlas_flushed = saved_tile_atlas_flushed || text_drawn;
 
         // Restore render-surface transforms for the workspace context.
         // If we have a current tile, restore its tile render context; otherwise
@@ -2835,7 +3612,8 @@ impl RenderState {
                 .update_render_context(self.render_area, workspace_scale);
         }
 
-        Ok((data.as_bytes().to_vec(), width, height))
+        walk_result?;
+        Ok(image)
     }
 
     /// Anchor the progressive render budget to wall-clock now when the
@@ -2856,12 +3634,13 @@ impl RenderState {
         timestamp
     }
 
+    /// `walk_start` is the slice start for progressive renders (see `continue_render_loop`).
     #[inline]
-    pub fn should_stop_rendering(&self, iteration: i32, timestamp: i32) -> bool {
+    pub fn should_stop_rendering(&self, iteration: i32, walk_start: i32) -> bool {
         if iteration % self.options.node_batch_threshold != 0 {
             return false;
         }
-        if performance::get_time() - timestamp <= self.options.max_blocking_time_ms {
+        if performance::get_time() - walk_start <= self.walk_deadline_ms {
             return false;
         }
 
@@ -2898,15 +3677,14 @@ impl RenderState {
 
     /// Skip all drop/inner shadows in fast mode, or when even a large design-space
     /// shadow would be subpixel. Otherwise filter per shadow via
-    /// [`Shadow::is_perceptible_at_scale_for`] (stricter for recursive shapes).
+    /// [`Shadow::is_perceptible_at_scale_for`] (stricter for recursive shapes). Uses
+    /// [`Self::decision_scale`].
     #[inline]
     pub(crate) fn should_skip_drop_shadows(&self) -> bool {
         if self.options.is_fast_mode() {
             return true;
         }
-        let scale = self.get_scale();
-        scale * crate::shapes::DROP_SHADOW_LARGE_DESIGN_PX
-            < crate::shapes::DROP_SHADOW_MIN_DEVICE_PX
+        lod::skips_drop_shadows_at(self.decision_scale())
     }
 
     #[inline]
@@ -2991,8 +3769,10 @@ impl RenderState {
                 if filter.is_some() {
                     if let Some(clips) = clip_bounds {
                         let antialias = !self.options.is_fast_mode()
-                            && element
-                                .should_use_antialias(scale, self.options.antialias_threshold);
+                            && element.should_use_antialias(
+                                self.decision_scale(),
+                                self.options.antialias_threshold,
+                            );
                         self.clip_target_surface_to_stack(clips, target_surface, scale, antialias);
                     }
                 }
@@ -3003,6 +3783,7 @@ impl RenderState {
                 }
 
                 let layer_rec = skia::canvas::SaveLayerRec::default().paint(&paint);
+                self.counters.save_layers += 1;
                 self.surfaces.canvas(target_surface).save_layer(&layer_rec);
             }
         }
@@ -3018,6 +3799,7 @@ impl RenderState {
             let mut mask_paint = skia::Paint::default();
             mask_paint.set_blend_mode(skia::BlendMode::DstIn);
             let mask_rec = skia::canvas::SaveLayerRec::default().paint(&mask_paint);
+            self.counters.save_layers += 1;
             self.surfaces.canvas(target_surface).save_layer(&mask_rec);
         }
 
@@ -3045,6 +3827,7 @@ impl RenderState {
             }
 
             let layer_rec = skia::canvas::SaveLayerRec::default().paint(&paint);
+            self.counters.save_layers += 1;
             self.surfaces.canvas(target_surface).save_layer(&layer_rec);
         }
     }
@@ -3111,8 +3894,9 @@ impl RenderState {
 
         // Skip when focus mode excludes this subtree (the focus scope closes after this,
         // so is_active() still reflects this element's focus state here).
-        let needs_exit_strokes =
-            self.focus_mode.is_active() && exit_draws_strokes_over_children(element, visited_mask);
+        let needs_exit_strokes = self.focus_mode.is_active()
+            && !element.strokes.is_empty()
+            && exit_draws_strokes_over_children(element, visited_mask);
 
         if needs_exit_strokes {
             let mut element_strokes: Cow<Shape> = Cow::Borrowed(element);
@@ -3277,6 +4061,7 @@ impl RenderState {
             } else {
                 let paint = skia::Paint::default();
                 let layer_rec = skia::canvas::SaveLayerRec::default().paint(&paint);
+                self.counters.save_layers += 1;
                 self.surfaces
                     .canvas(SurfaceId::DropShadows)
                     .save_layer(&layer_rec);
@@ -3353,6 +4138,7 @@ impl RenderState {
         let shadow_rec = skia::canvas::SaveLayerRec::default()
             .bounds(&layer_bounds)
             .paint(&shadow_paint);
+        self.counters.save_layers += 1;
         self.surfaces
             .canvas(SurfaceId::DropShadows)
             .save_layer(&shadow_rec);
@@ -3405,6 +4191,7 @@ impl RenderState {
         let mut mask_paint = skia::Paint::default();
         mask_paint.set_blend_mode(skia::BlendMode::DstIn);
         let mask_rec = skia::canvas::SaveLayerRec::default().paint(&mask_paint);
+        self.counters.save_layers += 1;
         self.surfaces
             .canvas(SurfaceId::DropShadows)
             .save_layer(&mask_rec);
@@ -3620,8 +4407,13 @@ impl RenderState {
 
         // Low zoom path: use blur filter but apply offset and spread geometrically
         if use_low_zoom_path {
+            self.counters.save_layers += 1;
+            // Bound to `bounds`, the shadow reach computed above (a superset of the drawing).
+            let bounded_layer_rec = skia::canvas::SaveLayerRec::default()
+                .bounds(&bounds)
+                .paint(&shadow_paint);
             let drop_canvas = self.surfaces.canvas(SurfaceId::DropShadows);
-            drop_canvas.save_layer(&layer_rec);
+            drop_canvas.save_layer(&bounded_layer_rec);
             //drop_canvas.scale((scale, scale));
             //drop_canvas.translate(translation);
 
@@ -3686,6 +4478,7 @@ impl RenderState {
             blur_downscale,
             |state, temp_surface| {
                 let canvas = state.surfaces.canvas(temp_surface);
+                state.counters.save_layers += 1;
                 canvas.save_layer(&layer_rec);
 
                 state.with_nested_blurs_suppressed(|state| {
@@ -3740,6 +4533,7 @@ impl RenderState {
         node_render_state: &NodeRenderState,
         target_surface: SurfaceId,
     ) -> Result<bool> {
+        let lod_scale = self.decision_scale();
         // Avoid a blank DropShadows→Current blit + clear when nothing will paint
         // (no shadows, fast/overview skip, or all footprints subpixel). Callers
         // must still touch DropShadows once per tile when this returns false
@@ -3747,7 +4541,7 @@ impl RenderState {
         if self.should_skip_drop_shadows()
             || !element
                 .drop_shadows_visible()
-                .any(|s| s.is_perceptible_at_scale_for(scale, element.is_recursive()))
+                .any(|s| s.is_perceptible_at_scale_for(lod_scale, element.is_recursive()))
         {
             return Ok(false);
         }
@@ -3767,14 +4561,29 @@ impl RenderState {
 
         let recursive = element.is_recursive();
         let use_direct_container_shadow = element.uses_direct_container_drop_shadow(tree);
+        // Shadows of child silhouettes can reach past `element_extrect` (it joins children
+        // without this element's shadow offset, blur and spread), so bound the composite to the
+        // full reach instead.
+        let shadow_reach = shadows::drop_shadow_reach_rect(
+            *element_extrect,
+            element
+                .drop_shadows_visible()
+                .filter(|s| s.is_perceptible_at_scale_for(lod_scale, recursive)),
+            &element.centered_transform(),
+            inherited_layer_blur.map_or(0.0, |blur| blur.sigma()),
+        );
         let mut rendered_any = false;
         for shadow in element.drop_shadows_visible() {
-            if !shadow.is_perceptible_at_scale_for(scale, recursive) {
+            if !shadow.is_perceptible_at_scale_for(lod_scale, recursive) {
                 continue;
             }
             rendered_any = true;
             let paint = skia::Paint::default();
+            // No layer bounds: they change the layer texture the shadow blur runs on, which
+            // moved shadow pixels by one level against upstream. Measured cost of the full
+            // layer: none in the nav benchmarks.
             let layer_rec = skia::canvas::SaveLayerRec::default().paint(&paint);
+            self.counters.save_layers += 1;
             self.surfaces
                 .canvas(SurfaceId::DropShadows)
                 .save_layer(&layer_rec);
@@ -3826,19 +4635,42 @@ impl RenderState {
             return Ok(false);
         }
 
-        if let Some(clips) = clip_bounds.as_ref() {
-            let antialias = !self.options.is_fast_mode()
-                && element.should_use_antialias(scale, self.options.antialias_threshold);
-            self.surfaces.canvas(target_surface).save();
-            self.clip_target_surface_to_stack(clips, target_surface, scale, antialias);
-            self.surfaces
-                .draw_into(SurfaceId::DropShadows, target_surface, None);
-            self.surfaces.canvas(target_surface).restore();
-        } else {
-            self.surfaces
-                .draw_into(SurfaceId::DropShadows, target_surface, None);
+        // The shadows above only paint inside `shadow_reach` (it already holds a full blur
+        // reach past the extrect), so only its device rect can hold pixels. Composite just
+        // that rect.
+        let mut device_rect = self
+            .surfaces
+            .canvas(SurfaceId::DropShadows)
+            .local_to_device_as_3x3()
+            .map_rect(shadow_reach)
+            .0;
+        // Outset by 2 px for antialiasing at the edge.
+        device_rect.outset((2.0, 2.0));
+        let (surface_w, surface_h) = self.surfaces.surface_size(SurfaceId::DropShadows);
+        if device_rect.intersect(skia::Rect::from_wh(surface_w as f32, surface_h as f32)) {
+            let device_irect = skia::IRect::from_ltrb(
+                device_rect.left.floor() as i32,
+                device_rect.top.floor() as i32,
+                device_rect.right.ceil() as i32,
+                device_rect.bottom.ceil() as i32,
+            );
+
+            if let Some(clips) = clip_bounds.as_ref() {
+                let antialias = !self.options.is_fast_mode()
+                    && element.should_use_antialias(lod_scale, self.options.antialias_threshold);
+                self.surfaces.canvas(target_surface).save();
+                self.clip_target_surface_to_stack(clips, target_surface, scale, antialias);
+                self.surfaces
+                    .draw_into_rect(SurfaceId::DropShadows, target_surface, device_irect);
+                self.surfaces.canvas(target_surface).restore();
+            } else {
+                self.surfaces
+                    .draw_into_rect(SurfaceId::DropShadows, target_surface, device_irect);
+            }
         }
 
+        // Full clear: the walk clears DropShadows after each element anyway, so a rect-limited
+        // clear saves nothing, and a full clear stays correct if a pixel ever lands outside it.
         self.surfaces
             .canvas(SurfaceId::DropShadows)
             .clear(skia::Color::TRANSPARENT);
@@ -3860,49 +4692,48 @@ impl RenderState {
             target_surface = SurfaceId::Export;
         }
 
-        // During interactive transforms we compute the union of the current bounds of all
-        // modified shapes (doc-space @ 100% zoom, scale=1.0). This is used as a cheap overlap
-        // guard to decide when cached top-level crops are unsafe to reuse (something is moving
-        // over/inside them), without doing expensive ancestor walks per node.
-        //
-        // `modifier_ids` is pre-computed once here and reused throughout the loop to avoid
-        // repeated allocations (formerly O(N_shapes) HashMap builds) per node.
+        // During interactive transforms, where the moved shapes were and are decides which
+        // top-level crops can stand in for their subtrees this frame (see
+        // `should_use_cached_top_level_during_interactive`). `modifier_ids` is computed once
+        // here and reused for every node.
         let modifier_ids = tree.modifier_ids();
-        let moved_bounds = if self.options.is_interactive_transform() && !modifier_ids.is_empty() {
-            let mut acc: Option<Rect> = None;
-            for id in modifier_ids.iter() {
-                // Current (post-modifier) bounds
-                if let Some(s) = tree.get(id) {
-                    let r = self.get_cached_extrect(s, tree, 1.0);
-                    acc = Some(match acc {
-                        None => r,
-                        Some(mut prev) => {
-                            prev.join(r);
-                            prev
-                        }
-                    });
-                }
-
-                // Pre-modifier bounds: important so cached top-level crops that still contain the
-                // shape at its original position are considered "unsafe" even after the shape
-                // has moved away (e.g. dragging a child out of a clipped frame).
-                if let Some(raw) = tree.get_raw(id) {
-                    let r0 = self.get_cached_extrect(raw, tree, 1.0);
-                    acc = Some(match acc {
-                        None => r0,
-                        Some(mut prev) => {
-                            prev.join(r0);
-                            prev
-                        }
-                    });
-                }
-            }
-            acc
+        let moved = if self.options.is_interactive_transform() && !modifier_ids.is_empty() {
+            Some(self.moved_coverage(tree, modifier_ids))
         } else {
             None
         };
 
+        // Imposters only in the interactive viewport: not in exports/thumbnails, the viewer,
+        // focus mode, viewer layer passes or loading previews.
+        // Close in, boards are walked so small ones (icons) stay sharp.
+        let imposters_allowed = !export
+            && self.options.imposters_enabled()
+            && self.get_scale() <= self.options.imposter_max_scale
+            && self.viewer_render_root.is_none()
+            && self.include_filter.is_none()
+            && !self.focus_mode.has_filter()
+            && !self.preview_mode;
+        // Boards being dragged, resized or reparented are walked live until the gesture ends, and
+        // their crops are not reused as backdrops.
+        if (imposters_allowed || self.options.is_interactive_transform())
+            && self.modified_roots.is_none()
+        {
+            self.modified_roots = Some(if tree.has_pending_modifiers() {
+                tree.modified_root_ids()
+            } else {
+                HashSet::new()
+            });
+        }
+        // Board pixels are captured only from full-quality tiles: fast mode and interactive
+        // transforms skip effects, and their tiles are not kept.
+        let may_capture_imposters = imposters_allowed
+            && !self.options.is_fast_mode()
+            && !self.options.is_interactive_transform();
+        let min_visible_px = self.options.min_visible_device_px;
+        let leaf_px = self.options.subpixel_leaf_device_px;
+
         while let Some(node_render_state) = self.pending_nodes.pop() {
+            self.counters.node_visits += 1;
             let node_id = node_render_state.id;
             let visited_children = node_render_state.visited_children;
             let visited_mask = node_render_state.visited_mask;
@@ -3917,10 +4748,11 @@ impl RenderState {
                 continue;
             };
             let scale = self.get_scale();
+            let lod_scale = self.decision_scale();
             let mut extrect: Option<Rect> = None;
 
             // If the shape is not in the tile set, then we add them.
-            if self.tiles.get_tiles_of(node_id).is_none() {
+            if !export && self.tiles.get_tiles_of(node_id).is_none() {
                 self.add_shape_tiles(element, tree);
             }
 
@@ -3980,18 +4812,53 @@ impl RenderState {
                     None => self.render_area_with_margins,
                 };
 
-                let is_visible = export
-                    || mask
-                    || if is_container || has_effects {
-                        let element_extrect =
-                            extrect.get_or_insert_with(|| transformed_element.extrect(tree, scale));
-                        element_extrect.intersects(area)
-                            && !transformed_element.visually_insignificant(scale, tree)
+                let is_visible = if mask || export {
+                    true
+                } else {
+                    let in_area = if self.partial_tile.is_some() {
+                        // A partial repaint has no margin around the changed pixels. Test
+                        // where each shape can paint: its extrect (own effects and the layer
+                        // blur of its ancestors), glyphs outside the text lines, and, for a
+                        // container, the glyphs of the texts it holds.
+                        let reach = match transformed_element.shape_type {
+                            Type::Text(_) => text_ink_reach(&transformed_element),
+                            _ if is_container => self.partial_text_reach,
+                            _ => 0.0,
+                        };
+                        extrect
+                            .get_or_insert_with(|| transformed_element.extrect(tree, scale))
+                            .with_outset((reach, reach))
+                            .intersects(area)
+                    } else if is_container || has_effects {
+                        extrect
+                            .get_or_insert_with(|| transformed_element.extrect(tree, scale))
+                            .intersects(area)
                     } else {
-                        let selrect = transformed_element.selrect();
-                        selrect.intersects(area)
-                            && !transformed_element.visually_insignificant(scale, tree)
+                        transformed_element.selrect().intersects(area)
                     };
+                    in_area && {
+                        let element_extrect = *extrect
+                            .get_or_insert_with(|| transformed_element.extrect(tree, scale));
+                        let insignificant = if is_container {
+                            lod::is_visually_insignificant(
+                                element_extrect,
+                                lod_scale,
+                                min_visible_px,
+                            )
+                        } else {
+                            lod::is_insignificant_leaf(
+                                element_extrect,
+                                lod_scale,
+                                min_visible_px,
+                                leaf_px,
+                            )
+                        };
+                        if insignificant && !is_container {
+                            self.counters.culled_leaves += 1;
+                        }
+                        !insignificant
+                    }
+                };
 
                 if self.options.is_debug_visible() {
                     let shape_extrect_bounds = self.get_shape_extrect_bounds(element, tree);
@@ -3999,6 +4866,30 @@ impl RenderState {
                 }
 
                 if !is_visible {
+                    continue;
+                }
+            }
+
+            // Root shapes: note where they paint in this tile, and copy small boards back from
+            // pixels captured in an earlier render of this tile instead of walking them.
+            if imposters_allowed
+                && !node_render_state.is_root()
+                && clip_bounds.is_none()
+                && element.parent_id == Some(Uuid::nil())
+            {
+                let element_extrect = *extrect.get_or_insert_with(|| element.extrect(tree, scale));
+                let reach = self.imposter_paint_reach(element, tree);
+                let drawn = lod::is_root_board(element)
+                    && self.try_draw_board_imposter(
+                        element,
+                        element_extrect,
+                        reach,
+                        tree,
+                        target_surface,
+                        may_capture_imposters,
+                    )?;
+                self.record_imposter_painted(element, element_extrect, reach);
+                if drawn {
                     continue;
                 }
             }
@@ -4011,7 +4902,7 @@ impl RenderState {
                     node_id,
                     tree,
                     modifier_ids,
-                    moved_bounds,
+                    moved.as_ref(),
                 );
 
                 if use_cached {
@@ -4021,7 +4912,7 @@ impl RenderState {
 
                         if let Some(clips) = clip_bounds.as_ref() {
                             let antialias = element
-                                .should_use_antialias(scale, self.options.antialias_threshold);
+                                .should_use_antialias(lod_scale, self.options.antialias_threshold);
                             self.clip_target_surface_to_stack(
                                 clips,
                                 target_surface,
@@ -4097,7 +4988,7 @@ impl RenderState {
                     && Self::frame_clip_layer_blur(element).is_some()
                     && element
                         .drop_shadows_visible()
-                        .any(|s| s.is_perceptible_at_scale_for(scale, element.is_recursive()));
+                        .any(|s| s.is_perceptible_at_scale_for(lod_scale, element.is_recursive()));
 
                 if shadow_before_layer
                     && self.render_element_drop_shadows_and_composite(
@@ -4290,6 +5181,8 @@ impl RenderState {
         timestamp: i32,
         allow_stop: bool,
     ) -> Result<FrameType> {
+        // Modifiers may change between frames; the walk recomputes the set on first use.
+        self.modified_roots = None;
         let mut should_stop = false;
         self.viewer_render_root = base_object.copied();
         let root_ids = {
@@ -4315,8 +5208,10 @@ impl RenderState {
                         .has_cached_tile_surface(current_tile, self.get_scale())
                 {
                     performance::begin_measure!("render_shape_tree::uncached");
+                    let walk_start = performance::get_time();
                     let (is_empty, early_return) = self
                         .render_shape_tree_partial_uncached(tree, timestamp, allow_stop, false)?;
+                    self.counters.walk_ms += (performance::get_time() - walk_start) as f64;
 
                     #[cfg(target_arch = "wasm32")]
                     if self.options.capture_frames > 0 {
@@ -4349,6 +5244,13 @@ impl RenderState {
                                 draw_on_cache,
                             );
                         } else {
+                            if let Some(partial) = self.partial_tile.take() {
+                                // Outside the changed pixels the tile is the one it was.
+                                self.surfaces
+                                    .copy_stale_slot_outside(&partial.slot, partial.dirty_px);
+                                self.surfaces.release_tile_slot(partial.slot);
+                                self.counters.partial_tiles += 1;
+                            }
                             self.apply_render_to_final_canvas()?;
                         }
 
@@ -4376,6 +5278,7 @@ impl RenderState {
             // let's check if there are more pending nodes
             if let Some(next_tile) = self.pending_tiles.pop() {
                 self.update_render_context(next_tile);
+                self.imposter_tile.reset();
                 // Reset for the new tile. We'll flip it to true if the
                 // tile has shapes, so a later "is_empty=true" reflects
                 // a resumed-from-yield case rather than a genuinely
@@ -4392,6 +5295,7 @@ impl RenderState {
 
                 let Some(ids) = self.tiles.get_shapes_at(next_tile) else {
                     // If the tile is empty we do not need to render it.
+                    self.surfaces.drop_stale_tile(next_tile, current_scale);
                     continue;
                 };
 
@@ -4403,8 +5307,10 @@ impl RenderState {
                 {
                     // If the tile is cached, then we do not need to
                     // render it.
+                    self.counters.tiles_from_cache += 1;
                     continue;
                 }
+                self.counters.tiles_rendered += 1;
 
                 // Check if any shape on this tile has a background blur.
                 // If so, we need ALL root shapes rendered (not just those
@@ -4414,6 +5320,60 @@ impl RenderState {
                     tree.get(id)
                         .is_some_and(|s| s.visible_background_blur().is_some())
                 });
+                let tile_root_ids: Vec<Uuid> = root_ids
+                    .iter()
+                    .filter(|id| ids.contains(id))
+                    .copied()
+                    .collect();
+
+                // A stale tile changed in part: repaint only the shapes that reach the change.
+                let partial_area = if viewer_masked_pass || tile_has_bg_blur {
+                    None
+                } else {
+                    match self.begin_partial_tile(next_tile, &tile_root_ids, tree) {
+                        PartialStart::Started(area) => Some(area),
+                        PartialStart::Restored => {
+                            self.counters.tiles_rendered -= 1;
+                            self.counters.tiles_from_cache += 1;
+                            continue;
+                        }
+                        PartialStart::No => None,
+                    }
+                };
+                if let Some(area) = partial_area {
+                    let reaches: Vec<f32> = tile_root_ids
+                        .iter()
+                        .map(|id| self.root_paint(id, tree).text_reach)
+                        .collect();
+                    let valid_ids: Vec<Uuid> = tile_root_ids
+                        .into_iter()
+                        .zip(reaches)
+                        .filter(|(id, reach)| {
+                            tree.get(id).is_some_and(|s| {
+                                s.extrect(tree, current_scale)
+                                    .with_outset((*reach, *reach))
+                                    .intersects(area)
+                            })
+                        })
+                        .map(|(id, _)| id)
+                        .collect();
+                    // Composite even with nothing to draw: the change may be a removal.
+                    self.current_tile_had_shapes = true;
+                    self.pending_nodes
+                        .extend(valid_ids.into_iter().map(|id| NodeRenderState {
+                            id,
+                            visited_children: false,
+                            clip_bounds: None,
+                            visited_mask: false,
+                            mask: false,
+                            flattened: false,
+                        }));
+                    continue;
+                }
+                self.surfaces.drop_stale_tile(next_tile, current_scale);
+                let Some(ids) = self.tiles.get_shapes_at(next_tile) else {
+                    continue;
+                };
 
                 // We only need first level shapes, in the same order as the parent node.
                 //
@@ -4683,6 +5643,7 @@ impl RenderState {
     }
 
     pub fn rebuild_tiles_from(&mut self, tree: ShapesPoolRef, base_id: Option<&Uuid>) {
+        self.clear_imposters();
         performance::begin_measure!("rebuild_tiles");
 
         self.tiles.invalidate();
@@ -4746,7 +5707,52 @@ impl RenderState {
 
         self.index_dependent_ancestors(&ids, tree);
 
+        // A container whose drop shadow depends on its children may switch how it draws it.
+        // Then the whole shadow changes, not only next to the changed child.
+        let keep_stale = !self.options.is_interactive_transform();
+        for id in Self::switched_shadow_containers(&ids, tree, &mut self.shadow_paths) {
+            if let Some(container) = tree.get(&id) {
+                let rect = self.get_cached_extrect(container, tree, 1.0);
+                self.surfaces
+                    .invalidate_cached_tiles_intersecting(rect, keep_stale);
+            }
+        }
+
         performance::end_measure!("rebuild_touched_tiles");
+    }
+
+    /// Ancestors of `ids` whose drop shadow depends on their children
+    /// ([`Shape::has_child_dependent_drop_shadow`]) and now takes another path than
+    /// `paths` recorded (or no path was recorded). Records the current paths.
+    fn switched_shadow_containers(
+        ids: &HashSet<Uuid>,
+        tree: ShapesPoolRef,
+        paths: &mut HashMap<Uuid, (bool, bool)>,
+    ) -> Vec<Uuid> {
+        let mut seen = HashSet::<Uuid>::new();
+        let mut switched = Vec::new();
+        for id in ids {
+            let mut parent_id = tree.get(id).and_then(|shape| shape.parent_id);
+            while let Some(container_id) = parent_id.filter(|id| !id.is_nil()) {
+                if !seen.insert(container_id) {
+                    break;
+                }
+                let Some(container) = tree.get(&container_id) else {
+                    break;
+                };
+                if container.has_child_dependent_drop_shadow() {
+                    let path = (
+                        container.uses_direct_container_drop_shadow(tree),
+                        container.container_fill_covers_shadow_descendants(tree),
+                    );
+                    if paths.insert(container_id, path) != Some(path) {
+                        switched.push(container_id);
+                    }
+                }
+                parent_id = container.parent_id;
+            }
+        }
+        switched
     }
 
     /// Re-indexes a set of shapes and evicts the cached tiles they dirty. Extrect caches
@@ -4776,15 +5782,67 @@ impl RenderState {
             tree.get_modifier(&shape.id)
                 .and_then(|_| tree.get_raw(&shape.id).map(|raw| raw.extrect(tree, 1.0)))
         });
-        let indexed = self
-            .tiles
-            .get_tiles_of(shape.id)
-            .into_iter()
-            .flatten()
-            .fold(skia::Rect::new_empty(), |acc, tile| {
-                tiles::join_nonempty(acc, tiles::get_tile_rect(*tile, scale))
-            });
-        tiles::union_edit_dirty_rect(prev_extrect, new_extrect, indexed)
+        // Without the extent before the edit, fall back to the tiles the shape was indexed
+        // on. With it, those tiles add nothing: nested shapes may still be indexed at the
+        // scale of an earlier zoom, so their tiles would only widen the repaint.
+        let indexed = if prev_extrect.is_some() {
+            skia::Rect::new_empty()
+        } else {
+            self.tiles
+                .get_tiles_of(shape.id)
+                .into_iter()
+                .flatten()
+                .fold(skia::Rect::new_empty(), |acc, tile| {
+                    tiles::join_nonempty(acc, tiles::get_tile_rect(*tile, scale))
+                })
+        };
+        let mut dirty = tiles::union_edit_dirty_rect(prev_extrect, new_extrect, indexed);
+        // Glyphs paint outside the laid-out lines that make the text extrect.
+        let ink = text_ink_reach(shape);
+        if ink > 0.0 && !dirty.is_empty() {
+            dirty.outset((ink, ink));
+        }
+        // Antialiasing reaches about a pixel past the geometry, also into the next tile.
+        if !dirty.is_empty() {
+            let aa = AA_REACH_PX / scale;
+            dirty.outset((aa, aa));
+        }
+        Self::with_ancestor_drop_shadows(dirty, shape, tree)
+    }
+
+    /// Grows `dirty` by the drop shadows of the ancestors of `shape`: a container shadow is
+    /// cast by its children, so a change inside it also moves its shadow.
+    fn with_ancestor_drop_shadows(
+        mut dirty: skia::Rect,
+        shape: &Shape,
+        tree: ShapesPoolRef,
+    ) -> skia::Rect {
+        if dirty.is_empty() {
+            return dirty;
+        }
+        let mut parent_id = shape.parent_id;
+        while let Some(id) = parent_id.filter(|id| !id.is_nil()) {
+            let Some(parent) = tree.get(&id) else {
+                break;
+            };
+            let mut grown = dirty;
+            for shadow in parent.drop_shadows_visible() {
+                let mut centered = *shadow;
+                centered.offset = (0.0, 0.0);
+                if let Some(filter) = centered.get_drop_shadow_filter() {
+                    // Offset as an outset on every side: the parent may be rotated.
+                    let reach = shadow.offset.0.abs() + shadow.offset.1.abs();
+                    grown.join(
+                        filter
+                            .compute_fast_bounds(dirty)
+                            .with_outset((reach, reach)),
+                    );
+                }
+            }
+            dirty = grown;
+            parent_id = parent.parent_id;
+        }
+        dirty
     }
 
     fn invalidate_shape_and_update_tiles(
@@ -4795,7 +5853,9 @@ impl RenderState {
     ) {
         let dirty = self.dirty_doc_rect_for_shape(shape, tree, prev_extrect);
         let _ = self.update_shape_tiles(shape, tree);
-        self.surfaces.invalidate_cached_tiles_intersecting(dirty);
+        let keep_stale = !self.options.is_interactive_transform();
+        self.surfaces
+            .invalidate_cached_tiles_intersecting(dirty, keep_stale);
     }
 
     fn index_dependent_ancestors(&mut self, ids: &HashSet<Uuid>, tree: ShapesPoolRef) {
@@ -4861,10 +5921,12 @@ impl RenderState {
         let previous = std::mem::replace(&mut self.moving_extrects, next);
         for (id, rect) in previous {
             if !self.moving_extrects.contains_key(&id) {
-                self.surfaces.invalidate_cached_tiles_intersecting(rect);
+                self.surfaces
+                    .invalidate_cached_tiles_intersecting(rect, false);
                 if let Some(shape) = tree.get(&id) {
                     let extrect = self.get_cached_extrect(shape, tree, 1.0);
-                    self.surfaces.invalidate_cached_tiles_intersecting(extrect);
+                    self.surfaces
+                        .invalidate_cached_tiles_intersecting(extrect, false);
                 }
             }
         }
@@ -4878,6 +5940,11 @@ impl RenderState {
         self.viewbox.get_scale()
     }
 
+    /// Scale for level-of-detail decisions: size culling, shadow skipping and antialias.
+    pub(crate) fn decision_scale(&self) -> f32 {
+        self.get_scale()
+    }
+
     pub fn zoom_changed(&self) -> bool {
         (self.viewbox.zoom - self.cached_viewbox.zoom).abs() > f32::EPSILON
     }
@@ -4887,6 +5954,7 @@ impl RenderState {
     }
 
     pub fn mark_touched_with_prev(&mut self, uuid: Uuid, prev_extrect: Option<Rect>) {
+        self.mark_imposter_dirty(uuid);
         if self.touched_ids.insert(uuid) {
             if let Some(rect) = prev_extrect.filter(|r| !r.is_empty()) {
                 self.touched_prev_extrects.insert(uuid, rect);
@@ -4905,7 +5973,14 @@ impl RenderState {
     }
 
     pub fn set_view(&mut self, zoom: f32, x: f32, y: f32) {
+        let prev_zoom = self.viewbox.zoom;
+        let prev_area = self.viewbox.area;
         self.viewbox.set_all(zoom, x, y);
+        if self.viewbox.zoom != prev_zoom || self.viewbox.area != prev_area {
+            // The backbuffer no longer matches the view, so a crop cut from it would land in the
+            // wrong place.
+            self.backbuffer_is_full_quality = false;
+        }
     }
 
     pub fn print_stats(&self) {
@@ -4915,6 +5990,10 @@ impl RenderState {
     pub fn prepare_context_loss_cleanup(&mut self) {
         // Drop cached GPU-backed snapshots before dropping the render state.
         self.backbuffer_crop_cache.clear();
+        self.clear_imposters();
+        self.backbuffer_crop_cache_stale = false;
+        self.backbuffer_is_full_quality = false;
+        self.view_moved_since_render = false;
         self.surfaces.invalidate_tile_cache();
         // Mark context as abandoned so resource destructors avoid issuing
         // GL commands when the browser has already lost/restored the context.
@@ -4922,6 +6001,8 @@ impl RenderState {
     }
 
     pub fn free_gpu_resources(&mut self) {
+        // Imposter textures are GPU images; drop them with the rest.
+        self.clear_imposters();
         get_gpu_state().context.free_gpu_resources();
     }
 }
@@ -5152,5 +6233,676 @@ mod tests {
             .expect("a clipping shape starts a stack");
 
         assert_eq!(stack[0].0, Rect::from_ltrb(2.0, 2.0, 98.0, 98.0));
+    }
+}
+
+#[cfg(test)]
+mod counters_tests {
+    use super::*;
+
+    #[test]
+    fn counters_serialize_as_fifty_six_little_endian_bytes() {
+        let counters = RenderCounters {
+            tiles_rendered: 1,
+            tiles_from_cache: 2,
+            node_visits: 3,
+            shapes_drawn: 4,
+            save_layers: 5,
+            partial_frames: 6,
+            full_frames: 7,
+            render_from_cache_calls: 8,
+            walk_ms: 9.5,
+            imposters_drawn: 10,
+            imposters_built: 11,
+            culled_leaves: 12,
+            partial_tiles: 13,
+        };
+
+        let bytes = counters_to_bytes(&counters);
+        assert_eq!(bytes.len(), 56);
+
+        let u32_at =
+            |index: usize| u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap());
+        assert_eq!(u32_at(0), 1);
+        assert_eq!(u32_at(1), 2);
+        assert_eq!(u32_at(2), 3);
+        assert_eq!(u32_at(3), 4);
+        assert_eq!(u32_at(4), 5);
+        assert_eq!(u32_at(5), 6);
+        assert_eq!(u32_at(6), 7);
+        assert_eq!(u32_at(7), 8);
+
+        let walk_ms = f64::from_le_bytes(bytes[32..40].try_into().unwrap());
+        assert_eq!(walk_ms, 9.5);
+
+        let u32_at_offset =
+            |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        assert_eq!(u32_at_offset(40), 10);
+        assert_eq!(u32_at_offset(44), 11);
+        assert_eq!(u32_at_offset(48), 12);
+        assert_eq!(u32_at_offset(52), 13);
+    }
+}
+
+#[cfg(test)]
+mod partial_repaint_root_tests {
+    use super::*;
+    use crate::shapes::{
+        FontFamily, FontStyle, Frame, Group, Paragraph, SVGRaw, ShadowStyle, TextAlign,
+        TextContent, TextDirection, TextSpan,
+    };
+    use crate::state::ShapesPool;
+
+    fn new_pool() -> ShapesPool {
+        let mut pool = ShapesPool::new();
+        pool.initialize(8);
+        pool
+    }
+
+    fn add_frame(pool: &mut ShapesPool, id: Uuid, children: &[Uuid]) {
+        let frame = pool.add_shape(id);
+        frame.set_shape_type(Type::Frame(Frame::default()));
+        frame.set_selrect(0.0, 0.0, 200.0, 100.0);
+        frame.children = children.to_vec();
+    }
+
+    fn add_rect(pool: &mut ShapesPool, id: Uuid, parent: Uuid) {
+        let rect = pool.add_shape(id);
+        rect.set_shape_type(Type::Rect(Default::default()));
+        rect.set_selrect(10.0, 10.0, 190.0, 90.0);
+        rect.set_parent(parent);
+    }
+
+    fn drop_shadow(hidden: bool) -> Shadow {
+        Shadow::new(
+            skia::Color::BLACK,
+            0.0,
+            0.0,
+            (0.0, 4.0),
+            ShadowStyle::Drop,
+            hidden,
+        )
+    }
+
+    fn span(font_size: f32) -> TextSpan {
+        TextSpan::new(
+            "ink".to_string(),
+            FontFamily::new(Uuid::nil(), 400, FontStyle::Normal),
+            font_size,
+            1.2,
+            0.0,
+            None,
+            None,
+            TextDirection::LTR,
+            400,
+            Uuid::nil(),
+            vec![],
+        )
+    }
+
+    fn paragraph(children: Vec<TextSpan>) -> Paragraph {
+        Paragraph::new(
+            TextAlign::Left,
+            TextDirection::LTR,
+            None,
+            None,
+            1.2,
+            0.0,
+            children,
+        )
+    }
+
+    fn text_node(paragraphs: Vec<Paragraph>) -> Type {
+        let mut content = TextContent::default();
+        content.paragraphs.extend(paragraphs);
+        Type::Text(content)
+    }
+
+    /// A filled frame with a visible drop shadow that holds one rect child.
+    fn shadowed_frame_pool(frame: Uuid, child: Uuid) -> ShapesPool {
+        let mut pool = new_pool();
+        add_frame(&mut pool, frame, &[child]);
+        {
+            let frame_shape = pool.get_mut(&frame).expect("frame");
+            frame_shape.add_fill(Fill::Solid(SolidColor(skia::Color::WHITE)));
+            frame_shape.add_shadow(drop_shadow(false));
+        }
+        add_rect(&mut pool, child, frame);
+        pool
+    }
+
+    #[test]
+    fn plain_subtree_has_default_root_paint() {
+        let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut pool = new_pool();
+        add_frame(&mut pool, root, &[child]);
+        add_rect(&mut pool, child, root);
+
+        assert_eq!(RootPaint::of(&root, &pool), RootPaint::default());
+    }
+
+    #[test]
+    fn text_grandchild_sets_the_largest_span_as_text_reach() {
+        let (root, group, text) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut pool = new_pool();
+        add_frame(&mut pool, root, &[group]);
+        {
+            let group_shape = pool.add_shape(group);
+            group_shape.set_shape_type(Type::Group(Group { masked: false }));
+            group_shape.set_parent(root);
+            group_shape.children = vec![text];
+        }
+        {
+            let text_shape = pool.add_shape(text);
+            text_shape.set_shape_type(text_node(vec![paragraph(vec![span(12.0), span(40.0)])]));
+            text_shape.set_parent(group);
+        }
+
+        assert_eq!(
+            RootPaint::of(&root, &pool),
+            RootPaint {
+                whole_tiles: false,
+                text_reach: 40.0,
+            }
+        );
+    }
+
+    #[test]
+    fn visible_background_blur_in_subtree_needs_whole_tiles() {
+        let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut pool = new_pool();
+        add_frame(&mut pool, root, &[child]);
+        add_rect(&mut pool, child, root);
+        pool.get_mut(&child)
+            .expect("child")
+            .set_background_blur(Some(Blur::new(BlurType::BackgroundBlur, false, 8.0)));
+
+        assert_eq!(
+            RootPaint::of(&root, &pool),
+            RootPaint {
+                whole_tiles: true,
+                text_reach: 0.0,
+            }
+        );
+    }
+
+    #[test]
+    fn hidden_background_blur_in_subtree_does_not_need_whole_tiles() {
+        let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut pool = new_pool();
+        add_frame(&mut pool, root, &[child]);
+        add_rect(&mut pool, child, root);
+        pool.get_mut(&child)
+            .expect("child")
+            .set_background_blur(Some(Blur::new(BlurType::BackgroundBlur, true, 8.0)));
+
+        assert_eq!(RootPaint::of(&root, &pool), RootPaint::default());
+    }
+
+    #[test]
+    fn svg_raw_in_subtree_needs_whole_tiles() {
+        let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut pool = new_pool();
+        add_frame(&mut pool, root, &[child]);
+        {
+            let svg = pool.add_shape(child);
+            svg.set_shape_type(Type::SVGRaw(SVGRaw::from_content(
+                "<svg></svg>".to_string(),
+            )));
+            svg.set_parent(root);
+        }
+
+        assert_eq!(
+            RootPaint::of(&root, &pool),
+            RootPaint {
+                whole_tiles: true,
+                text_reach: 0.0,
+            }
+        );
+    }
+
+    #[test]
+    fn filled_shadowed_frame_is_returned_once_until_its_paths_change() {
+        let (frame, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let pool = shadowed_frame_pool(frame, child);
+        let ids = HashSet::from([child]);
+        let mut paths = HashMap::new();
+
+        assert_eq!(
+            RenderState::switched_shadow_containers(&ids, &pool, &mut paths),
+            vec![frame]
+        );
+        assert_eq!(
+            RenderState::switched_shadow_containers(&ids, &pool, &mut paths),
+            Vec::<Uuid>::new()
+        );
+    }
+
+    #[test]
+    fn child_shadow_that_changes_the_direct_path_returns_the_clipped_frame_again() {
+        let (frame, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut pool = shadowed_frame_pool(frame, child);
+        pool.get_mut(&frame).expect("frame").set_clip(true);
+        let ids = HashSet::from([child]);
+        let mut paths = HashMap::new();
+
+        assert_eq!(
+            RenderState::switched_shadow_containers(&ids, &pool, &mut paths),
+            vec![frame]
+        );
+        assert_eq!(
+            RenderState::switched_shadow_containers(&ids, &pool, &mut paths),
+            Vec::<Uuid>::new()
+        );
+
+        pool.get_mut(&child)
+            .expect("child")
+            .add_shadow(drop_shadow(false));
+
+        assert_eq!(
+            RenderState::switched_shadow_containers(&ids, &pool, &mut paths),
+            vec![frame]
+        );
+        assert_eq!(paths.get(&frame), Some(&(false, true)));
+    }
+
+    #[test]
+    fn frame_without_fills_is_never_returned() {
+        let (frame, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut pool = shadowed_frame_pool(frame, child);
+        pool.get_mut(&frame).expect("frame").clear_fills();
+        let ids = HashSet::from([child]);
+        let mut paths = HashMap::new();
+
+        assert!(RenderState::switched_shadow_containers(&ids, &pool, &mut paths).is_empty());
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn frame_without_visible_drop_shadow_is_never_returned() {
+        let (frame, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut pool = shadowed_frame_pool(frame, child);
+        let ids = HashSet::from([child]);
+        let mut paths = HashMap::new();
+
+        pool.get_mut(&frame).expect("frame").clear_shadows();
+        assert!(RenderState::switched_shadow_containers(&ids, &pool, &mut paths).is_empty());
+
+        pool.get_mut(&frame)
+            .expect("frame")
+            .add_shadow(drop_shadow(true));
+        assert!(RenderState::switched_shadow_containers(&ids, &pool, &mut paths).is_empty());
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn nil_root_is_never_returned() {
+        let child = Uuid::new_v4();
+        let mut pool = new_pool();
+        add_frame(&mut pool, Uuid::nil(), &[child]);
+        {
+            let root = pool.get_mut(&Uuid::nil()).expect("root");
+            root.add_fill(Fill::Solid(SolidColor(skia::Color::WHITE)));
+            root.add_shadow(drop_shadow(false));
+        }
+        add_rect(&mut pool, child, Uuid::nil());
+        let ids = HashSet::from([child]);
+        let mut paths = HashMap::new();
+
+        assert!(RenderState::switched_shadow_containers(&ids, &pool, &mut paths).is_empty());
+        assert!(paths.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod text_ink_reach_tests {
+    use super::*;
+    use crate::shapes::{
+        FontFamily, FontStyle, Paragraph, TextAlign, TextContent, TextDirection, TextSpan,
+    };
+
+    fn span(font_size: f32) -> TextSpan {
+        TextSpan::new(
+            "ink".to_string(),
+            FontFamily::new(Uuid::nil(), 400, FontStyle::Normal),
+            font_size,
+            1.2,
+            0.0,
+            None,
+            None,
+            TextDirection::LTR,
+            400,
+            Uuid::nil(),
+            vec![],
+        )
+    }
+
+    fn paragraph(children: Vec<TextSpan>) -> Paragraph {
+        Paragraph::new(
+            TextAlign::Left,
+            TextDirection::LTR,
+            None,
+            None,
+            1.2,
+            0.0,
+            children,
+        )
+    }
+
+    fn text_shape(paragraphs: Vec<Paragraph>) -> Shape {
+        let mut content = TextContent::default();
+        content.paragraphs.extend(paragraphs);
+        let mut shape = Shape::new(Uuid::new_v4());
+        shape.set_shape_type(Type::Text(content));
+        shape
+    }
+
+    #[test]
+    fn non_text_shape_has_no_ink_reach() {
+        let shape = Shape::new(Uuid::new_v4());
+
+        assert_eq!(text_ink_reach(&shape), 0.0);
+    }
+
+    #[test]
+    fn largest_span_font_size_across_paragraphs_is_the_reach() {
+        let shape = text_shape(vec![
+            paragraph(vec![span(12.0), span(30.0)]),
+            paragraph(vec![span(18.0)]),
+        ]);
+
+        assert_eq!(text_ink_reach(&shape), 30.0);
+    }
+
+    #[test]
+    fn text_without_paragraphs_has_no_ink_reach() {
+        let shape = text_shape(vec![]);
+
+        assert_eq!(text_ink_reach(&shape), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod ancestor_shadow_tests {
+    use super::*;
+    use crate::shapes::ShadowStyle;
+    use crate::state::ShapesPool;
+
+    fn drop_shadow(offset: (f32, f32)) -> Shadow {
+        Shadow::new(
+            skia::Color::BLACK,
+            0.0,
+            0.0,
+            offset,
+            ShadowStyle::Drop,
+            false,
+        )
+    }
+
+    fn dirty() -> Rect {
+        Rect::from_ltrb(10.0, 10.0, 50.0, 50.0)
+    }
+
+    fn pool_with_root() -> ShapesPool {
+        let mut pool = ShapesPool::new();
+        pool.initialize(4);
+        pool.add_shape(Uuid::nil());
+        pool
+    }
+
+    fn assert_grown_by_offset_x(grown: Rect, original: Rect, offset_x: f32) {
+        assert!(grown.left <= original.left);
+        assert!(grown.top <= original.top);
+        assert!(grown.right >= original.right);
+        assert!(grown.bottom >= original.bottom);
+        assert!(grown.left <= original.left + offset_x);
+        assert!(grown.right >= original.right + offset_x);
+    }
+
+    #[test]
+    fn child_without_shadowed_ancestors_keeps_its_dirty_rect() {
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut pool = pool_with_root();
+        pool.add_shape(parent).set_parent(Uuid::nil());
+        pool.add_shape(child).set_parent(parent);
+        let shape = pool.get(&child).expect("child");
+
+        let grown = RenderState::with_ancestor_drop_shadows(dirty(), shape, &pool);
+
+        assert_eq!(grown, dirty());
+    }
+
+    #[test]
+    fn parent_drop_shadow_grows_the_dirty_rect_by_its_offset() {
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut pool = pool_with_root();
+        let parent_shape = pool.add_shape(parent);
+        parent_shape.set_parent(Uuid::nil());
+        parent_shape.add_shadow(drop_shadow((10.0, 0.0)));
+        pool.add_shape(child).set_parent(parent);
+        let shape = pool.get(&child).expect("child");
+
+        let grown = RenderState::with_ancestor_drop_shadows(dirty(), shape, &pool);
+
+        assert_grown_by_offset_x(grown, dirty(), 10.0);
+    }
+
+    #[test]
+    fn grandparent_drop_shadow_grows_the_dirty_rect_too() {
+        let grandparent = Uuid::new_v4();
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut pool = pool_with_root();
+        let grandparent_shape = pool.add_shape(grandparent);
+        grandparent_shape.set_parent(Uuid::nil());
+        grandparent_shape.add_shadow(drop_shadow((10.0, 0.0)));
+        pool.add_shape(parent).set_parent(grandparent);
+        pool.add_shape(child).set_parent(parent);
+        let shape = pool.get(&child).expect("child");
+
+        let grown = RenderState::with_ancestor_drop_shadows(dirty(), shape, &pool);
+
+        assert_grown_by_offset_x(grown, dirty(), 10.0);
+    }
+
+    #[test]
+    fn hidden_parent_drop_shadow_does_not_grow_the_dirty_rect() {
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut pool = pool_with_root();
+        let parent_shape = pool.add_shape(parent);
+        parent_shape.set_parent(Uuid::nil());
+        parent_shape.add_shadow(Shadow::new(
+            skia::Color::BLACK,
+            0.0,
+            0.0,
+            (10.0, 0.0),
+            ShadowStyle::Drop,
+            true,
+        ));
+        pool.add_shape(child).set_parent(parent);
+        let shape = pool.get(&child).expect("child");
+
+        let grown = RenderState::with_ancestor_drop_shadows(dirty(), shape, &pool);
+
+        assert_eq!(grown, dirty());
+    }
+
+    #[test]
+    fn inner_parent_shadow_does_not_grow_the_dirty_rect() {
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut pool = pool_with_root();
+        let parent_shape = pool.add_shape(parent);
+        parent_shape.set_parent(Uuid::nil());
+        parent_shape.add_shadow(Shadow::new(
+            skia::Color::BLACK,
+            0.0,
+            0.0,
+            (10.0, 0.0),
+            ShadowStyle::Inner,
+            false,
+        ));
+        pool.add_shape(child).set_parent(parent);
+        let shape = pool.get(&child).expect("child");
+
+        let grown = RenderState::with_ancestor_drop_shadows(dirty(), shape, &pool);
+
+        assert_eq!(grown, dirty());
+    }
+}
+
+#[cfg(test)]
+mod walk_budget_tests {
+    use super::*;
+
+    #[test]
+    fn deadline_uses_target_when_no_history_or_pre_slice_time() {
+        assert_eq!(progressive_walk_deadline_ms(16, 0.0, 0, 4, 32), 16);
+    }
+
+    #[test]
+    fn deadline_subtracts_post_walk_cost() {
+        assert_eq!(progressive_walk_deadline_ms(16, 6.0, 0, 4, 32), 10);
+    }
+
+    #[test]
+    fn deadline_subtracts_pre_slice_time_and_floors() {
+        assert_eq!(progressive_walk_deadline_ms(16, 6.0, 10, 4, 32), 4);
+    }
+
+    #[test]
+    fn negative_pre_slice_time_counts_as_zero() {
+        assert_eq!(progressive_walk_deadline_ms(16, 0.0, -5, 4, 32), 16);
+    }
+
+    #[test]
+    fn deadline_is_clamped_to_max() {
+        assert_eq!(progressive_walk_deadline_ms(40, 0.0, 0, 4, 32), 32);
+    }
+
+    #[test]
+    fn deadline_does_not_shrink_as_walks_get_shorter() {
+        let mut ema = 0.0_f32;
+        for _ in 0..30 {
+            ema = next_post_walk_ema_ms(ema, 5, 32);
+        }
+        assert!((ema - 5.0).abs() < 0.01, "ema was {ema}");
+        assert_eq!(progressive_walk_deadline_ms(16, ema, 0, 4, 32), 11);
+    }
+
+    #[test]
+    fn ema_clamps_outlier_samples() {
+        let ema = next_post_walk_ema_ms(0.0, 1000, 32);
+        assert!((ema - 0.3 * 32.0).abs() < 1e-4, "ema was {ema}");
+    }
+
+    #[test]
+    fn ema_treats_negative_sample_as_zero() {
+        let ema = next_post_walk_ema_ms(10.0, -3, 32);
+        assert!((ema - 7.0).abs() < 1e-4, "ema was {ema}");
+    }
+}
+
+#[cfg(test)]
+mod drag_crop_tests {
+    use super::*;
+
+    fn rect(l: f32, t: f32, r: f32, b: f32) -> Rect {
+        Rect::from_ltrb(l, t, r, b)
+    }
+
+    fn moved(before: Rect, after: Rect, crops_opaque: bool) -> MovedCoverage {
+        MovedCoverage {
+            before: vec![before],
+            after: vec![after],
+            crops_opaque,
+        }
+    }
+
+    const CROP: (f32, f32, f32, f32) = (1000.0, 0.0, 2000.0, 1000.0);
+
+    fn crop() -> Rect {
+        rect(CROP.0, CROP.1, CROP.2, CROP.3)
+    }
+
+    #[test]
+    fn crop_away_from_the_moved_shape_is_used() {
+        let m = moved(
+            rect(0.0, 0.0, 500.0, 500.0),
+            rect(100.0, 0.0, 600.0, 500.0),
+            false,
+        );
+        assert!(stationary_crop_usable(crop(), &m, false, || false));
+    }
+
+    #[test]
+    fn crop_of_a_modified_root_is_never_used() {
+        let m = moved(
+            rect(0.0, 0.0, 500.0, 500.0),
+            rect(100.0, 0.0, 600.0, 500.0),
+            true,
+        );
+        assert!(!stationary_crop_usable(crop(), &m, true, || true));
+    }
+
+    #[test]
+    fn crop_that_held_the_moved_shape_is_not_used() {
+        // A child dragged out of the board: its old pixels are in the board's crop.
+        let m = moved(
+            rect(1100.0, 100.0, 1200.0, 200.0),
+            rect(0.0, 0.0, 100.0, 100.0),
+            true,
+        );
+        assert!(!stationary_crop_usable(crop(), &m, false, || true));
+    }
+
+    #[test]
+    fn overlapped_crop_is_used_only_when_both_crops_are_opaque() {
+        let over = rect(800.0, 0.0, 1300.0, 500.0);
+        let before = rect(0.0, 0.0, 500.0, 500.0);
+        assert!(stationary_crop_usable(
+            crop(),
+            &moved(before, over, true),
+            false,
+            || true
+        ));
+        assert!(!stationary_crop_usable(
+            crop(),
+            &moved(before, over, false),
+            false,
+            || true
+        ));
+        assert!(!stationary_crop_usable(
+            crop(),
+            &moved(before, over, true),
+            false,
+            || false
+        ));
+    }
+
+    #[test]
+    fn opacity_is_only_checked_when_moved_content_overlaps() {
+        let m = moved(
+            rect(0.0, 0.0, 500.0, 500.0),
+            rect(100.0, 0.0, 600.0, 500.0),
+            true,
+        );
+        assert!(stationary_crop_usable(crop(), &m, false, || panic!(
+            "not needed"
+        )));
+    }
+
+    #[test]
+    fn preserve_target_renders_on_unchanged_view_run_to_the_end() {
+        // Shape edit, text-editor keystroke or SyncTiles over an unchanged view.
+        assert!(!progressive_render_allowed(true, false, false, false));
+        // Plain renders, pan/zoom ends and interactive transforms.
+        assert!(progressive_render_allowed(false, false, false, false));
+        assert!(progressive_render_allowed(true, true, false, false));
+        assert!(progressive_render_allowed(true, false, true, false));
+        assert!(progressive_render_allowed(true, false, false, true));
     }
 }

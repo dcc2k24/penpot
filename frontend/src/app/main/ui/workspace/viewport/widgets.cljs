@@ -262,8 +262,15 @@
   [{:keys [objects base-objects zoom selected focus is-show-artboard-names
            on-frame-enter on-frame-leave on-frame-select]}]
   (let [selected       (or selected #{})
-        frame-ids      (mf/with-memo [base-objects]
-                         (vec (ctt/get-frames-ids base-objects {:skip-copies? true :ignore-index? true})))
+        show-titles?   (dbg/enabled? :shape-titles)
+        ;; Only boards at the root get a title (see below), so read only the
+        ;; root children, back to front, so the title of the top board is
+        ;; drawn last; walking every frame decodes the whole page. The
+        ;; `:shape-titles` debug option shows every frame.
+        frame-ids      (mf/with-memo [base-objects show-titles?]
+                         (if show-titles?
+                           (vec (ctt/get-frames-ids base-objects {:skip-copies? true :ignore-index? true}))
+                           (ctt/get-top-level-frames-ids base-objects {:skip-copies? true})))
         shapes         (into [] (keep (d/getf objects)) frame-ids)
         shapes         (if (dbg/enabled? :shape-titles)
                          (into (set shapes)

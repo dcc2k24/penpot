@@ -31,6 +31,7 @@ Some legacy code violates this layering; do not copy those violations into new c
 Model, schema, and persistence shape:
 - File/page/shape/component attr changes, import/export surfaces, inspector/codegen, and cross-module checklist: `mem:common/data-model-change-checklist`.
 - Token data structures, token import/export, active theme/set semantics, and schema/coercion behavior: `mem:common/tokens-schema-subtleties`.
+- `app.common.types.objects-hints`: per-shape facts (frame bounds/grid, text font ids/position-data) attached to page objects metadata by the WASM upload workers; valid per id only while `omap/raw-value` is identical to the hint's `:raw`; `ctst/get-frames-by-position`, the frame ids index (`::ctst/index-frame-ids`), frame grids, `update-page-position-data` and `fix-deleted-fonts` use them to avoid decoding the whole page.
 
 Geometry and layout:
 - Shape geometry invariants, redundant geometry fields, and geometry-sensitive tests: `mem:common/geometry-invariants`.

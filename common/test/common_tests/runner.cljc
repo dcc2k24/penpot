@@ -99,6 +99,7 @@
    [common-tests.types.fill-test]
    [common-tests.types.font-test]
    [common-tests.types.modifiers-test]
+   [common-tests.types.objects-hints-test]
    [common-tests.types.objects-map-test]
    [common-tests.types.organization-test]
    [common-tests.types.path-data-test]
@@ -206,6 +207,7 @@
    'common-tests.types.fill-test
    'common-tests.types.font-test
    'common-tests.types.modifiers-test
+   'common-tests.types.objects-hints-test
    'common-tests.types.objects-map-test
    'common-tests.types.organization-test
    'common-tests.types.path-data-test

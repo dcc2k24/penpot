@@ -470,6 +470,7 @@ dependencies = [
  "insta",
  "macros",
  "miniz_oxide",
+ "rustc-hash",
  "skia-safe",
  "thiserror",
  "unicode-segmentation",

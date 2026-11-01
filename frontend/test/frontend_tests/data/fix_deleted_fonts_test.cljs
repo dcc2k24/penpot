@@ -40,17 +40,30 @@
                                                                font-id
                                                                font-family)})))
 
-(defn- watch-fix-deleted-fonts-events
-  [file]
-  (let [events (atom [])
-        store  (ths/setup-store file)
-        state  @store]
-    (when-let [result (ptk/watch (fdf/fix-deleted-fonts-for-page (:id file)
-                                                                 (cthf/current-page-id file))
-                                 state
-                                 (rx/empty))]
+(defn- watch-events
+  [event state]
+  (let [events (atom [])]
+    (when-let [result (ptk/watch event state (rx/empty))]
       (->> result (rx/subs! #(swap! events conj %))))
     @events))
+
+(defn- watch-fix-deleted-fonts-events
+  ([file]
+   (watch-fix-deleted-fonts-events file nil))
+  ([file opts]
+   (let [store (ths/setup-store file)]
+     (watch-events (fdf/fix-deleted-fonts-for-page (:id file)
+                                                   (cthf/current-page-id file)
+                                                   opts)
+                   @store))))
+
+(defn- committed-ignore-wasm?
+  "The `:ignore-wasm?` of the commit the fix emits."
+  [file opts]
+  (let [store  (ths/setup-store file)
+        [cc]   (watch-fix-deleted-fonts-events file opts)
+        [cmt]  (watch-events cc @store)]
+    (:ignore-wasm? (deref cmt))))
 
 (t/deftest fix-deleted-fonts-skips-unfixable-missing-font
   (let [file   (file-with-text-shape missing-font-id "Gibson")
@@ -71,5 +84,46 @@
             events (watch-fix-deleted-fonts-events file)]
         (t/is (= 1 (count events)))
         (t/is (ptk/type? ::dwc/commit-changes (first events))))
+      (finally
+        (cleanup)))))
+
+(t/deftest fix-deleted-fonts-writes-to-wasm-on-request
+  (let [replacement-id "custom-gibson-replacement"
+        cleanup        #(swap! fonts/fontsdb dissoc replacement-id)]
+    (try
+      (swap! fonts/fontsdb assoc replacement-id
+             {:id replacement-id
+              :family "Gibson"
+              :name "Gibson"
+              :variants []})
+      (let [file (file-with-text-shape missing-font-id "Gibson")]
+        (t/is (true? (committed-ignore-wasm? file nil))
+              "by default the page is not uploaded yet: skip WASM")
+        (t/is (false? (committed-ignore-wasm? file {:ignore-wasm? false}))
+              "after the upload the fixed texts go to WASM too"))
+      (finally
+        (cleanup)))))
+
+(t/deftest fix-deleted-fonts-skips-texts-under-edition
+  (let [replacement-id "custom-gibson-replacement"
+        cleanup        #(swap! fonts/fontsdb dissoc replacement-id)]
+    (try
+      (swap! fonts/fontsdb assoc replacement-id
+             {:id replacement-id
+              :family "Gibson"
+              :name "Gibson"
+              :variants []})
+      (let [file    (file-with-text-shape missing-font-id "Gibson")
+            text-id (cthi/id :text)
+            state   @(ths/setup-store file)
+            fix     #(fdf/fix-deleted-fonts-for-page (:id file)
+                                                     (cthf/current-page-id file))
+            editing #(assoc-in state [:workspace-local :edition] %)]
+        (t/is (empty? (watch-events (fix) (editing text-id)))
+              "the text open in the editor keeps its content")
+        (t/is (empty? (watch-events (fix) (assoc-in state [:workspace-editor-state text-id] {})))
+              "the text with an editor state keeps its content")
+        (t/is (= 1 (count (watch-events (fix) (editing (cthi/new-id! :other)))))
+              "editing another shape does not block the fix"))
       (finally
         (cleanup)))))

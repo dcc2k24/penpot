@@ -155,6 +155,18 @@
     :render-wasm-dpr
     ;; Show WASM renderer info label (hidden by default).
     :render-wasm-info
+    ;; Expose `window.penpotRenderCounters` for render benchmarks
+    ;; (disabled by default).
+    :render-wasm-counters
+    ;; Keeps the WASM shapes of recently visited pages, so switching back to
+    ;; a page skips the upload (enabled by default).
+    :render-wasm-page-cache
+    ;; Draws small root boards from cached textures in the WASM renderer
+    ;; (enabled by default).
+    :render-wasm-board-thumbnails
+    ;; Decodes and encodes the shapes of large pages in web workers for the
+    ;; WASM upload (enabled by default).
+    :render-wasm-worker-upload
     :render-switch
     :hide-release-modal
     :subscriptions
@@ -229,6 +241,9 @@
    :enable-token-import-from-library
    :enable-render-switch
    :enable-render-wasm-info
+   :enable-render-wasm-page-cache
+   :enable-render-wasm-board-thumbnails
+   :enable-render-wasm-worker-upload
    :enable-available-viewer-wasm
    :enable-background-blur
    :enable-stroke-path

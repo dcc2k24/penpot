@@ -232,9 +232,14 @@
                objects   (dsh/lookup-page-objects state page-id)
                ids       (into [] (filter some?) ids)
 
-               ;; Parent resizing only reads the builder objects for groups
+               ;; Two readers use the builder objects. Parent resizing reads
+               ;; them for group-like ancestors of the ids it resizes; a
+               ;; board drag resizes the board alone, so groups inside it
+               ;; do not count. `generate-unapply-tokens` reads text
+               ;; `:content` and the first stroke, which a pure translation
+               ;; never changes.
                skip-local?
-               (and translation? (not (any-group-like? objects ids)))
+               (and translation? (not (any-group-like? objects (or resize-ids ids))))
 
                changes
                (-> (pcb/empty-changes it page-id)

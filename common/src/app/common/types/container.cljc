@@ -20,8 +20,7 @@
    [app.common.types.shape.layout :as ctl]
    [app.common.types.text :as cttx]
    [app.common.types.token :as ctt]
-   [app.common.uuid :as uuid]
-   [clojure.set :as set]))
+   [app.common.uuid :as uuid]))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; SCHEMA
@@ -594,12 +593,10 @@
                               changed-groups)]
     changed-groups))
 
-(defn set-shape-attr
-  "Assign attribute to shape with touched logic.
-
-  The returned shape will contain a metadata associated with it
-  indicating if shape is touched or not."
-  [shape attr val & {:keys [ignore-touched ignore-geometry]}]
+(defn set-shape-attr*
+  "Positional form of `set-shape-attr`. Change application calls it once
+  per operation, so it skips the keyword-argument parsing."
+  [shape attr val ignore-touched ignore-geometry]
   (let [type      (get shape :type)
         group     (ctk/resolve-sync-group type attr)
         shape-val (get shape attr)
@@ -648,7 +645,7 @@
         groups
         (cond-> token-groups
           (and group (not equal?))
-          (set/union #{group} content-diff-type))]
+          (-> (conj group) (into content-diff-type)))]
 
     (cond-> shape
       ;; Depending on the origin of the attribute change, we need or not to
@@ -673,3 +670,11 @@
 
       :always
       (vary-meta assoc ::touched touched?))))
+
+(defn set-shape-attr
+  "Assign attribute to shape with touched logic.
+
+  The returned shape will contain a metadata associated with it
+  indicating if shape is touched or not."
+  [shape attr val & {:keys [ignore-touched ignore-geometry]}]
+  (set-shape-attr* shape attr val ignore-touched ignore-geometry))

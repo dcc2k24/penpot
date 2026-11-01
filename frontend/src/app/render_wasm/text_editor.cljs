@@ -383,9 +383,9 @@
              (wasm/ready?))
     (let [encoder (js/TextEncoder.)
           buf (.encode encoder text)
-          heapu8 (mem/get-heap-u8)
           size (mem/size buf)
-          offset (mem/alloc size)]
+          offset (mem/alloc size)
+          heapu8 (mem/get-heap-u8)]
       (mem/write-buffer offset heapu8 buf))))
 
 (defn text-editor-encode-text-post
@@ -507,16 +507,17 @@
     (try
       (let [byte-offset (mem/alloc 16)
             u32-offset (mem/->offset-32 byte-offset)
-            heap (mem/get-heap-u32)]
-        (h/call wasm/internal-module "_text_editor_get_active_shape_id" byte-offset)
-        (let [a (aget heap u32-offset)
-              b (aget heap (+ u32-offset 1))
-              c (aget heap (+ u32-offset 2))
-              d (aget heap (+ u32-offset 3))
-              result (when (or (not= a 0) (not= b 0) (not= c 0) (not= d 0))
-                       (uuid/from-unsigned-parts a b c d))]
-          (mem/free)
-          result))
+            _ (h/call wasm/internal-module "_text_editor_get_active_shape_id" byte-offset)
+            ;; Take the view after the call: it may have grown the memory.
+            heap (mem/get-heap-u32)
+            a (aget heap u32-offset)
+            b (aget heap (+ u32-offset 1))
+            c (aget heap (+ u32-offset 2))
+            d (aget heap (+ u32-offset 3))
+            result (when (or (not= a 0) (not= b 0) (not= c 0) (not= d 0))
+                     (uuid/from-unsigned-parts a b c d))]
+        (mem/free)
+        result)
       (catch js/Error e
         (js/console.error "[text-editor-get-active-shape-id] Error:" e)
         nil))))
@@ -526,8 +527,9 @@
   (when (wasm/ready?)
     (let [byte-offset     (mem/alloc 16)
           u32-offset      (mem/->offset-32 byte-offset)
-          heap            (mem/get-heap-u32)
-          has-selection?  (h/call wasm/internal-module "_text_editor_get_selection" byte-offset)]
+          has-selection?  (h/call wasm/internal-module "_text_editor_get_selection" byte-offset)
+          ;; Take the view after the call: it may have grown the memory.
+          heap            (mem/get-heap-u32)]
       (if has-selection?
         (let [result {:anchor-para   (aget heap u32-offset)
                       :anchor-offset (aget heap (+ u32-offset 1))
@@ -547,9 +549,30 @@
   (when (some? content)
     (swap! shape-text-contents assoc shape-id content)))
 
-(defn get-cached-content
+(defn drop-cached-content!
+  "Drops the cached content of the shape `shape-id`. The next read falls back
+  to the page content."
   [shape-id]
-  (get @shape-text-contents shape-id))
+  (swap! shape-text-contents dissoc shape-id))
+
+;; Reads the content of a shape that is not in the cache. Set by the render
+;; bridge, see `set-content-fallback!`.
+(defonce ^:private content-fallback (atom nil))
+
+(defn set-content-fallback!
+  "Sets `f`, called with a shape id, to read the content of a shape that is
+  not in the cache. The worker upload does not fill the cache, so the bridge
+  reads the content from the page."
+  [f]
+  (reset! content-fallback f))
+
+(defn get-cached-content
+  "Returns the content of the shape `shape-id`: from the cache, or else from
+  the fallback set with `set-content-fallback!`."
+  [shape-id]
+  (or (get @shape-text-contents shape-id)
+      (when-let [f @content-fallback]
+        (f shape-id))))
 
 (defn update-cached-content!
   [shape-id content]
@@ -870,10 +893,11 @@
     (let [id          (uuid/get-u32 shape-id)
           byte-offset (mem/alloc 16)
           f32-offset  (mem/->offset-32 byte-offset)
-          heap        (mem/get-heap-f32)
           has-text?   (h/call wasm/internal-module "_text_get_range_origin"
                               (aget id 0) (aget id 1) (aget id 2) (aget id 3)
                               start-para start-offset end-para end-offset byte-offset)
+          ;; Take the view after the call: it may have grown the memory.
+          heap        (mem/get-heap-f32)
           result      (when has-text?
                         {:x   (aget heap f32-offset)
                          :y   (aget heap (+ f32-offset 1))

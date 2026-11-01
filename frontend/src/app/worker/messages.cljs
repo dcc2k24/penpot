@@ -16,15 +16,26 @@
 
   Transit cannot carry `js/Blob`. If the payload map has `:blob`, or the
   message already has a top-level `:blob`, that value is sent as a
-  structured-clone field beside the Transit string — not inside it."
+  structured-clone field beside the Transit string — not inside it.
+
+  The same goes for `:raw`, a JS object in a map payload (the raw entries
+  of an ObjectsMap). It is sent as the `raw` field, so Transit does not
+  escape its strings a second time."
   [{:keys [sender-id reply-to payload buffer? blob completed error]}]
   (let [;; Peel `:blob` out of map payloads before Transit (selection/snap
         ;; replies are vectors and other non-maps; leave them untouched).
         inline-blob (when (map? payload) (:blob payload))
         blob        (or blob inline-blob)
+
+        ;; Peel `:raw` out of map payloads the same way.
+        raw         (when (map? payload) (:raw payload))
+
         payload     (cond-> payload
                       (some? inline-blob)
-                      (dissoc :blob))
+                      (dissoc :blob)
+
+                      (some? raw)
+                      (dissoc :raw))
         obj #js {:cmd (d/name (:cmd payload))
                  :senderId (when sender-id (str sender-id))
                  :replyTo (when reply-to (str reply-to))
@@ -35,6 +46,8 @@
                  :completed (when completed true)}]
     (when (some? blob)
       (obj/set! obj "blob" blob))
+    (when (some? raw)
+      (obj/set! obj "raw" raw))
     (when (some? error)
       (obj/set! obj "error" (clj->js error)))
     obj))
@@ -54,6 +67,7 @@
         payload (obj/get data "payload")
         buffer (obj/get data "buffer")
         blob (obj/get data "blob")
+        raw (obj/get data "raw")
         completed (obj/get data "completed")
         error (obj/get data "error")
         decoded
@@ -69,4 +83,7 @@
           :error (js->error-map error)})]
     (cond-> decoded
       (some? blob)
-      (update :payload assoc :blob blob))))
+      (update :payload assoc :blob blob)
+
+      (some? raw)
+      (update :payload assoc :raw raw))))

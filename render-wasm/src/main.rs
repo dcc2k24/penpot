@@ -23,7 +23,10 @@ use crate::error::{Error, Result};
 use crate::render::raster::RasterFormat;
 use crate::render::{FrameType, RenderFlag};
 
-use globals::{get_design_state, get_gpu_state, get_render_state, get_resources, has_render_state};
+use globals::{
+    get_design_state, get_gpu_state, get_page_cache, get_render_state, get_resources,
+    has_render_state,
+};
 
 use macros::wasm_error;
 use math::{Bounds, Matrix};
@@ -235,6 +238,10 @@ pub extern "C" fn render_preview() -> Result<()> {
 pub extern "C" fn begin_loading() -> Result<()> {
     with_state!(state, {
         state.loading = true;
+        // Shapes load without touches, so textures built meanwhile may miss shapes.
+        if has_render_state() {
+            get_render_state().clear_imposters();
+        }
     });
     Ok(())
 }
@@ -246,6 +253,10 @@ pub extern "C" fn begin_loading() -> Result<()> {
 pub extern "C" fn end_loading() -> Result<()> {
     with_state!(state, {
         state.loading = false;
+        // Shapes load without touches, so textures built meanwhile may miss shapes.
+        if has_render_state() {
+            get_render_state().clear_imposters();
+        }
     });
     Ok(())
 }
@@ -335,6 +346,8 @@ pub extern "C" fn set_view_end() -> Result<()> {
             // instead of re-drawing every visible tile from scratch.
             render_state.rebuild_tile_index(&state.shapes);
         }
+        // The next render follows a pan or zoom gesture, so it yields progressively.
+        render_state.view_moved_since_render = true;
         // Avoid `reset_canvas` on the post-gesture render (pan at stable zoom).
         if !render_state.options.is_profile_rebuild_tiles() {
             render_state.preserve_target_during_render = true;
@@ -353,10 +366,15 @@ pub extern "C" fn set_view_end() -> Result<()> {
 #[wasm_error]
 pub extern "C" fn set_modifiers_start() -> Result<()> {
     performance::begin_measure!("set_modifiers_start");
-    let render_state = get_render_state();
-    render_state.moving_extrects.clear();
-    render_state.options.set_fast_mode(true);
-    render_state.options.set_interactive_transform(true);
+    with_state!(state, {
+        let render_state = get_render_state();
+        render_state.moving_extrects.clear();
+        // Build the crop cache now, before this gesture's first `set_modifiers`, so it is cut
+        // from the backbuffer with the geometry the last full-quality frame drew.
+        render_state.ensure_backbuffer_crop_cache(&state.shapes);
+        render_state.options.set_fast_mode(true);
+        render_state.options.set_interactive_transform(true);
+    });
     performance::end_measure!("set_modifiers_start");
     Ok(())
 }
@@ -409,6 +427,112 @@ pub extern "C" fn init_shapes_pool(capacity: usize) -> Result<()> {
         state.init_shapes_pool(capacity);
     });
     Ok(())
+}
+
+/// Moves the shapes pool of the page on screen into the page cache, so that
+/// `restore_page` can bring it back without an upload. Called right before
+/// `clean_up` on a page switch. Returns false when the pool was not cached.
+#[no_mangle]
+#[wasm_error]
+pub extern "C" fn stash_page(a: u32, b: u32, c: u32, d: u32) -> Result<bool> {
+    let page_id = uuid_from_u32_quartet(a, b, c, d);
+    let stashed = with_state!(state, { state.stash_page(page_id, get_page_cache()) });
+    Ok(stashed)
+}
+
+/// Like `stash_page`, but the cached pool of the page `ka..kd` is never
+/// evicted to make room: the stash is refused instead. The frontend passes the
+/// page it switches to, so that it can still be restored. A nil id keeps no
+/// page.
+#[no_mangle]
+#[wasm_error]
+pub extern "C" fn stash_page_keeping(
+    a: u32,
+    b: u32,
+    c: u32,
+    d: u32,
+    ka: u32,
+    kb: u32,
+    kc: u32,
+    kd: u32,
+) -> Result<bool> {
+    let page_id = uuid_from_u32_quartet(a, b, c, d);
+    let keep_id = uuid_from_u32_quartet(ka, kb, kc, kd);
+    let keep = if keep_id == Uuid::nil() {
+        None
+    } else {
+        Some(keep_id)
+    };
+    get_page_cache().set_keep(keep);
+    let stashed = with_state!(state, { state.stash_page(page_id, get_page_cache()) });
+    get_page_cache().set_keep(None);
+    Ok(stashed)
+}
+
+/// Replaces the (fresh) shapes pool with the cached pool of a page. Returns
+/// false when the page is not cached; the caller then uploads the shapes.
+#[no_mangle]
+#[wasm_error]
+pub extern "C" fn restore_page(a: u32, b: u32, c: u32, d: u32) -> Result<bool> {
+    let page_id = uuid_from_u32_quartet(a, b, c, d);
+    let restored = with_state!(state, { state.restore_page(&page_id, get_page_cache()) });
+    Ok(restored)
+}
+
+/// Drops the cached pool of a page, if any.
+#[no_mangle]
+#[wasm_error]
+pub extern "C" fn drop_cached_page(a: u32, b: u32, c: u32, d: u32) -> Result<()> {
+    let page_id = uuid_from_u32_quartet(a, b, c, d);
+    get_page_cache().remove(&page_id);
+    Ok(())
+}
+
+/// Drops every cached page pool.
+#[no_mangle]
+#[wasm_error]
+pub extern "C" fn clear_page_cache() -> Result<()> {
+    get_page_cache().clear();
+    Ok(())
+}
+
+/// Sets how many pages the page cache keeps, the largest weight one page may
+/// have and the total weight of all cached pages (see `pool_weight` in
+/// `state/page_cache.rs`), evicting pages until the limits hold.
+#[no_mangle]
+#[wasm_error]
+pub extern "C" fn set_page_cache_limits(
+    max_pages: u32,
+    max_page_weight: u32,
+    max_weight: u32,
+) -> Result<()> {
+    get_page_cache().set_limits(
+        max_pages as usize,
+        max_page_weight as usize,
+        max_weight as usize,
+    );
+    Ok(())
+}
+
+/// Ids of the cached pages, most recent first. The frontend uses it to drop
+/// its records of pages the cache no longer holds.
+#[no_mangle]
+#[wasm_error]
+pub extern "C" fn cached_page_ids() -> Result<*mut u8> {
+    // `mem::write_vec` panics when the transfer slot is taken; report it as recoverable.
+    #[allow(static_mut_refs)]
+    let slot_taken = unsafe { mem::BUFFERU8.is_some() };
+    if slot_taken {
+        return Err(Error::RecoverableError(
+            "Cached page ids: byte buffer already in use".to_string(),
+        ));
+    }
+    let ids: Vec<Uuid> = get_page_cache()
+        .cached()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    Ok(mem::write_vec(ids))
 }
 
 #[no_mangle]
@@ -839,8 +963,36 @@ pub extern "C" fn render_stats() {
 }
 
 #[no_mangle]
+#[wasm_error]
+pub extern "C" fn get_render_counters() -> Result<*mut u8> {
+    // `mem::write_bytes` panics when the transfer slot is taken; report it as recoverable.
+    #[allow(static_mut_refs)]
+    let slot_taken = unsafe { mem::BUFFERU8.is_some() };
+    if slot_taken {
+        return Err(Error::RecoverableError(
+            "Render counters: byte buffer already in use".to_string(),
+        ));
+    }
+    Ok(mem::write_bytes(crate::render::counters_to_bytes(
+        &get_render_state().counters,
+    )))
+}
+
+#[no_mangle]
 pub fn free_gpu_resources() {
     get_render_state().free_gpu_resources();
+}
+
+/// Compiles the GPU programs the renderer uses, one small batch per call, so
+/// the first frame that needs an effect does not stall on shader compilation.
+/// Call with 0, then with each returned value until it returns 0. Draws only
+/// into its own offscreen surface; returns 0 without a live GPU context.
+#[no_mangle]
+pub extern "C" fn warm_up_shaders(step: u32) -> u32 {
+    performance::begin_measure!("warm_up_shaders");
+    let next = render::warmup::run_step(step);
+    performance::end_measure!("warm_up_shaders");
+    next
 }
 
 #[no_mangle]

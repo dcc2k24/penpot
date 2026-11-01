@@ -1403,17 +1403,43 @@
 
 (defn component-changed
   "Notify that the component with the given id has changed, so it needs to be updated
-   in the current file and in the copies. And also update its thumbnails."
-  [component-id file-id undo-group]
-  (ptk/reify ::component-changed
-    cljs.core/IDeref
-    (-deref [_] [component-id file-id])
+   in the current file and in the copies. And also update its thumbnails.
+   When `sync?` is false only the component is touched, because its copies
+   already have the change."
+  ([component-id file-id undo-group]
+   (component-changed component-id file-id undo-group true))
+  ([component-id file-id undo-group sync?]
+   (ptk/reify ::component-changed
+     cljs.core/IDeref
+     (-deref [_] [component-id file-id])
 
-    ptk/WatchEvent
-    (watch [_ _ _]
-      (rx/of
-       (touch-component component-id)
-       (launch-component-sync component-id file-id undo-group)))))
+     ptk/WatchEvent
+     (watch [_ _ _]
+       (if sync?
+         (rx/of
+          (touch-component component-id)
+          (launch-component-sync component-id file-id undo-group))
+         (rx/of
+          (touch-component component-id)))))))
+
+(defn- hold-component-change
+  "Keeps a component change found while token propagation runs, to replay it
+  when the run ends (see `watch-component-changes`)."
+  [holder-file-id component-id file-id undo-group sync?]
+  (ptk/reify ::hold-component-change
+    ptk/UpdateEvent
+    (update [_ state]
+      (update-in state [::held-component-changes holder-file-id [component-id file-id]]
+                 (fn [prev]
+                   {:undo-group (or (:undo-group prev) undo-group)
+                    :sync?      (boolean (or (:sync? prev) sync?))})))))
+
+(defn- clear-held-component-changes
+  [holder-file-id]
+  (ptk/reify ::clear-held-component-changes
+    ptk/UpdateEvent
+    (update [_ state]
+      (update state ::held-component-changes dissoc holder-file-id))))
 
 (defn watch-component-changes
   "Watch the state for changes that affect to any main instance. If a change is detected will call
@@ -1488,8 +1514,9 @@
             (rx/buffer-until (rx/debounce 0 commits-s) commits-s)
 
             get-component-changes
-            (fn [old-data {:keys [file-id changes save-undo? undo-group]}]
-              (let [changed-components
+            (fn [old-data {:keys [file-id changes save-undo? undo-group tags]}]
+              (let [tagged?          (contains? tags dwtp/commit-tag)
+                    changed-components
                     (when (and old-data
                                (or (nil? file-id) (= file-id (:id old-data))))
                       (into #{}
@@ -1499,12 +1526,17 @@
                   (empty? changed-components)
                   nil
 
-                  save-undo?
+                  ;; Token propagation commits (tagged `dwtp/commit-tag`) have no
+                  ;; undo entry of their own: the run adds one when it ends. They
+                  ;; already gave every copy its value, so they only touch the
+                  ;; component and refresh its thumbnail.
+                  (or save-undo? tagged?)
                   (do
                     (log/info :hint "detected component changes"
                               :ids (map str changed-components)
                               :undo-group undo-group)
-                    (map #(vector ::component-changed % (:id old-data) undo-group)
+                    (map #(vector ::component-changed % (:id old-data)
+                                  (when-not tagged? undo-group) (not tagged?))
                          changed-components))
 
                   :else
@@ -1513,26 +1545,59 @@
 
             ;; One event per distinct component change in the batch, each
             ;; commit checked against the file data right before it
+            ;; While token propagation runs, a sync could copy a main that the run
+            ;; has not reached yet over a copy it already updated, and nothing
+            ;; would repair it: component changes wait for the run to end.
             get-component-events
             (fn [batch]
-              (->> batch
-                   (mapcat (fn [[[event _] old-data]]
-                             (get-component-changes old-data event)))
-                   (distinct)
-                   (map (fn [[type component-id file-id undo-group]]
-                          (if (= type ::component-changed)
-                            (component-changed component-id file-id undo-group)
-                            (touch-component component-id))))
-                   (rx/from)))
+              (let [state    @st/state
+                    running? (dwtp/running? state)
+                    holder   (:current-file-id state)]
+                (->> batch
+                     (mapcat (fn [[[event _] old-data]]
+                               (get-component-changes old-data event)))
+                     (distinct)
+                     (map (fn [[type component-id file-id undo-group sync?]]
+                            (cond
+                              (not= type ::component-changed)
+                              (touch-component component-id)
+
+                              running?
+                              (hold-component-change holder component-id file-id undo-group sync?)
+
+                              :else
+                              (component-changed component-id file-id undo-group sync?))))
+                     (rx/from))))
+
+            ;; Replays the component changes held during a token propagation
+            ;; run, once per component, when no run is active any more.
+            held-changes-s
+            (->> stream
+                 (rx/filter dwtp/done-event?)
+                 (rx/mapcat
+                  (fn [_]
+                    (let [state   @st/state
+                          holder  (:current-file-id state)
+                          held    (get-in state [::held-component-changes holder])]
+                      (if (or (dwtp/running? state) (empty? held))
+                        (rx/empty)
+                        (rx/concat
+                         (rx/of (clear-held-component-changes holder))
+                         (->> held
+                              (map (fn [[[component-id file-id] {:keys [undo-group sync?]}]]
+                                     (component-changed component-id file-id undo-group sync?)))
+                              (rx/from))))))))
 
             component-events-s
-            (->> commit-batches-s
-                 (rx/mapcat
-                  (fn [batch]
-                    (->> (get-component-events batch)
-                         (rx/finalize #(finish-batch-barriers! batch)))))
-                 ;; Close barriers left behind when the page shuts down.
-                 (rx/finalize #(wrf/finish-tasks! @pending-sync-barriers*))
+            (->> (rx/merge
+                  (->> commit-batches-s
+                       (rx/mapcat
+                        (fn [batch]
+                          (->> (get-component-events batch)
+                               (rx/finalize #(finish-batch-barriers! batch)))))
+                       ;; Close barriers left behind when the page shuts down.
+                       (rx/finalize #(wrf/finish-tasks! @pending-sync-barriers*)))
+                  held-changes-s)
                  (rx/share))
 
             notifier-s

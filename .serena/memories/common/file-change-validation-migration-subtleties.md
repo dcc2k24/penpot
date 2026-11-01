@@ -3,6 +3,8 @@
 ## Change application
 
 - `process-changes` validates the whole change vector once by default, reduces changes, then performs a second pass for collected touched changes. Callers that already validated can pass `verify? false`.
+- `*touched-changes*` collects `{:id :page-id :component-id}` keys (`touched-key`), not whole changes: hashing operation values (points, selrects) cost ~50 ms on a 370-shape undo. `process-touched-change` must read only those keys.
+- `process-operation :set` calls the positional `ctn/set-shape-attr*`; `set-shape-attr` is its kwargs wrapper.
 - `process-operation :set` delegates to `ctn/set-shape-attr`; `:assign` first decodes attrs with the shape-attrs JSON transformer and then emits per-attr set operations.
 - `set-shape-attr` treats `:position-data` as derived and never touched. Geometry/content-path changes use approximate equality; geometry differences under about 1px can be ignored for touched purposes.
 - Width/height are excluded from the `is-geometry?` branch in `set-shape-attr`; do not assume all geometry-group attrs follow identical ignore-geometry behavior.

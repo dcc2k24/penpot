@@ -13,8 +13,10 @@
    [app.common.geom.rect :as grc]
    [app.common.geom.shapes :as gsh]
    [app.common.types.component :as ctk]
+   [app.common.types.objects-hints :as ohints]
    [app.common.types.shape-tree :as ctt]
    [app.common.uuid :as uuid]
+   [app.config :as cf]
    [app.main.data.shortcuts :as dsc]
    [app.main.data.workspace :as dw]
    [app.main.data.workspace.edition :as dwe]
@@ -269,7 +271,13 @@
      over-shapes-stream-debounced
      (mf/deps objects)
      (fn [_]
-       (reset! hover-top-frame-id (ctt/top-nested-frame objects (deref last-point-ref) nil (mf/ref-val read-only-ref)))))
+       ;; With the upload workers, a page that uploads may not have its hints
+       ;; yet, and building the frames index would decode the whole page. Skip
+       ;; the query until the hints are there or the upload ends.
+       (when-not (and (contains? cf/flags :render-wasm-worker-upload)
+                      @wasm.api/shapes-loading?
+                      (nil? (ohints/hints objects)))
+         (reset! hover-top-frame-id (ctt/top-nested-frame objects (deref last-point-ref) nil (mf/ref-val read-only-ref))))))
 
     ;; This ref is a cache of sorted ids. Sorting is expensive so we save the list
     (let [sorted-ids-cache (mf/use-ref {})]

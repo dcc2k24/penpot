@@ -1,7 +1,23 @@
 (ns app.main.data.render-wasm
   (:require
+   [app.common.types.objects-hints :as ohints]
+   [app.common.types.shape-tree :as ctst]
+   [app.main.data.helpers :as dsh]
    [beicon.v2.core :as rx]
    [potok.v2.core :as ptk]))
+
+(defn set-page-objects-hints
+  "Attaches the hints `hints` of the worker upload to the objects of the page
+  `page-id` of the file `file-id`. Does nothing when the page is missing."
+  [file-id page-id hints]
+  (ptk/reify ::set-page-objects-hints
+    ptk/UpdateEvent
+    (update [_ state]
+      (dsh/update-page state file-id page-id
+                       (fn [page]
+                         (update page :objects
+                                 #(ctst/start-page-index
+                                   (ohints/with-hints % hints))))))))
 
 (defn context-lost
   []

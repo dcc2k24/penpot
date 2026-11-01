@@ -12,10 +12,14 @@
    [app.common.geom.grid :as gg]
    [app.common.geom.rect :as grc]
    [app.common.math :as mth]
+   [app.common.types.objects-hints :as ohints]
+   [app.common.types.objects-map :as omap]
    [app.common.types.shape-tree :as ctst]
    [app.common.uuid :as uuid]
+   [app.config :as cf]
    [app.main.refs :as refs]
    [app.main.ui.workspace.viewport.rulers :as rulers]
+   [app.render-wasm.api :as wasm.api]
    [rumext.v2 :as mf]))
 
 (mf/defc square-grid* [{:keys [frame zoom grid]}]
@@ -160,15 +164,129 @@
              :row    [:> layout-grid* props])))])))
 
 (defn has-grid?
-  [{:keys [grids]}]
-  (and (some? grids)
-       (d/not-empty? (->> grids (filter :display)))))
+  [shape]
+  (ohints/has-displayed-grid? shape))
+
+;; Pages with at least this many shapes and no hints yet find their grid
+;; frames in idle time. A smaller page is filtered at once.
+(def ^:private big-page-shape-count 3000)
+
+;; The most time one idle callback spends on the grid scan, in milliseconds.
+(def ^:private scan-slice-ms 8)
+
+(defn- grid-frames
+  "Returns the frames of `objects` with a displayed grid, in map order."
+  [objects]
+  (into [] (filter has-grid?) (ctst/get-frames objects)))
+
+(defn- grid-frames-by-hints
+  "Same result as `grid-frames`. Only the shapes without a valid hint are
+  read."
+  [objects hints]
+  (into []
+        (keep (d/getf objects))
+        (remove #(= uuid/zero %)
+                (ohints/select-ids objects hints
+                                   #(get-in hints [:frames % :grid?])
+                                   #(and (cfh/frame-shape? %)
+                                         (ohints/has-displayed-grid? %))))))
+
+(defn- schedule-idle
+  "Calls `f` in idle time, with the idle deadline when the browser has idle
+  callbacks. Returns a fn that cancels the call."
+  [f]
+  (if (fn? (unchecked-get js/globalThis "requestIdleCallback"))
+    (let [id (js/requestIdleCallback f)]
+      #(js/cancelIdleCallback id))
+    (let [id (js/setTimeout #(f nil) 16)]
+      #(js/clearTimeout id))))
+
+(defn- scan-grid-frames
+  "Finds the frames with a displayed grid in `objects`, in map order, in
+  slices of at most `scan-slice-ms` in idle time. Calls `on-done` with the
+  frames when the scan ends. Returns a fn that cancels the scan."
+  [objects on-done]
+  (let [ids     (into [] (remove #(= uuid/zero %)) (keys objects))
+        total   (count ids)
+        state   (volatile! {:index 0 :frames []})
+        cancel  (volatile! nil)
+
+        step
+        (fn step [deadline]
+          (let [start (.now js/performance)
+                {:keys [index frames]} @state
+
+                ;; A slice always reads its first shape, so the scan moves
+                ;; on even when the browser gives it no time.
+                time-left?
+                (fn [i]
+                  (or (= i index)
+                      (and (< (- (.now js/performance) start) scan-slice-ms)
+                           (or (nil? deadline)
+                               (> (.timeRemaining deadline) 1)))))]
+
+            ;; While the page uploads, wait: the upload workers attach hints
+            ;; early in the upload, which replaces `objects` and ends this scan.
+            (loop [i      index
+                   frames frames]
+              (if (and (< i total)
+                       (not @wasm.api/shapes-loading?)
+                       (time-left? i))
+                (let [shape (get objects (nth ids i))]
+                  (recur (inc i)
+                         (if (and (cfh/frame-shape? shape) (has-grid? shape))
+                           (conj frames shape)
+                           frames)))
+                (if (< i total)
+                  (do (vreset! state {:index i :frames frames})
+                      (vreset! cancel (schedule-idle step)))
+                  (on-done frames))))))]
+
+    (vreset! cancel (schedule-idle step))
+    #(when-let [cancel-fn @cancel]
+       (cancel-fn))))
+
+(defn- use-grid-frames
+  "Returns the frames of the page `objects` with a displayed grid, in map
+  order. Uses the hints of the page when they are attached. With the upload
+  workers, a big page without hints is scanned in idle time. Until a scan
+  ends, the frames of the last scan that ended are kept, so the grids do not
+  vanish on a change."
+  [objects]
+  (let [hints   (ohints/hints objects)
+        page-id (mf/deref refs/current-page-id)
+        scan?   (and (contains? cf/flags :render-wasm-worker-upload)
+                     (nil? hints)
+                     (omap/objects-map? objects)
+                     (>= (count objects) big-page-shape-count))
+        scanned (mf/use-state nil)
+
+        _       (mf/with-effect [objects scan?]
+                  (when scan?
+                    (scan-grid-frames objects #(reset! scanned {:page-id page-id
+                                                                :frames  %}))))
+
+        ;; Memoized per page value, so the frames are found once per change.
+        frames  (mf/with-memo [objects]
+                  (cond
+                    scan?         nil
+                    (some? hints) (grid-frames-by-hints objects hints)
+                    :else         (grid-frames objects)))]
+
+    (if scan?
+      ;; The frames found on another page are never shown.
+      (when (= page-id (:page-id @scanned))
+        (:frames @scanned))
+      frames)))
 
 (mf/defc frame-grid*
   {::mf/wrap [mf/memo]}
   [{:keys [zoom transform selected focus vbox clip-rulers] :or {clip-rulers false}}]
-  (let [frames        (->> (mf/deref refs/workspace-frames)
-                           (filter has-grid?))
+  (let [objects       (mf/deref refs/workspace-page-objects)
+        ;; Re-renders on every vbox/zoom change while panning; the frames
+        ;; only change with the page, so the grid frames are found once per
+        ;; page value.
+        frames        (use-grid-frames objects)
         transforming  (when (some? transform) selected)]
 
     [:g.grid-display {:style {:pointer-events "none"}

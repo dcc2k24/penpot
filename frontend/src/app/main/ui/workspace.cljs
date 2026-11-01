@@ -8,11 +8,13 @@
   (:require-macros [app.main.style :as stl])
   (:require
    [app.common.data.macros :as dm]
+   [app.main.data.changes :as dch]
    [app.main.data.common :as dcm]
    [app.main.data.helpers :as dsh]
    [app.main.data.persistence :as dps]
    [app.main.data.plugins :as dpl]
    [app.main.data.workspace :as dw]
+   [app.main.data.workspace.tokens.propagation :as dwtp]
    [app.main.features :as features]
    [app.main.fonts :as fonts]
    [app.main.refs :as refs]
@@ -47,9 +49,14 @@
    [app.util.debug :as dbg]
    [app.util.dom :as dom]
    [app.util.i18n :as i18n :refer [tr]]
+   [beicon.v2.core :as rx]
    [goog.events :as events]
    [okulary.core :as l]
    [rumext.v2 :as mf]))
+
+;; Upper bound of the wait for the first WASM frame before the font
+;; preview sprite is fetched and parsed.
+(def ^:private ^:const preview-sprite-max-delay-ms 15000)
 
 (mf/defc workspace-content*
   {::mf/private true}
@@ -228,8 +235,41 @@
       (st/emit! (dps/initialize-persistence)
                 (dpl/update-plugins-permissions-peek)))
 
-    (mf/with-effect []
-      (fonts/prefetch-preview-sprite!))
+    ;; The sprite parse is a long task: with the WASM renderer, start it
+    ;; once the first page is on screen, so it does not run between the
+    ;; upload chunks of the page. A late or missing frame never blocks it
+    ;; for long, and opening the font selector starts it as well.
+    (mf/with-effect [wasm-renderer-enabled?]
+      (if (and wasm-renderer-enabled? (exists? js/document))
+        (let [first-frame-s
+              (->> (rx/from-event js/document "penpot:wasm:set-objects")
+                   (rx/take 1)
+                   (rx/mapcat (fn [_]
+                                (->> (rx/from-event js/document "penpot:wasm:tiles-complete")
+                                     (rx/take 1)))))
+              sub
+              (->> (rx/merge first-frame-s
+                             (rx/timer preview-sprite-max-delay-ms))
+                   (rx/take 1)
+                   (rx/subs! (fn [_] (fonts/prefetch-preview-sprite!))))]
+          #(rx/dispose! sub))
+        (fonts/prefetch-preview-sprite!)))
+
+    ;; Compile the edit-time checks in idle time once the first page is on
+    ;; screen, so their first compile does not land in an edit (see
+    ;; `dch/warm-up-checks!`).
+    (mf/with-effect [wasm-renderer-enabled?]
+      (let [cancel  (volatile! nil)
+            start-s (if (and wasm-renderer-enabled? (exists? js/document))
+                      (->> (rx/from-event js/document "penpot:wasm:tiles-complete")
+                           (rx/take 1))
+                      (rx/of nil))
+            sub     (rx/subs! (fn [_] (vreset! cancel (dch/warm-up-checks!)))
+                              start-s)]
+        (fn []
+          (rx/dispose! sub)
+          (when-let [cancel-fn @cancel]
+            (cancel-fn)))))
 
     ;; Setting the layout preset by its name
     (mf/with-effect [layout-name]
@@ -242,7 +282,10 @@
     (mf/with-effect [team-id file-id]
       (st/emit! (dw/initialize-workspace team-id file-id))
       (fn []
-        (st/emit! ::dps/force-persist
+        ;; Complete a running token propagation while the file data is
+        ;; still here.
+        (st/emit! (dwtp/finish-propagation)
+                  ::dps/force-persist
                   (dw/finalize-workspace team-id file-id))))
 
     (mf/with-effect [file-id page-id file-loaded?]

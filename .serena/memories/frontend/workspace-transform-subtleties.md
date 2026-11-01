@@ -5,6 +5,7 @@
 - High-frequency previews use `app.main.streams/wasm-modifiers` and `workspace-selrect` behavior subjects instead of normal store commits; components consume them through refs that wrap plain atoms.
 - `apply-modifiers*` is the lower-level commit path once object/text modifiers are ready. It updates frame guides, frame comment threads, and then emits `update-shapes` with `:reg-objects? true`.
 - Transform commits restrict diff attrs to `transform-attrs` to avoid scanning unrelated shape attrs.
+- A pure translation commit skips applying changes to the builder objects (`pcb/skip-local`) unless a resize id (`:resize-ids`, else the ids) or one of its ancestors is group-like. `resize-parents` needs them for group-like ancestors; `generate-unapply-tokens` also reads them (text `:content`, first stroke), which a pure translation never changes. A board drag resizes the board alone, so its ~N descendants are not applied twice.
 - Text transforms may carry derived `:position-data`; `assoc-position-data` attaches it while preserving the original text shape context.
 
 ## Component-copy touched suppression

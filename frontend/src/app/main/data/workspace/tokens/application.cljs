@@ -129,6 +129,16 @@
                             :page-id page-id
                             :attrs [:strokes]})))))
 
+(defn set-stroke-width-side
+  "Sets the width of the sides in `attributes` on the first stroke of
+  `shape` (see `update-stroke-width-side`)."
+  [shape attributes value]
+  (let [stroke (cts/materialize-stroke-side-widths
+                (first (:strokes shape)) attributes value)]
+    (if (seq (:strokes shape))
+      (update shape :strokes #(into [stroke] (rest %)))
+      (assoc shape :strokes [stroke]))))
+
 (defn update-stroke-width-side
   "Updates the width of the sides in `attributes` on the first stroke of each
   shape. Sides not in `attributes` keep their current width (0 when the shape
@@ -140,12 +150,7 @@
   ([value shape-ids attributes page-id]
    (when (number? value)
      (dwsh/update-shapes shape-ids
-                         (fn [shape]
-                           (let [stroke (cts/materialize-stroke-side-widths
-                                         (first (:strokes shape)) attributes value)]
-                             (if (seq (:strokes shape))
-                               (update shape :strokes #(into [stroke] (rest %)))
-                               (assoc shape :strokes [stroke]))))
+                         #(set-stroke-width-side % attributes value)
                          {:reg-objects? true
                           :ignore-touched true
                           :page-id page-id

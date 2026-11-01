@@ -437,6 +437,11 @@
           (tm/dispose! task)
           (run! events/unlistenByKey keys))))
 
+    ;; The workspace prefetches the sprite after its first frame; when the
+    ;; picker opens before that, start it now (no-op once started)
+    (mf/with-effect []
+      (fonts/prefetch-preview-sprite!))
+
     ;; Materialize the preview sprite into the DOM only while the picker is open
     ;; (markup is prefetched on workspace load), removing it on close so its
     ;; ~2000 nodes aren't kept around idle. The attachment is deferred so the

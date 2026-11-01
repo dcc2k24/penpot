@@ -10,6 +10,7 @@
    [app.common.data.macros :as dm]
    [app.common.files.changes :as cpc]
    [app.common.logging :as log]
+   [app.common.schema :as sm]
    [app.common.time :as ct]
    [app.common.types.shape :as cts]
    [app.common.types.shape-tree :as ctst]
@@ -19,7 +20,9 @@
    [app.main.features :as features]
    [app.main.worker :as mw]
    [app.render-wasm.api :as wasm.api]
+   [app.render-wasm.page-cache :as page-cache]
    [app.render-wasm.shape :as wasm.shape]
+   [app.util.timers :as tm]
    [beicon.v2.core :as rx]
    [potok.v2.core :as ptk]))
 
@@ -79,31 +82,42 @@
   ;; update-object-indices does not create a nil key in :pages-index.
   (keep :page-id))
 
-(def ^:private wasm-structural-change-types
-  #{:add-obj :mov-objects})
+(defn- wasm-structural-change?
+  "True for a change that needs the WASM shape tree resynced. A
+  `:mov-objects` without shapes changes nothing (`process-change` skips
+  it), and moving a root board inside the root emits one."
+  [{:keys [type shapes]}]
+  (case type
+    :add-obj     true
+    :mov-objects (boolean (seq shapes))
+    false))
 
 (defn- redo-changes-need-wasm-object-sync?
   [redo-changes]
-  (some #(contains? wasm-structural-change-types (:type %)) redo-changes))
+  (some wasm-structural-change? redo-changes))
 
 (defn- sync-wasm-structural-changes
   [{:keys [redo-changes]}]
   (ptk/reify ::sync-wasm-structural-changes
     ptk/EffectEvent
     (effect [_ state _]
-      (when (wasm.api/initialized?)
-        (let [objects (dsh/lookup-page-objects state)
-              shapes
-              (into []
-                    (keep (fn [{:keys [type id parent-id]}]
-                            (when (contains? wasm-structural-change-types type)
-                              (get objects (case type
-                                             :add-obj id
-                                             :mov-objects parent-id)))))
-                    redo-changes)]
+      (try
+        (when (wasm.api/initialized?)
+          (let [objects (dsh/lookup-page-objects state)
+                shapes
+                (into []
+                      (keep (fn [{:keys [type id parent-id] :as change}]
+                              (when (wasm-structural-change? change)
+                                (get objects (case type
+                                               :add-obj id
+                                               :mov-objects parent-id)))))
+                      redo-changes)]
 
-          (wasm.api/process-objects shapes)
-          (wasm.api/request-render "sync-wasm-structural-changes"))))))
+            (wasm.api/process-objects shapes)
+            (wasm.api/request-render "sync-wasm-structural-changes")))
+        (finally
+          ;; Counted by `page-cache/note-changes!` in `apply-changes-localy`.
+          (page-cache/end-structural-sync!))))))
 
 (defn- apply-changes-localy
   [{:keys [file-id redo-changes ignore-wasm?] :as commit} pending]
@@ -131,9 +145,22 @@
               (let [fdata (cpc/process-changes fdata undo-changes false)
                     fdata (cpc/process-changes fdata redo-changes false)
                     pids (into #{} xf:map-page-id redo-changes)]
-                (reduce #(ctst/update-object-indices %1 %2) fdata pids)))]
+                (reduce #(ctst/update-object-indices %1 %2) fdata pids)))
 
-        (if (and (not ignore-wasm?) (features/active-feature? state "render-wasm/v1"))
+            wasm-sync?
+            (and (not ignore-wasm?) (features/active-feature? state "render-wasm/v1"))]
+
+        ;; Every page these changes touch no longer matches a WASM copy
+        ;; stashed before (see `app.render-wasm.page-cache`).
+        (page-cache/note-changes!
+         (concat undo-changes redo-changes)
+         {:current-page-id  (:current-page-id state)
+          :wasm-synced?     wasm-sync?
+          ;; Same condition as the `sync-wasm-structural-changes` below.
+          :structural-sync? (and wasm-sync?
+                                 (redo-changes-need-wasm-object-sync? (:redo-changes commit)))})
+
+        (if wasm-sync?
           ;; Update the wasm model
           (let [shape-changes (js/Map.)
 
@@ -272,3 +299,37 @@
                          (assoc :skip-component-sync? skip-component-sync?)
                          (commit)))))
           (rx/empty))))))
+
+;; --- Check functions warm-up
+;;
+;; `sm/check-fn` compiles its schema on the first check. The checks below run
+;; on every edit (commit asserts, shape updates); a large one compiled on the
+;; first edit stalls that interaction.
+
+(def ^:private warm-up-check-fns
+  [cpc/check-changes
+   cts/check-shape-generic-attrs
+   cts/check-shape-attrs
+   cts/check-shape])
+
+(defn warm-up-checks!
+  "Compiles the validators of `warm-up-check-fns`, one per browser idle
+  period (see `sm/warm-check-fn!`). Returns a function that cancels the
+  ones still pending."
+  []
+  (let [pending (volatile! (seq warm-up-check-fns))
+        task    (volatile! nil)]
+    (letfn [(step []
+              (vreset! task nil)
+              (when-let [check-fn (first @pending)]
+                (vswap! pending next)
+                (try
+                  (sm/warm-check-fn! check-fn)
+                  (catch :default cause
+                    (log/warn :hint "check function warm-up failed" :cause cause)))
+                (when (seq @pending)
+                  (vreset! task (tm/schedule-on-idle step)))))]
+      (vreset! task (tm/schedule-on-idle step))
+      (fn []
+        (vreset! pending nil)
+        (some-> @task rx/dispose!)))))

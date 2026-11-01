@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::iter;
+
+use rustc_hash::FxHashMap;
 
 use crate::performance;
 use crate::shapes;
@@ -44,7 +47,7 @@ pub struct ShapesPoolImpl {
     counter: usize,
 
     /// Maps UUID to index in the shapes Vec. Uses owned Uuid, no lifetime needed.
-    uuid_to_idx: HashMap<Uuid, usize>,
+    uuid_to_idx: FxHashMap<Uuid, usize>,
 
     /// Cache for modified shapes, keyed by index
     modified_shape_cache: HashMap<usize, OnceCell<Shape>>,
@@ -71,7 +74,7 @@ impl ShapesPoolImpl {
         ShapesPoolImpl {
             shapes: vec![],
             counter: 0,
-            uuid_to_idx: HashMap::default(),
+            uuid_to_idx: FxHashMap::default(),
 
             modified_shape_cache: HashMap::default(),
             modifiers: HashMap::default(),
@@ -84,7 +87,7 @@ impl ShapesPoolImpl {
     pub fn initialize(&mut self, capacity: usize) {
         performance::begin_measure!("shapes_pool_initialize");
         self.counter = 0;
-        self.uuid_to_idx = HashMap::with_capacity(capacity);
+        self.uuid_to_idx = FxHashMap::with_capacity_and_hasher(capacity, Default::default());
 
         let additional = capacity as i32 - self.shapes.len() as i32;
         if additional <= 0 {
@@ -460,6 +463,46 @@ impl ShapesPoolImpl {
         &self.modifier_uuids
     }
 
+    /// True when any transform, structure or scale-content modifier is set, so `get` may
+    /// return geometry that differs from the last rendered frame.
+    pub fn has_pending_modifiers(&self) -> bool {
+        !self.modifiers.is_empty() || !self.structure.is_empty() || !self.scale_content.is_empty()
+    }
+
+    /// Root children (shapes whose parent is the root) that are, or contain, a shape with a
+    /// pending transform, structure or scale-content modifier.
+    pub fn modified_root_ids(&self) -> HashSet<Uuid> {
+        let mut roots = HashSet::new();
+        let mut seen: HashSet<usize> = HashSet::new();
+        for &idx in self
+            .modifiers
+            .keys()
+            .chain(self.structure.keys())
+            .chain(self.scale_content.keys())
+        {
+            let mut current = idx;
+            for _ in 0..4096 {
+                // A node seen before already led to its root (or to a dead end).
+                if !seen.insert(current) {
+                    break;
+                }
+                let shape = &self.shapes[current];
+                match shape.parent_id {
+                    Some(parent) if parent.is_nil() => {
+                        roots.insert(shape.id);
+                        break;
+                    }
+                    Some(parent) => match self.uuid_to_idx.get(&parent) {
+                        Some(&parent_idx) => current = parent_idx,
+                        None => break,
+                    },
+                    None => break,
+                }
+            }
+        }
+        roots
+    }
+
     pub fn subtree(&self, id: &Uuid) -> ShapesPoolImpl {
         let Some(shape) = self.get(id) else {
             panic!("Subtree not found");
@@ -467,7 +510,7 @@ impl ShapesPoolImpl {
 
         let mut shapes = vec![];
         let mut new_idx = 0;
-        let mut uuid_to_idx = HashMap::default();
+        let mut uuid_to_idx = FxHashMap::default();
 
         for child_id in shape.all_children_iter(self, true, true) {
             let Some(child_shape) = self.get(&child_id) else {
@@ -598,5 +641,44 @@ mod tests {
 
         pool.get_mut(&id).expect("shape").set_opacity(0.5);
         assert_eq!(pool.get(&id).expect("shape").opacity, 0.5);
+    }
+
+    fn add_test_shape(pool: &mut ShapesPool, id: Uuid, parent: Uuid, frame: bool) {
+        use crate::shapes::{Frame, Rect as RectType, Type};
+
+        let s = pool.add_shape(id);
+        s.set_parent(parent);
+        if frame {
+            s.set_shape_type(Type::Frame(Frame::default()));
+        } else {
+            s.set_shape_type(Type::Rect(RectType::default()));
+        }
+        s.set_selrect(0.0, 0.0, 100.0, 100.0);
+    }
+
+    #[test]
+    fn modified_root_ids_names_the_root_board_of_a_modified_shape() {
+        use crate::utils::uuid_from_u32_quartet;
+
+        let board_a = uuid_from_u32_quartet(0, 0, 0, 1);
+        let rect_1 = uuid_from_u32_quartet(0, 0, 0, 2);
+        let board_b = uuid_from_u32_quartet(0, 0, 0, 3);
+        let rect_2 = uuid_from_u32_quartet(0, 0, 0, 4);
+
+        let mut pool = ShapesPool::new();
+        add_test_shape(&mut pool, board_a, Uuid::nil(), true);
+        add_test_shape(&mut pool, rect_1, board_a, false);
+        pool.get_mut(&board_a).expect("board").add_child(rect_1);
+        add_test_shape(&mut pool, board_b, Uuid::nil(), true);
+        add_test_shape(&mut pool, rect_2, board_b, false);
+        pool.get_mut(&board_b).expect("board").add_child(rect_2);
+
+        assert!(pool.modified_root_ids().is_empty());
+
+        pool.set_modifiers(HashMap::from([(
+            rect_1,
+            skia::Matrix::translate((5.0, 0.0)),
+        )]));
+        assert_eq!(pool.modified_root_ids(), HashSet::from([board_a]));
     }
 }

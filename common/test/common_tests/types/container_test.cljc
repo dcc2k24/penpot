@@ -8,6 +8,7 @@
   (:require
    [app.common.types.container :as ctc]
    [app.common.types.shape :as cts]
+   [app.common.types.text :as txt]
    [app.common.uuid :as uuid]
    [clojure.test :as t]))
 
@@ -154,3 +155,59 @@
           shape-b (make-shape id-b :parent-id id-a)
           objects (objects-map shape-a shape-b)]
       (t/is (nil? (ctc/find-component-main objects shape-a false))))))
+
+;; ---------------------------------------------------------------------------
+;; set-shape-attr
+;; ---------------------------------------------------------------------------
+
+(t/deftest set-shape-attr-touches-group-in-copy
+  (let [shape  (make-shape (uuid/next) :shape-ref (uuid/next))
+        fills  [{:fill-color "#fabada" :fill-opacity 1}]
+        shape' (ctc/set-shape-attr shape :fills fills)]
+    (t/is (= fills (:fills shape')))
+    (t/is (= #{:fill-group} (:touched shape')))
+    (t/is (true? (::ctc/touched (meta shape'))))))
+
+(t/deftest set-shape-attr-touches-token-groups-in-copy
+  (let [shape  (make-shape (uuid/next) :shape-ref (uuid/next))
+        shape' (ctc/set-shape-attr shape :applied-tokens {:fill "color.primary"})]
+    (t/is (contains? (:touched shape') :fill-group))))
+
+(t/deftest set-shape-attr-text-content-adds-diff-type-in-copy
+  ;; Same structure and styles, other text: the only case where the
+  ;; content diff type adds groups beside the sync group.
+  (let [shape   (-> (cts/setup-shape {:type :text :x 0 :y 0 :width 100 :height 20
+                                      :shape-ref (uuid/next)})
+                    (update :content txt/change-text "hello"))
+        content (txt/change-text (:content shape) "world")
+        shape'  (ctc/set-shape-attr shape :content content)]
+    (t/is (= content (:content shape')))
+    (t/is (= #{:content-group :text-content-text} (:touched shape')))))
+
+(t/deftest set-shape-attr-ignore-touched-leaves-touched-alone
+  (let [shape  (make-shape (uuid/next) :shape-ref (uuid/next))
+        shape' (ctc/set-shape-attr shape :fills [{:fill-color "#fabada" :fill-opacity 1}]
+                                   :ignore-touched true)]
+    (t/is (nil? (:touched shape')))))
+
+(t/deftest set-shape-attr-ignore-geometry-skips-geometry-touched
+  (let [shape  (make-shape (uuid/next) :shape-ref (uuid/next))
+        shape' (ctc/set-shape-attr shape :x 50 :ignore-geometry true)]
+    (t/is (= 50 (:x shape')))
+    (t/is (nil? (:touched shape')))
+    (t/is (false? (::ctc/touched (meta shape'))))))
+
+(t/deftest set-shape-attr-positional-form-matches
+  (let [shape (make-shape (uuid/next) :shape-ref (uuid/next))]
+    (doseq [[attr val ignore-touched ignore-geometry]
+            [[:fills [{:fill-color "#fabada" :fill-opacity 1}] nil nil]
+             [:x 50 nil true]
+             [:x 50 nil nil]
+             [:fills nil true nil]
+             [:applied-tokens {:fill "color.primary"} nil nil]]]
+      (let [kw  (ctc/set-shape-attr shape attr val
+                                    :ignore-touched ignore-touched
+                                    :ignore-geometry ignore-geometry)
+            pos (ctc/set-shape-attr* shape attr val ignore-touched ignore-geometry)]
+        (t/is (= kw pos))
+        (t/is (= (meta kw) (meta pos)))))))

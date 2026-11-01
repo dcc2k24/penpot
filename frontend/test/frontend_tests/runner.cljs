@@ -19,6 +19,7 @@
    [frontend-tests.data.jobs-test]
    [frontend-tests.data.modal-test]
    [frontend-tests.data.nitrate-test]
+   [frontend-tests.data.objects-hints-consumers-test]
    [frontend-tests.data.persistence-retry-test]
    [frontend-tests.data.persistence-test]
    [frontend-tests.data.profile-test]
@@ -39,6 +40,7 @@
    [frontend-tests.data.workspace-shortcuts-test]
    [frontend-tests.data.workspace-texts-test]
    [frontend-tests.data.workspace-thumbnails-test]
+   [frontend-tests.data.workspace-thumbnails-wasm-test]
    [frontend-tests.data.workspace-variant-rename-test]
    [frontend-tests.data.workspace-versions-test]
    [frontend-tests.debug-logging-test]
@@ -63,6 +65,7 @@
    [frontend-tests.logic.path-lifecycle-test]
    [frontend-tests.logic.path-tools-test]
    [frontend-tests.logic.sidebar-transform-coalescing-test]
+   [frontend-tests.logic.translate-commit-test]
    [frontend-tests.logic.update-position-test]
    [frontend-tests.logic.wasm-modifiers-nil-id-test]
    [frontend-tests.logic.wasm-pixel-snap-test]
@@ -90,13 +93,18 @@
    [frontend-tests.plugins.utils-test]
    [frontend-tests.plugins.value-objects-test]
    [frontend-tests.render-dimensions-test]
+   [frontend-tests.render-wasm.heap-growth-test]
+   [frontend-tests.render-wasm.page-cache-test]
    [frontend-tests.render-wasm.process-objects-test]
    [frontend-tests.render-wasm.serialization-test]
    [frontend-tests.render-wasm.text-editor-apply-styles-test]
    [frontend-tests.render-wasm.text-editor-caret-color-test]
    [frontend-tests.render-wasm.text-editor-content-range-test]
    [frontend-tests.render-wasm.text-paste-test]
+   [frontend-tests.render-wasm.tree-order-test]
+   [frontend-tests.render-wasm.upload-entry-test]
    [frontend-tests.render-wasm.webgl-test]
+   [frontend-tests.render-wasm.worker-upload-replay-test]
    [frontend-tests.router-test]
    [frontend-tests.svg-fills-test]
    [frontend-tests.svg-filters-test]
@@ -106,6 +114,7 @@
    [frontend-tests.tokens.import-export-test]
    [frontend-tests.tokens.logic.token-actions-test]
    [frontend-tests.tokens.logic.token-data-test]
+   [frontend-tests.tokens.logic.token-propagation-test]
    [frontend-tests.tokens.logic.token-remapping-test]
    [frontend-tests.tokens.logic.tokens-source-test]
    [frontend-tests.tokens.logic.tokens-status-test]
@@ -161,6 +170,7 @@
    [frontend-tests.util.dom.dnd-test]
    [frontend-tests.worker-snap-test]
    [frontend-tests.worker.exports-test]
+   [frontend-tests.worker.messages-raw-test]
    [goog.object :as gobj]))
 
 (enable-console-print!)
@@ -185,6 +195,7 @@
    'frontend-tests.data.fix-deleted-fonts-test
    'frontend-tests.data.modal-test
    'frontend-tests.data.nitrate-test
+   'frontend-tests.data.objects-hints-consumers-test
    'frontend-tests.data.persistence-retry-test
    'frontend-tests.data.persistence-test
    'frontend-tests.data.profile-test
@@ -195,6 +206,7 @@
    'frontend-tests.data.imports-test
    'frontend-tests.data.jobs-test
    'frontend-tests.worker.exports-test
+   'frontend-tests.worker.messages-raw-test
    'frontend-tests.data.svg-upload-test
    'frontend-tests.data.uploads-test
    'frontend-tests.data.viewer-test
@@ -210,6 +222,7 @@
    'frontend-tests.data.workspace-shortcuts-test
    'frontend-tests.data.workspace-texts-test
    'frontend-tests.data.workspace-thumbnails-test
+   'frontend-tests.data.workspace-thumbnails-wasm-test
    'frontend-tests.data.workspace-variant-rename-test
    'frontend-tests.data.workspace-versions-test
    'frontend-tests.debug-logging-test
@@ -236,6 +249,7 @@
    'frontend-tests.main.refs-test
    'frontend-tests.main-errors-test
    'frontend-tests.logic.sidebar-transform-coalescing-test
+   'frontend-tests.logic.translate-commit-test
    'frontend-tests.logic.update-position-test
    'frontend-tests.logic.wasm-modifiers-nil-id-test
    'frontend-tests.logic.wasm-pixel-snap-test
@@ -260,13 +274,18 @@
    'frontend-tests.plugins.user-test
    'frontend-tests.plugins.utils-test
    'frontend-tests.plugins.value-objects-test
+   'frontend-tests.render-wasm.page-cache-test
+   'frontend-tests.render-wasm.heap-growth-test
    'frontend-tests.render-wasm.process-objects-test
    'frontend-tests.render-wasm.serialization-test
    'frontend-tests.render-wasm.text-editor-apply-styles-test
    'frontend-tests.render-wasm.text-editor-caret-color-test
    'frontend-tests.render-wasm.text-editor-content-range-test
    'frontend-tests.render-wasm.text-paste-test
+   'frontend-tests.render-wasm.tree-order-test
+   'frontend-tests.render-wasm.upload-entry-test
    'frontend-tests.render-wasm.webgl-test
+   'frontend-tests.render-wasm.worker-upload-replay-test
    'frontend-tests.browser-history-test
    'frontend-tests.router-test
    'frontend-tests.svg-fills-test
@@ -276,6 +295,7 @@
    'frontend-tests.tokens.import-export-test
    'frontend-tests.tokens.logic.token-actions-test
    'frontend-tests.tokens.logic.token-data-test
+   'frontend-tests.tokens.logic.token-propagation-test
    'frontend-tests.tokens.logic.token-remapping-test
    'frontend-tests.tokens.referenced-token-value-test
    'frontend-tests.tokens.style-dictionary-test

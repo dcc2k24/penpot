@@ -838,14 +838,16 @@
                          (filter (partial ctl/any-layout-immediate-child-id? objects)))
                    selected)
 
-             ;; Frame lookups per pointer move only test frames that can be a target
-             frames
-             (ctst/get-frames objects)
+             ;; Frame lookups per pointer move only test frames that can be a target.
+             ;; Only the frame ids are read here, so a big page does not decode
+             ;; all its frames when the drag starts.
+             frame-ids
+             (ctst/get-frame-index-ids objects)
 
              with-target-frames
              (fn [excluded]
-               (vary-meta objects assoc ::ctst/index-frames
-                          (into [] (remove #(contains? excluded (:id %))) frames)))
+               (vary-meta objects assoc ::ctst/index-frame-ids
+                          (into [] (remove #(contains? excluded %)) frame-ids)))
 
              target-objects
              (with-target-frames exclude-frames)

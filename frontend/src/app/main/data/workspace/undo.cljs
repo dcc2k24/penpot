@@ -226,6 +226,28 @@
       (log/info :hint "discard-undo-transaction")
       (update state :workspace-undo dissoc :transaction :transactions-pending))))
 
+(defn lock-undo
+  "Locks undo and redo until `unlock-undo` with the same `id`. For work that
+  spans several tasks and adds its own undo entry when it ends (token
+  propagation): an undo in between would revert something else while the
+  work goes on."
+  [id]
+  (ptk/reify ::lock-undo
+    ptk/UpdateEvent
+    (update [_ state]
+      (update-in state [:workspace-undo :locks] (fnil conj #{}) id))))
+
+(defn unlock-undo
+  [id]
+  (ptk/reify ::unlock-undo
+    ptk/UpdateEvent
+    (update [_ state]
+      (update-in state [:workspace-undo :locks] disj id))))
+
+(defn- undo-locked?
+  [state]
+  (d/not-empty? (get-in state [:workspace-undo :locks])))
+
 (defn- add-transaction-undo-entry
   "Conditionally add an undo entry from the current transaction. That
   only happens when no pending transactions are available and the
@@ -292,8 +314,9 @@
       (let [objects (dsh/lookup-page-objects state)
             edition (get-in state [:workspace-local :edition])
             drawing (get state :workspace-drawing)]
-        (when-not (and (or (some? edition) (some? (:object drawing)))
-                       (not (ctl/grid-layout? objects edition)))
+        (when-not (or (undo-locked? state)
+                      (and (or (some? edition) (some? (:object drawing)))
+                           (not (ctl/grid-layout? objects edition))))
           (let [undo  (:workspace-undo state)
                 items (:items undo)
                 index (or (:index undo) (dec (count items)))]
@@ -330,8 +353,9 @@
             drawing (get state :workspace-drawing)]
 
         ;; Editors handle their own undo's
-        (when (or (and (nil? edition) (nil? (:object drawing)))
-                  (ctl/grid-layout? objects edition))
+        (when (and (not (undo-locked? state))
+                   (or (and (nil? edition) (nil? (:object drawing)))
+                       (ctl/grid-layout? objects edition)))
           (let [undo  (:workspace-undo state)
                 items (:items undo)
                 index (or (:index undo) (dec (count items)))]
@@ -371,8 +395,9 @@
             drawing (get state :workspace-drawing)]
 
         ;; Editors handle their own undo's
-        (when (or (and (nil? edition) (nil? (:object drawing)))
-                  (ctl/grid-layout? objects edition))
+        (when (and (not (undo-locked? state))
+                   (or (and (nil? edition) (nil? (:object drawing)))
+                       (ctl/grid-layout? objects edition)))
           (let [undo  (:workspace-undo state)
                 items (:items undo)
                 index (or (:index undo) (dec (count items)))]

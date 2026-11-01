@@ -5,9 +5,10 @@ use crate::emscripten::init_gl;
 
 use crate::mem;
 use crate::render::{gpu_state::GpuState, RenderResources, RenderState};
-use crate::state::{State, TextEditorState, UIState};
+use crate::state::{PageCache, State, TextEditorState, UIState};
 
 static mut DESIGN_STATE: *mut State = std::ptr::null_mut();
+static mut PAGE_CACHE: *mut PageCache = std::ptr::null_mut();
 static mut GPU_STATE: *mut GpuState = std::ptr::null_mut();
 static mut RENDER_STATE: *mut RenderState = std::ptr::null_mut();
 static mut UI_STATE: *mut UIState = std::ptr::null_mut();
@@ -18,6 +19,18 @@ pub(crate) fn get_design_state() -> &'static mut State {
     unsafe {
         debug_assert!(!DESIGN_STATE.is_null(), "Design State is null");
         &mut *DESIGN_STATE
+    }
+}
+
+/// Shapes pools of recently visited pages. Unlike the other globals it is not
+/// rebuilt by `init` / `clean_up`, which run on every page switch, so it is
+/// created on first use and only emptied on request.
+pub(crate) fn get_page_cache() -> &'static mut PageCache {
+    unsafe {
+        if PAGE_CACHE.is_null() {
+            PAGE_CACHE = Box::into_raw(Box::new(PageCache::new()));
+        }
+        &mut *PAGE_CACHE
     }
 }
 
@@ -54,6 +67,11 @@ pub(crate) fn current_browser() -> u8 {
 #[inline(always)]
 pub(crate) fn has_render_state() -> bool {
     unsafe { !RENDER_STATE.is_null() }
+}
+
+#[inline(always)]
+pub(crate) fn has_gpu_state() -> bool {
+    unsafe { !GPU_STATE.is_null() }
 }
 
 #[inline(always)]
@@ -210,6 +228,7 @@ fn ui_init() {
 #[no_mangle]
 #[wasm_error]
 pub extern "C" fn init(width: i32, height: i32) -> Result<()> {
+    crate::render::warmup::reset();
     #[cfg(target_arch = "wasm32")]
     init_gl!();
     gpu_init();
@@ -240,6 +259,7 @@ pub extern "C" fn clean_up() -> Result<()> {
     // Cancel the current animation frame if it exists so
     // it won't try to render without context
     let render_state = get_render_state();
+    crate::render::warmup::reset();
     render_state.prepare_context_loss_cleanup();
     unsafe { DESIGN_STATE = std::ptr::null_mut() }
     mem::free_bytes()?;

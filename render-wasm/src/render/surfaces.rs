@@ -585,16 +585,19 @@ impl Surfaces {
 
     /// Pack `needed_slots` into the existing 4096 atlas by shrinking the
     /// physical cell size. No-op when the layout already fits.
-    pub fn ensure_tile_atlas_layout(&mut self, needed_slots: usize) {
+    /// Lays the tile atlas out for `needed_slots`. Returns true when it repacked the slots,
+    /// which drops every cached and stale tile.
+    pub fn ensure_tile_atlas_layout(&mut self, needed_slots: usize) -> bool {
         let atlas_px = self.tile_atlas.width().min(self.tile_atlas.height());
         let slot = tiles::tile_atlas_slot_size(needed_slots, atlas_px);
         if slot == self.tiles.slot_size() {
-            return;
+            return false;
         }
         self.tiles
             .repack(self.tile_atlas.width(), self.tile_atlas.height(), slot);
         self.tile_atlas.canvas().clear(skia::Color::TRANSPARENT);
         self.tile_atlas_image = None;
+        true
     }
 
     pub fn set_dpr(&mut self, dpr: f32) {
@@ -854,6 +857,19 @@ impl Surfaces {
             sampling_options,
             paint,
         );
+    }
+
+    /// Like `draw_into`, but only composites `rect` (device pixels of `from`,
+    /// which are also user-space coordinates of `to`'s current canvas, so the
+    /// canvas matrix and clip apply exactly as they do for `draw_into`).
+    pub fn draw_into_rect(&mut self, from: SurfaceId, to: SurfaceId, rect: skia::IRect) {
+        let sampling_options = self.sampling_options;
+        let mut src = self.get_mut(from).clone();
+        let canvas = self.canvas_and_mark_dirty(to);
+        canvas.save();
+        canvas.clip_rect(Rect::from(rect), None, false);
+        src.draw(canvas, (0.0, 0.0), sampling_options, None);
+        canvas.restore();
     }
 
     pub fn cache_dimensions(&self) -> skia::ISize {
@@ -1466,27 +1482,100 @@ impl Surfaces {
         let _ = self.atlas.clear_tile_in_atlas(gpu_state, key);
     }
 
-    /// Evict every cached tile whose stored doc rect intersects `doc_rect`.
-    pub fn invalidate_cached_tiles_intersecting(&mut self, doc_rect: skia::Rect) {
+    /// Invalidate every cached tile whose stored doc rect intersects `doc_rect`.
+    ///
+    /// With `keep_stale`, a cached tile is not dropped: it becomes stale (see
+    /// [`TileTextureCache::mark_stale`]) and remembers the part of it that
+    /// changed, so the next render can repaint only that part. Without it, or
+    /// for tiles that are not cached, the tile is evicted.
+    pub fn invalidate_cached_tiles_intersecting(&mut self, doc_rect: skia::Rect, keep_stale: bool) {
         if doc_rect.is_empty() {
             return;
         }
 
-        let keys: Vec<TileCacheKey> = self
+        let hits: Vec<(TileCacheKey, skia::Rect)> = self
             .atlas
             .tile_doc_rects
             .iter()
-            .filter_map(|(key, rect)| {
-                (!rect.is_empty() && rect.intersects(doc_rect)).then_some(*key)
-            })
+            .filter(|(_, rect)| !rect.is_empty() && rect.intersects(doc_rect))
+            .map(|(key, rect)| (*key, *rect))
             .collect();
 
         let gpu_state = get_gpu_state();
-        for key in keys {
+        for (key, tile_rect) in hits {
+            if keep_stale {
+                let mut dirty = doc_rect;
+                if dirty.intersect(tile_rect) && self.tiles.mark_stale(key, dirty) {
+                    continue;
+                }
+            }
             self.tiles.remove_at(key.tile, key.scale());
             let _ = self.atlas.clear_tile_in_atlas(gpu_state, key);
         }
         self.atlas.clear_doc_rect_in_atlas_clipped(doc_rect);
+    }
+
+    /// True when tile slots hold tiles 1:1, so a stale slot can be copied back
+    /// into `Current` without resampling.
+    pub fn tile_slots_are_full_size(&self) -> bool {
+        self.tiles.slot_size() == TILE_SIZE
+            && self.margins.width == TILE_MARGIN_SIZE
+            && self.margins.height == TILE_MARGIN_SIZE
+    }
+
+    /// Changed doc rect of the stale tile `(tile, scale)`, if it is stale.
+    pub fn stale_tile_dirty_rect(&self, tile: Tile, scale: f32) -> Option<skia::Rect> {
+        self.tiles.stale_dirty_rect(TileCacheKey::new(tile, scale))
+    }
+
+    /// Takes the stale entry of `(tile, scale)`. Its slot stays allocated until
+    /// [`Self::release_tile_slot`].
+    pub fn take_stale_tile(&mut self, tile: Tile, scale: f32) -> Option<TileAtlasTextureRef> {
+        self.tiles.take_stale(TileCacheKey::new(tile, scale))
+    }
+
+    /// Makes the stale tile `(tile, scale)` cached again, unchanged.
+    pub fn restore_stale_tile(&mut self, tile: Tile, scale: f32) {
+        self.tiles.restore_stale(TileCacheKey::new(tile, scale));
+    }
+
+    /// Drops the stale entry of `(tile, scale)`, if any, freeing its slot.
+    pub fn drop_stale_tile(&mut self, tile: Tile, scale: f32) {
+        if let Some(slot) = self.tiles.take_stale(TileCacheKey::new(tile, scale)) {
+            self.tiles.release_slot(slot);
+        }
+    }
+
+    /// Frees a slot taken with [`Self::take_stale_tile`].
+    pub fn release_tile_slot(&mut self, slot: TileAtlasTextureRef) {
+        self.tiles.release_slot(slot);
+    }
+
+    /// Drops stale tiles of another scale or outside `keep`.
+    pub fn gc_stale_tiles(&mut self, scale: f32, keep: TileRect) {
+        self.tiles
+            .drop_stale_where(|key| !key.matches_scale(scale) || !keep.contains(&key.tile));
+    }
+
+    /// Replaces the pixels of the `Current` drawable outside `dirty_px` with the
+    /// tile held in `slot`, so `Current` holds the whole tile after only the
+    /// `dirty_px` part was repainted. Needs [`Self::tile_slots_are_full_size`].
+    pub fn copy_stale_slot_outside(&mut self, slot: &TileAtlasTextureRef, dirty_px: IRect) {
+        let src = slot.rect;
+        let dst = skia::Rect::from(TILE_DRAWABLE_RECT);
+        let mut paint = Paint::default();
+        paint.set_blend_mode(skia::BlendMode::Src);
+        let nearest = skia::SamplingOptions::new(skia::FilterMode::Nearest, skia::MipmapMode::None);
+
+        let canvas = self.current.canvas();
+        canvas.save();
+        canvas.reset_matrix();
+        canvas.clip_rect(dst, None, false);
+        canvas.clip_rect(skia::Rect::from(dirty_px), skia::ClipOp::Difference, false);
+        canvas.translate((dst.left - src.left, dst.top - src.top));
+        self.tile_atlas
+            .draw(canvas, (0.0, 0.0), nearest, Some(&paint));
+        canvas.restore();
     }
 
     /// Draws the current tile directly to the backbuffer and cache surfaces without
@@ -1695,6 +1784,9 @@ pub struct TileTextureCache {
     textures: Vec<skia::Rect>,
     grid: HashMap<TileCacheKey, TileAtlasTextureRef>,
     removed: HashSet<TileCacheKey>,
+    /// Tiles whose content changed only in part: the slot keeps the old pixels
+    /// (still allocated, not composed) and the rect is the changed doc area.
+    stale: HashMap<TileCacheKey, (TileAtlasTextureRef, skia::Rect)>,
 }
 
 pub struct AtlasDrawBatch {
@@ -1720,6 +1812,56 @@ impl TileTextureCache {
             textures: Vec::with_capacity(capacity),
             grid: HashMap::with_capacity(capacity),
             removed: HashSet::with_capacity(capacity),
+            stale: HashMap::new(),
+        }
+    }
+
+    /// Turns the cached tile `key` stale: it leaves the cache (it is no longer
+    /// composed or reused) but keeps its slot and pixels, and `dirty` (doc
+    /// space) is added to its changed area. Returns false, changing nothing,
+    /// when `key` is neither cached nor stale.
+    pub fn mark_stale(&mut self, key: TileCacheKey, dirty: skia::Rect) -> bool {
+        if let Some((_, rect)) = self.stale.get_mut(&key) {
+            rect.join(dirty);
+            return true;
+        }
+        if self.removed.contains(&key) {
+            return false;
+        }
+        let Some(tile_ref) = self.grid.remove(&key) else {
+            return false;
+        };
+        self.stale.insert(key, (tile_ref, dirty));
+        self.is_updated = true;
+        true
+    }
+
+    pub fn stale_dirty_rect(&self, key: TileCacheKey) -> Option<skia::Rect> {
+        self.stale.get(&key).map(|(_, rect)| *rect)
+    }
+
+    /// Removes the stale entry of `key`; its slot stays allocated.
+    pub fn take_stale(&mut self, key: TileCacheKey) -> Option<TileAtlasTextureRef> {
+        self.stale.remove(&key).map(|(tile_ref, _)| tile_ref)
+    }
+
+    /// Puts the stale tile `key` back in the cache as it was.
+    pub fn restore_stale(&mut self, key: TileCacheKey) {
+        if let Some((tile_ref, _)) = self.stale.remove(&key) {
+            self.insert(key, tile_ref);
+        }
+    }
+
+    pub fn release_slot(&mut self, tile_ref: TileAtlasTextureRef) {
+        self.provider.deallocate(tile_ref);
+    }
+
+    pub fn drop_stale_where(&mut self, mut pred: impl FnMut(&TileCacheKey) -> bool) {
+        let keys: Vec<TileCacheKey> = self.stale.keys().copied().filter(|k| pred(k)).collect();
+        for key in keys {
+            if let Some((tile_ref, _)) = self.stale.remove(&key) {
+                self.provider.deallocate(tile_ref);
+            }
         }
     }
 
@@ -1740,6 +1882,8 @@ impl TileTextureCache {
         self.textures = Vec::with_capacity(capacity);
         self.grid = HashMap::with_capacity(capacity);
         self.removed = HashSet::with_capacity(capacity);
+        // The provider was replaced: the stale slots are gone with it.
+        self.stale.clear();
     }
 
     fn gc(&mut self) {
@@ -1947,13 +2091,25 @@ impl TileTextureCache {
         // fills up until `allocate()` has no slot left.
         let capacity = self.provider.length.min(TEXTURES_CACHE_CAPACITY);
 
+        if self.grid.len() + self.stale.len() >= capacity {
+            // Stale tiles are only a shortcut for a later repaint: free them first.
+            self.drop_stale_where(|_| true);
+        }
         if self.grid.len() >= capacity {
             self.gc();
             self.gc_non_visible(tile_viewbox, scale, view_doc, tile_doc_rects);
         }
 
-        let Some(tile_ref) = self.provider.allocate() else {
-            panic!("Tile texture allocation failed {}:{}", tile.0, tile.1);
+        let tile_ref = match self.provider.allocate() {
+            Some(tile_ref) => tile_ref,
+            None => {
+                self.drop_stale_where(|_| true);
+                self.gc();
+                let Some(tile_ref) = self.provider.allocate() else {
+                    panic!("Tile texture allocation failed {}:{}", tile.0, tile.1);
+                };
+                tile_ref
+            }
         };
         self.insert(TileCacheKey::new(*tile, scale), tile_ref)
     }
@@ -1980,6 +2136,7 @@ impl TileTextureCache {
     }
 
     pub fn remove(&mut self, tile: Tile) {
+        self.drop_stale_where(|key| key.tile == tile);
         let keys: Vec<_> = self
             .grid
             .keys()
@@ -2002,6 +2159,9 @@ impl TileTextureCache {
 
     pub fn remove_at(&mut self, tile: Tile, scale: f32) {
         let key = TileCacheKey::new(tile, scale);
+        if let Some((tile_ref, _)) = self.stale.remove(&key) {
+            self.provider.deallocate(tile_ref);
+        }
         let Some(tile_ref) = self.grid.get(&key) else {
             return;
         };
@@ -2013,9 +2173,234 @@ impl TileTextureCache {
     }
 
     pub fn clear(&mut self) {
+        self.drop_stale_where(|_| true);
         for k in self.grid.keys() {
             self.removed.insert(*k);
         }
         self.is_updated = true;
+    }
+}
+
+#[cfg(test)]
+mod stale_tile_tests {
+    use super::*;
+
+    const SCALE: f32 = 1.0;
+
+    fn cache() -> TileTextureCache {
+        TileTextureCache::new(1024, 1024)
+    }
+
+    fn key(x: i32, y: i32) -> TileCacheKey {
+        TileCacheKey::new(Tile(x, y), SCALE)
+    }
+
+    fn put(cache: &mut TileTextureCache, x: i32, y: i32) -> usize {
+        let tile_ref = cache.provider.allocate().expect("free slot");
+        let index = tile_ref.index;
+        cache.insert(key(x, y), tile_ref);
+        index
+    }
+
+    fn rect(l: f32, t: f32, r: f32, b: f32) -> skia::Rect {
+        skia::Rect::from_ltrb(l, t, r, b)
+    }
+
+    #[test]
+    fn mark_stale_takes_a_cached_tile_out_of_the_cache() {
+        let mut cache = cache();
+        put(&mut cache, 0, 0);
+        let dirty = rect(1.0, 2.0, 3.0, 4.0);
+
+        assert!(cache.mark_stale(key(0, 0), dirty));
+
+        assert!(!cache.has(Tile(0, 0), SCALE));
+        assert_eq!(cache.stale_dirty_rect(key(0, 0)), Some(dirty));
+    }
+
+    #[test]
+    fn mark_stale_keeps_the_slot_allocated() {
+        let mut cache = cache();
+        let index = put(&mut cache, 0, 0);
+
+        cache.mark_stale(key(0, 0), rect(0.0, 0.0, 10.0, 10.0));
+
+        assert!(cache.provider.in_use[index]);
+    }
+
+    #[test]
+    fn mark_stale_on_an_uncached_tile_changes_nothing() {
+        let mut cache = cache();
+
+        assert!(!cache.mark_stale(key(5, 5), rect(0.0, 0.0, 10.0, 10.0)));
+
+        assert_eq!(cache.stale_dirty_rect(key(5, 5)), None);
+        assert!(cache.stale.is_empty());
+        assert!(cache.provider.in_use.iter().all(|used| !used));
+    }
+
+    #[test]
+    fn mark_stale_on_a_removed_tile_returns_false() {
+        let mut cache = cache();
+        put(&mut cache, 0, 0);
+        cache.remove_at(Tile(0, 0), SCALE);
+
+        assert!(!cache.mark_stale(key(0, 0), rect(0.0, 0.0, 10.0, 10.0)));
+
+        assert_eq!(cache.stale_dirty_rect(key(0, 0)), None);
+    }
+
+    #[test]
+    fn second_mark_stale_joins_the_dirty_rects() {
+        let mut cache = cache();
+        put(&mut cache, 0, 0);
+        cache.mark_stale(key(0, 0), rect(0.0, 0.0, 10.0, 10.0));
+
+        assert!(cache.mark_stale(key(0, 0), rect(20.0, -5.0, 30.0, 8.0)));
+
+        assert_eq!(
+            cache.stale_dirty_rect(key(0, 0)),
+            Some(rect(0.0, -5.0, 30.0, 10.0))
+        );
+    }
+
+    #[test]
+    fn restore_stale_puts_the_tile_back_in_the_same_slot() {
+        let mut cache = cache();
+        let index = put(&mut cache, 0, 0);
+        cache.mark_stale(key(0, 0), rect(0.0, 0.0, 10.0, 10.0));
+
+        cache.restore_stale(key(0, 0));
+
+        assert!(cache.has(Tile(0, 0), SCALE));
+        assert_eq!(cache.get(Tile(0, 0), SCALE).map(|r| r.index), Some(index));
+        assert_eq!(cache.stale_dirty_rect(key(0, 0)), None);
+    }
+
+    #[test]
+    fn take_stale_removes_the_entry_and_keeps_the_slot() {
+        let mut cache = cache();
+        let index = put(&mut cache, 0, 0);
+        cache.mark_stale(key(0, 0), rect(0.0, 0.0, 10.0, 10.0));
+
+        let taken = cache.take_stale(key(0, 0)).expect("stale tile");
+
+        assert_eq!(taken.index, index);
+        assert!(!cache.has(Tile(0, 0), SCALE));
+        assert_eq!(cache.stale_dirty_rect(key(0, 0)), None);
+        assert!(cache.provider.in_use[index]);
+    }
+
+    #[test]
+    fn take_stale_on_an_unknown_tile_returns_none() {
+        let mut cache = cache();
+        put(&mut cache, 0, 0);
+
+        assert!(cache.take_stale(key(0, 0)).is_none());
+        assert!(cache.has(Tile(0, 0), SCALE));
+    }
+
+    #[test]
+    fn release_slot_frees_a_taken_slot() {
+        let mut cache = cache();
+        let index = put(&mut cache, 0, 0);
+        cache.mark_stale(key(0, 0), rect(0.0, 0.0, 10.0, 10.0));
+        let taken = cache.take_stale(key(0, 0)).expect("stale tile");
+
+        cache.release_slot(taken);
+
+        assert!(!cache.provider.in_use[index]);
+    }
+
+    #[test]
+    fn drop_stale_where_frees_only_the_matching_entries() {
+        let mut cache = cache();
+        let first = put(&mut cache, 0, 0);
+        let second = put(&mut cache, 1, 0);
+        cache.mark_stale(key(0, 0), rect(0.0, 0.0, 10.0, 10.0));
+        cache.mark_stale(key(1, 0), rect(0.0, 0.0, 10.0, 10.0));
+
+        cache.drop_stale_where(|k| k.tile == Tile(0, 0));
+
+        assert_eq!(cache.stale_dirty_rect(key(0, 0)), None);
+        assert!(cache.stale_dirty_rect(key(1, 0)).is_some());
+        assert!(!cache.provider.in_use[first]);
+        assert!(cache.provider.in_use[second]);
+    }
+
+    #[test]
+    fn remove_drops_the_stale_entry_and_frees_its_slot() {
+        let mut cache = cache();
+        let index = put(&mut cache, 0, 0);
+        cache.mark_stale(key(0, 0), rect(0.0, 0.0, 10.0, 10.0));
+
+        cache.remove(Tile(0, 0));
+
+        assert_eq!(cache.stale_dirty_rect(key(0, 0)), None);
+        assert!(!cache.provider.in_use[index]);
+    }
+
+    #[test]
+    fn remove_at_drops_the_stale_entry_and_frees_its_slot() {
+        let mut cache = cache();
+        let index = put(&mut cache, 0, 0);
+        cache.mark_stale(key(0, 0), rect(0.0, 0.0, 10.0, 10.0));
+
+        cache.remove_at(Tile(0, 0), SCALE);
+
+        assert_eq!(cache.stale_dirty_rect(key(0, 0)), None);
+        assert!(!cache.provider.in_use[index]);
+    }
+
+    #[test]
+    fn clear_drops_stale_entries_and_frees_their_slots() {
+        let mut cache = cache();
+        let stale_index = put(&mut cache, 0, 0);
+        put(&mut cache, 1, 0);
+        cache.mark_stale(key(0, 0), rect(0.0, 0.0, 10.0, 10.0));
+
+        cache.clear();
+
+        assert_eq!(cache.stale_dirty_rect(key(0, 0)), None);
+        assert!(!cache.provider.in_use[stale_index]);
+        assert!(!cache.has(Tile(1, 0), SCALE));
+    }
+
+    #[test]
+    fn repack_forgets_stale_entries() {
+        let mut cache = cache();
+        put(&mut cache, 0, 0);
+        cache.mark_stale(key(0, 0), rect(0.0, 0.0, 10.0, 10.0));
+
+        cache.repack(1024, 1024, 512);
+
+        assert_eq!(cache.stale_dirty_rect(key(0, 0)), None);
+        assert!(cache.provider.in_use.iter().all(|used| !used));
+    }
+
+    #[test]
+    fn add_frees_stale_slots_when_the_cache_is_full() {
+        let mut cache = cache();
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            put(&mut cache, x, y);
+        }
+        cache.mark_stale(key(0, 0), rect(0.0, 0.0, 10.0, 10.0));
+        cache.mark_stale(key(1, 0), rect(0.0, 0.0, 10.0, 10.0));
+        let viewbox = Viewbox::new(1024.0, 1024.0);
+        let tile_viewbox = TileViewbox::new_with_interest(&viewbox, 0);
+        let mut doc_rects = HashMap::new();
+
+        let added = cache.add(
+            &tile_viewbox,
+            &Tile(5, 5),
+            SCALE,
+            rect(0.0, 0.0, 1024.0, 1024.0),
+            &mut doc_rects,
+        );
+
+        assert!(cache.has(Tile(5, 5), SCALE));
+        assert!(cache.provider.in_use[added.index]);
+        assert!(cache.stale.is_empty());
+        assert_eq!(cache.grid.len(), 3);
     }
 }

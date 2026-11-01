@@ -13,6 +13,7 @@
    [app.common.test-helpers.files :as thf]
    [app.common.test-helpers.ids-map :as thi]
    [app.common.test-helpers.shapes :as ths]
+   [app.common.time :as ct]
    [clojure.test :as t]))
 
 (t/use-fixtures :each thi/test-fixture)
@@ -94,6 +95,31 @@
     (t/is (= (:fill-opacity fill') 1))
     (t/is (= (:touched copy-root') nil))
     (t/is (= (:touched copy-child') #{:fill-group}))))
+
+(t/deftest test-touched-main-child-marks-component-modified
+  (let [;; ==== Setup
+        file       (-> (thf/sample-file :file1)
+                       (tho/add-simple-component :component1 :main-root :main-child))
+        page       (thf/current-page file)
+        main-child (ths/get-shape file :main-child)
+        now        (ct/inst 5000)
+
+        ;; ==== Action
+        changes    (cls/generate-update-shapes (pcb/empty-changes nil (:id page))
+                                               #{(:id main-child)}
+                                               (fn [shape]
+                                                 (assoc shape :fills (ths/sample-fills-color :fill-color "#fabada")))
+                                               (:objects page)
+                                               {})
+
+        file'      (with-redefs [ct/now (constantly now)]
+                     (thf/apply-changes file changes))
+
+        ;; ==== Get
+        component' (thc/get-component file' :component1)]
+
+    ;; ==== Check
+    (t/is (= now (:modified-at component')))))
 
 (t/deftest test-not-touched-when-adding-shape
   (let [;; ==== Setup

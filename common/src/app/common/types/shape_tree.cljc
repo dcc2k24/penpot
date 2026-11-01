@@ -13,6 +13,7 @@
    [app.common.geom.shapes :as gsh]
    [app.common.math :as mth]
    [app.common.types.component :as ctk]
+   [app.common.types.objects-hints :as ohints]
    [app.common.types.shape.layout :as ctl]
    [app.common.uuid :as uuid]))
 
@@ -110,6 +111,51 @@
                       (fn [shapes]
                         (into [] (filter contains?) shapes)))))
 
+(defn- skip-frames
+  "Drops the frames left out by the `:skip-components?` and `:skip-copies?`
+  options of `get-frames`."
+  [frames {:keys [skip-components? skip-copies?]}]
+  (remove #(or (and ^boolean skip-components?
+                    ^boolean (ctk/instance-head? %))
+               (and ^boolean skip-copies?
+                    (and ^boolean (ctk/instance-head? %)
+                         (not ^boolean (ctk/main-instance? %)))))
+          frames))
+
+(defn- lookup-frames
+  "Looks up the frames with the given ids, in order, and skips the ones
+  left out by the options of `get-frames`."
+  [objects ids options]
+  (skip-frames (keep (d/getf objects) ids) options))
+
+(defn- scan-frame-ids
+  "Returns the ids of the frames of `objects` by reading every shape, root
+  excluded."
+  [objects]
+  (sequence (comp (remove #(= uuid/zero %))
+                  (filter #(cfh/frame-shape? (get objects %))))
+            (keys objects)))
+
+(defn- frame-ids-of
+  "Returns the ids of the frames of `objects`, root excluded, in map order.
+  With hints attached, a shape that has a valid hint is not decoded."
+  [objects]
+  (if-some [hints (ohints/hints objects)]
+    (remove #(= uuid/zero %)
+            (ohints/select-ids objects hints
+                               #(contains? (:frames hints) %)
+                               cfh/frame-shape?))
+    (scan-frame-ids objects)))
+
+(defn get-frame-index-ids
+  "Returns the ids of every frame of `objects`, root excluded. Uses the
+  frame ids index in the metadata when present. Otherwise it reads the
+  page, and with hints attached it does not decode the non-frame shapes."
+  [objects]
+  (if-some [ids (-> objects meta ::index-frame-ids)]
+    ids
+    (frame-ids-of objects)))
+
 (defn get-frames
   "Retrieves all frame objects as vector"
   ([objects] (get-frames objects nil))
@@ -117,21 +163,19 @@
              :or {skip-components? false
                   skip-copies? false
                   ignore-index? false}}]
-   (let [frame-index
-         (if (and (not ignore-index?) (-> objects meta ::index-frames))
-           (-> objects meta ::index-frames)
-           (let [lookup (d/getf objects)
-                 xform  (comp (remove #(= uuid/zero %))
-                              (keep lookup)
-                              (filter cfh/frame-shape?))]
-             (->> (keys objects)
-                  (sequence xform))))]
-     (->> frame-index
-          (remove #(or (and ^boolean skip-components?
-                            ^boolean (ctk/instance-head? %))
-                       (and ^boolean skip-copies?
-                            (and ^boolean (ctk/instance-head? %)
-                                 (not ^boolean (ctk/main-instance? %))))))))))
+   (let [options      {:skip-components? skip-components?
+                       :skip-copies?    skip-copies?}
+         index-ids    (when-not ignore-index? (-> objects meta ::index-frame-ids))
+         index-frames (when-not ignore-index? (-> objects meta ::index-frames))]
+     (cond
+       (some? index-ids)
+       (lookup-frames objects index-ids options)
+
+       (some? index-frames)
+       (skip-frames index-frames options)
+
+       :else
+       (lookup-frames objects (scan-frame-ids objects) options)))))
 
 (defn get-frames-ids
   "Retrieves all frame ids as vector"
@@ -139,6 +183,32 @@
   ([objects options]
    (->> (get-frames objects options)
         (map :id))))
+
+(defn get-top-level-frames-ids
+  "Retrieves the ids of the frames that are direct children of the root
+  shape, as a vector, in the order of the root `:shapes` (back to front).
+  Takes the `:skip-components?` and `:skip-copies?` options of
+  `get-frames`. Ids of the root `:shapes` missing from `objects` are
+  skipped.
+
+  Only the root and its direct children are looked up, so the other shapes
+  of a lazy objects map are not decoded, and the other keys are not walked."
+  ([objects] (get-top-level-frames-ids objects nil))
+  ([objects {:keys [skip-components? skip-copies?]
+             :or {skip-components? false
+                  skip-copies? false}}]
+   (into []
+         (comp (remove #(= uuid/zero %))
+               (distinct)
+               (keep (d/getf objects))
+               (filter cfh/frame-shape?)
+               (remove #(or (and ^boolean skip-components?
+                                 ^boolean (ctk/instance-head? %))
+                            (and ^boolean skip-copies?
+                                 (and ^boolean (ctk/instance-head? %)
+                                      (not ^boolean (ctk/main-instance? %))))))
+               (map :id))
+         (dm/get-in objects [uuid/zero :shapes]))))
 
 (defn get-nested-frames
   [objects frame-id]
@@ -286,6 +356,37 @@
                     (not (:show-content ancestor))
                     (not ^boolean (gsh/has-point? ancestor position)))))))
 
+(defn- clipped-at-position-fn
+  "Returns a function of a shape id that is true when `position` falls
+  outside the visible bounds of that shape or of one of its ancestors: one
+  of them, other than the root, is a frame that clips its content and
+  does not contain `position`. Same rule as `clipped-by-ancestor?`, applied
+  to the shape itself too.
+
+  Each id is answered once per returned function, so testing every frame
+  of a page looks up each ancestor once, and the frames inside a clipping
+  board that misses `position` reuse its answer."
+  [objects position]
+  (let [cache (volatile! (transient {}))]
+    (letfn [(clipped? [id]
+              (let [cached (get @cache id ::unknown)]
+                (if (not= ::unknown cached)
+                  cached
+                  (let [shape     (get objects id)
+                        parent-id (:parent-id shape)
+                        result    (boolean
+                                   (and (some? shape)
+                                        (or (and (some? parent-id)
+                                                 (not= parent-id id)
+                                                 ^boolean (clipped? parent-id))
+                                            (and (not= id uuid/zero)
+                                                 ^boolean (cfh/frame-shape? shape)
+                                                 (not (:show-content shape))
+                                                 (not ^boolean (gsh/has-point? shape position))))))]
+                    (vswap! cache assoc! id result)
+                    result))))]
+      clipped?)))
+
 (defn get-frame-by-position
   ([objects position]
    (get-frame-by-position objects position nil))
@@ -312,14 +413,39 @@
    (when-let [frame (get-frame-by-position objects position options)]
      (dm/get-prop frame :id))))
 
+(defn- frame-ids-at-position
+  "Keeps the ids that may hold `position`. A known id is tested against
+  the box of its hint. Any other id passes, because its shape is read."
+  [objects hints ids position]
+  (filter (fn [id]
+            (or (not (ohints/known? hints objects id))
+                (ohints/may-contain-point? (get-in hints [:frames id :bounds])
+                                           position)))
+          ids))
+
 (defn get-frames-by-position
   ([objects position] (get-frames-by-position objects position nil))
   ([objects position options]
-   (->> (get-frames objects options)
-        (filter #(and ^boolean (some? position)
-                      ^boolean (gsh/has-point? % position)
-                      ^boolean (not (clipped-by-ancestor? objects % position))))
-        (sort-z-index-objects objects))))
+   (let [clipped?  (when (some? position)
+                     (clipped-at-position-fn objects position))
+         hints     (ohints/hints objects)
+         index-ids (when (and (some? position)
+                              (some? hints)
+                              (not (:ignore-index? options)))
+                     (-> objects meta ::index-frame-ids))
+         frames    (if (some? index-ids)
+                     (lookup-frames objects
+                                    (frame-ids-at-position objects hints index-ids position)
+                                    options)
+                     (get-frames objects options))]
+     (->> frames
+          ;; The cheap point test runs first and rejects almost every frame
+          ;; of a page; only the few frames under `position` pay for the
+          ;; (memoized) ancestor clip test.
+          (filter #(and ^boolean (some? position)
+                        ^boolean (gsh/has-point? % position)
+                        (not ^boolean (clipped? (dm/get-prop % :parent-id)))))
+          (sort-z-index-objects objects)))))
 
 (defn top-nested-frame
   "Search for the top nested frame for positioning shapes when moving or creating.
@@ -366,13 +492,31 @@
                 (map identity)
                 (remove :hide-in-viewer))))))
 
+(defn- with-frames-index
+  "Returns `objects` with its frame ids index (`::index-frame-ids`) in
+  metadata. The hints of `objects`, if any, are kept.
+
+  The index is a lazy seq computed against the returned map itself, not
+  against a metadata-less copy: an `ObjectsMap` decodes and caches each
+  shape on the instance it is looked up on, so walking a throwaway
+  `(with-meta objects nil)` copy decoded every shape of the page a second
+  time on page open. With hints, the ids come from the hints, and only the
+  shapes without a valid hint are decoded."
+  [objects]
+  (let [result (volatile! nil)
+        ids    (lazy-seq (frame-ids-of @result))
+        hints  (ohints/hints objects)]
+    (vreset! result (with-meta objects
+                      (cond-> {::index-frame-ids ids}
+                        (some? hints) (assoc ::ohints/hints hints))))))
+
 (defn start-page-index
   [objects]
-  (with-meta objects {::index-frames (get-frames (with-meta objects nil))}))
+  (with-frames-index objects))
 
 (defn update-page-index
   [objects]
-  (with-meta objects {::index-frames (get-frames (with-meta objects nil))}))
+  (with-frames-index objects))
 
 (defn update-object-indices
   [file page-id]

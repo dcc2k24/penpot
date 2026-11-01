@@ -55,7 +55,6 @@ use crate::math::{self, Bounds, Matrix, Point};
 
 use crate::state::ShapesPoolRef;
 
-const MIN_VISIBLE_SIZE: f32 = 2.0;
 const MIN_STROKE_WIDTH: f32 = 0.001;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -867,11 +866,6 @@ impl Shape {
         self.calculate_extrect(shapes_pool, scale)
     }
 
-    pub fn visually_insignificant(&self, scale: f32, shapes_pool: ShapesPoolRef) -> bool {
-        let extrect = self.extrect(shapes_pool, scale);
-        extrect.width() * scale < MIN_VISIBLE_SIZE && extrect.height() * scale < MIN_VISIBLE_SIZE
-    }
-
     pub fn should_use_antialias(&self, scale: f32, threshold: f32) -> bool {
         self.selrect.width() * scale > threshold || self.selrect.height() * scale > threshold
     }
@@ -1623,6 +1617,23 @@ impl Shape {
             && self.blend_mode().0 == skia::BlendMode::SrcOver
     }
 
+    /// Whether a drag crop of this shape holds only its own pixels, so it can be drawn over or
+    /// under other crops in z-order: an axis-aligned board or rectangle with square corners,
+    /// an opaque solid fill, no visible strokes, and nothing that
+    /// [`is_safe_for_drag_crop_cache`](Self::is_safe_for_drag_crop_cache) rejects. Its content
+    /// then covers its whole crop.
+    pub fn is_opaque_for_drag_crop(&self, shapes_pool: ShapesPoolRef) -> bool {
+        matches!(self.shape_type, Type::Frame(_) | Type::Rect(_))
+            && self.shape_type.corners().is_none()
+            && self.transform.is_identity()
+            && !self.has_visible_strokes()
+            && self
+                .fills
+                .iter()
+                .any(|fill| matches!(fill, Fill::Solid(SolidColor(color)) if color.a() == u8::MAX))
+            && self.is_safe_for_drag_crop_cache(shapes_pool)
+    }
+
     /// Fill + visible strokes in **document space** for clipping interactive drag textures.
     ///
     /// The backbuffer crop uses an axis-aligned `extrect`; we clip the blit so backdrop pixels
@@ -2144,6 +2155,13 @@ impl Shape {
 
     fn is_filled_frame(&self) -> bool {
         matches!(self.shape_type, Type::Frame(_)) && self.has_fills()
+    }
+
+    /// A filled frame with a visible drop shadow: how it draws the shadow
+    /// ([`Self::uses_direct_container_drop_shadow`],
+    /// [`Self::container_fill_covers_shadow_descendants`]) depends on its descendants.
+    pub fn has_child_dependent_drop_shadow(&self) -> bool {
+        self.is_filled_frame() && self.drop_shadows_visible().next().is_some()
     }
 
     fn descendants_have_drop_shadows(&self, tree: ShapesPoolRef) -> bool {
@@ -2855,5 +2873,70 @@ mod tests {
 
         let frame = pool.get(&frame_id).expect("frame");
         assert!(frame.uses_direct_container_drop_shadow(&pool));
+    }
+
+    fn opaque_board_pool(edit: impl FnOnce(&mut Shape)) -> (ShapesPool, Uuid) {
+        let mut pool = ShapesPool::new();
+        pool.initialize(1);
+        let id = Uuid::new_v4();
+        {
+            let board = pool.add_shape(id);
+            board.set_shape_type(Type::Frame(Frame::default()));
+            board.set_selrect(0.0, 0.0, 200.0, 100.0);
+            board.add_fill(Fill::Solid(SolidColor(skia::Color::WHITE)));
+            board.set_clip(true);
+            edit(board);
+        }
+        (pool, id)
+    }
+
+    #[test]
+    fn square_board_with_opaque_fill_has_an_opaque_drag_crop() {
+        let (pool, id) = opaque_board_pool(|_| {});
+        assert!(pool.get(&id).expect("board").is_opaque_for_drag_crop(&pool));
+    }
+
+    #[test]
+    fn translucent_rounded_stroked_or_shadowed_boards_are_not_opaque_drag_crops() {
+        let cases: Vec<Box<dyn FnOnce(&mut Shape)>> = vec![
+            Box::new(|s: &mut Shape| {
+                s.set_fills(vec![Fill::Solid(SolidColor(skia::Color::from_argb(
+                    128, 255, 255, 255,
+                )))])
+            }),
+            Box::new(|s: &mut Shape| s.set_fills(vec![])),
+            Box::new(|s: &mut Shape| s.set_corners((8.0, 8.0, 8.0, 8.0))),
+            Box::new(|s: &mut Shape| {
+                s.add_stroke(Stroke::new_center_stroke(
+                    2.0,
+                    StrokeStyle::Solid,
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
+            }),
+            Box::new(|s: &mut Shape| {
+                s.add_shadow(Shadow::new(
+                    skia::Color::BLACK,
+                    4.0,
+                    0.0,
+                    (0.0, 4.0),
+                    ShadowStyle::Drop,
+                    false,
+                ))
+            }),
+            Box::new(|s: &mut Shape| s.opacity = 0.5),
+        ];
+        for edit in cases {
+            let (pool, id) = opaque_board_pool(edit);
+            assert!(!pool.get(&id).expect("board").is_opaque_for_drag_crop(&pool));
+        }
+    }
+
+    #[test]
+    fn groups_are_not_opaque_drag_crops() {
+        let (pool, id) = opaque_board_pool(|s| s.set_shape_type(Type::Group(Group::default())));
+        assert!(!pool.get(&id).expect("group").is_opaque_for_drag_crop(&pool));
     }
 }

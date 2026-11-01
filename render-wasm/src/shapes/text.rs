@@ -254,6 +254,10 @@ pub struct TextContentLayout {
     /// Shared across shape clones (e.g. modifier transforms) so rotation/pan
     /// can paint without rebuilding Skia layout. Cleared builders on clone are OK.
     pub paragraphs: Rc<Vec<Vec<skia::textlayout::Paragraph>>>,
+    /// True when the cached paragraphs were built while some span had an image
+    /// fill, so their paints may hold image shaders bound to the GL context of
+    /// the renderer that built them.
+    pub has_image_shaders: bool,
     cached_extrect: Cell<Option<CachedExtrect>>,
 }
 
@@ -268,6 +272,7 @@ impl Clone for TextContentLayout {
         Self {
             paragraph_builders: vec![],
             paragraphs: Rc::clone(&self.paragraphs),
+            has_image_shaders: self.has_image_shaders,
             cached_extrect: Cell::new(self.cached_extrect.get()),
         }
     }
@@ -284,6 +289,7 @@ impl TextContentLayout {
         Self {
             paragraph_builders: vec![],
             paragraphs: Rc::new(Vec::new()),
+            has_image_shaders: false,
             cached_extrect: Cell::new(None),
         }
     }
@@ -1133,6 +1139,36 @@ impl TextContent {
         })
     }
 
+    /// True when some span has an image fill.
+    pub fn has_image_fills(&self) -> bool {
+        self.paragraphs.iter().any(|paragraph| {
+            paragraph.children().iter().any(|span| {
+                span.fills
+                    .iter()
+                    .any(|fill| matches!(fill, shapes::Fill::Image(_)))
+            })
+        })
+    }
+
+    /// True when the cached layout was built with image fills (see
+    /// `TextContentLayout::has_image_shaders`).
+    pub fn layout_has_image_shaders(&self) -> bool {
+        self.layout.has_image_shaders
+    }
+
+    /// Releases the cached Skia layout of a text moving to a new renderer. Its
+    /// paints may hold image shaders made from textures of the renderer being
+    /// torn down, so the paint builders and the paragraphs are dropped now,
+    /// while the GL context that built them is still current. The paragraphs
+    /// are empty until the next layout, so the text cannot be measured or hit
+    /// tested before then. The frontend lays these texts out again after a
+    /// restore.
+    pub fn detach_paint_cache(&mut self) {
+        drop(std::mem::take(&mut self.layout.paragraph_builders));
+        self.layout.paragraphs = Rc::new(Vec::new());
+        self.force_next_layout_update();
+    }
+
     /// True when the cached fill shaders fit a box of `selrect`'s size.
     fn paint_size_matches(&self, selrect: &Rect) -> bool {
         if !self.has_box_relative_fills() {
@@ -1177,6 +1213,9 @@ impl TextContent {
         default_height: f32,
     ) {
         self.layout.set(result.0, result.1);
+        // Paints are built from the span fills, so record now whether they
+        // hold image shaders; the fills may change before the next layout.
+        self.layout.has_image_shaders = self.has_image_fills();
         self.size
             .copy_finite_size(result.2, default_width, default_height);
         // Paragraph paints (incl. absolute image/gradient shaders) were built
@@ -2323,6 +2362,44 @@ mod tests {
     }
 
     #[test]
+    fn has_image_fills_detects_image_span() {
+        let image = shapes::Fill::Image(shapes::ImageFill::new(Uuid::nil(), 255, 100, 100, true));
+        let solid = shapes::Fill::Solid(shapes::SolidColor(skia::Color::BLACK));
+
+        let mut with_image = sample_text_content();
+        let span = &mut with_image.paragraphs_mut()[0].children_mut()[0];
+        span.fills.push(image);
+        assert!(with_image.has_image_fills());
+
+        let mut with_solid = sample_text_content();
+        let span = &mut with_solid.paragraphs_mut()[0].children_mut()[0];
+        span.fills.push(solid);
+        assert!(!with_solid.has_image_fills());
+
+        let empty = TextContent::new(Rect::from_xywh(0.0, 0.0, 100.0, 50.0), GrowType::Fixed);
+        assert!(!empty.has_image_fills());
+    }
+
+    #[test]
+    fn detach_paint_cache_drops_the_cache() {
+        let mut content = sample_text_content();
+        content.layout.paragraphs = Rc::new(vec![vec![]]);
+        content.layout.paragraph_builders = vec![vec![]];
+        content.layout_version = content.content_version;
+        assert!(content.layout_cache_versions_match());
+        assert_eq!(content.layout.paragraph_builders.len(), 1);
+        let before = Rc::clone(&content.layout.paragraphs);
+
+        content.detach_paint_cache();
+
+        assert!(content.layout.paragraph_builders.is_empty());
+        assert!(content.layout.paragraphs.is_empty());
+        assert!(!content.layout_cache_versions_match());
+        // Only the test's own handle is left: the layout dropped its handle.
+        assert_eq!(Rc::strong_count(&before), 1);
+    }
+
+    #[test]
     fn has_text_decorations_detects_underline() {
         let mut content = sample_text_content();
         content.paragraphs_mut()[0].children_mut()[0].text_decoration =
@@ -2517,5 +2594,37 @@ mod tests {
         layout.paragraphs = Rc::new(vec![vec![]]);
         layout.clear();
         assert!(layout.needs_update());
+    }
+
+    #[test]
+    fn set_layout_from_result_records_image_shaders() {
+        let mut content = sample_text_content();
+        let image = shapes::Fill::Image(shapes::ImageFill::new(Uuid::nil(), 255, 100, 100, true));
+        content.paragraphs_mut()[0].children_mut()[0]
+            .fills
+            .push(image);
+
+        content.set_layout_from_result(
+            TextContentLayoutResult(vec![], vec![], TextContentSize::default()),
+            100.0,
+            50.0,
+        );
+        assert!(content.layout_has_image_shaders());
+        assert!(content.layout.clone().has_image_shaders);
+
+        // The fills change, but the layout is not rebuilt: it still records
+        // the image shaders it was built with.
+        let span = &mut content.paragraphs_mut()[0].children_mut()[0];
+        span.fills.clear();
+        span.fills
+            .push(shapes::Fill::Solid(shapes::SolidColor(skia::Color::BLACK)));
+        assert!(content.layout_has_image_shaders());
+
+        content.set_layout_from_result(
+            TextContentLayoutResult(vec![], vec![], TextContentSize::default()),
+            100.0,
+            50.0,
+        );
+        assert!(!content.layout_has_image_shaders());
     }
 }

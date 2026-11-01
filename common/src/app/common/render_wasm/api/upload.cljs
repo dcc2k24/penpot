@@ -414,7 +414,7 @@
        fills-size
        strokes-size)))
 
-(defn- encode-shape-record
+(defn encode-shape-record
   "Returns a Uint8Array: [u32 payload_len][payload]."
   [shape opts]
   (let [capacity (+ 4 (payload-byte-size shape opts))
@@ -427,14 +427,12 @@
     (buf/write-u32 dview 0 payload-len)
     (js/Uint8Array. buffer 0 end)))
 
-(defn flush-shapes-batch!
-  "Upload `shapes` as one `_set_shapes_batch` call.
-   `opts` passed to each record writer (`:include-layout?`,
-   `:include-fills-strokes?`)."
-  [shapes opts]
-  (when (and (wasm/live?) (seq shapes))
-    (let [records (mapv #(encode-shape-record % opts) shapes)
-          total   (reduce (fn [acc ^js u8] (+ acc (.-byteLength u8))) 4 records)
+(defn upload-records!
+  "Copies encoded records into the WASM heap and calls `_set_shapes_batch`.
+   `records` is a seq of Uint8Arrays, each `[u32 payload-len][payload]`."
+  [records]
+  (when (and (wasm/live?) (seq records))
+    (let [total   (reduce (fn [acc ^js u8] (+ acc (.-byteLength u8))) 4 records)
           offset  (mem/alloc total)
           heap    (mem/get-heap-u8)
           dview   (js/DataView. (.-buffer heap))]
@@ -446,6 +444,14 @@
               records)
       (h/call wasm/internal-module "_set_shapes_batch")
       nil)))
+
+(defn flush-shapes-batch!
+  "Upload `shapes` as one `_set_shapes_batch` call.
+   `opts` passed to each record writer (`:include-layout?`,
+   `:include-fills-strokes?`)."
+  [shapes opts]
+  (when (and (wasm/live?) (seq shapes))
+    (upload-records! (mapv #(encode-shape-record % opts) shapes))))
 
 (defn set-shape-upload!
   "Single-shape structural upload (enlarged blob, one FFI)."
