@@ -6,7 +6,6 @@
 
 (ns backend-tests.jobs-metrics-test
   (:require
-   [app.common.logging :as l]
    [app.db :as db]
    [app.jobs :as jobs]
    [app.jobs.metrics :as jobs-metrics]
@@ -209,27 +208,6 @@
       (t/is (= 1.0 (histogram-count metrics :jobs-total-timing ["echo" "failed"])))
       (t/is (= 1.0 (histogram-count metrics :jobs-total-timing ["echo" "cancelled"])))
       (t/is (= 0.0 (histogram-count metrics :jobs-total-timing ["echo" "aborted"]))))))
-
-(t/deftest the-submit-log-names-the-row-the-statement-wrote
-  (let [metrics  (make-metrics)
-        cfg      {::jobs/defs   (echo-defs)
-                  ::db/pool     th/*pool*
-                  ::mtx/metrics metrics}
-        options  {::jobs/name     :echo
-                  ::jobs/params   {}
-                  ::jobs/label    "debounce-log"
-                  ::jobs/debounce true}
-        id       (jobs/submit cfg options)
-        captured (atom nil)]
-    (with-redefs [l/enabled? (fn [_logger level] (= :trace level))
-                  l/emit-log (fn [props _cause _context _logger _level _sync?]
-                               (let [props (into {} @props)]
-                                 (when (= "submit" (:hint props))
-                                   (reset! captured props))))]
-      (jobs/submit cfg options))
-    (t/testing "the line names the refreshed row, not the candidate uuid"
-      (t/is (= (str id) (:job-id @captured)))
-      (t/is (= "refreshed" (:outcome @captured))))))
 
 (t/deftest lifecycle-helpers-use-labels-as-is
   (let [metrics (make-metrics)

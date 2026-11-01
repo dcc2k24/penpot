@@ -188,6 +188,15 @@
         (t/is (not (str/includes? def (str "'" status "'")))
               (str "the " status " status leaves the index"))))))
 
+(t/deftest job-dedupe-migration-is-idempotent
+  ;; The out-of-band runbook of 0162 pre-applies the whole migration (the
+  ;; `dedupe` column and then the `CONCURRENTLY` index), so the migration
+  ;; must find both and do nothing when it runs afterwards.
+  (let [apply! (mg/resource "app/migrations/sql/0162-add-job-dedupe-column.sql")]
+    (t/is (true? (apply! th/*pool*)))
+    (t/is (contains? (table-columns "job") "dedupe"))
+    (t/is (contains? (table-indexes "job") "job__new_dedupe__uniq"))))
+
 (t/deftest job-live-exclusive-index-admits-one-live-row-per-key
   ;; The exclusion of the live jobs is the index, not a check that races
   ;; an insert: it is unique, it covers the whole key, and it only

@@ -54,4 +54,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS job__new_dedupe__uniq
 --    WHERE indexrelid = 'job__new_dedupe__uniq'::regclass;
 --
 -- Both statements are IF NOT EXISTS, so this migration finds the column and
--- the index and does nothing.
+-- the index and does nothing: the schema is already in place. It still takes
+-- its locks for the instant the no-op lasts (ACCESS EXCLUSIVE for the ALTER,
+-- SHARE for the index), so a long transaction on `job` still delays the
+-- deploy.
+--
+-- Treat the checks above as a gate, not as a curiosity: IF NOT EXISTS matches
+-- by name, so an INVALID index left by an interrupted build satisfies this
+-- migration too and the dedupe silently stops enforcing. Drop it and rebuild
+-- before deploying.

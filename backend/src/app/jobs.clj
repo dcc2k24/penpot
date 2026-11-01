@@ -499,7 +499,7 @@
         job-name     (d/name name)
         queue        (d/name queue)
         ;; A single ON CONFLICT clause per insert: the option picks it,
-        ;; and the unique index of that option decides. `insert!` is the
+        ;; and the unique index of that option decides. The insert is the
         ;; only statement, so there is nothing to delete and nothing to
         ;; roll back on its own.
         conflict     (cond
