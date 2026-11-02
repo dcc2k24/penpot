@@ -1,10 +1,10 @@
 frontend/vendor/* linguist-vendored
 
-# Scripts run inside Linux containers and WSL. Keep them LF in every
-# checkout, also on Windows with core.autocrlf=true, or bash fails with
-# "$'\r': command not found". text=auto leaves binary files untouched.
-*.sh                       text eol=lf
-**/scripts/**              text=auto eol=lf
-docker/**                  text=auto eol=lf
-render-wasm/*              text=auto eol=lf
-mcp/types-generator/build  text eol=lf
+# Store and check out every text file with LF line endings, on every OS
+# and whatever core.autocrlf is set to. This matches .editorconfig, and
+# keeps scripts runnable by bash in WSL and Linux containers. Binary
+# files are detected and left untouched.
+* text=auto eol=lf
+
+# Test fixtures whose exact bytes matter.
+backend/test/backend_tests/test_files/sample1.svg -text
