@@ -510,6 +510,12 @@
                               :width 10 :height 10 :content "<svg></svg>"})]
     (t/is (= 1 (unchecked-get (ue/encode-entry svg identity) "host")))))
 
+(defn- cached-text-content
+  "The content that the text editor cache holds for `id`, without the page
+  fallback of `text-editor/get-cached-content`."
+  [id]
+  (get @@#'text-editor/shape-text-contents id))
+
 (t/deftest worker-upload-drops-the-cached-content-of-its-texts
   (let [objects (omap/from-data (omap/raw-data (omap/wrap (fixture-page))))
         shapes  (tree-shapes objects)
@@ -522,10 +528,17 @@
     (t/is (seq texts) "the fixture has texts with content")
     (doseq [id texts]
       (text-editor/cache-shape-text-content! id stale))
-    (recorded #(main-apply (worker-reply raw ids) objects))
     (doseq [id texts]
-      (t/is (nil? (get @#'text-editor/shape-text-contents id))
-            "the stale cached content is dropped, so the editor reads the page"))))
+      (t/is (= stale (cached-text-content id))
+            "the cache holds the stale content before the upload"))
+    (try
+      (recorded #(main-apply (worker-reply raw ids) objects))
+      (doseq [id texts]
+        (t/is (nil? (cached-text-content id))
+              "the stale cached content is dropped, so the editor reads the page"))
+      (finally
+        (doseq [id texts]
+          (text-editor/drop-cached-content! id))))))
 
 (def ^:private replay-state
   {:thumbnails [] :full [] :text-font-state empty-font-state :shapes []})

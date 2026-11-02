@@ -97,6 +97,7 @@
    [frontend-tests.render-wasm.page-cache-test]
    [frontend-tests.render-wasm.process-objects-test]
    [frontend-tests.render-wasm.serialization-test]
+   [frontend-tests.render-wasm.shader-warmup-test]
    [frontend-tests.render-wasm.text-editor-apply-styles-test]
    [frontend-tests.render-wasm.text-editor-caret-color-test]
    [frontend-tests.render-wasm.text-editor-content-range-test]
@@ -278,6 +279,7 @@
    'frontend-tests.render-wasm.heap-growth-test
    'frontend-tests.render-wasm.process-objects-test
    'frontend-tests.render-wasm.serialization-test
+   'frontend-tests.render-wasm.shader-warmup-test
    'frontend-tests.render-wasm.text-editor-apply-styles-test
    'frontend-tests.render-wasm.text-editor-caret-color-test
    'frontend-tests.render-wasm.text-editor-content-range-test

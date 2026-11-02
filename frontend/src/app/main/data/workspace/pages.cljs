@@ -84,8 +84,11 @@
 ;; opens it or not. To bound that cost we warm only the next page (the most
 ;; likely switch), and only when it has fewer than `warmup-max-shapes` shapes.
 ;; The previous page is warmed as well only when it is small (fewer than
-;; `warmup-prev-max-shapes`), where the memory is cheap. Larger pages keep the
-;; slow first switch in exchange for the memory saved.
+;; `warmup-prev-max-shapes`), where the memory is cheap. A page that the
+;; upload workers load (see `wasm.api/worker-upload-enabled?`) is warmed only
+;; in part: the workers decode it from its raw strings, so only the shapes
+;; that the main thread reads when the page opens are decoded (see
+;; `warmup-ids`).
 
 (def ^:private ^:const warmup-max-shapes 15000)
 (def ^:private ^:const warmup-prev-max-shapes 5000)
@@ -114,6 +117,27 @@
   [objects max-shapes]
   (and (omap/objects-map? objects)
        (< (count objects) max-shapes)))
+
+(defn- layer-tree-ids
+  "The ids of the children of the root shape of `objects` and of their
+  children, lazily: the shapes that the layers panel and the board titles
+  read when the page opens."
+  [objects]
+  (let [children (:shapes (get objects uuid/zero))]
+    (concat children
+            (mapcat #(:shapes (get objects %)) children))))
+
+(defn- warmup-ids
+  "The ids of the shapes of `objects` to decode ahead of a switch to its
+  page. The upload workers load a large page (see
+  `wasm.api/worker-upload-enabled?`) from its raw strings, so only the
+  shapes that the main thread reads when the page opens are decoded (see
+  `layer-tree-ids`). Every shape of any other page is decoded, since its
+  upload reads them all on the main thread."
+  [objects]
+  (if (wasm.api/worker-upload-enabled? objects)
+    (layer-tree-ids objects)
+    (keys objects)))
 
 (defn- current-page?
   [page-id]
@@ -161,12 +185,12 @@
        (rx/take 1)))
 
 (defn- decode-in-idle
-  "Returns an observable that looks up every shape of the `targets` pages
-  (from `warmup-targets`), decoding and caching it on the page's objects map,
-  during browser idle periods. Each page is read from the current state when
-  its turn comes, and read again at each idle callback. Stops when
-  `page-id` is no longer the current page. Completes when done; disposing it
-  cancels the pending idle callback."
+  "Returns an observable that looks up the shapes that `warmup-ids` names in
+  the `targets` pages (from `warmup-targets`), decoding and caching them on
+  the page's objects map, during browser idle periods. Each page is read from
+  the current state when its turn comes, and read again at each idle
+  callback. Stops when `page-id` is no longer the current page. Completes when
+  done; disposing it cancels the pending idle callback."
   [file-id page-id targets]
   (rx/create
    (fn [subs]
@@ -186,7 +210,7 @@
                          (do
                            (vreset! target item)
                            (vreset! objects objs)
-                           (vreset! ids (seq (keys objs)))
+                           (vreset! ids (seq (warmup-ids objs)))
                            true)
                          (recur)))
                      false)))
@@ -270,11 +294,25 @@
     (let [id (js/setTimeout #(f nil) 50)]
       #(js/clearTimeout id))))
 
+(defn- may-hold-media?
+  "False when the shape `id` of `objects` has no media for `shape-media-uri`
+  for sure: its encoded string names neither `:metadata` nor `:fill-image`,
+  so it is not decoded. A shape with no encoded string (an entry set after
+  the map was decoded, or any shape of a plain map) is decoded already, so
+  it may hold media."
+  [objects id]
+  (let [s (omap/raw-value objects id)]
+    (or (nil? s)
+        (str/includes? s "~:metadata")
+        (str/includes? s "~:fill-image"))))
+
 (defn- shapes-in-idle
-  "Returns an observable that emits every shape of `objects`, looking them
-  up during browser idle periods, at most `warmup-slice-ms` per period, and
-  then completes. Disposing it cancels the pending idle callback."
-  [objects]
+  "Returns an observable that emits the shapes of `objects` whose id passes
+  `read?`, looking them up during browser idle periods, at most
+  `warmup-slice-ms` per period, and then completes. An id that fails
+  `read?` is skipped without reading its shape. Disposing it cancels the
+  pending idle callback."
+  [objects read?]
   (rx/create
    (fn [subs]
      (let [ids    (volatile! (seq (keys objects)))
@@ -288,8 +326,9 @@
                                 (< (- (js/performance.now) start) warmup-slice-ms))
                        (let [id (first @ids)]
                          (vswap! ids next)
-                         (when-let [shape (get objects id)]
-                           (rx/push! subs shape)))
+                         (when (read? id)
+                           (when-let [shape (get objects id)]
+                             (rx/push! subs shape))))
                        (recur))))
                  (if (seq @ids)
                    (vreset! cancel (request-idle! step))
@@ -305,10 +344,11 @@
   "Fetches the media of the page shapes as data URIs, which fills the cache
   of `http/fetch-data-uri` (used by SVG rendering, exports and the code
   view). The WASM renderer loads its own images, so this waits for the
-  first full frame of the page and reads the shapes in idle time instead of
-  decoding the whole page before its upload. Stops when the page is
-  finalized or a page is initialized again (see `page-stopper`). Does
-  nothing when there is no DOM."
+  first full frame of the page and reads in idle time only the shapes whose
+  encoded string names a media key (see `may-hold-media?`), instead of
+  decoding the whole page. Stops when the page is finalized or a page is
+  initialized again (see `page-stopper`). Does nothing when there is no
+  DOM."
   [file-id page-id]
   (ptk/reify ::prefetch-page-media
     ptk/WatchEvent
@@ -320,8 +360,9 @@
                                (rx/take 1))))
              (rx/mapcat
               (fn [_]
-                (let [seen (volatile! #{})]
-                  (->> (shapes-in-idle (dsh/lookup-page-objects @st/state file-id page-id))
+                (let [objects (dsh/lookup-page-objects @st/state file-id page-id)
+                      seen    (volatile! #{})]
+                  (->> (shapes-in-idle objects (partial may-hold-media? objects))
                        (rx/map shape-media-uri)
                        (rx/filter (fn [uri]
                                     (when (and (some? uri) (not (contains? @seen uri)))

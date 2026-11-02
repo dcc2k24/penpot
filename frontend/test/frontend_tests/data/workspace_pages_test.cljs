@@ -10,8 +10,13 @@
    [app.common.files.changes-builder :as pcb]
    [app.common.test-helpers.files :as cthf]
    [app.common.test-helpers.ids-map :as cthi]
+   [app.common.types.objects-map :as omap]
+   [app.common.types.shape :as cts]
+   [app.common.uuid :as uuid]
    [app.main.data.workspace.pages :as dwpg]
+   [beicon.v2.core :as rx]
    [cljs.test :as t :include-macros true]
+   [clojure.datafy :refer [datafy]]
    [frontend-tests.helpers.state :as ths]))
 
 (t/use-fixtures :each
@@ -127,3 +132,77 @@
                  "at least one page remains")
            (t/is (= page1-id (first pgs))
                  "the first page (in page order) is kept")))))))
+
+;; ---------------------------------------------------------------------------
+;; The media prefetch reads only the shapes that may hold media, so it does
+;; not decode (and keep decoded) every shape of a large page.
+;; ---------------------------------------------------------------------------
+
+(defn- media-fixture
+  "A plain rect, an image shape and a rect with a legacy `:fill-image`, all
+  in an objects map that holds only raw strings, as a loaded page does."
+  []
+  (let [rect-id   (uuid/next)
+        image-id  (uuid/next)
+        legacy-id (uuid/next)
+        base      {:x 0 :y 0 :width 10 :height 10
+                   :parent-id uuid/zero :frame-id uuid/zero}
+        rect      (cts/setup-shape (assoc base :id rect-id :type :rect))
+        image     (cts/setup-shape (assoc base :id image-id :type :image
+                                          :metadata {:id (uuid/next) :width 10 :height 10
+                                                     :mtype "image/png"}))
+        legacy    (-> (cts/setup-shape (assoc base :id legacy-id :type :rect))
+                      (assoc :fill-image {:id (uuid/next) :width 10 :height 10
+                                          :mtype "image/png"}))
+        objects   (omap/from-data
+                   (omap/raw-data (omap/wrap {rect-id rect image-id image legacy-id legacy})))]
+    {:objects objects :rect-id rect-id :image-id image-id :legacy-id legacy-id :rect rect}))
+
+(t/deftest may-hold-media-reads-the-raw-strings
+  (let [{:keys [objects rect-id image-id legacy-id rect]} (media-fixture)
+        may-hold? #'dwpg/may-hold-media?]
+    (t/is (true? (may-hold? objects image-id)) "an image shape names :metadata")
+    (t/is (true? (may-hold? objects legacy-id)) "a legacy fill image names :fill-image")
+    (t/is (false? (may-hold? objects rect-id)) "a plain rect has no media")
+    (t/is (true? (may-hold? (assoc objects rect-id rect) rect-id))
+          "an entry set after decoding has no raw string, so it is read")
+    (t/is (empty? (:cache (datafy objects))) "no shape was decoded")))
+
+(t/deftest shapes-in-idle-decodes-only-the-shapes-that-pass
+  (t/async done
+    (let [{:keys [objects image-id legacy-id]} (media-fixture)
+          seen (volatile! [])]
+      (rx/subscribe
+       (#'dwpg/shapes-in-idle objects (partial #'dwpg/may-hold-media? objects))
+       (fn [shape] (vswap! seen conj (:id shape)))
+       (fn [cause]
+         (t/is false (str cause))
+         (done))
+       (fn []
+         (t/is (= #{image-id legacy-id} (set @seen)) "only the media shapes are emitted")
+         (t/is (= #{image-id legacy-id} (set (keys (:cache (datafy objects)))))
+               "only the media shapes are decoded")
+         (done))))))
+
+(t/deftest layer-tree-ids-names-two-levels-under-the-root
+  (let [frame-id (uuid/next)
+        child-id (uuid/next)
+        deep-id  (uuid/next)
+        base     {:x 0 :y 0 :width 10 :height 10}
+        root     (cts/setup-shape (assoc base :id uuid/zero :type :frame
+                                         :parent-id uuid/zero :frame-id uuid/zero
+                                         :shapes [frame-id]))
+        frame    (cts/setup-shape (assoc base :id frame-id :type :frame
+                                         :parent-id uuid/zero :frame-id uuid/zero
+                                         :shapes [child-id]))
+        child    (cts/setup-shape (assoc base :id child-id :type :group
+                                         :parent-id frame-id :frame-id frame-id
+                                         :shapes [deep-id]))
+        deep     (cts/setup-shape (assoc base :id deep-id :type :rect
+                                         :parent-id child-id :frame-id frame-id))
+        objects  (omap/from-data
+                  (omap/raw-data (omap/wrap {uuid/zero root frame-id frame
+                                             child-id child deep-id deep})))]
+    (t/is (= [frame-id child-id] (vec (#'dwpg/layer-tree-ids objects))))
+    (t/is (not (contains? (:cache (datafy objects)) deep-id))
+          "the shapes below the second level are not decoded")))

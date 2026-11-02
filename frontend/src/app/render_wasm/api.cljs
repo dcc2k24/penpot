@@ -662,10 +662,47 @@
 ;; This compiles them one small batch per idle callback instead. The programs
 ;; belong to the GL context, so this runs once per context: it is armed in
 ;; `init-canvas-context` and removed in `clear-canvas` and on context loss.
+;; A step takes 50-250 ms of main thread, so it also waits until the user
+;; has paused: no pointer, key or wheel input for
+;; `shader-warmup-input-quiet-ms`.
 (defonce ^:private shader-warmup-tiles-handler* (atom nil))
 (defonce ^:private shader-warmup-idle-id* (atom nil))
 (defonce ^:private shader-warmup-epoch* (atom 0))
 (def ^:private shader-warmup-min-idle-ms 8)
+(def ^:private shader-warmup-input-quiet-ms 2000)
+;; `performance.now()` of the last user input, or nil before any.
+(defonce ^:private shader-warmup-last-input* (atom nil))
+(def ^:private shader-warmup-input-events
+  #js ["pointerdown" "pointermove" "keydown" "wheel"])
+
+(defn- shader-warmup-input-wait-ms
+  "Milliseconds left before the input pause that a warm-up step needs, given
+  the time `now` and the time `last-input` of the last input (nil when there
+  was none). 0 when a step may run."
+  [now last-input]
+  (if (nil? last-input)
+    0
+    (mth/max 0 (- (+ last-input shader-warmup-input-quiet-ms) now))))
+
+(defn- note-shader-warmup-input!
+  [_]
+  (reset! shader-warmup-last-input* (js/performance.now)))
+
+;; Stable identity, so `removeEventListener` matches across hot reloads.
+(defonce ^:private shader-warmup-input-listener
+  (fn [event] (note-shader-warmup-input! event)))
+
+(defn- listen-shader-warmup-input!
+  []
+  (doseq [event shader-warmup-input-events]
+    (.addEventListener ^js ug/document event shader-warmup-input-listener
+                       #js {:capture true :passive true})))
+
+(defn- unlisten-shader-warmup-input!
+  []
+  (doseq [event shader-warmup-input-events]
+    (.removeEventListener ^js ug/document event shader-warmup-input-listener
+                          #js {:capture true})))
 
 (defn- idle-callback-supported?
   []
@@ -691,41 +728,53 @@
 
 (defn- schedule-shader-warmup-step!
   [epoch step]
-  (reset! shader-warmup-idle-id*
-          (.requestIdleCallback
-           js/globalThis
-           (fn [^js deadline]
-             (reset! shader-warmup-idle-id* nil)
-             (when (= epoch @shader-warmup-epoch*)
-               (cond
-                 (or (shader-warmup-busy?)
-                     (< (.timeRemaining deadline) shader-warmup-min-idle-ms))
-                 (schedule-shader-warmup-step! epoch step)
+  (let [wait-ms (shader-warmup-input-wait-ms (js/performance.now)
+                                             @shader-warmup-last-input*)]
+    (if (pos? wait-ms)
+      ;; Recent input: come back once the pause is long enough.
+      (timers/schedule wait-ms
+                       #(when (= epoch @shader-warmup-epoch*)
+                          (schedule-shader-warmup-step! epoch step)))
+      (reset! shader-warmup-idle-id*
+              (.requestIdleCallback
+               js/globalThis
+               (fn [^js deadline]
+                 (reset! shader-warmup-idle-id* nil)
+                 (when (= epoch @shader-warmup-epoch*)
+                   (cond
+                     (or (shader-warmup-busy?)
+                         (pos? (shader-warmup-input-wait-ms
+                                (js/performance.now)
+                                @shader-warmup-last-input*))
+                         (< (.timeRemaining deadline) shader-warmup-min-idle-ms))
+                     (schedule-shader-warmup-step! epoch step)
 
-                 ;; Stale WASM build without the export: stop.
-                 (not (fn? (unchecked-get wasm/internal-module "_warm_up_shaders")))
-                 nil
+                     ;; Stale WASM build without the export: stop.
+                     (not (fn? (unchecked-get wasm/internal-module "_warm_up_shaders")))
+                     nil
 
-                 :else
-                 (let [result (try
-                                (h/call wasm/internal-module "_warm_up_shaders" step)
-                                (catch :default cause
-                                  (log/warn :hint "shader warm-up failed" :cause cause)
-                                  nil))]
-                   (when (and (number? result) (pos? result))
-                     (schedule-shader-warmup-step! epoch result)))))))))
+                     :else
+                     (let [result (try
+                                    (h/call wasm/internal-module "_warm_up_shaders" step)
+                                    (catch :default cause
+                                      (log/warn :hint "shader warm-up failed" :cause cause)
+                                      nil))]
+                       (when (and (number? result) (pos? result))
+                         (schedule-shader-warmup-step! epoch result)))))))))))
 
 (defn- stop-shader-warmup!
   []
   (when-let [handler @shader-warmup-tiles-handler*]
     (.removeEventListener ^js ug/document "penpot:wasm:tiles-complete" handler))
   (reset! shader-warmup-tiles-handler* nil)
+  (unlisten-shader-warmup-input!)
   (cancel-shader-warmup!))
 
 (defn- start-shader-warmup-listener!
   []
   (stop-shader-warmup!)
   (when (idle-callback-supported?)
+    (listen-shader-warmup-input!)
     (let [handler (fn handler [_]
                     (.removeEventListener ^js ug/document "penpot:wasm:tiles-complete" handler)
                     (reset! shader-warmup-tiles-handler* nil)
@@ -2560,7 +2609,7 @@
    :records  records
    :no-nils? (not-any? nil? (vals raw))})
 
-(defn- worker-upload-enabled?
+(defn worker-upload-enabled?
   "True when `objects` is a large page that the upload workers should load."
   [objects]
   (and (contains? cf/flags :render-wasm-worker-upload)
