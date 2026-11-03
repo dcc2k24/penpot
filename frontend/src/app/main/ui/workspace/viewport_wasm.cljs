@@ -664,6 +664,8 @@
       (when (and path-editing? edition @initialized?)
         (when (wasm.api/initialized?)
           (wselect/use-shape edition)
+          ;; The hidden flag is only in WASM, not in the file: do not stash this page.
+          (page-cache/taint-resident!)
           (wasm.api/set-shape-hidden true)
           (wasm.api/request-render "start-path-edition"))
         (fn []

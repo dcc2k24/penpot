@@ -2152,12 +2152,20 @@
                (not= version (page-cache/version page-id)))
       (page-cache/taint-resident!))))
 
+(defn- hold-for-pending-fonts!
+  "Keeps the page of `resident` from being stashed while `text-font-state` has
+  pending faces: its texts were laid out with fallback faces, and a restore
+  would not lay them out again once the face is stored."
+  [resident text-font-state]
+  (when (seq (:pending-faces text-font-state))
+    (page-cache/hold-resident! (:token resident))))
+
 (defn- stash-resident-page!
   "Ends the residency of the page the renderer holds. When `stash?` is true
   and nothing on screen differs from the file data (no shapes loading, no
-  text being edited, no temporary property preview, the file data is still
-  loaded), keeps its shapes pool in WASM for a later `initialize-viewport` of
-  the same page. Must run before `_clean_up`."
+  text being edited, no text resize waiting to run, no temporary property
+  preview, the file data is still loaded), keeps its shapes pool in WASM for
+  a later `initialize-viewport` of the same page. Must run before `_clean_up`."
   [stash?]
   (when (wasm/module-ready?)
     (try
@@ -2167,6 +2175,8 @@
                               ;; Finalize may drop the file data before the viewport unmounts.
                               (some? (dsh/lookup-file-data @st/state))
                               (not @shapes-loading?)
+                              ;; A resize still waiting to run would be lost on a restore.
+                              (empty? @pending-stale-selrect-ids)
                               (empty? (:wasm-props @st/state))
                               (nil? (text-editor/text-editor-get-active-shape-id)))
                          ;; The page being switched to is not evicted to make room.
@@ -2282,8 +2292,8 @@
       (let [pending-thumbnails (d/index-by :key :callback thumbnails-acc)
             pending-full       (d/index-by :key :callback full-acc)
             pending?           (or (seq pending-thumbnails) (seq pending-full))]
-        ;; Text layouts are final when no font or image is pending.
         (register-resident! resident)
+        (hold-for-pending-fonts! resident text-font-state-acc)
         (if render-callback
           (render-callback)
           (request-render "set-objects-complete"))
@@ -2310,6 +2320,7 @@
                 noop-fn
                 (fn []
                   (relayout-after-fonts! shapes text-font-state-acc)
+                  (page-cache/release-resident! (:token resident))
                   (request-render "images-loaded")))))))))
 
 (defn- set-objects-async
@@ -2450,9 +2461,12 @@
       (h/call wasm/internal-module "_set_view_end")
       (reset! view-interaction-active? false)
       (register-resident! resident)
+      (hold-for-pending-fonts! resident text-font-state)
       (process-pending shapes thumbnails full text-font-state
                        (fn []
                          ;; Runs once fonts and images are in and texts laid out again.
+                         (when (or (seq thumbnails) (seq full))
+                           (page-cache/release-resident! (:token resident)))
                          (if render-callback
                            (render-callback)
                            (request-render "set-objects-sync-complete"))
@@ -3099,6 +3113,7 @@
             (when (and (wasm/live?)
                        (= token (page-cache/resident-token)))
               (relayout-after-fonts! texts text-font-state)
+              (page-cache/release-resident! token)
               (request-render "fonts-loaded")))))))
 
 (defn- restore-resources
@@ -3161,6 +3176,7 @@
     (force-update-text-layouts image-text-ids)
     (perf/end-measure "restore-page")
     (register-resident! resident)
+    (hold-for-pending-fonts! resident text-font-state)
     ;; Listen before the fetches start, so no stored face is missed.
     (relayout-when-fonts-stored! token texts text-font-state)
     (run-resource-callbacks! fonts)

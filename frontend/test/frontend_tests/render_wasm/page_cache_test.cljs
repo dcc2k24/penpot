@@ -311,6 +311,58 @@
         (t/is (false? (pc/stash! epoch-a true)))
         (t/is (not (called? calls "_stash_page")))))))
 
+(t/deftest hold-blocks-stash
+  (pc/reset-state!)
+  (let [[module calls] (mock-module {})]
+    (with-redefs [wasm/internal-module module]
+      (let [token (pc/begin-load!)]
+        (pc/set-resident! token page-a epoch-a)
+        (pc/hold-resident! token)
+        (t/is (false? (pc/stash! epoch-a true)))
+        (t/is (not (called? calls "_stash_page")))))))
+
+(t/deftest release-allows-stash
+  (pc/reset-state!)
+  (let [[module calls] (mock-module {})]
+    (with-redefs [wasm/internal-module module]
+      (let [token (pc/begin-load!)]
+        (pc/set-resident! token page-a epoch-a)
+        (pc/hold-resident! token)
+        (pc/release-resident! token)
+        (t/is (true? (pc/stash! epoch-a true)))
+        (t/is (called? calls "_stash_page"))))))
+
+(t/deftest hold-and-release-ignore-another-load
+  (pc/reset-state!)
+  (let [[module _calls] (mock-module {})]
+    (with-redefs [wasm/internal-module module]
+      (let [stale (pc/begin-load!)
+            token (pc/begin-load!)]
+        (pc/set-resident! token page-a epoch-a)
+        (pc/hold-resident! stale)
+        (t/is (true? (pc/stash! epoch-a true))
+              "a hold of another load does not block the stash"))
+      (let [stale (pc/begin-load!)
+            token (pc/begin-load!)]
+        (pc/set-resident! token page-a epoch-a)
+        (pc/hold-resident! token)
+        (pc/release-resident! stale)
+        (t/is (false? (pc/stash! epoch-a true))
+              "a release of another load does not lift the hold")))))
+
+(t/deftest set-resident-clears-the-hold
+  (pc/reset-state!)
+  (let [[module calls] (mock-module {})]
+    (with-redefs [wasm/internal-module module]
+      (let [token (pc/begin-load!)]
+        (pc/set-resident! token page-a epoch-a)
+        (pc/hold-resident! token))
+      (let [token (pc/begin-load!)]
+        (pc/set-resident! token page-a epoch-a)
+        (t/is (true? (pc/stash! epoch-a true))
+              "a new residency starts with no hold")
+        (t/is (called? calls "_stash_page"))))))
+
 (t/deftest synced-change-on-other-page-does-not-taint
   (pc/reset-state!)
   (let [[module calls] (mock-module {})]

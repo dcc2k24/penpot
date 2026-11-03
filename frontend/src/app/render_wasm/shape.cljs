@@ -16,6 +16,7 @@
    [app.common.types.shape.layout :as ctl]
    [app.main.refs :as refs]
    [app.render-wasm.api :as api]
+   [app.render-wasm.page-cache :as page-cache]
    [beicon.v2.core :as rx]
    [cljs.core :as c]
    [cuerdas.core :as str]))
@@ -254,6 +255,9 @@
                 pending-thumbnails (vec text-content-pending)
                 pending-full (vec (api/set-shape-text-images id v))
                 text-font-state (api/text-font-state-for-shape shape)]
+            ;; Its layout uses fallback faces until the font lands: do not stash this page.
+            (when (seq (:pending-faces text-font-state))
+              (page-cache/taint-resident!))
             ;; FIXME: this is a hack to process the pending tasks
             ;; asynchronously we should probably modify set-wasm-attr!
             ;; to return a list of callbacks to be executed in a

@@ -17,7 +17,8 @@
   also records a data epoch (file id, file version, preview id).
 
   A commit applied while the page is on screen, but not written to WASM,
-  taints that page. A tainted page is not stashed.
+  taints that page. A tainted page is not stashed. A page whose texts wait
+  for a relayout (see `hold-resident!`) is not stashed either.
 
   The upload summary of a page (see `set-summary!`) is kept here too, so
   it is dropped together with the copy it describes.
@@ -40,7 +41,7 @@
 (defonce ^:private summaries (atom {}))
 
 ;; The page on screen, or nil.
-;; {:page-id uuid :epoch any :token int :tainted? bool}
+;; {:page-id uuid :epoch any :token int :tainted? bool :layouts-pending? bool}
 (defonce ^:private resident (atom nil))
 
 ;; Incremented by every begin-load!. Only the latest token may set the resident.
@@ -216,6 +217,23 @@
   (when (some? @resident)
     (swap! resident assoc :tainted? true)))
 
+(defn hold-resident!
+  "Marks the resident page of load `token` as waiting for a text relayout: its
+  texts were laid out with fallback faces, so it is not stashed. Does nothing
+  for another load. Returns nil."
+  [token]
+  (when (and (some? token) (= token (:token @resident)))
+    (swap! resident assoc :layouts-pending? true))
+  nil)
+
+(defn release-resident!
+  "Ends `hold-resident!` for the resident page of load `token`, now that its
+  texts are laid out again. Does nothing for another load. Returns nil."
+  [token]
+  (when (and (some? token) (= token (:token @resident)))
+    (swap! resident assoc :layouts-pending? false))
+  nil)
+
 (defn clear!
   "Forgets every stashed page and summary, and taints the resident page.
 
@@ -300,10 +318,11 @@
   Resets the structural sync count. Returns nil."
   [token page-id epoch]
   (when (= token @load-token)
-    (reset! resident {:page-id  page-id
-                      :epoch    epoch
-                      :token    token
-                      :tainted? false})
+    (reset! resident {:page-id          page-id
+                      :epoch            epoch
+                      :token            token
+                      :tainted?         false
+                      :layouts-pending? false})
     (reset! pending-syncs 0))
   nil)
 
@@ -342,9 +361,10 @@
 
   Returns true when the pool was stashed. The pool is stashed only when
   `allowed?` is true, the page cache is enabled, the page is not tainted,
-  `epoch` equals the epoch of the resident, no structural sync runs, the
-  WASM module is ready and WASM accepts the stash. In every other case the
-  page is dropped from the cache, with its summary, and false is returned.
+  the page has no pending text relayout, `epoch` equals the epoch of the
+  resident, no structural sync runs, the WASM module is ready and WASM
+  accepts the stash. In every other case the page is dropped from the cache,
+  with its summary, and false is returned.
 
   `keep-page-id` is the page about to be restored, when it is another page.
   WASM does not evict it to make room. The cache is then pruned to the pages
@@ -362,6 +382,7 @@
                     (and allowed?
                          (enabled?)
                          (not (:tainted? res))
+                         (not (:layouts-pending? res))
                          (= epoch (:epoch res))
                          (zero? @pending-syncs)
                          (wasm/module-ready?)
