@@ -5987,17 +5987,15 @@ impl RenderState {
         self.stats.print();
     }
 
+    /// Drops the GPU-backed caches before the render state is dropped. The GPU
+    /// context is still live here. `clean_up` releases and abandons it later.
     pub fn prepare_context_loss_cleanup(&mut self) {
-        // Drop cached GPU-backed snapshots before dropping the render state.
         self.backbuffer_crop_cache.clear();
         self.clear_imposters();
         self.backbuffer_crop_cache_stale = false;
         self.backbuffer_is_full_quality = false;
         self.view_moved_since_render = false;
         self.surfaces.invalidate_tile_cache();
-        // Mark context as abandoned so resource destructors avoid issuing
-        // GL commands when the browser has already lost/restored the context.
-        get_gpu_state().context.abandon();
     }
 
     pub fn free_gpu_resources(&mut self) {

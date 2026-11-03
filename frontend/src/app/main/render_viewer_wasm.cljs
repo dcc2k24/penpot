@@ -89,10 +89,11 @@
 
 (defn- viewer-restore-layer-mask!
   [page-objects clear-fills-ids]
-  (wasm.api/clear-render-include-filter!)
-  (doseq [id clear-fills-ids]
-    (wselect/use-shape id)
-    (wasm.api/set-shape-fills id (get-in page-objects [id :fills] []) false)))
+  (when (wasm.api/initialized?)
+    (wasm.api/clear-render-include-filter!)
+    (doseq [id clear-fills-ids]
+      (wselect/use-shape id)
+      (wasm.api/set-shape-fills id (get-in page-objects [id :fills] []) false))))
 
 (defn- viewer-do-render!
   [page-objects canvas os-canvas object-id vis-w vis-h scale size

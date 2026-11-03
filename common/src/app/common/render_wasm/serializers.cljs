@@ -327,6 +327,8 @@
     :safari 2
     :safari-16 2
     :safari-17 2
+    :safari-18 2
+    :safari-26 2
     :edge 3
     :unknown 4
     4))

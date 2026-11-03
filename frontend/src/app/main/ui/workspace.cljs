@@ -49,6 +49,7 @@
    [app.util.debug :as dbg]
    [app.util.dom :as dom]
    [app.util.i18n :as i18n :refer [tr]]
+   [app.util.input-quiet :as iq]
    [beicon.v2.core :as rx]
    [goog.events :as events]
    [okulary.core :as l]
@@ -238,10 +239,13 @@
     ;; The sprite parse is a long task: with the WASM renderer, start it
     ;; once the first page is on screen, so it does not run between the
     ;; upload chunks of the page. A late or missing frame never blocks it
-    ;; for long, and opening the font selector starts it as well.
+    ;; for long, and opening the font selector starts it as well. The parse
+    ;; also waits until the user pauses input (`iq/quiet-ms`), so it does
+    ;; not land in the first zoom or pan after open.
     (mf/with-effect [wasm-renderer-enabled?]
       (if (and wasm-renderer-enabled? (exists? js/document))
-        (let [first-frame-s
+        (let [task (volatile! nil)
+              first-frame-s
               (->> (rx/from-event js/document "penpot:wasm:set-objects")
                    (rx/take 1)
                    (rx/mapcat (fn [_]
@@ -251,20 +255,28 @@
               (->> (rx/merge first-frame-s
                              (rx/timer preview-sprite-max-delay-ms))
                    (rx/take 1)
-                   (rx/subs! (fn [_] (fonts/prefetch-preview-sprite!))))]
-          #(rx/dispose! sub))
+                   (rx/subs! (fn [_]
+                               (vreset! task
+                                        (iq/schedule-on-idle-after-input
+                                         fonts/prefetch-preview-sprite!)))))]
+          (fn []
+            (rx/dispose! sub)
+            (some-> @task rx/dispose!)))
         (fonts/prefetch-preview-sprite!)))
 
     ;; Compile the edit-time checks in idle time once the first page is on
     ;; screen, so their first compile does not land in an edit (see
-    ;; `dch/warm-up-checks!`).
+    ;; `dch/warm-up-checks!`). Each compile step also waits for an input
+    ;; pause (see `iq/schedule-on-idle-after-input`).
     (mf/with-effect [wasm-renderer-enabled?]
       (let [cancel  (volatile! nil)
             start-s (if (and wasm-renderer-enabled? (exists? js/document))
                       (->> (rx/from-event js/document "penpot:wasm:tiles-complete")
                            (rx/take 1))
                       (rx/of nil))
-            sub     (rx/subs! (fn [_] (vreset! cancel (dch/warm-up-checks!)))
+            sub     (rx/subs! (fn [_]
+                                (vreset! cancel
+                                         (dch/warm-up-checks! iq/schedule-on-idle-after-input)))
                               start-s)]
         (fn []
           (rx/dispose! sub)

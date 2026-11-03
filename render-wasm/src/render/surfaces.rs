@@ -27,6 +27,43 @@ const TILE_DRAWABLE_RECT: IRect = IRect {
 };
 const DOC_ATLAS_MAX_DIM: i32 = 4096;
 
+/// On WebKit, sampling the render-target texture after a page-cache restore
+/// returns transparent pixels, so nothing shows. A copy of the region samples
+/// correctly, so Safari composites from a copy. Chromium and Firefox keep the
+/// direct draw. `composite_rect` picks its path from this.
+fn composite_from_copy() -> bool {
+    crate::globals::current_browser() == crate::utils::Browser::Safari as u8
+}
+
+/// Clips `canvas` to `rect` and composites `src` into it: from a copy of the
+/// region when `from_copy` is set, otherwise by drawing all of `src`.
+fn composite_rect(
+    src: &mut skia::Surface,
+    canvas: &skia::Canvas,
+    rect: IRect,
+    sampling_options: skia::SamplingOptions,
+    from_copy: bool,
+) {
+    canvas.save();
+    canvas.clip_rect(Rect::from(rect), None, false);
+    if from_copy {
+        let surface_bounds = IRect::from_wh(src.width(), src.height());
+        if let Some(bounds) = IRect::intersect(&rect, &surface_bounds) {
+            if let Some(image) = src.image_snapshot_with_bounds(bounds) {
+                canvas.draw_image_with_sampling_options(
+                    &image,
+                    (bounds.left as f32, bounds.top as f32),
+                    sampling_options,
+                    None,
+                );
+            }
+        }
+    } else {
+        src.draw(canvas, (0.0, 0.0), sampling_options, None);
+    }
+    canvas.restore();
+}
+
 /// GPU→GPU copy of `src` from `from` into `dst` on `to_canvas`, without
 /// `image_snapshot` (avoids per-tile sync stalls on WebGL).
 fn draw_surface_src_rect_to_dst(
@@ -862,14 +899,18 @@ impl Surfaces {
     /// Like `draw_into`, but only composites `rect` (device pixels of `from`,
     /// which are also user-space coordinates of `to`'s current canvas, so the
     /// canvas matrix and clip apply exactly as they do for `draw_into`).
+    /// On Safari the region is composited from a GPU copy (see `composite_rect`).
     pub fn draw_into_rect(&mut self, from: SurfaceId, to: SurfaceId, rect: skia::IRect) {
         let sampling_options = self.sampling_options;
         let mut src = self.get_mut(from).clone();
         let canvas = self.canvas_and_mark_dirty(to);
-        canvas.save();
-        canvas.clip_rect(Rect::from(rect), None, false);
-        src.draw(canvas, (0.0, 0.0), sampling_options, None);
-        canvas.restore();
+        composite_rect(
+            &mut src,
+            canvas,
+            rect,
+            sampling_options,
+            composite_from_copy(),
+        );
     }
 
     pub fn cache_dimensions(&self) -> skia::ISize {
@@ -2402,5 +2443,90 @@ mod stale_tile_tests {
         assert!(cache.provider.in_use[added.index]);
         assert!(cache.stale.is_empty());
         assert_eq!(cache.grid.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIZE: i32 = 64;
+
+    fn raster_surface() -> skia::Surface {
+        skia::surfaces::raster_n32_premul((SIZE, SIZE)).expect("raster surface")
+    }
+
+    fn clear_surface(surface: &mut skia::Surface, color: skia::Color) {
+        surface.canvas().clear(color);
+    }
+
+    fn pixels(surface: &mut skia::Surface) -> Vec<u8> {
+        surface
+            .peek_pixels()
+            .and_then(|pixmap| pixmap.bytes().map(|bytes| bytes.to_vec()))
+            .expect("raster surface has readable pixels")
+    }
+
+    fn pixel(bytes: &[u8], x: i32, y: i32) -> &[u8] {
+        let offset = ((y * SIZE + x) * 4) as usize;
+        &bytes[offset..offset + 4]
+    }
+
+    fn source_surface() -> skia::Surface {
+        let mut src = raster_surface();
+        clear_surface(&mut src, skia::Color::TRANSPARENT);
+        let canvas = src.canvas();
+        let mut red = skia::Paint::default();
+        red.set_color(skia::Color::from_argb(128, 200, 40, 40));
+        canvas.draw_rect(skia::Rect::from_xywh(0.0, 0.0, 40.0, 40.0), &red);
+        let mut shade = skia::Paint::default();
+        shade.set_color(skia::Color::from_argb(57, 0, 0, 0));
+        canvas.draw_rect(skia::Rect::from_xywh(20.0, 20.0, 60.0, 60.0), &shade);
+        src
+    }
+
+    #[test]
+    fn composite_rect_from_copy_matches_direct_draw() {
+        let mut src = source_surface();
+        let sampling =
+            skia::SamplingOptions::new(skia::FilterMode::Linear, skia::MipmapMode::Nearest);
+        let target_color = skia::Color::from_argb(255, 16, 32, 48);
+        let rects = [
+            IRect::from_xywh(0, 0, SIZE, SIZE),
+            IRect::from_xywh(10, 12, 20, 30),
+            // partly outside the source
+            IRect::from_xywh(50, 50, 40, 40),
+            // fully outside the source
+            IRect::from_xywh(70, 70, 10, 10),
+        ];
+
+        for rect in rects {
+            let mut direct = raster_surface();
+            let mut copied = raster_surface();
+            clear_surface(&mut direct, target_color);
+            clear_surface(&mut copied, target_color);
+
+            composite_rect(&mut src, direct.canvas(), rect, sampling, false);
+            composite_rect(&mut src, copied.canvas(), rect, sampling, true);
+
+            assert_eq!(pixels(&mut direct), pixels(&mut copied), "rect {rect:?}");
+        }
+
+        // The clip keeps pixels outside the rect at the clear color.
+        let rect = IRect::from_xywh(10, 12, 20, 30);
+        let mut target = raster_surface();
+        clear_surface(&mut target, target_color);
+        let before = pixels(&mut target);
+        composite_rect(&mut src, target.canvas(), rect, sampling, false);
+        let after = pixels(&mut target);
+
+        for (x, y) in [(0, 0), (9, 12), (30, 12), (10, 42), (63, 63)] {
+            assert_eq!(
+                pixel(&after, x, y),
+                pixel(&before, x, y),
+                "outside ({x}, {y})"
+            );
+        }
+        assert_ne!(pixel(&after, 15, 20), pixel(&before, 15, 20));
     }
 }

@@ -206,21 +206,28 @@
 
 (defn on-dpr-change
   "Registers a recurring listener for device-pixel-ratio changes (browser zoom).
-   Calls `f` with the new DPR each time it changes. Returns a 0-arity cancel fn."
+   Calls `f` with the new DPR each time it changes. Returns a 0-arity cancel fn
+   that stops the listener and removes the one currently registered."
   [f]
-  (let [cancelled? (volatile! false)]
+  (let [cancelled? (volatile! false)
+        current    (volatile! nil)]
     (letfn [(listen! []
               (when-not @cancelled?
-                (let [dpr (.-devicePixelRatio ^js globals/window)
-                      mq  (.matchMedia globals/window (str "(resolution: " dpr "dppx)"))]
-                  (.addEventListener mq "change"
-                                     (fn [_]
-                                       (when-not @cancelled?
-                                         (f (.-devicePixelRatio ^js globals/window))
-                                         (listen!)))
-                                     #js {:once true}))))]
+                (let [dpr     (.-devicePixelRatio ^js globals/window)
+                      ^js mq  (.matchMedia globals/window (str "(resolution: " dpr "dppx)"))
+                      handler (fn [_]
+                                (vreset! current nil)
+                                (when-not @cancelled?
+                                  (f (.-devicePixelRatio ^js globals/window))
+                                  (listen!)))]
+                  (vreset! current [mq handler])
+                  (.addEventListener mq "change" handler #js {:once true}))))]
       (listen!)
-      (fn [] (vreset! cancelled? true)))))
+      (fn []
+        (vreset! cancelled? true)
+        (when-let [[^js mq handler] @current]
+          (vreset! current nil)
+          (.removeEventListener mq "change" handler))))))
 
 (defn empty-png-size*
   [width height]

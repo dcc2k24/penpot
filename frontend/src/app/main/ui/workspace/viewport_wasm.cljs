@@ -662,9 +662,10 @@
 
     (mf/with-effect [path-editing? edition @initialized?]
       (when (and path-editing? edition @initialized?)
-        (wselect/use-shape edition)
-        (wasm.api/set-shape-hidden true)
-        (wasm.api/request-render "start-path-edition")
+        (when (wasm.api/initialized?)
+          (wselect/use-shape edition)
+          (wasm.api/set-shape-hidden true)
+          (wasm.api/request-render "start-path-edition"))
         (fn []
           (when (wasm.api/initialized?)
             (wselect/use-shape edition)

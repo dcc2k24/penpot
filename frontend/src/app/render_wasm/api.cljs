@@ -1067,19 +1067,21 @@
   (-> (.arrayBuffer blob)
       (p/then
        (fn [buffer]
-         (let [image-bytes (js/Uint8Array. buffer)
-               ;; Header: 16 bytes shape uuid + 16 bytes image uuid
-               ;; + 4 bytes thumbnail flag, then the raw SVG payload.
-               offset (mem/alloc (+ 36 (.-byteLength image-bytes)))
-               heap   (mem/get-heap-u8)
-               dview  (mem/get-data-view)]
-           (-> offset
-               (mem/write-uuid dview shape-id)
-               (mem/write-uuid dview image-id)
-               (mem/write-u32 dview (if thumbnail? 1 0))
-               (mem/write-buffer heap image-bytes))
-           (h/call wasm/internal-module "_store_image")
-           true)))))
+         ;; The fetch can finish after `_clean_up` freed the image store.
+         (when (wasm/live?)
+           (let [image-bytes (js/Uint8Array. buffer)
+                 ;; Header: 16 bytes shape uuid + 16 bytes image uuid
+                 ;; + 4 bytes thumbnail flag, then the raw SVG payload.
+                 offset (mem/alloc (+ 36 (.-byteLength image-bytes)))
+                 heap   (mem/get-heap-u8)
+                 dview  (mem/get-data-view)]
+             (-> offset
+                 (mem/write-uuid dview shape-id)
+                 (mem/write-uuid dview image-id)
+                 (mem/write-u32 dview (if thumbnail? 1 0))
+                 (mem/write-buffer heap image-bytes))
+             (h/call wasm/internal-module "_store_image")
+             true))))))
 
 (defn- store-image-url!
   "Registers the public URL an image was loaded from so SVG export can emit a
@@ -1248,9 +1250,10 @@
 
 (defn set-shape-blend-mode
   [blend-mode]
-  ;; These values correspond to skia::BlendMode representation
-  ;; https://rust-skia.github.io/doc/skia_safe/enum.BlendMode.html
-  (h/call wasm/internal-module "_set_shape_blend_mode" (sr/translate-blend-mode blend-mode)))
+  (when (initialized?)
+    ;; These values correspond to skia::BlendMode representation
+    ;; https://rust-skia.github.io/doc/skia_safe/enum.BlendMode.html
+    (h/call wasm/internal-module "_set_shape_blend_mode" (sr/translate-blend-mode blend-mode))))
 
 (defn set-shape-vertical-align
   [vertical-align]
@@ -3126,13 +3129,14 @@
 
 (defn- restore-page!
   "Finishes loading a page whose shapes pool came back from the page cache,
-  in place of `set-objects`. The renderer was rebuilt with empty font and
-  image stores, so before the first frame this stores the page's fonts,
-  registers its image URLs and starts the font fetches. Until the fonts are
-  stored, text passes that build paragraphs from the font store (strokes,
-  shadows, texts without a usable cached layout) use fallback faces, so once
-  they are stored every text whose faces were missing is laid out again and
-  its tiles redrawn. Images load in idle time.
+  in place of `set-objects`. The renderer was rebuilt with an empty image
+  store; it keeps the font store while the page cache holds pages, but a
+  page's fonts may not all be in it yet. So before the first frame this
+  stores the page's fonts, registers its image URLs and starts the font
+  fetches. Until the fonts are stored, text passes that build paragraphs from
+  the font store (strokes, shadows, texts without a usable cached layout) use
+  fallback faces, so once they are stored every text whose faces were missing
+  is laid out again and its tiles redrawn. Images load in idle time.
 
   The resources come from the summary that the last worker upload of the page
   left (see `page-cache/summary`). A shape whose raw value is still the one the
@@ -3600,7 +3604,9 @@
   [canvas]
   (if-not (wasm/module-ready?)
     false
-    (let [flags      (debug-flags)
+    ;; A failed `init-context` releases the renderer, so clear the flag first.
+    (let [_          (set! wasm/context-initialized? false)
+          flags      (debug-flags)
           context-id (if (dbg/enabled? :wasm-gl-context-init-error) "fail" "webgl2")
           browser    (sr/translate-browser cf/browser)
           dpr        (get-dpr)

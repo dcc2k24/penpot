@@ -117,10 +117,11 @@ fn create_image_from_gl_texture(
         gpu::backend_textures::make_gl((width, height), gpu::Mipmapped::No, texture_info, label)
     };
 
-    // Create a Skia image from the backend texture
+    // Adopt the texture into a Skia image. Skia owns it from now on and
+    // deletes it when the image is dropped.
     // Use TopLeft origin because HTML images have their origin at top-left,
     // while WebGL textures traditionally use bottom-left
-    let image = Image::from_texture(
+    let image = gpu::images::adopt_texture_from(
         context.as_mut(),
         &backend_texture,
         gpu::SurfaceOrigin::TopLeft,
@@ -374,7 +375,11 @@ impl ImageStore {
     ) -> Result<()> {
         let key = (id, is_thumbnail);
 
+        // The caller hands over the texture. If it is not stored, nobody owns it.
         if self.images.contains_key(&key) {
+            if self.context.is_some() {
+                unsafe { gl::DeleteTextures(1, &texture_id) };
+            }
             return Ok(());
         }
 
@@ -384,7 +389,13 @@ impl ImageStore {
                 "Cannot register a GL texture without a GPU context".to_string(),
             ));
         };
-        let image = create_image_from_gl_texture(context, texture_id, width, height)?;
+        let image = match create_image_from_gl_texture(context, texture_id, width, height) {
+            Ok(image) => image,
+            Err(err) => {
+                unsafe { gl::DeleteTextures(1, &texture_id) };
+                return Err(err);
+            }
+        };
         let bytes = (width as usize) * (height as usize) * 4;
         self.insert_entry(key, StoredImage::Gpu(image), bytes);
 

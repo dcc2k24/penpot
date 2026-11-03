@@ -122,5 +122,6 @@ pub extern "C" fn is_font_uploaded(
     let id = uuid_from_u32_quartet(a, b, c, d);
     let font_style = RawFontStyle::from(style);
     let family = FontFamily::new(id, weight, font_style.into());
-    get_resources().fonts.has_family(&family, is_emoji)
+    // Callable between `clean_up` and `init`, when there is no font store.
+    crate::globals::has_render_resources() && get_resources().fonts.has_family(&family, is_emoji)
 }
