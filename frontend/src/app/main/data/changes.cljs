@@ -313,23 +313,28 @@
    cts/check-shape])
 
 (defn warm-up-checks!
-  "Compiles the validators of `warm-up-check-fns`, one per browser idle
-  period (see `sm/warm-check-fn!`). Returns a function that cancels the
-  ones still pending."
-  []
-  (let [pending (volatile! (seq warm-up-check-fns))
-        task    (volatile! nil)]
-    (letfn [(step []
-              (vreset! task nil)
-              (when-let [check-fn (first @pending)]
-                (vswap! pending next)
-                (try
-                  (sm/warm-check-fn! check-fn)
-                  (catch :default cause
-                    (log/warn :hint "check function warm-up failed" :cause cause)))
-                (when (seq @pending)
-                  (vreset! task (tm/schedule-on-idle step)))))]
-      (vreset! task (tm/schedule-on-idle step))
-      (fn []
-        (vreset! pending nil)
-        (some-> @task rx/dispose!)))))
+  "Compiles the validators of `warm-up-check-fns`, one step at a time.
+  Each step is run through `schedule`, a fn of one step fn that returns
+  a disposable (default: one step per browser idle period, see
+  `sm/warm-check-fn!`). Returns a function that cancels the ones still
+  pending."
+  ([]
+   (warm-up-checks! tm/schedule-on-idle))
+
+  ([schedule]
+   (let [pending (volatile! (seq warm-up-check-fns))
+         task    (volatile! nil)]
+     (letfn [(step []
+               (vreset! task nil)
+               (when-let [check-fn (first @pending)]
+                 (vswap! pending next)
+                 (try
+                   (sm/warm-check-fn! check-fn)
+                   (catch :default cause
+                     (log/warn :hint "check function warm-up failed" :cause cause)))
+                 (when (seq @pending)
+                   (vreset! task (schedule step)))))]
+       (vreset! task (schedule step))
+       (fn []
+         (vreset! pending nil)
+         (some-> @task rx/dispose!))))))
