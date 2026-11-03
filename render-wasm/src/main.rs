@@ -493,6 +493,7 @@ pub extern "C" fn drop_cached_page(a: u32, b: u32, c: u32, d: u32) -> Result<()>
 #[wasm_error]
 pub extern "C" fn clear_page_cache() -> Result<()> {
     get_page_cache().clear();
+    globals::drop_retained_fonts();
     Ok(())
 }
 
