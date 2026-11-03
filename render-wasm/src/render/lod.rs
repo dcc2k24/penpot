@@ -206,6 +206,16 @@ pub fn board_subtree_check(
 /// gives 2 widths past the stroke's half width).
 const MITER_REACH_WIDTHS: f32 = 2.0;
 
+/// How far stroke miter joins of `shape` may paint outside its extrect (0 for a shape that
+/// is not a path or bool).
+pub fn miter_reach(shape: &Shape) -> f32 {
+    if !matches!(shape.shape_type, Type::Path(_) | Type::Bool(_)) {
+        return 0.0;
+    }
+    let widest = shape.strokes.iter().map(|s| s.width).fold(0.0, f32::max);
+    MITER_REACH_WIDTHS * widest
+}
+
 /// How far root shape `root` and its visible descendants may paint outside its extrect, or
 /// `None` when that is unbounded (raw SVG). Content inside a board that clips its content is
 /// held by that board's rect and counts as 0. `ink_reach` gives the glyph overhang of a text
@@ -226,10 +236,7 @@ pub fn subtree_paint_reach(
             return None;
         }
         reach = reach.max(ink_reach(shape));
-        if matches!(shape.shape_type, Type::Path(_) | Type::Bool(_)) {
-            let widest = shape.strokes.iter().map(|s| s.width).fold(0.0, f32::max);
-            reach = reach.max(MITER_REACH_WIDTHS * widest);
-        }
+        reach = reach.max(miter_reach(shape));
         // A clipping board holds everything under it inside its rect, so the children are
         // skipped entirely.
         let clips_children = matches!(shape.shape_type, Type::Frame(_)) && shape.clip();
@@ -1308,6 +1315,41 @@ mod tests {
 
         let shape = pool.get_raw(&board).expect("board");
         assert_eq!(subtree_paint_reach(&pool, shape, |_| 0.0), Some(6.0));
+    }
+
+    #[test]
+    fn miter_reach_is_twice_the_widest_stroke_of_a_path() {
+        let path = uid(1);
+        let mut pool = ShapesPool::new();
+        {
+            let s = pool.add_shape(path);
+            s.set_shape_type(Type::Path(Path::default()));
+            let thin = Stroke::new_center_stroke(7.0, StrokeStyle::Solid, None, None, None, None);
+            let thick = Stroke::new_center_stroke(14.0, StrokeStyle::Solid, None, None, None, None);
+            s.add_stroke(thin);
+            s.add_stroke(thick);
+        }
+        let shape = pool.get_raw(&path).expect("path");
+        assert_eq!(miter_reach(shape), 28.0);
+    }
+
+    #[test]
+    fn miter_reach_is_zero_for_a_stroked_rect_or_an_unstroked_path() {
+        let rect_id = uid(1);
+        let path_id = uid(2);
+        let mut pool = ShapesPool::new();
+        add_rect(&mut pool, rect_id, Uuid::nil());
+        {
+            let stroke = Stroke::new_center_stroke(7.0, StrokeStyle::Solid, None, None, None, None);
+            pool.get_mut(&rect_id).expect("rect").add_stroke(stroke);
+        }
+        let rect = pool.get_raw(&rect_id).expect("rect");
+        assert_eq!(miter_reach(rect), 0.0);
+
+        let path = pool.add_shape(path_id);
+        path.set_shape_type(Type::Path(Path::default()));
+        let path = pool.get_raw(&path_id).expect("path");
+        assert_eq!(miter_reach(path), 0.0);
     }
 
     /// Small deterministic generator so the test scene is stable across runs.

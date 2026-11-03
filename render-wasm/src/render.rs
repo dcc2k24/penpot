@@ -530,6 +530,12 @@ fn text_ink_reach(shape: &Shape) -> f32 {
     max_font_size
 }
 
+/// How far (doc units) `shape` may paint outside its extrect: the glyphs of a text and the
+/// miter joins of a stroked path or bool.
+pub(crate) fn shape_paint_reach(shape: &Shape) -> f32 {
+    text_ink_reach(shape).max(lod::miter_reach(shape))
+}
+
 /// Device pixels that antialiasing may paint past a shape's bounds.
 const AA_REACH_PX: f32 = 2.0;
 
@@ -538,8 +544,8 @@ const AA_REACH_PX: f32 = 2.0;
 struct RootPaint {
     /// Holds a shape that only a whole-tile repaint draws right.
     whole_tiles: bool,
-    /// Largest `text_ink_reach` of its texts.
-    text_reach: f32,
+    /// Largest `shape_paint_reach` of its shapes.
+    paint_reach: f32,
 }
 
 impl RootPaint {
@@ -557,7 +563,7 @@ impl RootPaint {
             {
                 paint.whole_tiles = true;
             }
-            paint.text_reach = paint.text_reach.max(text_ink_reach(shape));
+            paint.paint_reach = paint.paint_reach.max(shape_paint_reach(shape));
             stack.extend(shape.children.iter().copied());
         }
         paint
@@ -680,11 +686,11 @@ pub(crate) struct RenderState {
     modified_roots: Option<HashSet<Uuid>>,
     /// The stale tile being repainted in part, see [`PartialTile`].
     partial_tile: Option<PartialTile>,
-    /// Largest `text_ink_reach` of the texts under the roots of the partial tile: how far a
-    /// container may paint glyphs outside its extrect.
-    partial_text_reach: f32,
+    /// Largest `shape_paint_reach` of the shapes under the roots of the partial tile: how far a
+    /// container may paint outside its extrect.
+    partial_paint_reach: f32,
     /// Whether the subtree of a root shape holds a shape that needs its tiles repainted
-    /// whole, and the reach of its glyphs (see [`RootPaint`]).
+    /// whole, and how far its shapes paint outside their extrects (see [`RootPaint`]).
     whole_tile_roots: HashMap<Uuid, RootPaint>,
     /// Drop-shadow path last seen for containers whose shadow depends on their children,
     /// see [`RenderState::switched_shadow_containers`].
@@ -989,7 +995,7 @@ impl RenderState {
             imposter_tile: lod::TileImposters::default(),
             modified_roots: None,
             partial_tile: None,
-            partial_text_reach: 0.0,
+            partial_paint_reach: 0.0,
             shadow_paths: HashMap::default(),
             whole_tile_roots: HashMap::default(),
             whole_tile_dirty: HashSet::default(),
@@ -2869,9 +2875,9 @@ impl RenderState {
         let Some(slot) = self.surfaces.take_stale_tile(tile, scale) else {
             return PartialStart::No;
         };
-        self.partial_text_reach = tile_root_ids
+        self.partial_paint_reach = tile_root_ids
             .iter()
-            .map(|id| self.root_paint(id, tree).text_reach)
+            .map(|id| self.root_paint(id, tree).paint_reach)
             .fold(0.0, f32::max);
         let area = Rect::from_ltrb(
             self.render_area.left + px.left as f32 / scale,
@@ -4818,12 +4824,13 @@ impl RenderState {
                     let in_area = if self.partial_tile.is_some() {
                         // A partial repaint has no margin around the changed pixels. Test
                         // where each shape can paint: its extrect (own effects and the layer
-                        // blur of its ancestors), glyphs outside the text lines, and, for a
-                        // container, the glyphs of the texts it holds.
-                        let reach = match transformed_element.shape_type {
-                            Type::Text(_) => text_ink_reach(&transformed_element),
-                            _ if is_container => self.partial_text_reach,
-                            _ => 0.0,
+                        // blur of its ancestors), glyphs outside the text lines, miter joins
+                        // outside a stroked path, and, for a container, the glyphs and miter
+                        // joins of the shapes it holds.
+                        let reach = if is_container {
+                            self.partial_paint_reach
+                        } else {
+                            shape_paint_reach(&transformed_element)
                         };
                         extrect
                             .get_or_insert_with(|| transformed_element.extrect(tree, scale))
@@ -5343,7 +5350,7 @@ impl RenderState {
                 if let Some(area) = partial_area {
                     let reaches: Vec<f32> = tile_root_ids
                         .iter()
-                        .map(|id| self.root_paint(id, tree).text_reach)
+                        .map(|id| self.root_paint(id, tree).paint_reach)
                         .collect();
                     let valid_ids: Vec<Uuid> = tile_root_ids
                         .into_iter()
@@ -5779,8 +5786,17 @@ impl RenderState {
         let scale = self.get_scale();
         let new_extrect = self.get_cached_extrect(shape, tree, 1.0);
         let prev_extrect = prev_extrect.or_else(|| {
-            tree.get_modifier(&shape.id)
-                .and_then(|_| tree.get_raw(&shape.id).map(|raw| raw.extrect(tree, 1.0)))
+            tree.get_modifier(&shape.id).and_then(|_| {
+                tree.get_raw(&shape.id).map(|raw| {
+                    let extrect = raw.extrect(tree, 1.0);
+                    let reach = shape_paint_reach(raw);
+                    if extrect.is_empty() || reach <= 0.0 {
+                        extrect
+                    } else {
+                        extrect.with_outset((reach, reach))
+                    }
+                })
+            })
         });
         // Without the extent before the edit, fall back to the tiles the shape was indexed
         // on. With it, those tiles add nothing: nested shapes may still be indexed at the
@@ -5797,10 +5813,11 @@ impl RenderState {
                 })
         };
         let mut dirty = tiles::union_edit_dirty_rect(prev_extrect, new_extrect, indexed);
-        // Glyphs paint outside the laid-out lines that make the text extrect.
-        let ink = text_ink_reach(shape);
-        if ink > 0.0 && !dirty.is_empty() {
-            dirty.outset((ink, ink));
+        // Glyphs paint outside the laid-out lines that make the text extrect, and miter joins
+        // paint outside a stroked path's extrect.
+        let reach = shape_paint_reach(shape);
+        if reach > 0.0 && !dirty.is_empty() {
+            dirty.outset((reach, reach));
         }
         // Antialiasing reaches about a pixel past the geometry, also into the next tile.
         if !dirty.is_empty() {
@@ -6286,8 +6303,8 @@ mod counters_tests {
 mod partial_repaint_root_tests {
     use super::*;
     use crate::shapes::{
-        FontFamily, FontStyle, Frame, Group, Paragraph, SVGRaw, ShadowStyle, TextAlign,
-        TextContent, TextDirection, TextSpan,
+        FontFamily, FontStyle, Frame, Group, Paragraph, Path, SVGRaw, ShadowStyle, Stroke,
+        StrokeStyle, TextAlign, TextContent, TextDirection, TextSpan,
     };
     use crate::state::ShapesPool;
 
@@ -6380,7 +6397,7 @@ mod partial_repaint_root_tests {
     }
 
     #[test]
-    fn text_grandchild_sets_the_largest_span_as_text_reach() {
+    fn text_grandchild_sets_the_largest_span_as_paint_reach() {
         let (root, group, text) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let mut pool = new_pool();
         add_frame(&mut pool, root, &[group]);
@@ -6400,9 +6417,47 @@ mod partial_repaint_root_tests {
             RootPaint::of(&root, &pool),
             RootPaint {
                 whole_tiles: false,
-                text_reach: 40.0,
+                paint_reach: 40.0,
             }
         );
+    }
+
+    #[test]
+    fn shape_paint_reach_of_a_stroked_path_is_its_miter_reach() {
+        let path = Uuid::new_v4();
+        let mut pool = new_pool();
+        {
+            let shape = pool.add_shape(path);
+            shape.set_shape_type(Type::Path(Path::default()));
+            shape.set_selrect(10.0, 10.0, 190.0, 90.0);
+            let stroke = Stroke::new_center_stroke(7.0, StrokeStyle::Solid, None, None, None, None);
+            shape.add_stroke(stroke);
+        }
+        let shape = pool.get_raw(&path).expect("path");
+
+        assert_eq!(shape_paint_reach(shape), lod::miter_reach(shape));
+        assert_eq!(shape_paint_reach(shape), 14.0);
+    }
+
+    #[test]
+    fn stroked_path_in_subtree_sets_its_miter_reach_as_paint_reach() {
+        let (root, path) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut pool = new_pool();
+        add_frame(&mut pool, root, &[path]);
+        {
+            let shape = pool.add_shape(path);
+            shape.set_shape_type(Type::Path(Path::default()));
+            shape.set_parent(root);
+            let stroke = Stroke::new_center_stroke(7.0, StrokeStyle::Solid, None, None, None, None);
+            shape.add_stroke(stroke);
+        }
+
+        let paint = RootPaint::of(&root, &pool);
+        assert_eq!(
+            paint.paint_reach,
+            lod::miter_reach(pool.get_raw(&path).expect("path"))
+        );
+        assert!(!paint.whole_tiles);
     }
 
     #[test]
@@ -6419,7 +6474,7 @@ mod partial_repaint_root_tests {
             RootPaint::of(&root, &pool),
             RootPaint {
                 whole_tiles: true,
-                text_reach: 0.0,
+                paint_reach: 0.0,
             }
         );
     }
@@ -6454,7 +6509,7 @@ mod partial_repaint_root_tests {
             RootPaint::of(&root, &pool),
             RootPaint {
                 whole_tiles: true,
-                text_reach: 0.0,
+                paint_reach: 0.0,
             }
         );
     }

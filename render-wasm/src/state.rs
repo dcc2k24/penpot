@@ -13,6 +13,7 @@ pub use ui::UIState;
 
 use crate::error::{Error, Result};
 use crate::render::raster::RasterFormat;
+use crate::render::shape_paint_reach;
 use crate::render::FrameType;
 use crate::shapes::{grid_layout::grid_cell_data, FontFamily, Shape, Type};
 use crate::uuid::Uuid;
@@ -480,10 +481,17 @@ impl State {
         if self.loading || !has_render_state() {
             return;
         }
-        let prev = self
-            .shapes
-            .get(&id)
-            .map(|shape| shape.extrect(&self.shapes, 1.0));
+        // The shape still holds its old stroke widths and font sizes here, so the recorded
+        // extent is grown by the reach it had before the mutation.
+        let prev = self.shapes.get(&id).map(|shape| {
+            let extrect = shape.extrect(&self.shapes, 1.0);
+            let reach = shape_paint_reach(shape);
+            if extrect.is_empty() || reach <= 0.0 {
+                extrect
+            } else {
+                extrect.with_outset((reach, reach))
+            }
+        });
         get_render_state().mark_touched_with_prev(id, prev);
     }
 }

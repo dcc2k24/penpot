@@ -64,21 +64,24 @@
   only the shapes reaching the changed pixels and copies the rest back from the old slot
   (`copy_stale_slot_outside`, `BlendMode::Src`). `begin_partial_tile` sets
   `render_area_with_margins` to the changed pixels plus `AA_REACH_PX`; in partial mode every
-  node is culled by extrect (own effects and ancestor layer blur), texts grown by
-  `text_ink_reach`, containers and roots by the largest `text_ink_reach` under the tile's
-  roots (`RootPaint`, cached per root). Whole repaint when the change covers > 75% of the
+  node is culled by extrect (own effects and ancestor layer blur), grown by
+  `shape_paint_reach` (glyphs of texts, miter joins of stroked paths and bools); containers
+  and roots by the largest `shape_paint_reach` under the tile's roots (`RootPaint`, cached
+  per root). Whole repaint when the change covers > 75% of the
   tile, slots are packed (< 512 px), in fast mode / viewer / include filter, or a root on the
   tile holds a visible background blur or raw SVG (`RootPaint::whole_tiles`). An atlas
   repack forgets the in-flight tile and makes the next render start over. Anything a shape
   paints outside its extent must be in both the dirty rect and the cull test, or stale
   pixels survive next to the change.
-- Edit dirty rect = prev∪new extrect, texts grown by `text_ink_reach`, all by `AA_REACH_PX`,
+- Edit dirty rect = prev∪new extrect, each grown by `shape_paint_reach`, all by `AA_REACH_PX`,
   then by ancestor drop shadows (`with_ancestor_drop_shadows`). A filled frame with a drop
   shadow draws it by a path that depends on its descendants; when that path switches
   (`switched_shadow_containers`, last path per container in `shadow_paths`, unknown counts
   as switched) its whole extrect is dirtied. The indexed tiles join only when no prev extent
   is known (nested shapes can stay indexed at an older zoom's scale). Touch before mutating
-  so the prev extent is recorded (`update_shape_text_layout_for`).
+  so the prev extent is recorded (`update_shape_text_layout_for`). `touch_shape` grows the
+  recorded prev extent by the old shape's `shape_paint_reach`, since that shape is gone
+  after the mutation.
 - `set-guides` (CLJS) skips the call when guides and their boards are unchanged:
   `_set_guides` presents a frame, and the viewport called it on every commit.
 - Component thumbnails (`thumbnails-wasm/render-thumbnail`): UI renders run inside an idle
