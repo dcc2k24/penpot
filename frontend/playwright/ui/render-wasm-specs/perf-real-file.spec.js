@@ -74,6 +74,7 @@ const S9_NAMES = ["S9 opacity 5", "S9 opacity 0", "S9 undo opacity"];
 const THEME_SWITCHES = [["Light", "Dark"], ["Dark", "Mid"], ["Mid", "Light"]];
 const THEME_TIMEOUT_MS = 10 * 60 * 1000;
 const THEME_QUIET_MS = 1000;
+const STABLE_SHOT_MS = 5000;
 const THEME_SELECT_TIMEOUT_MS = 15000;
 const THEME_CLIP_PX = 160;
 const OTHER_CLIP_PX = 240;
@@ -853,6 +854,20 @@ function themeLabelIs(label, name) {
  * Opens a page from the Layers tab and waits until it is quiet. Not measured:
  * the recording is stopped and dropped.
  */
+async function stableClipShot(page, clip) {
+  let previous = await clipShot(page, clip);
+  const deadline = Date.now() + THEME_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(STABLE_SHOT_MS);
+    const shot = await clipShot(page, clip);
+    if (shot.equals(previous)) {
+      return shot;
+    }
+    previous = shot;
+  }
+  return previous;
+}
+
 async function gotoPage(page, target) {
   await openTab(page, "Layers");
   const item = page.locator(`[data-testid="page-${target.id}"]`);
@@ -990,7 +1005,8 @@ async function runThemeGroup(
     // Baseline of the other page in Light.
     await gotoPage(page, other);
     const otherClip = centreClip(await viewportBox(), OTHER_CLIP_PX);
-    let otherOld = await clipShot(page, otherClip);
+    // The page transition can outlast the quiet wait, so wait for a stable shot.
+    let otherOld = await stableClipShot(page, otherClip);
     const otherInitial = otherOld;
 
     // Baseline of the cold page, framed on one board.
@@ -1135,7 +1151,7 @@ async function runThemeGroup(
       });
       const otherRaw = await stopRecording(page);
       const otherCounters = await readCounters(page);
-      const final = await clipShot(page, otherClip);
+      const final = await stableClipShot(page, otherClip);
       const otherScenario = buildScenario({
         name: otherName,
         zoom: null,
