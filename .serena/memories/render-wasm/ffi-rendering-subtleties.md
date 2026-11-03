@@ -20,6 +20,7 @@
 - Host 1 shapes (svg-raw with content, grid layout, text without content) keep their host attrs on the main thread; their entries carry no text or image data.
 - Dirty rule: an id keeps its worker entry only while its raw `ObjectsMap` string is `identical?` to the one at load start. Any other id (changed, or raw value nil) is encoded on the main thread from the current page, or dropped when gone.
 - Worker failure before the hints are attached falls back to `set-objects-async`; after that, the remaining chunks are encoded on the main thread.
+- Store keeps faces across page switches, so a later page has no pending face for them. `sync-text-selrects-after-load!` checks exactly the texts that use a face the session fetched (`f/font-fetched?`) and no pending face. Texts using only the built-in face or a failed face stay unchecked, as upstream; widening this makes opening a file commit resizes upstream does not make. A page with a resize still waiting is not stashed.
 
 ## Tile/render behavior
 

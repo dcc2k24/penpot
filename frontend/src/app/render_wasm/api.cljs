@@ -2160,6 +2160,23 @@
   (when (seq (:pending-faces text-font-state))
     (page-cache/hold-resident! (:token resident))))
 
+(defn- sync-text-selrects-after-load!
+  "Checks the texts of a workspace page just uploaded that use a face kept from
+  an earlier page. Such a face is never pending, so `relayout-after-fonts!`
+  would not check them, though it would have if the face had to be fetched
+  again. A text with a pending face waits for that function."
+  [resident shapes {:keys [font-index] :as text-font-state}]
+  (when (some? (:page-id resident))
+    (let [pending-ids (or (shape-ids-for-pending-fonts text-font-state) #{})
+          kept-ids    (into #{}
+                            (comp (filter (comp f/font-fetched? key))
+                                  (mapcat val)
+                                  (remove pending-ids))
+                            font-index)]
+      (when (seq kept-ids)
+        (sync-stale-text-selrects!
+         (into [] (filter (comp kept-ids :id)) shapes))))))
+
 (defn- stash-resident-page!
   "Ends the residency of the page the renderer holds. When `stash?` is true
   and nothing on screen differs from the file data (no shapes loading, no
@@ -2288,6 +2305,7 @@
       (let [text-ids (into [] (comp (filter cfh/text-shape?) (map :id)) shapes)]
         (when (seq text-ids)
           (update-text-layouts text-ids)))
+      (sync-text-selrects-after-load! resident shapes text-font-state-acc)
 
       (let [pending-thumbnails (d/index-by :key :callback thumbnails-acc)
             pending-full       (d/index-by :key :callback full-acc)
@@ -2470,7 +2488,8 @@
                          (if render-callback
                            (render-callback)
                            (request-render "set-objects-sync-complete"))
-                         (ug/dispatch! (set-objects-event resident)))))))
+                         (ug/dispatch! (set-objects-event resident))))
+      (sync-text-selrects-after-load! resident shapes text-font-state))))
 
 (defn- shapes-in-tree-order
   "Returns shapes sorted in tree order (parents before children).

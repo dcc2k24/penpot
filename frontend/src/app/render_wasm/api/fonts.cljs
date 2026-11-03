@@ -33,6 +33,9 @@
 ;; Emits every font face that WASM can measure.
 (defonce font-stored-stream (rx/subject))
 
+;; Font-data keys of faces this session stored by fetching them.
+(defonce ^:private fetched-font-keys (atom #{}))
+
 ;; Emits failed font faces so layout can fall back.
 (defonce font-storage-failed-stream (rx/subject))
 
@@ -196,6 +199,7 @@
               fallback?)
       (store-font-url font-data font-url)
       (clear-font-storage-failure! font-data)
+      (swap! fetched-font-keys conj (font-data-key font-data))
       ;; Reported after the store call: subscribers react by measuring text.
       (rx/push! font-stored-stream (font-data-key font-data))
       true)))
@@ -315,6 +319,12 @@
   [font-data]
   (or (contains? @failed-font-data-keys (font-data-key font-data))
       (font-stored? font-data (:emoji? font-data))))
+
+(defn font-fetched?
+  "Returns true when this session fetched and stored the face with this key.
+  Faces built into WASM and faces that failed to load never are."
+  [font-key]
+  (contains? @fetched-font-keys font-key))
 
 (defn- store-font-id
   [font-data asset-id emoji? fallback?]
