@@ -219,3 +219,9 @@
       (t/is (= [(first once) (first once)] twice)
             "an id listed twice in one request gives two equal entries")
       (wu/handle! #js {:op "release" :job job}))))
+
+(t/deftest translate-browser-maps-safari-versions-to-safari
+  (t/testing "every Safari build maps to code 2 and Chrome keeps its own code"
+    (t/is (= 2 (sr/translate-browser :safari-26)))
+    (t/is (= 2 (sr/translate-browser :safari-18)))
+    (t/is (= 1 (sr/translate-browser :chrome)))))
