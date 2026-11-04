@@ -4414,12 +4414,10 @@ impl RenderState {
         // Low zoom path: use blur filter but apply offset and spread geometrically
         if use_low_zoom_path {
             self.counters.save_layers += 1;
-            // Bound to `bounds`, the shadow reach computed above (a superset of the drawing).
-            let bounded_layer_rec = skia::canvas::SaveLayerRec::default()
-                .bounds(&bounds)
-                .paint(&shadow_paint);
+            // No layer bounds: they change the layer texture the shadow blur runs on, which
+            // moved shadow pixels by up to 8 levels against upstream.
             let drop_canvas = self.surfaces.canvas(SurfaceId::DropShadows);
-            drop_canvas.save_layer(&bounded_layer_rec);
+            drop_canvas.save_layer(&layer_rec);
             //drop_canvas.scale((scale, scale));
             //drop_canvas.translate(translation);
 
