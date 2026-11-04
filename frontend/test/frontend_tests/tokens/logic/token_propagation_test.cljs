@@ -313,7 +313,9 @@
       (add-token-pair "radius.md" :border-radius (:radius light) (:radius dark))
       (add-token-pair "opacity.soft" :opacity (:opacity light) (:opacity dark))
       (add-token-pair "stroke.w" :stroke-width (:stroke light) (:stroke dark))
-      (add-token-pair "shadow.card" :shadow shadow-light shadow-dark)))
+      (add-token-pair "shadow.card" :shadow shadow-light shadow-dark)
+      (add-token-pair "size.w" :sizing "100" "250")
+      (add-token-pair "font.size" :font-size "12" "30")))
 
 (defn- base-file-on
   "A file with the tokens and the Dark theme active, page `page-label` current."
@@ -409,7 +411,7 @@
   (let [text-label (keyword (str (name copy-label) "-text"))
         text       (cths/get-shape file text-label)]
     (cths/update-shape file text-label :content
-                      (txt/change-text (:content text) "Edited"))))
+                       (txt/change-text (:content text) "Edited"))))
 
 (defn- build-file
   "The fixture. Page `:page-ds` holds the components, `:page-screens` the
@@ -526,6 +528,30 @@
       (cthf/switch-to-page :page-copies)
       (add-dark-rects "fill-" 60)
       (cthc/instantiate-component :comp-x :copy-x :children-labels [:copy-x-rect])))
+
+(defn- build-legacy-file
+  "The fixture for the event path, on the Dark theme. Page `:page-ds` holds the
+  rect `:size-rect`, with the token `size.w` on its width, and the text
+  `:size-text`, with the token `font.size` on its font size. Page `:page-other`
+  holds the rect `:other-rect`, with `size.w` on its width, and the text
+  `:other-text`. Page `:page-ds` is current at the end."
+  []
+  (-> (base-file)
+      (ctho/add-rect :size-rect)
+      (ctht/apply-token-to-shape :size-rect "size.w" [:width] [:width] 100)
+      (ctht/apply-token-to-shape :size-rect "color.bg" [:fill] [:fill] (:bg light))
+      (ctho/add-text :size-text "hello")
+      (text-fill :size-text "color.fg" (:fg light))
+      (ctht/apply-token-to-shape :size-text "font.size" [:font-size] [] 12)
+
+      (cthf/add-sample-page :page-other)
+      (ctho/add-rect :other-rect)
+      (ctht/apply-token-to-shape :other-rect "size.w" [:width] [:width] 100)
+      (ctho/add-text :other-text "hello")
+      (text-fill :other-text "color.fg" (:fg light))
+      (set-position-data :other-text (position-data-of [(fill-of (:fg light))]))
+
+      (cthf/switch-to-page :page-ds)))
 
 (defn- many-page-label
   [i]
@@ -778,6 +804,83 @@
                              "redo to apply the run again"))
       (t/is (= after (pages-objects (:data (state-file store))))
             "redo applies the run again"))))
+
+(t/deftest ^:async event-path-joins-one-undo-step
+  (let [file   (build-legacy-file)
+        store  (ths/setup-store file)
+        before (pages-objects (:data file))]
+    (ptk/emit! store (tohs/watch-undo-stack))
+    (await (emit-until store ::dwtp/propagation-done
+                       [(dwtp/propagate-workspace-tokens)]))
+    (t/is (= 250 (:width (shape-of (state-file store) :page-ds :size-rect)))
+          "the event path has finished when the run is done")
+    (await (async/settle))
+    (let [file'  (state-file store)
+          after  (pages-objects (:data file'))
+          nodes  (text-nodes (shape-of file' :page-ds :size-text))]
+      (t/is (= 250 (:width (shape-of file' :page-ds :size-rect)))
+            "the width token reaches the rect on the current page")
+      (t/is (= 250 (:width (shape-of file' :page-other :other-rect)))
+            "the width token reaches the rect on the other page")
+      (t/is (seq nodes)
+            "the size text keeps its text nodes")
+      (t/is (every? #(= "30" (:font-size %)) nodes)
+            "the font size token reaches the text nodes")
+      (t/is (= 1 (count (get-in @store [:workspace-undo :items])))
+            "fast and event-path updates share one undo entry")
+
+      (ptk/emit! store dwu/undo)
+      (await (async/wait-for #(= before (pages-objects (:data (state-file store))))
+                             "undo to restore the fixture"))
+      (t/is (= before (pages-objects (:data (state-file store))))
+            "undo restores every page, event-path updates included")
+
+      (ptk/emit! store dwu/redo)
+      (await (async/wait-for #(= after (pages-objects (:data (state-file store))))
+                             "redo to apply the run again"))
+      (t/is (= after (pages-objects (:data (state-file store))))
+            "redo applies the run again, event-path updates included"))))
+
+(t/deftest ^:async undo-unlocked-after-event-path
+  (let [file   (build-legacy-file)
+        store  (ths/setup-store file)
+        before (pages-objects (:data file))]
+    (ptk/emit! store (tohs/watch-undo-stack))
+    (await (emit-until store ::dwtp/propagation-done
+                       [(dwtp/propagate-workspace-tokens)]))
+    (await (async/settle))
+    (t/is (not (dwtp/running? @store))
+          "the run is no longer active once the event path has settled")
+
+    (ptk/emit! store dwu/undo)
+    (await (async/wait-for #(= before (pages-objects (:data (state-file store))))
+                           "undo to restore the fixture"))
+    (t/is (= before (pages-objects (:data (state-file store))))
+          "undo is not refused after the event path")))
+
+(t/deftest ^:async event-path-matches-legacy
+  (let [file         (build-legacy-file)
+        store-legacy (ths/setup-store file)
+        store-new    (ths/setup-store file)]
+    (await (emit-until store-legacy ::dwu/commit-undo-transaction
+                       [(legacy-propagate-workspace-tokens)]))
+    (await (emit-until store-new ::dwtp/propagation-done
+                       [(dwtp/propagate-workspace-tokens)]))
+    (await (async/settle))
+
+    (let [legacy (state-file store-legacy)
+          new    (state-file store-new)]
+      (doseq [[page-label label] [[:page-ds :size-rect]
+                                  [:page-other :other-rect]]]
+        (t/is (= (:width (shape-of legacy page-label label))
+                 (:width (shape-of new page-label label)))
+              (str label " width matches the legacy path")))
+      ;; Text widths come from WASM, which is mocked here: only the content counts.
+      (doseq [[page-label label] [[:page-ds :size-text]
+                                  [:page-other :other-text]]]
+        (t/is (= (:content (shape-of legacy page-label label))
+                 (:content (shape-of new page-label label)))
+              (str label " text content matches the legacy path"))))))
 
 (t/deftest ^:async tokenscript-resolver
   (let [file  (build-file)
