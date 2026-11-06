@@ -117,6 +117,38 @@
                (hash (:objects res))))))
    {:num 50}))
 
+(t/deftest find-and-select-keys-on-loaded-map
+  ;; A map loaded from its serialized bytes (as the database gives it)
+  ;; must answer find, select-keys, into, keys and vals.
+  (let [id1  (uuid/custom 0 1)
+        id2  (uuid/custom 0 2)
+        id3  (uuid/custom 0 3)
+        obj1 {:id id1 :name "first"}
+        obj2 {:id id2 :name "second"}
+        obj  (omap/create (deref (omap/wrap {id1 obj1 id2 obj2})))]
+
+    (t/testing "find returns an entry with the uuid and the decoded object"
+      (let [entry (find obj id1)]
+        (t/is (map-entry? entry))
+        (t/is (= id1 (key entry)))
+        (t/is (= obj1 (val entry)))))
+
+    (t/testing "find of a missing key is nil"
+      (t/is (nil? (find obj id3))))
+
+    (t/testing "select-keys keeps the present keys and drops the missing one"
+      (let [result (select-keys obj [id1 id3 id2])]
+        (t/is (= {id1 obj1 id2 obj2} result))
+        (t/is (= 2 (count result)))))
+
+    (t/testing "into, keys and vals agree with get"
+      (let [m (into {} obj)]
+        (t/is (= {id1 obj1 id2 obj2} m))
+        (t/is (= #{id1 id2} (set (keys obj))))
+        (t/is (= #{obj1 obj2} (set (vals obj))))
+        (doseq [k (keys obj)]
+          (t/is (= (get obj k) (get m k))))))))
+
 (t/deftest transit-encode-decode
   (smt/check!
    (smt/for [data (->> (cg/map cg/uuid (sg/generator cts/schema:shape))

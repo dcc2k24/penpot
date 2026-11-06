@@ -280,7 +280,8 @@
 
   (entryAt [this key]
     (when-not loaded? (load! this))
-    (ObjectsMapEntry. this key))
+    (when (contains? positions key)
+      (ObjectsMapEntry. key this)))
 
   (valAt [this key]
     (when-not loaded? (load! this))

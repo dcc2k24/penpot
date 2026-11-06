@@ -46,16 +46,23 @@
      (-val [_] (get omap key))
 
      c/IHash
-     (-hash [_]
-       (-hash-for-key omap key))
+     (-hash [this]
+       (hash [key (c/-val this)]))
 
      c/IEquiv
      (-equiv [this other]
-       (and (c/map-entry? other)
-            (= (key this)
-               (key other))
-            (= (val this)
-               (val other))))
+       (cond
+         (c/map-entry? other)
+         (and (= key (c/-key other))
+              (= (c/-val this) (c/-val other)))
+
+         (sequential? other)
+         (and (= 2 (count other))
+              (= key (nth other 0))
+              (= (c/-val this) (nth other 1)))
+
+         :else
+         false))
 
      c/ISequential
      c/ISeqable
@@ -75,6 +82,12 @@
        (cond (== n 0) key
              (== n 1) (c/-val node)
              :else    not-found))
+
+     ;; A plain map's conj takes only vectors from a seq, so the entry is
+     ;; a vector, as cljs.core/MapEntry is
+     c/IVector
+     (-assoc-n [node n v]
+       (c/-assoc-n [key (c/-val node)] n v))
 
      c/ILookup
      (-lookup [node k]
@@ -123,17 +136,40 @@
          (== n 1) (val node)
          :else    not-found))
 
+     clojure.lang.Sequential
+
      clojure.lang.IPersistentCollection
      (empty [_] [])
      (count [_] 2)
      (seq [this]
        (cons key (lazy-seq (cons (val this) nil))))
      (cons [this item]
-       (.cons ^clojure.lang.IPersistentCollection (vec this) item))
+       (conj [key (val this)] item))
+     (equiv [this other]
+       (cond
+         (map-entry? other)
+         (and (= key (clojure.core/key other))
+              (= (val this) (clojure.core/val other)))
+
+         (sequential? other)
+         (and (= 2 (count other))
+              (= key (nth other 0))
+              (= (val this) (nth other 1)))
+
+         :else
+         false))
 
      clojure.lang.IHashEq
-     (hasheq [_]
-       (-hash-for-key omap key))))
+     (hasheq [this]
+       (Murmur3/hashOrdered [key (val this)]))
+
+     Object
+     (equals [this other]
+       (= this other))
+     (hashCode [this]
+       (unchecked-int
+        (+ (* 31 (+ 31 (java.util.Objects/hashCode key)))
+           (java.util.Objects/hashCode (val this)))))))
 
 #?(:cljs
    (deftype ObjectMapIterator [iterator omap]
@@ -211,7 +247,7 @@
 
      c/IWithMeta
      (-with-meta [this new-meta]
-       (if (identical? new-meta meta)
+       (if (identical? new-meta metadata)
          this
          (ObjectsMap. new-meta
                       cache
@@ -245,14 +281,14 @@
            (if (nil? es)
              ret
              (let [e (first es)]
-               (if (vector? e)
+               (if (or (map-entry? e) (vector? e))
                  (recur (c/-assoc ret (c/-nth e 0) (c/-nth e 1))
                         (next es))
                  (throw (js/Error. "conj on a map takes map entries or seqables of map entries"))))))))
 
      c/IEmptyableCollection
      (-empty [_]
-       (create))
+       (ObjectsMap. metadata {} {} false nil))
 
      c/IEquiv
      (-equiv [this other]
@@ -276,15 +312,16 @@
 
      c/ILookup
      (-lookup [this k]
-       (or (c/-lookup cache k)
-           (if (c/-contains-key? data k)
-             (let [v (c/-lookup data k)
-                   v (t/decode-str v)]
-               (set! (.-cache this) (c/-assoc cache k v))
-               v)
-             (do
-               (set! (.-cache this) (assoc cache k nil))
-               nil))))
+       (if (c/-contains-key? cache k)
+         (c/-lookup cache k)
+         (if (c/-contains-key? data k)
+           (let [v (c/-lookup data k)
+                 v (t/decode-str v)]
+             (set! (.-cache this) (c/-assoc cache k v))
+             v)
+           (do
+             (set! (.-cache this) (c/-assoc cache k nil))
+             nil))))
 
      (-lookup [this k not-found]
        (if (c/-contains-key? data k)
@@ -346,9 +383,60 @@
                         ^:unsynchronized-mutable modified
                         ^:unsynchronized-mutable hash]
 
+     clojure.lang.MapEquivalence
+
+     clojure.lang.IObj
+     (withMeta [this new-meta]
+       (if (identical? new-meta metadata)
+         this
+         (ObjectsMap. new-meta cache data modified hash)))
+
+     clojure.lang.IMeta
+     (meta [_] metadata)
+
+     clojure.lang.IFn
+     (invoke [this k]
+       (get this k))
+     (invoke [this k not-found]
+       (get this k not-found))
+     (applyTo [this arglist]
+       (clojure.lang.AFn/applyToHelper this arglist))
+
+     java.util.Map
+     (size [this]
+       (count this))
+     (isEmpty [this]
+       (zero? (count this)))
+     (containsValue [this v]
+       (boolean (some #(= v %) (vals this))))
+     (get [this k]
+       (get this k))
+     (put [_ _ _]
+       (throw (UnsupportedOperationException. "objects map is immutable")))
+     (remove [_ _]
+       (throw (UnsupportedOperationException. "objects map is immutable")))
+     (putAll [_ _]
+       (throw (UnsupportedOperationException. "objects map is immutable")))
+     (clear [_]
+       (throw (UnsupportedOperationException. "objects map is immutable")))
+     (keySet [this]
+       (set (keys this)))
+     (values [this]
+       (vec (vals this)))
+     (entrySet [this]
+       (set (seq this)))
+
      Object
      (hashCode [this]
-       (.hasheq ^clojure.lang.IHashEq this))
+       ;; The java.util.Map contract: the sum of key ^ value hash codes.
+       (unchecked-int
+        (reduce (fn [acc e]
+                  (+ acc (bit-xor (java.util.Objects/hashCode (key e))
+                                  (java.util.Objects/hashCode (val e)))))
+                0
+                (seq this))))
+     (equals [this other]
+       (= this other))
 
      cp/Datafiable
      (datafy [_]
@@ -399,45 +487,54 @@
 
      clojure.lang.IPersistentCollection
      (equiv [this other]
-       (and (instance? ObjectsMap other)
+       (and (or (instance? clojure.lang.IPersistentMap other)
+                (instance? java.util.Map other))
             (= (count this) (count other))
-            (reduce-kv (fn [_ id _]
-                         (let [this-val  (get this id)
-                               other-val (get other id)
-                               result    (= this-val other-val)]
-                           (or result
-                               (reduced false))))
-                       true
-                       data)))
+            (every? (fn [e]
+                      (let [k (key e)]
+                        (and (contains? other k)
+                             (= (val e) (get other k)))))
+                    (seq this))))
 
      clojure.lang.IPersistentMap
      (cons [this o]
-       (if (map-entry? o)
+       (cond
+         (map-entry? o)
          (assoc this (key o) (val o))
-         (if (vector? o)
+
+         (vector? o)
+         (if (== 2 (count o))
            (assoc this (nth o 0) (nth o 1))
-           (throw (UnsupportedOperationException. "invalid arguments to cons")))))
+           (throw (IllegalArgumentException. "Vector arg to map conj must be a pair")))
+
+         :else
+         (reduce (fn [acc e]
+                   (assoc acc (key e) (val e)))
+                 this
+                 (seq o))))
 
      (empty [_]
-       (create))
+       (ObjectsMap. metadata {} {} false nil))
 
      (containsKey [_ key]
        (.containsKey ^clojure.lang.IPersistentMap data key))
 
      (entryAt [this key]
-       (ObjectsMapEntry. this key))
+       (when (.containsKey ^clojure.lang.IPersistentMap data key)
+         (ObjectsMapEntry. key this)))
 
      (valAt [this key]
-       (or (get cache key)
-           (locking this
-             (if (contains? data key)
-               (let [value (get data key)
-                     value (t/decode-str value)]
-                 (set! (.-cache this) (assoc cache key value))
-                 value)
-               (do
-                 (set! (.-cache this) (assoc cache key nil))
-                 nil)))))
+       (if (contains? cache key)
+         (get cache key)
+         (locking this
+           (if (contains? data key)
+             (let [value (get data key)
+                   value (t/decode-str value)]
+               (set! (.-cache this) (assoc cache key value))
+               value)
+             (do
+               (set! (.-cache this) (assoc cache key nil))
+               nil)))))
 
      (valAt [this key not-found]
        (if (.containsKey ^clojure.lang.IPersistentMap data key)
