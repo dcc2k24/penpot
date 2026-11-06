@@ -3,6 +3,19 @@ import "reflect-metadata";
 import { TextResponse, ToolResponse } from "./ToolResponse";
 import type { PenpotMcpServer, SessionContext } from "./PenpotMcpServer";
 import { createLogger } from "./logger";
+import { TokenDigest } from "./backend/TokenDigest";
+
+/** The facts of one finished tool call, as the server logs them. The token itself is never part of it. */
+export interface ToolCallRecord {
+    /** Name of the tool. */
+    tool: string;
+    /** Fingerprint of the MCP token of the call, or `<none>`. */
+    tokenFp: string;
+    /** Wall-clock duration of the call, in milliseconds. */
+    durationMs: number;
+    /** `ok` when the tool returned a result, `error` when it failed. */
+    outcome: "ok" | "error";
+}
 
 /**
  * An empty arguments class for tools that do not require any parameters.
@@ -48,6 +61,8 @@ export abstract class Tool<TArgs extends object> {
      */
     async execute(args: unknown): Promise<ToolResponse> {
         const executionId = ++Tool.executionCounter;
+        const started = performance.now();
+        let outcome: ToolCallRecord["outcome"] = "error";
         try {
             let argsInstance: TArgs = args as TArgs;
             this.logger.info("Tool execution #%d starting: %s", executionId, this.getToolName());
@@ -59,10 +74,19 @@ export abstract class Tool<TArgs extends object> {
             let result = await this.executeCore(argsInstance);
 
             this.logger.info("Tool execution #%d complete: %s", executionId, this.getToolName());
+            outcome = "ok";
             return result;
         } catch (error) {
             this.logger.error("Tool execution #%d failed: %s; error: %s", executionId, this.getToolName(), error);
-            return new TextResponse(`Tool execution failed: ${String(error)}`);
+            return TextResponse.failure(`Tool execution failed: ${String(error)}`);
+        } finally {
+            // the hook is optional, so that stub servers in tests need not provide it
+            this.mcpServer.recordToolCall?.({
+                tool: this.getToolName(),
+                tokenFp: TokenDigest.fingerprintOrNone(this.getSessionContext()?.userToken),
+                durationMs: Math.round(performance.now() - started),
+                outcome,
+            });
         }
     }
 

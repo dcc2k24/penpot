@@ -415,6 +415,60 @@
         (> expires-at (ct/now)))
     false))
 
+(defn- mcp-scopes-with-write
+  "Return the scopes for an MCP token with `mcp:write` set to `write?`.
+  `mcp:manage` and `mcp:delete` are kept when the token already has them."
+  [scopes write?]
+  (let [current (set scopes)]
+    (cond-> (if write? ["mcp:read" "mcp:write"] ["mcp:read"])
+      (contains? current "mcp:manage") (conj "mcp:manage")
+      (contains? current "mcp:delete") (conj "mcp:delete"))))
+
+(mf/defc mcp-write-access*
+  {::mf/private true}
+  [{:keys [token]}]
+  (let [scopes     (:scopes token)
+        write?     (contains? (set scopes) "mcp:write")
+        busy*      (mf/use-state false)
+        ;; Bumped on failure so the switch remounts with the stored value.
+        revision*  (mf/use-state 0)
+        busy?      (deref busy*)
+        revision   (deref revision*)
+        help-id    (mf/use-id)
+
+        on-error
+        (mf/use-fn
+         (fn [_]
+           (reset! busy* false)
+           (swap! revision* inc)
+           (st/emit! (ntf/error (tr "errors.generic"))
+                     (du/fetch-access-tokens))))
+
+        on-change
+        (mf/use-fn
+         (mf/deps scopes on-error)
+         (fn [enabled?]
+           (reset! busy* true)
+           (let [params {:scopes (mcp-scopes-with-write scopes enabled?)}
+                 mdata  {:on-success (fn [_]
+                                       (reset! busy* false)
+                                       (st/emit! (du/fetch-access-tokens)))
+                         :on-error on-error}]
+             (st/emit! (du/update-mcp-token-scopes (with-meta params mdata))))))]
+
+    [:div {:class (stl/css :mcp-server-write)}
+     [:> switch* {:key revision
+                  :label (tr "integrations.mcp-key.allow-write")
+                  :default-checked write?
+                  :disabled busy?
+                  :aria-describedby help-id
+                  :on-change on-change}]
+     [:> text* {:as "div"
+                :id help-id
+                :typography t/body-small
+                :class (stl/css :color-secondary)}
+      (tr "integrations.mcp-key.allow-write.help")]]))
+
 (mf/defc mcp-server-section*
   {::mf/private true}
   [{:keys [access-tokens]}]
@@ -556,7 +610,8 @@
                            :id (:id token)
                            :name (:name token)
                            :expires-at (:expires-at token)
-                           :on-delete handle-delete}]]]])
+                           :on-delete handle-delete}]]
+         [:> mcp-write-access* {:token token}]]])
 
      [:> notification-pill* {:level :default
                              :type :context}

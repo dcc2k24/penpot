@@ -33,6 +33,7 @@
    [app.rpc.cond :as cond]
    [app.rpc.doc :as doc]
    [app.rpc.helpers :as rph]
+   [app.rpc.mcp-scope :as mcp-scope]
    [app.rpc.retry :as retry]
    [app.rpc.rlimit :as rlimit]
    [app.setup :as-alias setup]
@@ -128,6 +129,11 @@
                                    (assoc ::token-type (::actoken/type request))))
                              (cond-> key-id
                                (assoc ::auth-key-id key-id))
+                             ;; Server-side only, like the ids above: a
+                             ;; restricted session (MCP render) cannot be
+                             ;; widened from the body.
+                             (cond-> (::session/restriction request)
+                               (assoc ::session-restriction (::session/restriction request)))
                              ;; Server-side only: request bodies cannot forge
                              ;; it (qualified keys are stripped before the
                              ;; merge). Upload maps are only trusted when they
@@ -168,11 +174,30 @@
                       :val (inst-ms (tp))
                       :labels labels)))))))
 
+(defn- resolve-mcp-scope
+  "The scope a request needs: `::mcp-scope` as given, or the value of
+  the function it holds for these params. Commands that declare none need
+  `mcp:read`."
+  [scope-spec params]
+  (cond
+    (fn? scope-spec) (scope-spec params)
+    (string? scope-spec) scope-spec
+    :else mcp-scope/read-scope))
+
 (defn- wrap-authentication
+  "Check that the caller may run the command. Two metadata keys govern MCP
+  tokens:
+
+  - `::token-type \"mcp\"`: only MCP tokens may run the command.
+  - `::allow-token-types #{\"mcp\"}`: MCP tokens may run it too, next to
+    sessions and personal tokens.
+
+  The scope an MCP token needs is checked by `wrap-mcp-scope`."
   [_ f mdata]
   (let [required-auth?      (::auth mdata true)
         required-auth-type  (::auth-type mdata)
         required-token-type (::token-type mdata)
+        allow-token-types   (set (::allow-token-types mdata))
         required-perms      (into #{} (::perms mdata))]
     (fn [cfg params]
       (let [profile-id  (::profile-id params)
@@ -191,7 +216,8 @@
                    (or (not= auth-type :token)
                        (not= required-token-type token-type)))
               (and (= token-type "mcp")
-                   (not= required-token-type "mcp")))
+                   (not= required-token-type "mcp")
+                   (not (contains? allow-token-types "mcp"))))
           (ex/raise :type :authorization
                     :code :token-auth-required
                     :hint "access token authentication required for this endpoint")
@@ -211,6 +237,57 @@
 
           :else
           (f cfg params))))))
+
+(defn wrap-mcp-scope
+  "Check the scope of an MCP token against the command's `::mcp-scope`.
+  Sessions and personal tokens are not checked. It sits inside
+  `wrap-params-validation`, so a function scope sees the merged body params."
+  [_ f mdata]
+  (fn [cfg params]
+    (when (= (::token-type params) "mcp")
+      (mcp-scope/check-scope! (set (::token-perms params #{}))
+                              (resolve-mcp-scope (::mcp-scope mdata) params)))
+    (f cfg params)))
+
+(def ^:private render-session-commands
+  "Reads a restricted (MCP render) session may make: the exporter's."
+  #{:get-profile :get-team :get-font-variants :get-page :get-file
+    :get-file-fragment :get-file-libraries})
+
+(defn- render-scope?
+  "True when `params` of command `cmd` name only files the restricted
+  session covers. `get-team` and `get-font-variants` must name the file:
+  their `id`, `team-id` and `project-id` params would read another team."
+  [cmd params file-ids]
+  (let [file-id (:file-id params)]
+    (and (contains? render-session-commands cmd)
+         (case cmd
+           :get-profile       true
+           :get-file          (contains? file-ids (:id params))
+           :get-team          (and (contains? file-ids file-id)
+                                   (nil? (:id params)))
+           :get-font-variants (and (contains? file-ids file-id)
+                                   (nil? (:team-id params))
+                                   (nil? (:project-id params)))
+           (contains? file-ids file-id)))))
+
+(defn- wrap-session-restriction
+  "Keep a restricted session (an MCP render, see `app.http.session`) to
+  the render reads of the files it covers. The merged params carry
+  `::session-restriction` only when the request authenticated with one.
+  A call that also carries a shared key (`::auth-key-id`, the exporter
+  uploading its render to the management API) is authenticated by that
+  key, so the restriction does not apply to it."
+  [_ f mdata]
+  (let [cmd (keyword (::sv/name mdata))]
+    (fn [cfg params]
+      (when-let [restriction (when-not (::auth-key-id params)
+                               (::session-restriction params))]
+        (when-not (render-scope? cmd params (:file-ids restriction))
+          (ex/raise :type :authorization
+                    :code :session-restricted
+                    :hint "session is restricted to MCP render calls")))
+      (f cfg params))))
 
 (defn- wrap-db-transaction
   [_ f mdata]
@@ -363,6 +440,8 @@
     (rlimit/wrap cfg $ mdata)
     (wrap-audit cfg $ mdata)
     (wrap-nitrate-sso cfg $ mdata)
+    (wrap-mcp-scope cfg $ mdata)
+    (wrap-session-restriction cfg $ mdata)
     (wrap-params-validation cfg $ mdata)
     (wrap-authentication cfg $ mdata)))
 
@@ -375,6 +454,8 @@
     (wrap-metrics cfg $ mdata)
     (wrap-audit cfg $ mdata)
     (wrap-nitrate-sso cfg $ mdata)
+    (wrap-mcp-scope cfg $ mdata)
+    (wrap-session-restriction cfg $ mdata)
     (wrap-params-validation cfg $ mdata)
     (wrap-authentication cfg $ mdata)))
 
@@ -411,6 +492,8 @@
           'app.rpc.commands.jobs
           'app.rpc.commands.ldap
           'app.rpc.commands.management
+          'app.rpc.commands.mcp
+          'app.rpc.commands.mcp-write
           'app.rpc.commands.media
           'app.rpc.commands.nitrate
           'app.rpc.commands.plugins

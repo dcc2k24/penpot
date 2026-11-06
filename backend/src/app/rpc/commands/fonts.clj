@@ -62,7 +62,9 @@
    [::sm/contains-any #{:team-id :file-id :project-id}]])
 
 (sv/defmethod ::get-font-variants
-  {::doc/added "1.18"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.18"
    ::sm/params schema:get-font-variants}
   [{:keys [::db/pool] :as cfg} {:keys [::rpc/profile-id team-id file-id project-id share-id] :as params}]
   (dm/with-open [conn (db/open pool)]

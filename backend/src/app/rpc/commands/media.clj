@@ -57,7 +57,9 @@
    [:content media.v/schema:upload]])
 
 (sv/defmethod ::upload-file-media-object
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.17"
    ::doc/changes [["2.19" "The optional :id param is rejected with a params-validation error; the server always generates the identifier"]]
    ::sm/params schema:upload-file-media-object
    ::rpc/multipart-only-params [:content]
@@ -237,7 +239,9 @@
    [:name {:optional true} [:string {:max 250}]]])
 
 (sv/defmethod ::create-file-media-object-from-url
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.17"
    ::doc/changes [["2.19" "The optional :id param is rejected with a params-validation error; the server always generates the identifier"]]
    ::climit/id [[:process-image/by-profile ::rpc/profile-id]
                 [:process-image/global]]

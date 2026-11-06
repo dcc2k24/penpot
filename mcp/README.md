@@ -298,10 +298,22 @@ The Penpot MCP server can be configured using environment variables.
 | `PENPOT_MCP_REMOTE_MODE`                         | Enable remote mode (disables file system access). Set to `true` to enable.                                                                                                                                                                                                  | `false`        |
 | `PENPOT_MCP_DEVENV`                              | Enable Penpot development environment tools in local single-user mode. Set to `true` to enable.                                                                                                                                                                             | `false`        |
 | `PENPOT_MCP_TOOL_TIMEOUT_S`                      | Timeout, in seconds, for tool calls dispatched to the Penpot plugin                                                                                                                                                                                                         | `120`          |
-| `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS`  | Maximum number of parallel export shape requests (multi-user mode only).                                                                                                                                                                                                    | `0` (no limit) |
+| `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS`  | Maximum number of parallel export shape requests in multi-user mode. In backend mode the backend export tools default to 4.                                                                                                                                                                                                    | `0` (no limit) |
 | `PENPOT_MCP_AUTH_URI` | Public base URL of the MCP authorization service, e.g. `https://penpot.example/api/mcp/oauth`. Set to enable OAuth; requires `--multi-user`. Use HTTPS (HTTP is allowed on loopback for development), without credentials, query parameters, or a fragment. | (unset; OAuth disabled) |
 | `PENPOT_MCP_REDIS_URI`                           | Redis connection URI (e.g. `redis://host:6379`) enabling multi-instance horizontal scaling via Redis pub/sub task routing (multi-user mode only). When unset, the server runs in single-instance mode, requiring the plugin and MCP client to connect to the same instance. | (unset)        |
-| `PENPOT_MCP_BACKEND_URI` | Penpot instance base URI. Setting a nonblank value enables tools that communicate with the Penpot backend (currently only the `submit_feedback` tool). The MCP server appends suffixes such as `api/main/methods/send-mcp-feedback`. Backend interactions require MCP user tokens to be provided.  | (unset) |
+| `PENPOT_MCP_BACKEND_URI` | Penpot instance base URI. Setting a nonblank value enables the backend tools (`submit_feedback` and, in backend or both mode, the tools in [Backend mode](#backend-mode)). The MCP server appends suffixes such as `api/main/methods/send-mcp-feedback`. Backend interactions require MCP user tokens to be provided.  | (unset) |
+| `PENPOT_MCP_MODE` | Which tools the server offers: `bridge` (plugin tools only), `backend` (backend tools only, no plugin bridge and no WebSocket server) or `both`. `backend` and `both` require `PENPOT_MCP_BACKEND_URI`. In `both` mode the plugin tools are named `execute_code_in_tab`, `export_shape_from_tab` and `import_image_in_tab`. When unset, the mode is `both` if `PENPOT_MCP_BACKEND_URI` is set and `bridge` otherwise. | (`both` with a backend URI, else `bridge`) |
+| `PENPOT_MCP_ALLOW_QUERY_TOKEN` | Accept the MCP token as the `userToken` query parameter. Set to `false` to accept only the `Authorization` header; a request with the query parameter then gets a 401. A warning is logged once per token when the parameter is used. | `true` |
+| `PENPOT_MCP_RATE_LIMIT_RPS` | Sustained requests per second allowed for each MCP token in backend mode | `10` |
+| `PENPOT_MCP_RATE_LIMIT_BURST` | Requests each MCP token may send at once in backend mode | `20` |
+| `PENPOT_MCP_BACKEND_TIMEOUT_S` | Timeout, in seconds, for each call to the Penpot backend | `120` |
+| `PENPOT_MCP_EXPORTER_URI` | Base URI of the Penpot exporter service. The `export_shape` backend tool posts export requests to its root path. | `http://localhost:6061/` |
+| `PENPOT_MCP_ASSETS_URI` | Base URI that serves `/assets/by-id/` for downloads of export results and of `mode: fill` media. Set it when the backend answers asset requests with HTTP 204 and an `x-accel-redirect` header, which nginx turns into the file. Unset, the server downloads from the origin of the URI that the exporter answers with, which is the public URI. A fill download has no exporter answer, so it uses `PENPOT_MCP_BACKEND_URI` when this is unset. | (unset) |
+| `PENPOT_MCP_BACKEND_MAX_RESPONSE_MB` | Cap, in megabytes, on the body of one backend or exporter response. A larger response fails with an error that names this variable. | `64` |
+| `PENPOT_MCP_MAX_BODY_MB` | Largest HTTP request body the server accepts, in megabytes. The same limit caps the base64 text that `import_archive` and `import_image` accept inline, so an archive above it must be given as `filePath` or `url`. | `32` |
+| `PENPOT_MCP_SANDBOX_TIMEOUT_S` | Time limit, in seconds, of one `execute_code` call in backend mode. | `10` |
+| `PENPOT_MCP_SANDBOX_IDLE_MIN` | Minutes without a call after which the sandbox state of an MCP token (its runtime and its `storage`) is dropped. | `30` |
+| `PENPOT_MCP_EXPORT_DIR` | Absolute directory that the `filePath` argument of the export tools may write to. Paths outside it, including through symbolic links, are refused. | the home directory of the user who runs the server |
 
 ### Backend Configuration
 
@@ -353,6 +365,43 @@ Some of the aforementioned configuration options control these modes.
   This can result in connections from the same user being owned by different server instances,
   making it necessary to dispatch tasks to the correct instance. This is handled through Redis,
   and the mode is thus enabled by setting the environment variable providing the Redis connection URI.
+
+## Backend mode
+
+In backend mode the server talks to the Penpot backend directly. It reads and writes files in the database,
+so no browser tab with the plugin has to be open. Set `PENPOT_MCP_MODE=backend` (or `both`, to keep the plugin
+tools too) and `PENPOT_MCP_BACKEND_URI`:
+
+```sh
+PENPOT_MCP_MODE=backend PENPOT_MCP_BACKEND_URI=https://penpot.example/ node dist/index.js
+```
+
+The backend tools follow one discovery flow, with explicit ids at every step:
+`whoami` → `list_teams` → `list_projects` → `list_files` → `get_file_outline` → `get_page_tree` → `get_shapes`.
+Writes go through `apply_operations` (typed operations, `$tmp:` handles for shapes created in the same call) or
+`apply_raw_changes`. Every write accepts `dryRun`, `snapshot`, `baseRevn` and `failOnConflict`.
+The `high_level_overview` tool returns the backend instructions in this mode; the file is
+`packages/server/data/backend_instructions.md`.
+
+Each MCP token is validated against the backend (`mcp-whoami`, cached for 60 seconds) and limited to
+`PENPOT_MCP_RATE_LIMIT_RPS` requests per second. Writes to one file run one after another.
+Request bodies are capped at `PENPOT_MCP_MAX_BODY_MB`, and backend responses at `PENPOT_MCP_BACKEND_MAX_RESPONSE_MB`.
+Exports wait for a slot: at most `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` run at once (4 by default in backend mode).
+A failed tool call returns `isError: true` with the failure text.
+Each tool call writes one log line with the tool name, the token fingerprint, the duration and the outcome.
+A token needs the scopes of the tools it calls: `mcp:read` for reads, `mcp:write` for design changes,
+`mcp:manage` for team, project and file management, and `mcp:delete` for deletions.
+
+In `both` mode the plain tool names belong to the backend tools, such as `whoami`, `apply_operations`,
+`execute_code`, `export_shape` and `import_image`. The plugin tools get new names: `execute_code_in_tab`,
+`export_shape_from_tab` and `import_image_in_tab`. Clients that call the plugin tools by their old names must
+switch to the new names. To keep the old names and drop the backend tools, set `PENPOT_MCP_MODE=bridge`.
+
+When `PENPOT_MCP_MODE` is unset and `PENPOT_MCP_BACKEND_URI` is set, the server runs in `both` mode and logs a
+warning at startup. Set `PENPOT_MCP_MODE` to `backend` or `bridge` to choose one.
+
+The `import_archive` tool takes a `url` only in local mode. The server downloads it, follows at most five
+redirects and refuses loopback, private, link-local, unique-local, CGNAT and unspecified addresses.
 
 ## Development
 

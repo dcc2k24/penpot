@@ -5,3 +5,15 @@ python-scripts/
 
 # auto-generated files
 mcp-server/data/api_types.yml
+
+# design-parity: generated app sources and scratch output
+packages/design-parity/app/src/components/
+packages/design-parity/app/src/screens/
+packages/design-parity/app/index.html
+packages/design-parity/app/src/tokens.css
+packages/design-parity/app/src/typography.css
+packages/design-parity/out/
+packages/design-parity/src/generate/testdata/ButtonPrimaryMD.golden.tsx
+
+# load-test result pages
+packages/loadtest/results/

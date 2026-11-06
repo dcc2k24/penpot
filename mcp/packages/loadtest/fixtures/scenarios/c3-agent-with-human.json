@@ -1,0 +1,112 @@
+{
+  "name": "C3-agent-with-human",
+  "description": "Plan 8.4 C3, agent side only: one agent bulk-writes the S2 trees into ${fileId}/${pageId} while a person (or a Playwright script) edits the same file in a browser tab. The shape names carry the run id, so the counts hold on a page that already has shapes, and the human can keep the page open between runs. Pass needs the human side too (edits persist, human save p95 rise under 500 ms, the tab shows the agent shapes live, no console errors); this harness has no browser actor, so record those by hand (see PERF-RUNBOOK.md).",
+  "agents": 1,
+  "iterations": 1,
+  "steps": [
+    {
+      "name": "batch_create_shapes 3 trees of 86 nodes",
+      "tool": "batch_create_shapes",
+      "repeat": 4,
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageId}",
+        "tree": [
+          {
+            "$repeat": 3,
+            "as": "r",
+            "value": {
+              "type": "board",
+              "name": "C3 ${runId} batch ${index} root ${r}",
+              "x": 0,
+              "y": 0,
+              "width": 1200,
+              "height": 1600,
+              "children": [
+                {
+                  "$repeat": 5,
+                  "as": "a",
+                  "value": {
+                    "type": "board",
+                    "name": "C3 ${runId} frame ${r}-${a}",
+                    "x": 0,
+                    "y": 0,
+                    "width": 1100,
+                    "height": 300,
+                    "children": [
+                      {
+                        "$repeat": 4,
+                        "as": "b",
+                        "value": {
+                          "type": "board",
+                          "name": "Section ${a}-${b}",
+                          "x": 0,
+                          "y": 0,
+                          "width": 260,
+                          "height": 280,
+                          "children": [
+                            {
+                              "$repeat": 3,
+                              "as": "c",
+                              "value": { "type": "rect", "name": "Rect ${b}-${c}", "x": 0, "y": 0, "width": 80, "height": 80 }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "find the 12 root boards of this run",
+      "tool": "find_shapes",
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "type": "board", "nameRegex": "^C3 ${runId} batch ", "limit": 100 },
+      "capture": { "rootIds": "$.result.matches[*].id" },
+      "expect": { "path": "$.result.matches", "length": 12 }
+    },
+    {
+      "name": "find the 60 frame boards of this run",
+      "tool": "find_shapes",
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "type": "board", "nameRegex": "^C3 ${runId} frame ", "limit": 100 },
+      "capture": { "frameIds": "$.result.matches[*].id" },
+      "expect": { "path": "$.result.matches", "length": 60 }
+    },
+    {
+      "name": "set flex layouts on 12 roots and 60 frames",
+      "tool": "apply_operations",
+      "args": {
+        "fileId": "${fileId}",
+        "operations": [
+          {
+            "$repeat": 12,
+            "as": "r",
+            "value": {
+              "op": "set_flex_layout",
+              "pageId": "${pageId}",
+              "id": "${rootIds[r]}",
+              "layoutFlexDir": "column",
+              "layoutGap": { "rowGap": 16, "columnGap": 16 },
+              "layoutPadding": { "p1": 16, "p2": 16, "p3": 16, "p4": 16 }
+            }
+          },
+          {
+            "$repeat": 60,
+            "as": "f",
+            "value": {
+              "op": "set_flex_layout",
+              "pageId": "${pageId}",
+              "id": "${frameIds[f]}",
+              "layoutFlexDir": "row",
+              "layoutGap": { "rowGap": 8, "columnGap": 8 }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

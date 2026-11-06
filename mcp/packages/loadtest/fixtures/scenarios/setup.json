@@ -1,0 +1,52 @@
+{
+  "name": "setup",
+  "description": "Finds the team and project, creates the main file and one file per agent, and reads their page ids. The setup command writes the captured values to a vars file. Run it once per backend.",
+  "agents": 1,
+  "iterations": 1,
+  "steps": [
+    {
+      "name": "whoami",
+      "tool": "whoami",
+      "args": {},
+      "capture": { "profileId": "$.result.profileId" }
+    },
+    {
+      "name": "list teams",
+      "tool": "list_teams",
+      "args": {},
+      "capture": { "teamId": "$.result[0].id" }
+    },
+    {
+      "name": "list projects",
+      "tool": "list_projects",
+      "args": { "teamId": "${teamId}" },
+      "capture": { "projectId": "$.result[0].id" }
+    },
+    {
+      "name": "create main file",
+      "tool": "manage_files",
+      "args": { "action": "create_file", "projectId": "${projectId}", "name": "mcp-perf-main" },
+      "capture": { "fileId": "$.result.id" }
+    },
+    {
+      "name": "read main file outline",
+      "tool": "get_file_outline",
+      "args": { "fileId": "${fileId}" },
+      "capture": { "pageId": "$.result.pages[0].id", "pageIds": "$.result.pages[*].id" }
+    },
+    {
+      "name": "create one file per agent",
+      "tool": "manage_files",
+      "repeat": "${fileCount}",
+      "args": { "action": "create_file", "projectId": "${projectId}", "name": "mcp-perf-agent-${index}" },
+      "capture": { "agentFileIds": "$.result.id" }
+    },
+    {
+      "name": "read agent file outlines",
+      "tool": "get_file_outline",
+      "repeat": "${fileCount}",
+      "args": { "fileId": "${agentFileIds[index]}" },
+      "capture": { "agentPageIds": "$.result.pages[0].id" }
+    }
+  ]
+}

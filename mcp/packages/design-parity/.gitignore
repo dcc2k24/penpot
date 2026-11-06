@@ -1,0 +1,5 @@
+out/
+dist/
+app/node_modules/
+app/dist/
+app/public/fonts/

@@ -1,0 +1,142 @@
+{
+  "name": "S4-components",
+  "description": "Plan 8.4 S4 without variants: 200 components, 1,000 copies (5 of each), then one call that changes the fill of 20 mains and syncs their copies in the same commit. Pass when the edit step takes under 10 s and the 100 copies of the 20 edited mains show the new fill. The MCP has no variant operation, so the 100 components with 3 variants each are not built. Each run creates its own file in ${projectId}, because components belong to the file.",
+  "agents": 1,
+  "iterations": 1,
+  "setup": [
+    {
+      "name": "create the run file",
+      "tool": "manage_files",
+      "args": { "action": "create_file", "projectId": "${projectId}", "name": "S4 components ${runId} a${agent} i${iteration}" },
+      "capture": { "fileId": "$.result.id" }
+    },
+    {
+      "name": "read the run file outline",
+      "tool": "get_file_outline",
+      "args": { "fileId": "${fileId}" },
+      "capture": { "pageId": "$.result.pages[0].id" }
+    }
+  ],
+  "steps": [
+    {
+      "name": "create 200 main boards with a rect each",
+      "tool": "batch_create_shapes",
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageId}",
+        "snapshot": false,
+        "tree": [
+          {
+            "$repeat": 200,
+            "as": "k",
+            "value": {
+              "type": "board",
+              "name": "Main ${k}",
+              "x": "${k}",
+              "y": 0,
+              "width": 100,
+              "height": 100,
+              "props": { "fills": [{ "fillColor": "#336699", "fillOpacity": 1 }] },
+              "children": [
+                {
+                  "type": "rect",
+                  "name": "Main rect ${k}",
+                  "x": "${k}",
+                  "y": 0,
+                  "width": 50,
+                  "height": 50,
+                  "props": { "fills": [{ "fillColor": "#99ccff", "fillOpacity": 1 }] }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "find the 200 main boards",
+      "tool": "find_shapes",
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "type": "board", "nameRegex": "^Main [0-9]+$", "limit": 1000 },
+      "capture": { "mainIds": "$.result.matches[*].id" },
+      "expect": { "path": "$.result.matches", "length": 200 }
+    },
+    {
+      "name": "make 200 components",
+      "tool": "apply_operations",
+      "args": {
+        "fileId": "${fileId}",
+        "snapshot": false,
+        "operations": [
+          {
+            "$repeat": 200,
+            "as": "k",
+            "value": {
+              "op": "create_component",
+              "pageId": "${pageId}",
+              "shapeIds": ["${mainIds[k]}"],
+              "name": "Perf comp ${k}",
+              "path": "Perf"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "read the component ids",
+      "tool": "get_library",
+      "args": { "fileId": "${fileId}", "kinds": ["components"], "limit": 1000 },
+      "capture": { "componentIds": "$.result.components[*].id" },
+      "expect": { "path": "$.result.components", "length": 200 }
+    },
+    {
+      "name": "make 200 copies, 5 times",
+      "tool": "apply_operations",
+      "repeat": 5,
+      "args": {
+        "fileId": "${fileId}",
+        "allowSplit": true,
+        "snapshot": false,
+        "operations": [
+          {
+            "$repeat": 200,
+            "as": "k",
+            "value": {
+              "op": "instantiate_component",
+              "pageId": "${pageId}",
+              "componentId": "${componentIds[k]}",
+              "x": "${k}",
+              "y": "${index}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "edit 20 mains and sync their copies in one call",
+      "tool": "apply_operations",
+      "maxDurationMs": 10000,
+      "args": {
+        "fileId": "${fileId}",
+        "operations": [
+          {
+            "$repeat": 20,
+            "as": "k",
+            "value": {
+              "op": "update_shape",
+              "pageId": "${pageId}",
+              "id": "${mainIds[k]}",
+              "props": { "fills": [{ "fillColor": "#ff0000", "fillOpacity": 1 }] }
+            }
+          },
+          { "op": "sync_components" }
+        ]
+      }
+    },
+    {
+      "name": "check the 20 mains and their 100 copies",
+      "tool": "find_shapes",
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "type": "board", "colors": ["#ff0000"], "limit": 1000 },
+      "expect": { "path": "$.result.matches", "length": 120 }
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "name": "S6-import-archive",
+  "description": "Plan 8.4 S6: import a .penpot archive through import_archive and check the object count. Pass when the import takes under 30 s and the imported file holds the same number of shapes as the source. Give the archive as archivePath (an absolute path on the machine that runs the MCP server) and its shape count as archiveShapeCount. The plan's 2,446-shape archive from the external importer is not in the repo; export one from the frontend (see PERF-RUNBOOK.md). import_archive makes a new file in ${projectId}: the backend has no import into an existing file.",
+  "agents": 1,
+  "iterations": 1,
+  "steps": [
+    {
+      "name": "import the archive",
+      "tool": "import_archive",
+      "maxDurationMs": 30000,
+      "args": { "projectId": "${projectId}", "filePath": "${archivePath}", "name": "S6 import ${runId} i${iteration}" },
+      "capture": { "importedFileId": "$.result.fileIds[0]" }
+    },
+    {
+      "name": "count the imported shapes",
+      "tool": "get_file_outline",
+      "args": { "fileId": "${importedFileId}" },
+      "expect": { "path": "$.result.pages[*].shapeCount", "sum": "${archiveShapeCount}" }
+    }
+  ]
+}

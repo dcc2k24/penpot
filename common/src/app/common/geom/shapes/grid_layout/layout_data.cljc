@@ -73,7 +73,7 @@
 
 (defn layout-bounds
   [parent shape-bounds]
-  (let [[pad-top pad-right pad-bottom pad-left] (ctl/paddings parent)]
+  (let [[pad-top pad-right pad-bottom pad-left] (map #(or % 0) (ctl/paddings parent))]
     (gpo/pad-points shape-bounds pad-top pad-right pad-bottom pad-left)))
 
 (defn calculate-initial-track-size
@@ -102,7 +102,8 @@
 
     (reduce (fn [tracks [child-bounds child-shape]]
               (let [cell (get shape-cells (:id child-shape))
-                    idx (dec (get cell prop))
+                    ;; JVM parity: ClojureScript coerces a missing cell index to 0 (idx -1, no track)
+                    idx (dec (or (get cell prop) 0))
                     track (get tracks idx)]
                 (cond-> tracks
                   (and (= (get cell prop-span) 1)
@@ -122,10 +123,11 @@
   [track-list]
   (let [calc-tracks-total-frs
         (fn [acc {:keys [type value]}]
-          (let [value (max 1 value)]
-            (cond-> acc
-              (= type :flex)
-              (+ value))))]
+          ;; Only a flex track has a value; an auto track has none, so the
+          ;; max must not run on it (nil throws on the JVM)
+          (cond-> acc
+            (= type :flex)
+            (+ (max 1 value))))]
     (->> track-list (reduce calc-tracks-total-frs 0))))
 
 (defn tracks-total-autos
@@ -175,7 +177,7 @@
 
             ;; When auto, we don't need to remove the excess
             (if (or auto?
-                    (= free-frs 0)
+                    (zero? free-frs)
                     (mth/almost-zero? pending))
               assign-fr
 
@@ -374,7 +376,8 @@
                                    [to-allocate 0 []]))
 
                       to-allocate (max to-allocate 0)
-                      fr-value (/ to-allocate total-frs)]
+                      ;; No flex value in the span (all zero): nothing to share out
+                      fr-value (if (zero? total-frs) 0 (/ to-allocate total-frs))]
                   (allocate-flex-tracks alloc indexed-tracks to-allocate fr-value)))
               {}))
 
@@ -392,7 +395,8 @@
     (if (empty? tracks)
       min-fr
       (let [{:keys [size type value]} (first tracks)
-            min-fr (if (= type :flex) (max min-fr (/ size value)) min-fr)]
+            ;; A flex track with a zero value cannot give a minimum fr: skip it
+            min-fr (if (and (= type :flex) (pos? value)) (max min-fr (/ size value)) min-fr)]
         (recur (rest tracks) (double min-fr))))))
 
 (defn calc-layout-data
@@ -513,7 +517,7 @@
            (max column-gap (/ (- bound-width column-total-size) (inc num-columns)))
 
            (= :space-around (:layout-justify-content parent))
-           (max column-gap (/ (- bound-width column-total-size) num-columns))
+           (max column-gap (if (zero? num-columns) 0 (/ (- bound-width column-total-size) num-columns)))
 
            (= :space-between (:layout-justify-content parent))
            (max column-gap (if (= num-columns 1) column-gap (/ (- bound-width column-total-size) (dec num-columns))))
@@ -531,7 +535,7 @@
            (max row-gap (/ (- bound-height row-total-size) (inc num-rows)))
 
            (= :space-around (:layout-align-content parent))
-           (max row-gap (/ (- bound-height row-total-size) num-rows))
+           (max row-gap (if (zero? num-rows) 0 (/ (- bound-height row-total-size) num-rows)))
 
            (= :space-between (:layout-align-content parent))
            (max row-gap (if (= num-rows 1) row-gap (/ (- bound-height row-total-size) (dec num-rows))))

@@ -1,7 +1,31 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import express from "express";
-import { McpAuthentication } from "./McpAuthentication";
+import { BoundedFingerprintSet, McpAuthentication } from "./McpAuthentication";
+
+test("the warned-fingerprint set keeps at most 1000 entries and evicts the oldest", () => {
+    const set = new BoundedFingerprintSet(1000);
+    for (let i = 0; i < 1005; i++) {
+        assert.equal(set.add(`fp-${i}`), true);
+    }
+    assert.equal(set.size, 1000);
+    // the five oldest were evicted, so the first one is new again
+    assert.equal(set.add("fp-0"), true);
+    assert.equal(set.size, 1000);
+    // a recent fingerprint is still kept, so it is refreshed and not warned again
+    assert.equal(set.add("fp-1004"), false);
+});
+
+test("a refreshed fingerprint becomes the newest entry of the set", () => {
+    const set = new BoundedFingerprintSet(2);
+    assert.equal(set.add("a"), true);
+    assert.equal(set.add("b"), true);
+    assert.equal(set.add("a"), false);
+    assert.equal(set.add("c"), true);
+    // b was the oldest after a was refreshed, so it was evicted
+    assert.equal(set.add("b"), true);
+    assert.equal(set.add("c"), false);
+});
 
 test("OAuth is opt-in and requires multi-user mode", () => {
     assert.equal(new McpAuthentication(undefined, false).isOAuthEnabled, false);

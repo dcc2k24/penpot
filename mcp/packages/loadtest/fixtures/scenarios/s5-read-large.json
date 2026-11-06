@@ -1,0 +1,100 @@
+{
+  "name": "S5-read-large",
+  "description": "Plan 8.4 S5 read path: file outline, 20 page trees, 200 get_shapes calls and 50 find_shapes calls, against the generated large reference file. The 50 find_shapes calls go over the first 20 pages in three passes (20, 20, 10), so the file needs at least 20 pages, and its first page at least 200 shapes. Run with --duration 30m for the full run. Each step is capped at 10 calls per second, the per-token limit of the server. Pass when p95 per tool class stays inside the large-file row of 8.1 and the backend heap stays stable.",
+  "agents": 1,
+  "iterations": 1,
+  "steps": [
+    {
+      "name": "file outline",
+      "tool": "get_file_outline",
+      "rateLimitPerSecond": 10,
+      "args": {
+        "fileId": "${fileId}"
+      },
+      "capture": {
+        "pageIds": "$.result.pages[*].id"
+      }
+    },
+    {
+      "name": "page tree of each page",
+      "tool": "get_page_tree",
+      "repeat": 20,
+      "rateLimitPerSecond": 10,
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageIds[index]}",
+        "depth": 3,
+        "limit": 500
+      }
+    },
+    {
+      "name": "find shapes for get_shapes",
+      "tool": "find_shapes",
+      "rateLimitPerSecond": 10,
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageIds[0]}",
+        "limit": 200
+      },
+      "capture": {
+        "shapeIds": "$.result.matches[*].id"
+      },
+      "expect": {
+        "path": "$.result.matches",
+        "length": 200
+      }
+    },
+    {
+      "name": "get_shapes one id",
+      "tool": "get_shapes",
+      "repeat": 200,
+      "rateLimitPerSecond": 10,
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageIds[0]}",
+        "ids": [
+          "${shapeIds[index]}"
+        ]
+      }
+    },
+    {
+      "name": "find_shapes one page, pass 1",
+      "tool": "find_shapes",
+      "repeat": 20,
+      "rateLimitPerSecond": 10,
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageIds[index]}",
+        "type": "frame",
+        "nameRegex": "^Board",
+        "limit": 100
+      }
+    },
+    {
+      "name": "find_shapes one page, pass 2",
+      "tool": "find_shapes",
+      "repeat": 20,
+      "rateLimitPerSecond": 10,
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageIds[index]}",
+        "type": "frame",
+        "nameRegex": "^Board",
+        "limit": 100
+      }
+    },
+    {
+      "name": "find_shapes one page, pass 3",
+      "tool": "find_shapes",
+      "repeat": 10,
+      "rateLimitPerSecond": 10,
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageIds[index]}",
+        "type": "frame",
+        "nameRegex": "^Board",
+        "limit": 100
+      }
+    }
+  ]
+}

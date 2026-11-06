@@ -10,6 +10,7 @@ export class ConfigurationLoader {
     private readonly baseDir: string;
     private readonly initialInstructions: string;
     private readonly baseInstructions: string;
+    private readonly backendInstructions: string;
 
     /**
      * Creates a new configuration loader instance.
@@ -20,6 +21,7 @@ export class ConfigurationLoader {
         this.baseDir = baseDir;
         this.initialInstructions = this.loadFileContent(join(this.baseDir, "data", "initial_instructions.md"));
         this.baseInstructions = this.loadFileContent(join(this.baseDir, "data", "base_instructions.md"));
+        this.backendInstructions = this.loadFileContent(join(this.baseDir, "data", "backend_instructions.md"));
     }
 
     private loadFileContent(filePath: string): string {
@@ -47,5 +49,14 @@ export class ConfigurationLoader {
      */
     public getBaseInstructions(): string {
         return this.baseInstructions;
+    }
+
+    /**
+     * Gets the high-level overview for backend mode, which covers ids, the discovery flow and writes.
+     *
+     * @returns The backend instructions string
+     */
+    public getBackendInstructions(): string {
+        return this.backendInstructions;
     }
 }

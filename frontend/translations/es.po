@@ -2536,6 +2536,17 @@ msgstr ""
 "El servidor MCP de Penpot permite a los clientes MCP interactuar "
 "directamente con los archivos de diseño de Penpot."
 
+#: src/app/main/ui/settings/integrations.cljs:461
+msgid "integrations.mcp-key.allow-write"
+msgstr "Permitir que MCP edite diseños"
+
+#: src/app/main/ui/settings/integrations.cljs:470
+msgid "integrations.mcp-key.allow-write.help"
+msgstr ""
+"Si está desactivado, la clave MCP solo puede leer, exportar y descargar. "
+"Actívala para que los agentes puedan crear y modificar páginas, formas, "
+"tokens y componentes."
+
 #: src/app/main/ui/settings/integrations.cljs:119
 msgid "integrations.mcp-key.will-expire"
 msgstr "La clave MCP expirará el %s"
@@ -9824,5 +9835,29 @@ msgstr "Los autoguardados duran %s días."
 msgid "mcp.oauth.access"
 msgstr "Este cliente puede leer y modificar diseños mediante conexiones MCP establecidas desde Penpot."
 
+#: src/app/main/ui/mcp_authorize.cljs:213
+msgid "mcp.oauth.access.read-only"
+msgstr "Este cliente puede leer diseños, exportar y descargar mediante conexiones MCP establecidas desde Penpot."
+
 msgid "mcp.oauth.cancelled"
 msgstr "Conexión cancelada"
+
+#: src/app/main/ui/mcp_authorize.cljs:84
+msgid "mcp-authorize.scope.read"
+msgstr "Leer diseños, exportar y descargar"
+
+#: src/app/main/ui/mcp_authorize.cljs:81
+msgid "mcp-authorize.scope.write"
+msgstr "Crear y modificar diseños"
+
+#: src/app/main/ui/mcp_authorize.cljs:82
+msgid "mcp-authorize.scope.manage"
+msgstr "Crear, renombrar, mover y compartir equipos, proyectos y archivos"
+
+#: src/app/main/ui/mcp_authorize.cljs:83
+msgid "mcp-authorize.scope.delete"
+msgstr "Eliminar proyectos y archivos"
+
+#: src/app/main/ui/mcp_authorize.cljs:201
+msgid "mcp-authorize.scope.also-granted"
+msgstr "Tu clave MCP ya tiene estos permisos, que este cliente también recibirá:"

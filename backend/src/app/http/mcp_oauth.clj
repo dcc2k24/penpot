@@ -21,6 +21,7 @@
    [app.mcp.oauth-clients :as clients]
    [app.mcp.oauth-state :as state]
    [app.rpc.commands.access-token :as access-token]
+   [app.rpc.mcp-scope :as mcp-scope]
    [app.util.json :as json]
    [clojure.string :as str]
    [integrant.core :as ig]
@@ -37,6 +38,27 @@
 (defn issuer [] (str (cf/get-public-uri "api/mcp/oauth")))
 (defn resource [] (str (cf/get-public-uri "mcp/stream")))
 
+(def ^:private scopes-supported
+  ["mcp" "mcp:read" "mcp:write" "mcp:manage" "mcp:delete"])
+
+(def ^:private scope-aliases
+  "The legacy `mcp` scope asks for read access."
+  {"mcp" "mcp:read"})
+
+(defn- normalize-scope
+  "Normalise a space-separated scope request into a sorted, duplicate-free
+  string of `mcp:*` scopes, with `mcp` read as `mcp:read`. Nil when the
+  request is missing, empty or names an unsupported scope."
+  [value]
+  (when (string? value)
+    (let [names (str/split (str/trim value) #"\s+")]
+      (when (every? (set scopes-supported) names)
+        (->> names
+             (map #(get scope-aliases % %))
+             (distinct)
+             (sort)
+             (str/join " "))))))
+
 (defn authorization-metadata
   "OAuth capabilities and endpoints advertised to MCP clients."
   []
@@ -48,7 +70,7 @@
    :grant_types_supported ["authorization_code"]
    :code_challenge_methods_supported ["S256"]
    :token_endpoint_auth_methods_supported ["none" "client_secret_basic" "client_secret_post"]
-   :scopes_supported ["mcp"]
+   :scopes_supported scopes-supported
    :authorization_response_iss_parameter_supported true
    :client_id_metadata_document_supported true})
 
@@ -57,7 +79,7 @@
   []
   {:resource (resource)
    :authorization_servers [(issuer)]
-   :scopes_supported ["mcp"]
+   :scopes_supported scopes-supported
    :bearer_methods_supported ["header"]
    :resource_name "Penpot MCP"})
 
@@ -125,7 +147,8 @@
   (limit! cfg request :authorize-rate 60)
   (let [params   (parse-form (yreq/query request))
         client   (clients/resolve-client cfg (:client_id params))
-        callback (:redirect_uri params)]
+        callback (:redirect_uri params)
+        scope    (normalize-scope (get params :scope "mcp"))]
     ;; Never redirect until the client and its callback have been checked.
     (when-not (clients/redirect-matches? client callback)
       (clients/invalid! "invalid_request"))
@@ -133,7 +156,7 @@
                    (= "S256" (:code_challenge_method params))
                    (string? (:code_challenge params))
                    (re-matches #"[A-Za-z0-9_-]{43}" (:code_challenge params))
-                   (= "mcp" (get params :scope "mcp"))
+                   (some? scope)
                    (= (resource) (get params :resource (resource)))
                    (<= (count (:state params)) 2048))
       (clients/invalid! "invalid_request"))
@@ -145,7 +168,7 @@
                                  :challenge (:code_challenge params)
                                  :state (:state params)
                                  :resource (resource)
-                                 :scope "mcp"}
+                                 :scope scope}
                                 600)]
       (redirect (append-query (str (cf/get-public-uri))
                               {:screen "mcp-authorize" :request handle})))))
@@ -157,6 +180,19 @@
     (when-not (:profile-id session) (clients/invalid! "login_required" 401))
     {:profile-id (str (:profile-id session))
      :session-id (state/digest (str (:id session)))}))
+
+(defn- scope-text
+  "Space-separated scopes in sorted order, as the `scope` fields carry them."
+  [scopes]
+  (str/join " " (sort scopes)))
+
+(defn- granted-scope
+  "Scopes the MCP token of the bound profile holds once the staged request is
+  approved: its current scopes plus the requested ones. The token is shared by
+  every client, so the consent page must show what it will end up with."
+  [cfg {:keys [profile-id]} value]
+  (scope-text (access-token/get-granted-mcp-scopes
+               cfg (uuid/parse profile-id) (str/split (:scope value) #" "))))
 
 (defn- approval-request
   "Bind a pending request to its first authenticated session and return UI data.
@@ -171,13 +207,16 @@
         (when-not (= binding (select-keys value [:profile-id :session-id]))
           (clients/invalid! "access_denied" 403))
         (state/replace! cfg :request handle record
-                        (merge value binding {:csrf (state/random-secret)}))))
+                        (merge value binding
+                               {:csrf          (state/random-secret)
+                                :granted-scope (granted-scope cfg binding value)}))))
     ;; Another GET may have won the binding race. Read the winning record so
     ;; same-session retries share its CSRF value; other sessions cannot proceed.
     (let [value (:value (state/read! cfg :request handle))]
       (when-not (= binding (select-keys value [:profile-id :session-id]))
         (clients/invalid! "invalid_request"))
-      (response (select-keys value [:client-id :client-name :logo-uri :csrf :scope])))))
+      (response (select-keys value [:client-id :client-name :logo-uri :csrf
+                                    :scope :granted-scope])))))
 
 (defn- same-origin?
   [request]
@@ -206,12 +245,15 @@
       (clients/invalid! "invalid_request"))
     (let [result (if (= "deny" (:decision params))
                    {:error "access_denied"}
-                   (let [token (db/tx-run! cfg access-token/ensure-mcp-access!
-                                           (uuid/parse (:profile-id value)))
+                   (let [scopes (str/split (normalize-scope (:scope value)) #" ")
+                         token  (db/tx-run! cfg access-token/grant-mcp-scopes
+                                            (uuid/parse (:profile-id value))
+                                            scopes)
                          ;; Retain the token row ID, never the fixed token itself.
                          code  (state/create! cfg :code
                                               (-> value
-                                                  (dissoc :csrf :session-id :client-name)
+                                                  (dissoc :csrf :session-id :client-name
+                                                          :granted-scope)
                                                   (assoc :token-id (str (:id token))))
                                               120)]
                      {:code code}))]
@@ -278,13 +320,17 @@
     ;; Regeneration deletes the old token row. Never substitute the profile's
     ;; latest token for the one this approval authorized, nor return it expired.
     (let [row (db/exec-one! (::db/pool cfg)
-                            [(str "SELECT token FROM access_token"
+                            [(str "SELECT token, perms FROM access_token"
                                   " WHERE id = ? AND profile_id = ? AND type = 'mcp'"
                                   " AND (expires_at IS NULL OR expires_at > now())")
                              (uuid/parse (:token-id value))
                              (uuid/parse (:profile-id value))])]
       (when-not row (clients/invalid! "invalid_grant"))
-      (response {:access_token (:token row) :token_type "Bearer" :scope "mcp"}))))
+      ;; The scope the token holds now, which can be wider than this approval's.
+      (response {:access_token (:token row)
+                 :token_type "Bearer"
+                 :scope (scope-text (mcp-scope/effective-scopes
+                                     (db/decode-pgarray (:perms row) [])))}))))
 
 (defn- register
   "Issue a self-contained client registration; does not grant user access."

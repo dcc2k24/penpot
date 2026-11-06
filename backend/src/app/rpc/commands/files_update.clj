@@ -41,6 +41,7 @@
    [clojure.set :as set]))
 
 (declare ^:private get-lagged-changes)
+(declare ^:private read-changed-shapes)
 (declare ^:private send-notifications!)
 (declare ^:private send-repair-notifications)
 (declare ^:private update-file)
@@ -151,20 +152,38 @@
 ;; set is different than the persisted one, update it on the
 ;; database.
 
-(sv/defmethod ::update-file
-  {::rpc/id-type :file
-   ::climit/id [[:update-file/by-profile ::rpc/profile-id]
-                [:update-file/global]]
+(defn update-file!
+  "Apply the changes of `params` to a file. This is the single commit
+  path for human (RPC `update-file`) and MCP writes: both go through
+  here, so the lock, the revn and vern checks, the features, the
+  persistence and the notifications cannot drift apart.
 
-   ::webhooks/event? true
-   ::webhooks/batch-timeout (ct/duration "2m")
-   ::webhooks/batch-key (webhooks/key-fn ::rpc/profile-id :id)
+  `cfg` must carry `::db/conn` (the caller owns the transaction) and
+  `::mtx/metrics`. `params` carries `::rpc/profile-id`, `:id`, `:revn`,
+  `:vern`, `:session-id`, `:features`, either `:changes` or
+  `:changes-with-metadata`, and optionally `:skip-validate`.
 
-   ::sm/params schema:update-file
-   ::sm/result schema:update-file-result
-   ::doc/module :files
-   ::doc/added "1.17"
-   ::db/transaction true}
+  Two optional MCP hooks are read from `params`:
+
+  - `::mcp-snapshot` `{:label .. :keep ..}`: before the changes are
+    applied, the pre-change file is saved as a snapshot with that
+    label, and the snapshots of this file with an `mcp/` label are
+    pruned to the `keep` newest (default 20). The automatic snapshot
+    is not taken in the same call. The result carries `:snapshot-id`.
+  - `::changed-shape-ids-since` (a revn): the result carries
+    `:changed-shape-ids`, the ids of the shapes that the commits of
+    other sessions made after that revn touch, read before this call
+    commits (so never this call's own shapes). The ids come from at
+    most `changed-rows-limit` rows. `:changed-shape-ids-truncated?` is
+    true when the read was cut short or a row did not decode.
+  - `::mcp-write?` true: the snapshots the call takes, the automatic
+    one included, load only the pointer maps of the file and keep its
+    objects maps as they are (see `attach-snapshot`).
+
+  Returns `{:revn <revn before the update> :lagged [...]}` plus the
+  keys above when they apply. Its metadata carries `::stored-revn`, the
+  revn the call stored (two more than `:revn` when the file was
+  repaired)."
   [{:keys [::mtx/metrics ::db/conn] :as cfg}
    {:keys [::rpc/profile-id id changes changes-with-metadata] :as params}]
 
@@ -271,6 +290,23 @@
                    :reprocess-changes-ms (get timings :reprocess-changes-ms)))
           (throw cause))))))
 
+(sv/defmethod ::update-file
+  {::rpc/id-type :file
+   ::climit/id [[:update-file/by-profile ::rpc/profile-id]
+                [:update-file/global]]
+
+   ::webhooks/event? true
+   ::webhooks/batch-timeout (ct/duration "2m")
+   ::webhooks/batch-key (webhooks/key-fn ::rpc/profile-id :id)
+
+   ::sm/params schema:update-file
+   ::sm/result schema:update-file-result
+   ::doc/module :files
+   ::doc/added "1.17"
+   ::db/transaction true}
+  [cfg params]
+  (update-file! cfg params))
+
 (defn- update-file*
   "Internal function, part of the update-file process, that encapsulates
   the changes application offload to a separated thread and emit all
@@ -294,10 +330,32 @@
           revn
           (get file :revn)
 
-          file
+          snapshot-deleted-at
+          (ct/plus timestamp (ldel/get-deletion-delay team))
+
+          mcp-snapshot
+          (when-let [{:keys [label keep]} (::mcp-snapshot params)]
+            {:label label
+             :keep (max 1 (or keep 20))
+             :profile-id profile-id
+             :session-id session-id
+             :deleted-at snapshot-deleted-at})
+
+          ;; Read before the commit below, so the ids never include
+          ;; the shapes touched by this call's own change row.
+          changed-reads
+          (when (some? (::changed-shape-ids-since params))
+            (read-changed-shapes conn (:id file)
+                                 (::changed-shape-ids-since params)
+                                 revn
+                                 session-id))
+
+          [file snapshot-id]
           (binding [cfeat/*current*  features
                     cfeat/*previous* (:features file)]
             (update-file-data! cfg file
+                               {:mcp-snapshot mcp-snapshot
+                                :mcp-write? (::mcp-write? params)}
                                process-changes-and-validate
                                changes skip-validate))
 
@@ -306,9 +364,6 @@
 
           repair
           (::repair file)
-
-          snapshot-deleted-at
-          (ct/plus timestamp (ldel/get-deletion-delay team))
 
           change-created-at
           (cond-> timestamp
@@ -371,16 +426,26 @@
 
       (persist-file! cfg (dissoc file ::repair))
 
+      ;; Runs when the transaction commits, so a reader cannot refill the cache with the old summary before the new one is stored.
       (when (contains? cf/flags :redis-cache)
-        (invalidate-caches! cfg file))
+        (db/after-commit
+         (fn []
+           (invalidate-caches! cfg file))))
 
       ;; Send asynchronous notifications
       (when repair
         (send-repair-notifications cfg params file repair))
       (send-notifications! cfg params file)
 
-      (with-meta {:revn revn :lagged (get-lagged-changes conn params)}
-        {::audit/replace-props
+      (with-meta (cond-> {:revn revn :lagged (get-lagged-changes conn params)}
+                   snapshot-id
+                   (assoc :snapshot-id snapshot-id)
+
+                   (some? changed-reads)
+                   (assoc :changed-shape-ids (:shape-ids changed-reads)
+                          :changed-shape-ids-truncated? (:truncated? changed-reads)))
+        {::stored-revn (:revn file)
+         ::audit/replace-props
          {:id          (:id file)
           :name        (:name file)
           :features    (:features file)
@@ -431,21 +496,74 @@
 
 (defn- attach-snapshot
   "Attach snapshot data to the file. This should be called before the
-  upcoming file operations are applied to the file."
-  [cfg migrated? file]
-  (let [snapshot (if migrated? file (fdata/realize cfg file))]
+  upcoming file operations are applied to the file.
+
+  With `pointers-only?` only the pointer maps are loaded and the objects
+  maps stay as they are: the snapshot holds the same data, but it is
+  much cheaper to build and to encode on a large file. This path loads
+  the pointer maps of a migrated file too, since `file_gc` drops the
+  fragments the file no longer uses."
+  [cfg migrated? pointers-only? file]
+  (let [snapshot (cond
+                   pointers-only? (fdata/realize-pointers cfg file)
+                   migrated?      file
+                   :else          (fdata/realize cfg file))]
     (assoc file ::snapshot snapshot)))
+
+(def ^:private sql:mcp-snapshots
+  "select c.id
+     from file_change as c
+    where c.file_id = ?
+      and c.created_by = 'system'
+      and c.label like 'mcp/%'
+      and (c.deleted_at is null or c.deleted_at >= ?::timestamptz)
+    order by c.created_at asc, c.id asc")
+
+(defn- create-mcp-snapshot!
+  "Snapshot the pre-change `file` (with `::snapshot` attached) for an
+  MCP write. First marks the oldest `mcp/` snapshots of the file as
+  deleted, so that `keep` snapshots remain counting the new one. Raises
+  `:snapshot-failed` when the snapshot cannot be created, which aborts
+  the transaction. Returns the new snapshot."
+  [cfg file {:keys [label keep profile-id session-id deleted-at]}]
+  (let [file-id  (:id file)
+        now      (ct/now)
+        existing (db/exec! cfg [sql:mcp-snapshots file-id now])
+        excess   (- (count existing) (dec keep))]
+
+    (doseq [{:keys [id]} (take (max 0 excess) existing)]
+      (fsnap/delete! cfg :id id :file-id file-id :deleted-at now))
+
+    (try
+      (fsnap/create! cfg (::snapshot file)
+                     {:label label
+                      :created-by "system"
+                      :deleted-at deleted-at
+                      :profile-id profile-id
+                      :session-id session-id})
+      (catch Throwable cause
+        (ex/raise :type :validation
+                  :code :snapshot-failed
+                  :hint "unable to snapshot the file before the write; the write was aborted"
+                  :file-id file-id
+                  :cause cause)))))
 
 (defn- update-file-data!
   "Perform a file data transformation in with all update context setup.
 
-  This function expected not-decoded file and transformation function. Returns
-  an encoded file.
+  This function expected not-decoded file, the snapshot options and
+  transformation function. The options are `:mcp-snapshot`, the MCP
+  snapshot spec (or nil), and `:mcp-write?`, true when an MCP call
+  makes the write. Returns a vector with the encoded file and the id of
+  the MCP snapshot taken before `update-fn` ran (nil when none was
+  taken). When a MCP snapshot is taken, the automatic snapshot is not.
+  The snapshots of an MCP write load only the pointer maps (see
+  `attach-snapshot`).
 
   This function is not responsible of saving the file. It only saves
   fdata/pointer-map modified fragments."
 
-  [cfg {:keys [id] :as file} update-fn & args]
+  [cfg {:keys [id] :as file} {:keys [mcp-snapshot mcp-write?]} update-fn & args]
   (let [file (update file :data (fn [data]
                                   (-> data
                                       (blob/decode)
@@ -456,7 +574,8 @@
         (fmg/need-migration? file)
 
         take-snapshot?
-        (take-snapshot? file)
+        (and (nil? mcp-snapshot)
+             (take-snapshot? file))
 
         ;; For avoid unnecesary overhead of creating multiple
         ;; pointers and handly internally with objects map in their
@@ -471,10 +590,20 @@
           need-migration?
           (fmg/migrate-file libs)
 
-          take-snapshot?
-          (->> (attach-snapshot cfg need-migration?)))]
+          (or take-snapshot? (some? mcp-snapshot))
+          (->> (attach-snapshot cfg need-migration?
+                                (or (boolean mcp-write?) (some? mcp-snapshot)))))
 
-    (apply update-fn cfg file args)))
+        snapshot-id
+        (when (some? mcp-snapshot)
+          (:id (create-mcp-snapshot! cfg file mcp-snapshot)))
+
+        file
+        (cond-> file
+          (some? mcp-snapshot)
+          (dissoc ::snapshot))]
+
+    [(apply update-fn cfg file args) snapshot-id]))
 
 (defn- soft-validate-file-schema!
   [file]
@@ -593,9 +722,19 @@
             (record-repair-outcome cfg :unrepaired)
             (throw cause)))))))
 
+(defn validation-mode
+  "What the commit path validates, decided from the feature flags.
+  `:affected` runs the affected-shapes validation, `:schema` the schema
+  validation. Soft validation only logs, so it is not part of this.
+  The MCP dry run calls this too, so a dry run decides as a commit does."
+  []
+  {:affected (contains? cf/flags :file-validation)
+   :schema   (contains? cf/flags :file-schema-validation)})
+
 (defn- process-changes-and-validate
   [cfg file changes skip-validate]
-  (let [original  file
+  (let [mode      (validation-mode)
+        original  file
         tracked   pmap/*tracked*
         tracked-0 (some-> tracked deref)
 
@@ -645,7 +784,7 @@
             (finally
               (record-validation-timing cfg :soft-validate-schema-ms "soft-validate-schema" (inst-ms (t)))))))
 
-      (when (and (contains? cf/flags :file-validation)
+      (when (and (:affected mode)
                  (not skip-validate))
         (let [t (ct/tpoint)]
           (try
@@ -657,7 +796,7 @@
             (finally
               (record-validation-timing cfg :validate-affected-ms "validate-affected" (inst-ms (t)))))))
 
-      (when (and (contains? cf/flags :file-schema-validation)
+      (when (and (:schema mode)
                  (not skip-validate)
                  (nil? @pending-repair))
         (let [t (ct/tpoint)]
@@ -698,56 +837,112 @@
        (mapv (fn [row]
                (update row :changes blob/decode)))))
 
+(defn change-shape-ids
+  "Ids of the shapes a change touches, for the changes that name them.
+  A move or reorder touches its shapes and its parent. `:reg-objects`
+  names no shape to conflict on, so it returns nil."
+  [{:keys [type] :as change}]
+  (case type
+    (:add-obj :mod-obj :del-obj) [(:id change)]
+    (:mov-objects :reorder-children)
+    (into [] (remove nil?) (concat (:shapes change) (:ids change) [(:parent-id change)]))
+    nil))
+
+(def changed-rows-limit
+  "The most `file_change` rows `read-changed-shapes` reads in one call."
+  500)
+
+(def ^:private sql:changed-shape-rows
+  "select c.changes
+     from file_change as c
+    where c.file_id = ?
+      and c.revn > ?
+      and c.revn <= ?
+      and c.changes is not null
+      and c.session_id is distinct from ?
+    order by c.revn asc
+    limit ?")
+
+(defn read-changed-shapes
+  "Ids of the shapes touched by the commits with a revn in (`since`,
+  `stored-revn`], leaving out the rows of `session-id` (nil leaves out
+  none). Reads at most `changed-rows-limit` rows. Returns
+  `{:shape-ids #{...} :truncated? bool}`. `:truncated?` is true when
+  rows were left out by the limit, or when a row does not decode. A row
+  that does not decode is logged and skipped; this never raises for a
+  bad row."
+  [conn file-id since stored-revn session-id]
+  (let [rows      (db/exec! conn [sql:changed-shape-rows
+                                  file-id since stored-revn session-id
+                                  (inc changed-rows-limit)])
+        overflow? (> (count rows) changed-rows-limit)]
+    (reduce (fn [acc {:keys [changes]}]
+              (try
+                (update acc :shape-ids into (mapcat change-shape-ids) (blob/decode changes))
+                (catch Throwable cause
+                  (l/wrn :hint "revn-lag: a file change does not decode; skipped"
+                         :file-id (str file-id)
+                         :cause cause)
+                  (assoc acc :truncated? true))))
+            {:shape-ids #{} :truncated? overflow?}
+            (take changed-rows-limit rows))))
+
 (defn- send-repair-notifications
   [cfg {:keys [team session-id] :as params} file repair]
   (let [changes  (:changes repair)
         lchanges (filter library-change? changes)
         msgbus   (::mbus/msgbus cfg)]
 
-    (mbus/pub! msgbus
-               :topic (:id file)
-               :message {:type :file-change
-                         :profile-id (:profile-id params)
-                         :file-id (:id file)
-                         :session-id repair-session-id
-                         :revn (:revn repair)
-                         :vern (:vern file)
-                         :changes changes
-                         :repaired true})
+    ;; Published when the transaction commits, never before, so a rolled back call reaches no open tab.
+    (db/after-commit
+     (fn []
+       (mbus/pub! msgbus
+                  :topic (:id file)
+                  :message {:type :file-change
+                            :profile-id (:profile-id params)
+                            :file-id (:id file)
+                            :session-id repair-session-id
+                            :revn (:revn repair)
+                            :vern (:vern file)
+                            :changes changes
+                            :repaired true})
 
-    (when (and (:is-shared file) (seq lchanges))
-      (mbus/pub! msgbus
-                 :topic (:id team)
-                 :message {:type :library-change
-                           :profile-id (:profile-id params)
-                           :file-id (:id file)
-                           :session-id session-id
-                           :revn (:revn repair)
-                           :modified-at (ct/now)
-                           :changes lchanges}))))
+       (when (and (:is-shared file) (seq lchanges))
+         (mbus/pub! msgbus
+                    :topic (:id team)
+                    :message {:type :library-change
+                              :profile-id (:profile-id params)
+                              :file-id (:id file)
+                              :session-id session-id
+                              :revn (:revn repair)
+                              :modified-at (ct/now)
+                              :changes lchanges}))))))
 
 (defn- send-notifications!
   [cfg {:keys [team changes session-id] :as params} file]
   (let [lchanges (filter library-change? changes)
         msgbus   (::mbus/msgbus cfg)]
 
-    (mbus/pub! msgbus
-               :topic (:id file)
-               :message {:type :file-change
-                         :profile-id (:profile-id params)
-                         :file-id (:id file)
-                         :session-id (:session-id params)
-                         :revn (:revn file)
-                         :vern (:vern file)
-                         :changes changes})
+    ;; Published when the transaction commits, never before, so a rolled back call reaches no open tab.
+    (db/after-commit
+     (fn []
+       (mbus/pub! msgbus
+                  :topic (:id file)
+                  :message {:type :file-change
+                            :profile-id (:profile-id params)
+                            :file-id (:id file)
+                            :session-id (:session-id params)
+                            :revn (:revn file)
+                            :vern (:vern file)
+                            :changes changes})
 
-    (when (and (:is-shared file) (seq lchanges))
-      (mbus/pub! msgbus
-                 :topic (:id team)
-                 :message {:type :library-change
-                           :profile-id (:profile-id params)
-                           :file-id (:id file)
-                           :session-id session-id
-                           :revn (:revn file)
-                           :modified-at (ct/now)
-                           :changes lchanges}))))
+       (when (and (:is-shared file) (seq lchanges))
+         (mbus/pub! msgbus
+                    :topic (:id team)
+                    :message {:type :library-change
+                              :profile-id (:profile-id params)
+                              :file-id (:id file)
+                              :session-id session-id
+                              :revn (:revn file)
+                              :modified-at (ct/now)
+                              :changes lchanges}))))))

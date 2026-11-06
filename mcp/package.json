@@ -17,7 +17,9 @@
     "client-setup": "node bin/client-setup.js",
     "fmt": "prettier --write packages/",
     "fmt:check": "prettier --check packages/",
-    "test": "pnpm -r run test"
+    "test": "pnpm -r run test",
+    "loadtest": "pnpm --filter mcp-loadtest run start",
+    "design-parity": "pnpm --filter mcp-design-parity run start"
   },
   "repository": {
     "type": "git",

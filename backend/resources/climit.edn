@@ -76,4 +76,16 @@
  {:permits 1 :queue 2 :timeout 60000}
 
  :profile-plugin-ops/by-profile
- {:permits 1 :queue 2 :timeout 30000}}
+ {:permits 1 :queue 2 :timeout 30000}
+
+ :mcp-apply/by-profile
+ {:permits 2 :queue 10 :timeout 60000}
+
+ :mcp-apply/global
+ {:permits 10 :queue 50 :timeout 60000}
+
+ :mcp-read/by-profile
+ {:permits 4 :queue 20 :timeout 30000}
+
+ :mcp-read/global
+ {:permits 16 :queue 64 :timeout 30000}}

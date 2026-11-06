@@ -1,0 +1,3981 @@
+{
+  "revn": 21,
+  "shapes": [
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64ae4658b",
+      "name": "Onboarding / Welcome",
+      "type": "frame",
+      "x": 0,
+      "y": 0,
+      "width": 1440,
+      "height": 900,
+      "rotation": 0,
+      "selrect": {
+        "x": 0,
+        "y": 0,
+        "width": 1440,
+        "height": 900,
+        "x1": 0,
+        "y1": 0,
+        "x2": 1440,
+        "y2": 900
+      },
+      "points": [
+        {
+          "x": 0,
+          "y": 0
+        },
+        {
+          "x": 1440,
+          "y": 0
+        },
+        {
+          "x": 1440,
+          "y": 900
+        },
+        {
+          "x": 0,
+          "y": 900
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "00000000-0000-0000-0000-000000000000",
+      "frameId": "00000000-0000-0000-0000-000000000000",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "layoutGapType": "multiple",
+      "layoutPadding": {
+        "p1": 0,
+        "p2": 0,
+        "p3": 0,
+        "p4": 0
+      },
+      "layoutWrapType": "nowrap",
+      "layout": "flex",
+      "layoutAlignItems": "start",
+      "layoutPaddingType": "simple",
+      "r2": 0,
+      "proportionLock": false,
+      "layoutGap": {
+        "rowGap": 0,
+        "columnGap": 0
+      },
+      "r3": 0,
+      "layoutJustifyContent": "start",
+      "r1": 0,
+      "layoutFlexDir": "column",
+      "layoutAlignContent": "stretch",
+      "strokes": [],
+      "proportion": 1,
+      "r4": 0,
+      "fills": [
+        {
+          "fillColor": "#FFFFFF",
+          "fillOpacity": 1
+        }
+      ],
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64ae4b250",
+        "ce1379a2-f81f-8121-8008-e4e64ae8c3f1"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64ae4b250",
+      "name": "Body",
+      "type": "frame",
+      "x": 0,
+      "y": 64,
+      "width": 1440,
+      "height": 836,
+      "rotation": 0,
+      "selrect": {
+        "x": 0,
+        "y": 64,
+        "width": 1440,
+        "height": 836,
+        "x1": 0,
+        "y1": 64,
+        "x2": 1440,
+        "y2": 900
+      },
+      "points": [
+        {
+          "x": 0,
+          "y": 64
+        },
+        {
+          "x": 1440,
+          "y": 64
+        },
+        {
+          "x": 1440,
+          "y": 900
+        },
+        {
+          "x": 0,
+          "y": 900
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64ae4658b",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64ae4658b",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "r2": 0,
+      "proportionLock": false,
+      "r3": 0,
+      "r1": 0,
+      "strokes": [],
+      "proportion": 1,
+      "r4": 0,
+      "fills": [],
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64ae4f1c3",
+        "ce1379a2-f81f-8121-8008-e4e64ae58bb2",
+        "ce1379a2-f81f-8121-8008-e4e64ae6c1ad"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64ae4f1c3",
+      "name": "Headline",
+      "type": "text",
+      "x": 360,
+      "y": 240,
+      "width": 720,
+      "height": 58,
+      "rotation": 0,
+      "selrect": {
+        "x": 360,
+        "y": 240,
+        "width": 720,
+        "height": 58,
+        "x1": 360,
+        "y1": 240,
+        "x2": 1080,
+        "y2": 298
+      },
+      "points": [
+        {
+          "x": 360,
+          "y": 240
+        },
+        {
+          "x": 1080,
+          "y": 240
+        },
+        {
+          "x": 1080,
+          "y": 298
+        },
+        {
+          "x": 360,
+          "y": 298
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64ae4b250",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64ae4b250",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.2",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e33424",
+                    "textTransform": "none",
+                    "textAlign": "center",
+                    "verticalAlign": "center",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "48",
+                    "fontWeight": "700",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#161A26",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Welcome to Design Lab"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "48",
+                "fontWeight": "700",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#161A26",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "textLayoutState": "approximate",
+      "characters": "Welcome to Design Lab"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64ae58bb2",
+      "name": "Intro",
+      "type": "text",
+      "x": 360,
+      "y": 318,
+      "width": 720,
+      "height": 24,
+      "rotation": 0,
+      "selrect": {
+        "x": 360,
+        "y": 318,
+        "width": 720,
+        "height": 24,
+        "x1": 360,
+        "y1": 318,
+        "x2": 1080,
+        "y2": 342
+      },
+      "points": [
+        {
+          "x": 360,
+          "y": 318
+        },
+        {
+          "x": 1080,
+          "y": 318
+        },
+        {
+          "x": 1080,
+          "y": 342
+        },
+        {
+          "x": 360,
+          "y": 342
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64ae4b250",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64ae4b250",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.5",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452b",
+                    "textTransform": "none",
+                    "textAlign": "center",
+                    "verticalAlign": "center",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "16",
+                    "fontWeight": "400",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#5C6578",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Sketch, prototype and ship from one file."
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "16",
+                "fontWeight": "400",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#5C6578",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "textLayoutState": "approximate",
+      "characters": "Sketch, prototype and ship from one file."
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64ae6c1ad",
+      "name": "Button / Primary / LG",
+      "type": "frame",
+      "x": 632,
+      "y": 380,
+      "width": 176,
+      "height": 48,
+      "rotation": 0,
+      "selrect": {
+        "x": 632,
+        "y": 380,
+        "width": 176,
+        "height": 48,
+        "x1": 632,
+        "y1": 380,
+        "x2": 808,
+        "y2": 428
+      },
+      "points": [
+        {
+          "x": 632,
+          "y": 380
+        },
+        {
+          "x": 808,
+          "y": 380
+        },
+        {
+          "x": 808,
+          "y": 428
+        },
+        {
+          "x": 632,
+          "y": 428
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64ae4b250",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64ae4b250",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "layoutGapType": "multiple",
+      "layoutPadding": {
+        "p1": 0,
+        "p2": 0,
+        "p3": 0,
+        "p4": 0
+      },
+      "layoutWrapType": "nowrap",
+      "layout": "flex",
+      "layoutAlignItems": "center",
+      "layoutPaddingType": "simple",
+      "r2": 8,
+      "componentRoot": true,
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e6456bb6d5",
+      "proportionLock": false,
+      "layoutGap": {
+        "rowGap": 8,
+        "columnGap": 8
+      },
+      "r3": 8,
+      "layoutJustifyContent": "center",
+      "r1": 8,
+      "layoutFlexDir": "row",
+      "layoutAlignContent": "stretch",
+      "componentId": "ce1379a2-f81f-8121-8008-e4e6456d4ac8",
+      "strokes": [],
+      "proportion": 1,
+      "r4": 8,
+      "fills": [
+        {
+          "fillColor": "#3366FF",
+          "fillOpacity": 1
+        }
+      ],
+      "componentFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64ae786a9",
+        "ce1379a2-f81f-8121-8008-e4e64ae786aa"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64ae786a9",
+      "name": "Label",
+      "type": "text",
+      "x": 676,
+      "y": 392,
+      "width": 112,
+      "height": 24,
+      "rotation": 0,
+      "selrect": {
+        "x": 676,
+        "y": 392,
+        "width": 112,
+        "height": 24,
+        "x1": 676,
+        "y1": 392,
+        "x2": 788,
+        "y2": 416
+      },
+      "points": [
+        {
+          "x": 676,
+          "y": 392
+        },
+        {
+          "x": 788,
+          "y": 392
+        },
+        {
+          "x": 788,
+          "y": 416
+        },
+        {
+          "x": 676,
+          "y": 416
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64ae6c1ad",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64ae6c1ad",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.2",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452e",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "16",
+                    "fontWeight": "600",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#FFFFFF",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Get started"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "14",
+                "fontWeight": "600",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#FFFFFF",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "touched": [
+        "content-group",
+        "text-content-text"
+      ],
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e6456bca36",
+      "textLayoutState": "approximate",
+      "characters": "Get started"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64ae786aa",
+      "name": "Icon",
+      "type": "rect",
+      "x": 652,
+      "y": 396,
+      "width": 16,
+      "height": 16,
+      "rotation": 0,
+      "selrect": {
+        "x": 652,
+        "y": 396,
+        "width": 16,
+        "height": 16,
+        "x1": 652,
+        "y1": 396,
+        "x2": 668,
+        "y2": 412
+      },
+      "points": [
+        {
+          "x": 652,
+          "y": 396
+        },
+        {
+          "x": 668,
+          "y": 396
+        },
+        {
+          "x": 668,
+          "y": 412
+        },
+        {
+          "x": 652,
+          "y": 412
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64ae6c1ad",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64ae6c1ad",
+      "flipX": null,
+      "flipY": null,
+      "r2": 0,
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e6456ceefc",
+      "proportionLock": false,
+      "r3": 0,
+      "r1": 0,
+      "strokes": [],
+      "proportion": 1,
+      "r4": 0,
+      "fills": [
+        {
+          "fillColor": "#FFFFFF",
+          "fillOpacity": 1
+        }
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64ae8c3f1",
+      "name": "NavBar",
+      "type": "frame",
+      "x": 0,
+      "y": 0,
+      "width": 1440,
+      "height": 64,
+      "rotation": 0,
+      "selrect": {
+        "x": 0,
+        "y": 0,
+        "width": 1440,
+        "height": 64,
+        "x1": 0,
+        "y1": 0,
+        "x2": 1440,
+        "y2": 64
+      },
+      "points": [
+        {
+          "x": 0,
+          "y": 0
+        },
+        {
+          "x": 1440,
+          "y": 0
+        },
+        {
+          "x": 1440,
+          "y": 64
+        },
+        {
+          "x": 0,
+          "y": 64
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64ae4658b",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64ae4658b",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "r2": 0,
+      "componentRoot": true,
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e647ca8817",
+      "proportionLock": false,
+      "r3": 0,
+      "r1": 0,
+      "componentId": "ce1379a2-f81f-8121-8008-e4e647cca584",
+      "strokes": [
+        {
+          "strokeColor": "#DDE1E8",
+          "strokeOpacity": 1,
+          "strokeWidth": 1
+        }
+      ],
+      "proportion": 1,
+      "r4": 0,
+      "fills": [
+        {
+          "fillColor": "#FFFFFF",
+          "fillOpacity": 1
+        }
+      ],
+      "componentFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64ae8c3f2",
+        "ce1379a2-f81f-8121-8008-e4e64ae91582",
+        "ce1379a2-f81f-8121-8008-e4e64ae91583",
+        "ce1379a2-f81f-8121-8008-e4e64ae963ce",
+        "ce1379a2-f81f-8121-8008-e4e64ae963cf",
+        "ce1379a2-f81f-8121-8008-e4e64ae999c1"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64ae8c3f2",
+      "name": "Logo",
+      "type": "rect",
+      "x": 24,
+      "y": 16,
+      "width": 32,
+      "height": 32,
+      "rotation": 0,
+      "selrect": {
+        "x": 24,
+        "y": 16,
+        "width": 32,
+        "height": 32,
+        "x1": 24,
+        "y1": 16,
+        "x2": 56,
+        "y2": 48
+      },
+      "points": [
+        {
+          "x": 24,
+          "y": 16
+        },
+        {
+          "x": 56,
+          "y": 16
+        },
+        {
+          "x": 56,
+          "y": 48
+        },
+        {
+          "x": 24,
+          "y": 48
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64ae8c3f1",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64ae8c3f1",
+      "flipX": null,
+      "flipY": null,
+      "r2": 8,
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e647cafbad",
+      "proportionLock": false,
+      "r3": 8,
+      "r1": 8,
+      "strokes": [],
+      "proportion": 1,
+      "r4": 8,
+      "fills": [
+        {
+          "fillColor": "#3366FF",
+          "fillOpacity": 1
+        }
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64ae91582",
+      "name": "Title",
+      "type": "text",
+      "x": 68,
+      "y": 20,
+      "width": 160,
+      "height": 24,
+      "rotation": 0,
+      "selrect": {
+        "x": 68,
+        "y": 20,
+        "width": 160,
+        "height": 24,
+        "x1": 68,
+        "y1": 20,
+        "x2": 228,
+        "y2": 44
+      },
+      "points": [
+        {
+          "x": 68,
+          "y": 20
+        },
+        {
+          "x": 228,
+          "y": 20
+        },
+        {
+          "x": 228,
+          "y": 44
+        },
+        {
+          "x": 68,
+          "y": 44
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64ae8c3f1",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64ae8c3f1",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.3",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452a",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "18",
+                    "fontWeight": "600",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#161A26",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Design Lab"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "18",
+                "fontWeight": "600",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#161A26",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e647cafbaf",
+      "textLayoutState": "approximate",
+      "characters": "Design Lab"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64ae91583",
+      "name": "Link Dashboard",
+      "type": "text",
+      "x": 260,
+      "y": 22,
+      "width": 90,
+      "height": 20,
+      "rotation": 0,
+      "selrect": {
+        "x": 260,
+        "y": 22,
+        "width": 90,
+        "height": 20,
+        "x1": 260,
+        "y1": 22,
+        "x2": 350,
+        "y2": 42
+      },
+      "points": [
+        {
+          "x": 260,
+          "y": 22
+        },
+        {
+          "x": 350,
+          "y": 22
+        },
+        {
+          "x": 350,
+          "y": 42
+        },
+        {
+          "x": 260,
+          "y": 42
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64ae8c3f1",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64ae8c3f1",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.4",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452c",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "14",
+                    "fontWeight": "400",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#2E3445",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Dashboard"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "14",
+                "fontWeight": "400",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#2E3445",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e647cb589c",
+      "textLayoutState": "approximate",
+      "characters": "Dashboard"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64ae963ce",
+      "name": "Link Settings",
+      "type": "text",
+      "x": 370,
+      "y": 22,
+      "width": 80,
+      "height": 20,
+      "rotation": 0,
+      "selrect": {
+        "x": 370,
+        "y": 22,
+        "width": 80,
+        "height": 20,
+        "x1": 370,
+        "y1": 22,
+        "x2": 450,
+        "y2": 42
+      },
+      "points": [
+        {
+          "x": 370,
+          "y": 22
+        },
+        {
+          "x": 450,
+          "y": 22
+        },
+        {
+          "x": 450,
+          "y": 42
+        },
+        {
+          "x": 370,
+          "y": 42
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64ae8c3f1",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64ae8c3f1",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.4",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452c",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "14",
+                    "fontWeight": "400",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#2E3445",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Settings"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "14",
+                "fontWeight": "400",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#2E3445",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e647cbbfd4",
+      "textLayoutState": "approximate",
+      "characters": "Settings"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64ae963cf",
+      "name": "Link Billing",
+      "type": "text",
+      "x": 470,
+      "y": 22,
+      "width": 80,
+      "height": 20,
+      "rotation": 0,
+      "selrect": {
+        "x": 470,
+        "y": 22,
+        "width": 80,
+        "height": 20,
+        "x1": 470,
+        "y1": 22,
+        "x2": 550,
+        "y2": 42
+      },
+      "points": [
+        {
+          "x": 470,
+          "y": 22
+        },
+        {
+          "x": 550,
+          "y": 22
+        },
+        {
+          "x": 550,
+          "y": 42
+        },
+        {
+          "x": 470,
+          "y": 42
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64ae8c3f1",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64ae8c3f1",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.4",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452c",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "14",
+                    "fontWeight": "400",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#2E3445",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Billing"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "14",
+                "fontWeight": "400",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#2E3445",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e647cbe74a",
+      "textLayoutState": "approximate",
+      "characters": "Billing"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64ae999c1",
+      "name": "Avatar",
+      "type": "circle",
+      "x": 1376,
+      "y": 12,
+      "width": 40,
+      "height": 40,
+      "rotation": 0,
+      "selrect": {
+        "x": 1376,
+        "y": 12,
+        "width": 40,
+        "height": 40,
+        "x1": 1376,
+        "y1": 12,
+        "x2": 1416,
+        "y2": 52
+      },
+      "points": [
+        {
+          "x": 1376,
+          "y": 12
+        },
+        {
+          "x": 1416,
+          "y": 12
+        },
+        {
+          "x": 1416,
+          "y": 52
+        },
+        {
+          "x": 1376,
+          "y": 52
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64ae8c3f1",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64ae8c3f1",
+      "flipX": null,
+      "flipY": null,
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e647cca581",
+      "proportionLock": false,
+      "strokes": [],
+      "proportion": 1,
+      "fills": [
+        {
+          "fillColor": "#E2D6FF",
+          "fillOpacity": 1
+        }
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aeaa2c8",
+      "name": "Onboarding / Sign up",
+      "type": "frame",
+      "x": 1600,
+      "y": 0,
+      "width": 1440,
+      "height": 900,
+      "rotation": 0,
+      "selrect": {
+        "x": 1600,
+        "y": 0,
+        "width": 1440,
+        "height": 900,
+        "x1": 1600,
+        "y1": 0,
+        "x2": 3040,
+        "y2": 900
+      },
+      "points": [
+        {
+          "x": 1600,
+          "y": 0
+        },
+        {
+          "x": 3040,
+          "y": 0
+        },
+        {
+          "x": 3040,
+          "y": 900
+        },
+        {
+          "x": 1600,
+          "y": 900
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "00000000-0000-0000-0000-000000000000",
+      "frameId": "00000000-0000-0000-0000-000000000000",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "layoutGapType": "multiple",
+      "layoutPadding": {
+        "p1": 0,
+        "p2": 0,
+        "p3": 0,
+        "p4": 0
+      },
+      "layoutWrapType": "nowrap",
+      "layout": "flex",
+      "layoutAlignItems": "start",
+      "layoutPaddingType": "simple",
+      "r2": 0,
+      "proportionLock": false,
+      "layoutGap": {
+        "rowGap": 0,
+        "columnGap": 0
+      },
+      "r3": 0,
+      "layoutJustifyContent": "start",
+      "r1": 0,
+      "layoutFlexDir": "column",
+      "layoutAlignContent": "stretch",
+      "strokes": [],
+      "proportion": 1,
+      "r4": 0,
+      "fills": [
+        {
+          "fillColor": "#FFFFFF",
+          "fillOpacity": 1
+        }
+      ],
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64aeaa2ca",
+        "ce1379a2-f81f-8121-8008-e4e64aef02ea"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aeaa2ca",
+      "name": "Body",
+      "type": "frame",
+      "x": 1600,
+      "y": 64,
+      "width": 1440,
+      "height": 836,
+      "rotation": 0,
+      "selrect": {
+        "x": 1600,
+        "y": 64,
+        "width": 1440,
+        "height": 836,
+        "x1": 1600,
+        "y1": 64,
+        "x2": 3040,
+        "y2": 900
+      },
+      "points": [
+        {
+          "x": 1600,
+          "y": 64
+        },
+        {
+          "x": 3040,
+          "y": 64
+        },
+        {
+          "x": 3040,
+          "y": 900
+        },
+        {
+          "x": 1600,
+          "y": 900
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aeaa2c8",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aeaa2c8",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "r2": 0,
+      "proportionLock": false,
+      "r3": 0,
+      "r1": 0,
+      "strokes": [],
+      "proportion": 1,
+      "r4": 0,
+      "fills": [],
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64aeacba5",
+        "ce1379a2-f81f-8121-8008-e4e64aeb96e8",
+        "ce1379a2-f81f-8121-8008-e4e64aee69c8"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aeacba5",
+      "name": "Input / Default",
+      "type": "frame",
+      "x": 2160,
+      "y": 200,
+      "width": 320,
+      "height": 88,
+      "rotation": 0,
+      "selrect": {
+        "x": 2160,
+        "y": 200,
+        "width": 320,
+        "height": 88,
+        "x1": 2160,
+        "y1": 200,
+        "x2": 2480,
+        "y2": 288
+      },
+      "points": [
+        {
+          "x": 2160,
+          "y": 200
+        },
+        {
+          "x": 2480,
+          "y": 200
+        },
+        {
+          "x": 2480,
+          "y": 288
+        },
+        {
+          "x": 2160,
+          "y": 288
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aeaa2ca",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aeaa2ca",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "layoutGapType": "multiple",
+      "layoutPadding": {
+        "p1": 0,
+        "p2": 0,
+        "p3": 0,
+        "p4": 0
+      },
+      "layoutWrapType": "nowrap",
+      "layout": "flex",
+      "layoutAlignItems": "start",
+      "layoutPaddingType": "simple",
+      "r2": 0,
+      "componentRoot": true,
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e645f5c1c4",
+      "proportionLock": false,
+      "layoutGap": {
+        "rowGap": 4,
+        "columnGap": 4
+      },
+      "r3": 0,
+      "layoutJustifyContent": "start",
+      "r1": 0,
+      "layoutFlexDir": "column",
+      "layoutAlignContent": "stretch",
+      "componentId": "ce1379a2-f81f-8121-8008-e4e645f7d9c9",
+      "strokes": [],
+      "proportion": 1,
+      "r4": 0,
+      "fills": [],
+      "componentFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64aeb221d",
+        "ce1379a2-f81f-8121-8008-e4e64aeb221e",
+        "ce1379a2-f81f-8121-8008-e4e64aeb2220"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aeb221d",
+      "name": "Helper",
+      "type": "text",
+      "x": 2160,
+      "y": 264,
+      "width": 320,
+      "height": 16,
+      "rotation": 0,
+      "selrect": {
+        "x": 2160,
+        "y": 264,
+        "width": 320,
+        "height": 16,
+        "x1": 2160,
+        "y1": 264,
+        "x2": 2480,
+        "y2": 280
+      },
+      "points": [
+        {
+          "x": 2160,
+          "y": 264
+        },
+        {
+          "x": 2480,
+          "y": 264
+        },
+        {
+          "x": 2480,
+          "y": 280
+        },
+        {
+          "x": 2160,
+          "y": 280
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aeacba5",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aeacba5",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.4",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452d",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "12",
+                    "fontWeight": "400",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#5C6578",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "We never share your email"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "12",
+                "fontWeight": "400",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#5C6578",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e645f5c1c6",
+      "textLayoutState": "approximate",
+      "characters": "We never share your email"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aeb221e",
+      "name": "Input Box",
+      "type": "frame",
+      "x": 2160,
+      "y": 220,
+      "width": 320,
+      "height": 40,
+      "rotation": 0,
+      "selrect": {
+        "x": 2160,
+        "y": 220,
+        "width": 320,
+        "height": 40,
+        "x1": 2160,
+        "y1": 220,
+        "x2": 2480,
+        "y2": 260
+      },
+      "points": [
+        {
+          "x": 2160,
+          "y": 220
+        },
+        {
+          "x": 2480,
+          "y": 220
+        },
+        {
+          "x": 2480,
+          "y": 260
+        },
+        {
+          "x": 2160,
+          "y": 260
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aeacba5",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aeacba5",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "r2": 8,
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e645f66f3c",
+      "proportionLock": false,
+      "r3": 8,
+      "r1": 8,
+      "strokes": [
+        {
+          "strokeColor": "#9AA3B2",
+          "strokeOpacity": 1,
+          "strokeWidth": 1
+        }
+      ],
+      "proportion": 1,
+      "r4": 8,
+      "fills": [
+        {
+          "fillColor": "#FFFFFF",
+          "fillOpacity": 1
+        }
+      ],
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64aeb221f"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aeb221f",
+      "name": "Placeholder",
+      "type": "text",
+      "x": 2172,
+      "y": 230,
+      "width": 296,
+      "height": 20,
+      "rotation": 0,
+      "selrect": {
+        "x": 2172,
+        "y": 230,
+        "width": 296,
+        "height": 20,
+        "x1": 2172,
+        "y1": 230,
+        "x2": 2468,
+        "y2": 250
+      },
+      "points": [
+        {
+          "x": 2172,
+          "y": 230
+        },
+        {
+          "x": 2468,
+          "y": 230
+        },
+        {
+          "x": 2468,
+          "y": 250
+        },
+        {
+          "x": 2172,
+          "y": 250
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aeb221e",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aeb221e",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.4",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452c",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "14",
+                    "fontWeight": "400",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#9AA3B2",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "you@example.com"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "14",
+                "fontWeight": "400",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#9AA3B2",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e645f691ad",
+      "textLayoutState": "approximate",
+      "characters": "you@example.com"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aeb2220",
+      "name": "Label",
+      "type": "text",
+      "x": 2160,
+      "y": 200,
+      "width": 320,
+      "height": 16,
+      "rotation": 0,
+      "selrect": {
+        "x": 2160,
+        "y": 200,
+        "width": 320,
+        "height": 16,
+        "x1": 2160,
+        "y1": 200,
+        "x2": 2480,
+        "y2": 216
+      },
+      "points": [
+        {
+          "x": 2160,
+          "y": 200
+        },
+        {
+          "x": 2480,
+          "y": 200
+        },
+        {
+          "x": 2480,
+          "y": 216
+        },
+        {
+          "x": 2160,
+          "y": 216
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aeacba5",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aeacba5",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.4",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452d",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "12",
+                    "fontWeight": "400",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#2E3445",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Email"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "12",
+                "fontWeight": "400",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#2E3445",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e645f6cf89",
+      "textLayoutState": "approximate",
+      "characters": "Email"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aeb96e8",
+      "name": "Input / Error",
+      "type": "frame",
+      "x": 2160,
+      "y": 320,
+      "width": 320,
+      "height": 88,
+      "rotation": 0,
+      "selrect": {
+        "x": 2160,
+        "y": 320,
+        "width": 320,
+        "height": 88,
+        "x1": 2160,
+        "y1": 320,
+        "x2": 2480,
+        "y2": 408
+      },
+      "points": [
+        {
+          "x": 2160,
+          "y": 320
+        },
+        {
+          "x": 2480,
+          "y": 320
+        },
+        {
+          "x": 2480,
+          "y": 408
+        },
+        {
+          "x": 2160,
+          "y": 408
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aeaa2ca",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aeaa2ca",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "layoutGapType": "multiple",
+      "layoutPadding": {
+        "p1": 0,
+        "p2": 0,
+        "p3": 0,
+        "p4": 0
+      },
+      "layoutWrapType": "nowrap",
+      "layout": "flex",
+      "layoutAlignItems": "start",
+      "layoutPaddingType": "simple",
+      "r2": 0,
+      "componentRoot": true,
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e645fae043",
+      "proportionLock": false,
+      "layoutGap": {
+        "rowGap": 4,
+        "columnGap": 4
+      },
+      "r3": 0,
+      "layoutJustifyContent": "start",
+      "r1": 0,
+      "layoutFlexDir": "column",
+      "layoutAlignContent": "stretch",
+      "componentId": "ce1379a2-f81f-8121-8008-e4e645fcf656",
+      "strokes": [],
+      "proportion": 1,
+      "r4": 0,
+      "fills": [],
+      "componentFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64aec0da4",
+        "ce1379a2-f81f-8121-8008-e4e64aec7f77",
+        "ce1379a2-f81f-8121-8008-e4e64aecc080"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aec0da4",
+      "name": "Helper",
+      "type": "text",
+      "x": 2160,
+      "y": 384,
+      "width": 320,
+      "height": 16,
+      "rotation": 0,
+      "selrect": {
+        "x": 2160,
+        "y": 384,
+        "width": 320,
+        "height": 16,
+        "x1": 2160,
+        "y1": 384,
+        "x2": 2480,
+        "y2": 400
+      },
+      "points": [
+        {
+          "x": 2160,
+          "y": 384
+        },
+        {
+          "x": 2480,
+          "y": 384
+        },
+        {
+          "x": 2480,
+          "y": 400
+        },
+        {
+          "x": 2160,
+          "y": 400
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aeb96e8",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aeb96e8",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.4",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452d",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "12",
+                    "fontWeight": "400",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#D64545",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Use at least 8 characters"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "12",
+                "fontWeight": "400",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#D64545",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "touched": [
+        "content-group",
+        "text-content-text"
+      ],
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e645fb3358",
+      "textLayoutState": "approximate",
+      "characters": "Use at least 8 characters"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aec7f77",
+      "name": "Input Box",
+      "type": "frame",
+      "x": 2160,
+      "y": 340,
+      "width": 320,
+      "height": 40,
+      "rotation": 0,
+      "selrect": {
+        "x": 2160,
+        "y": 340,
+        "width": 320,
+        "height": 40,
+        "x1": 2160,
+        "y1": 340,
+        "x2": 2480,
+        "y2": 380
+      },
+      "points": [
+        {
+          "x": 2160,
+          "y": 340
+        },
+        {
+          "x": 2480,
+          "y": 340
+        },
+        {
+          "x": 2480,
+          "y": 380
+        },
+        {
+          "x": 2160,
+          "y": 380
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aeb96e8",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aeb96e8",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "r2": 8,
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e645fb7787",
+      "proportionLock": false,
+      "r3": 8,
+      "r1": 8,
+      "strokes": [
+        {
+          "strokeColor": "#D64545",
+          "strokeOpacity": 1,
+          "strokeWidth": 2
+        }
+      ],
+      "proportion": 1,
+      "r4": 8,
+      "fills": [
+        {
+          "fillColor": "#FFFFFF",
+          "fillOpacity": 1
+        }
+      ],
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64aeca02b"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aeca02b",
+      "name": "Placeholder",
+      "type": "text",
+      "x": 2172,
+      "y": 350,
+      "width": 296,
+      "height": 20,
+      "rotation": 0,
+      "selrect": {
+        "x": 2172,
+        "y": 350,
+        "width": 296,
+        "height": 20,
+        "x1": 2172,
+        "y1": 350,
+        "x2": 2468,
+        "y2": 370
+      },
+      "points": [
+        {
+          "x": 2172,
+          "y": 350
+        },
+        {
+          "x": 2468,
+          "y": 350
+        },
+        {
+          "x": 2468,
+          "y": 370
+        },
+        {
+          "x": 2172,
+          "y": 370
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aec7f77",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aec7f77",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.4",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452c",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "14",
+                    "fontWeight": "400",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#9AA3B2",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Enter a password"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "14",
+                "fontWeight": "400",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#9AA3B2",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "touched": [
+        "content-group",
+        "text-content-text"
+      ],
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e645fb8ec5",
+      "textLayoutState": "approximate",
+      "characters": "Enter a password"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aecc080",
+      "name": "Label",
+      "type": "text",
+      "x": 2160,
+      "y": 320,
+      "width": 320,
+      "height": 16,
+      "rotation": 0,
+      "selrect": {
+        "x": 2160,
+        "y": 320,
+        "width": 320,
+        "height": 16,
+        "x1": 2160,
+        "y1": 320,
+        "x2": 2480,
+        "y2": 336
+      },
+      "points": [
+        {
+          "x": 2160,
+          "y": 320
+        },
+        {
+          "x": 2480,
+          "y": 320
+        },
+        {
+          "x": 2480,
+          "y": 336
+        },
+        {
+          "x": 2160,
+          "y": 336
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aeb96e8",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aeb96e8",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.4",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452d",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "12",
+                    "fontWeight": "400",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#2E3445",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Password"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "12",
+                "fontWeight": "400",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#2E3445",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "touched": [
+        "content-group",
+        "text-content-text"
+      ],
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e645fbdf49",
+      "textLayoutState": "approximate",
+      "characters": "Password"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aee69c8",
+      "name": "Button / Primary / MD",
+      "type": "frame",
+      "x": 2248,
+      "y": 440,
+      "width": 144,
+      "height": 40,
+      "rotation": 0,
+      "selrect": {
+        "x": 2248,
+        "y": 440,
+        "width": 144,
+        "height": 40,
+        "x1": 2248,
+        "y1": 440,
+        "x2": 2392,
+        "y2": 480
+      },
+      "points": [
+        {
+          "x": 2248,
+          "y": 440
+        },
+        {
+          "x": 2392,
+          "y": 440
+        },
+        {
+          "x": 2392,
+          "y": 480
+        },
+        {
+          "x": 2248,
+          "y": 480
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aeaa2ca",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aeaa2ca",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "layoutGapType": "multiple",
+      "layoutPadding": {
+        "p1": 0,
+        "p2": 0,
+        "p3": 0,
+        "p4": 0
+      },
+      "layoutWrapType": "nowrap",
+      "layout": "flex",
+      "layoutAlignItems": "center",
+      "layoutPaddingType": "simple",
+      "r2": 8,
+      "componentRoot": true,
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e64569c7ea",
+      "proportionLock": false,
+      "layoutGap": {
+        "rowGap": 8,
+        "columnGap": 8
+      },
+      "r3": 8,
+      "layoutJustifyContent": "center",
+      "r1": 8,
+      "layoutFlexDir": "row",
+      "layoutAlignContent": "stretch",
+      "componentId": "ce1379a2-f81f-8121-8008-e4e6456b1aea",
+      "strokes": [],
+      "proportion": 1,
+      "r4": 8,
+      "fills": [
+        {
+          "fillColor": "#3366FF",
+          "fillOpacity": 1
+        }
+      ],
+      "componentFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64aeeb99b",
+        "ce1379a2-f81f-8121-8008-e4e64aeedcb6"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aeeb99b",
+      "name": "Label",
+      "type": "text",
+      "x": 2284,
+      "y": 450,
+      "width": 96,
+      "height": 20,
+      "rotation": 0,
+      "selrect": {
+        "x": 2284,
+        "y": 450,
+        "width": 96,
+        "height": 20,
+        "x1": 2284,
+        "y1": 450,
+        "x2": 2380,
+        "y2": 470
+      },
+      "points": [
+        {
+          "x": 2284,
+          "y": 450
+        },
+        {
+          "x": 2380,
+          "y": 450
+        },
+        {
+          "x": 2380,
+          "y": 470
+        },
+        {
+          "x": 2284,
+          "y": 470
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aee69c8",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aee69c8",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.2",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452e",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "14",
+                    "fontWeight": "600",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#FFFFFF",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Create account"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "14",
+                "fontWeight": "600",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#FFFFFF",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "touched": [
+        "content-group",
+        "text-content-text"
+      ],
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e64569c7ec",
+      "textLayoutState": "approximate",
+      "characters": "Create account"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aeedcb6",
+      "name": "Icon",
+      "type": "rect",
+      "x": 2260,
+      "y": 452,
+      "width": 16,
+      "height": 16,
+      "rotation": 0,
+      "selrect": {
+        "x": 2260,
+        "y": 452,
+        "width": 16,
+        "height": 16,
+        "x1": 2260,
+        "y1": 452,
+        "x2": 2276,
+        "y2": 468
+      },
+      "points": [
+        {
+          "x": 2260,
+          "y": 452
+        },
+        {
+          "x": 2276,
+          "y": 452
+        },
+        {
+          "x": 2276,
+          "y": 468
+        },
+        {
+          "x": 2260,
+          "y": 468
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aee69c8",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aee69c8",
+      "flipX": null,
+      "flipY": null,
+      "r2": 0,
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e6456a8d2e",
+      "proportionLock": false,
+      "r3": 0,
+      "r1": 0,
+      "strokes": [],
+      "proportion": 1,
+      "r4": 0,
+      "fills": [
+        {
+          "fillColor": "#FFFFFF",
+          "fillOpacity": 1
+        }
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aef02ea",
+      "name": "NavBar",
+      "type": "frame",
+      "x": 1600,
+      "y": 0,
+      "width": 1440,
+      "height": 64,
+      "rotation": 0,
+      "selrect": {
+        "x": 1600,
+        "y": 0,
+        "width": 1440,
+        "height": 64,
+        "x1": 1600,
+        "y1": 0,
+        "x2": 3040,
+        "y2": 64
+      },
+      "points": [
+        {
+          "x": 1600,
+          "y": 0
+        },
+        {
+          "x": 3040,
+          "y": 0
+        },
+        {
+          "x": 3040,
+          "y": 64
+        },
+        {
+          "x": 1600,
+          "y": 64
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aeaa2c8",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aeaa2c8",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "r2": 0,
+      "componentRoot": true,
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e647ca8817",
+      "proportionLock": false,
+      "r3": 0,
+      "r1": 0,
+      "componentId": "ce1379a2-f81f-8121-8008-e4e647cca584",
+      "strokes": [
+        {
+          "strokeColor": "#DDE1E8",
+          "strokeOpacity": 1,
+          "strokeWidth": 1
+        }
+      ],
+      "proportion": 1,
+      "r4": 0,
+      "fills": [
+        {
+          "fillColor": "#FFFFFF",
+          "fillOpacity": 1
+        }
+      ],
+      "componentFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64aef02eb",
+        "ce1379a2-f81f-8121-8008-e4e64aef7cfd",
+        "ce1379a2-f81f-8121-8008-e4e64aef7cfe",
+        "ce1379a2-f81f-8121-8008-e4e64aef7cff",
+        "ce1379a2-f81f-8121-8008-e4e64aef7d00",
+        "ce1379a2-f81f-8121-8008-e4e64aef7d01"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aef02eb",
+      "name": "Logo",
+      "type": "rect",
+      "x": 1624,
+      "y": 16,
+      "width": 32,
+      "height": 32,
+      "rotation": 0,
+      "selrect": {
+        "x": 1624,
+        "y": 16,
+        "width": 32,
+        "height": 32,
+        "x1": 1624,
+        "y1": 16,
+        "x2": 1656,
+        "y2": 48
+      },
+      "points": [
+        {
+          "x": 1624,
+          "y": 16
+        },
+        {
+          "x": 1656,
+          "y": 16
+        },
+        {
+          "x": 1656,
+          "y": 48
+        },
+        {
+          "x": 1624,
+          "y": 48
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aef02ea",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aef02ea",
+      "flipX": null,
+      "flipY": null,
+      "r2": 8,
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e647cafbad",
+      "proportionLock": false,
+      "r3": 8,
+      "r1": 8,
+      "strokes": [],
+      "proportion": 1,
+      "r4": 8,
+      "fills": [
+        {
+          "fillColor": "#3366FF",
+          "fillOpacity": 1
+        }
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aef7cfd",
+      "name": "Title",
+      "type": "text",
+      "x": 1668,
+      "y": 20,
+      "width": 160,
+      "height": 24,
+      "rotation": 0,
+      "selrect": {
+        "x": 1668,
+        "y": 20,
+        "width": 160,
+        "height": 24,
+        "x1": 1668,
+        "y1": 20,
+        "x2": 1828,
+        "y2": 44
+      },
+      "points": [
+        {
+          "x": 1668,
+          "y": 20
+        },
+        {
+          "x": 1828,
+          "y": 20
+        },
+        {
+          "x": 1828,
+          "y": 44
+        },
+        {
+          "x": 1668,
+          "y": 44
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aef02ea",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aef02ea",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.3",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452a",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "18",
+                    "fontWeight": "600",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#161A26",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Design Lab"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "18",
+                "fontWeight": "600",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#161A26",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e647cafbaf",
+      "textLayoutState": "approximate",
+      "characters": "Design Lab"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aef7cfe",
+      "name": "Link Dashboard",
+      "type": "text",
+      "x": 1860,
+      "y": 22,
+      "width": 90,
+      "height": 20,
+      "rotation": 0,
+      "selrect": {
+        "x": 1860,
+        "y": 22,
+        "width": 90,
+        "height": 20,
+        "x1": 1860,
+        "y1": 22,
+        "x2": 1950,
+        "y2": 42
+      },
+      "points": [
+        {
+          "x": 1860,
+          "y": 22
+        },
+        {
+          "x": 1950,
+          "y": 22
+        },
+        {
+          "x": 1950,
+          "y": 42
+        },
+        {
+          "x": 1860,
+          "y": 42
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aef02ea",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aef02ea",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.4",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452c",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "14",
+                    "fontWeight": "400",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#2E3445",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Dashboard"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "14",
+                "fontWeight": "400",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#2E3445",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e647cb589c",
+      "textLayoutState": "approximate",
+      "characters": "Dashboard"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aef7cff",
+      "name": "Link Settings",
+      "type": "text",
+      "x": 1970,
+      "y": 22,
+      "width": 80,
+      "height": 20,
+      "rotation": 0,
+      "selrect": {
+        "x": 1970,
+        "y": 22,
+        "width": 80,
+        "height": 20,
+        "x1": 1970,
+        "y1": 22,
+        "x2": 2050,
+        "y2": 42
+      },
+      "points": [
+        {
+          "x": 1970,
+          "y": 22
+        },
+        {
+          "x": 2050,
+          "y": 22
+        },
+        {
+          "x": 2050,
+          "y": 42
+        },
+        {
+          "x": 1970,
+          "y": 42
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aef02ea",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aef02ea",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.4",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452c",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "14",
+                    "fontWeight": "400",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#2E3445",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Settings"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "14",
+                "fontWeight": "400",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#2E3445",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e647cbbfd4",
+      "textLayoutState": "approximate",
+      "characters": "Settings"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aef7d00",
+      "name": "Link Billing",
+      "type": "text",
+      "x": 2070,
+      "y": 22,
+      "width": 80,
+      "height": 20,
+      "rotation": 0,
+      "selrect": {
+        "x": 2070,
+        "y": 22,
+        "width": 80,
+        "height": 20,
+        "x1": 2070,
+        "y1": 22,
+        "x2": 2150,
+        "y2": 42
+      },
+      "points": [
+        {
+          "x": 2070,
+          "y": 22
+        },
+        {
+          "x": 2150,
+          "y": 22
+        },
+        {
+          "x": 2150,
+          "y": 42
+        },
+        {
+          "x": 2070,
+          "y": 42
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aef02ea",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aef02ea",
+      "flipX": null,
+      "flipY": null,
+      "growType": "fixed",
+      "content": {
+        "type": "root",
+        "children": [
+          {
+            "type": "paragraph-set",
+            "children": [
+              {
+                "lineHeight": "1.2",
+                "fontStyle": "normal",
+                "children": [
+                  {
+                    "lineHeight": "1.4",
+                    "fontStyle": "normal",
+                    "typographyRefId": "ce1379a2-f81f-8121-8008-e4e644e3452c",
+                    "textTransform": "none",
+                    "textAlign": "left",
+                    "fontId": "sourcesanspro",
+                    "fontSize": "14",
+                    "fontWeight": "400",
+                    "typographyRefFile": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+                    "textDirection": "ltr",
+                    "fontVariantId": "regular",
+                    "textDecoration": "none",
+                    "letterSpacing": "0",
+                    "fills": [
+                      {
+                        "fillColor": "#2E3445",
+                        "fillOpacity": 1
+                      }
+                    ],
+                    "fontFamily": "Source Sans Pro",
+                    "text": "Billing"
+                  }
+                ],
+                "typographyRefId": null,
+                "textTransform": "none",
+                "textAlign": "left",
+                "fontId": "sourcesanspro",
+                "fontSize": "14",
+                "fontWeight": "400",
+                "typographyRefFile": null,
+                "textDirection": "ltr",
+                "type": "paragraph",
+                "fontVariantId": "regular",
+                "textDecoration": "none",
+                "letterSpacing": "0",
+                "fills": [
+                  {
+                    "fillColor": "#2E3445",
+                    "fillOpacity": 1
+                  }
+                ],
+                "fontFamily": "sourcesanspro"
+              }
+            ]
+          }
+        ]
+      },
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e647cbe74a",
+      "textLayoutState": "approximate",
+      "characters": "Billing"
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aef7d01",
+      "name": "Avatar",
+      "type": "circle",
+      "x": 2976,
+      "y": 12,
+      "width": 40,
+      "height": 40,
+      "rotation": 0,
+      "selrect": {
+        "x": 2976,
+        "y": 12,
+        "width": 40,
+        "height": 40,
+        "x1": 2976,
+        "y1": 12,
+        "x2": 3016,
+        "y2": 52
+      },
+      "points": [
+        {
+          "x": 2976,
+          "y": 12
+        },
+        {
+          "x": 3016,
+          "y": 12
+        },
+        {
+          "x": 3016,
+          "y": 52
+        },
+        {
+          "x": 2976,
+          "y": 52
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aef02ea",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aef02ea",
+      "flipX": null,
+      "flipY": null,
+      "shapeRef": "ce1379a2-f81f-8121-8008-e4e647cca581",
+      "proportionLock": false,
+      "strokes": [],
+      "proportion": 1,
+      "fills": [
+        {
+          "fillColor": "#E2D6FF",
+          "fillOpacity": 1
+        }
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64aefcae9",
+      "name": "Onboarding / Verify email",
+      "type": "frame",
+      "x": 3200,
+      "y": 0,
+      "width": 1440,
+      "height": 900,
+      "rotation": 0,
+      "selrect": {
+        "x": 3200,
+        "y": 0,
+        "width": 1440,
+        "height": 900,
+        "x1": 3200,
+        "y1": 0,
+        "x2": 4640,
+        "y2": 900
+      },
+      "points": [
+        {
+          "x": 3200,
+          "y": 0
+        },
+        {
+          "x": 4640,
+          "y": 0
+        },
+        {
+          "x": 4640,
+          "y": 900
+        },
+        {
+          "x": 3200,
+          "y": 900
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "00000000-0000-0000-0000-000000000000",
+      "frameId": "00000000-0000-0000-0000-000000000000",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "layoutGapType": "multiple",
+      "layoutPadding": {
+        "p1": 0,
+        "p2": 0,
+        "p3": 0,
+        "p4": 0
+      },
+      "layoutWrapType": "nowrap",
+      "layout": "flex",
+      "layoutAlignItems": "start",
+      "layoutPaddingType": "simple",
+      "r2": 0,
+      "proportionLock": false,
+      "layoutGap": {
+        "rowGap": 0,
+        "columnGap": 0
+      },
+      "r3": 0,
+      "layoutJustifyContent": "start",
+      "r1": 0,
+      "layoutFlexDir": "column",
+      "layoutAlignContent": "stretch",
+      "strokes": [],
+      "proportion": 1,
+      "r4": 0,
+      "fills": [
+        {
+          "fillColor": "#FFFFFF",
+          "fillOpacity": 1
+        }
+      ],
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64af011e7",
+        "ce1379a2-f81f-8121-8008-e4e64af2803f"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64af011e7",
+      "name": "Body",
+      "type": "frame",
+      "x": 3200,
+      "y": 64,
+      "width": 1440,
+      "height": 836,
+      "rotation": 0,
+      "selrect": {
+        "x": 3200,
+        "y": 64,
+        "width": 1440,
+        "height": 836,
+        "x1": 3200,
+        "y1": 64,
+        "x2": 4640,
+        "y2": 900
+      },
+      "points": [
+        {
+          "x": 3200,
+          "y": 64
+        },
+        {
+          "x": 4640,
+          "y": 64
+        },
+        {
+          "x": 4640,
+          "y": 900
+        },
+        {
+          "x": 3200,
+          "y": 900
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64aefcae9",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64aefcae9",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "r2": 0,
+      "proportionLock": false,
+      "r3": 0,
+      "r1": 0,
+      "strokes": [],
+      "proportion": 1,
+      "r4": 0,
+      "fills": [],
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64af07dd9",
+        "ce1379a2-f81f-8121-8008-e4e64af1a0eb",
+        "ce1379a2-f81f-8121-8008-e4e64af1d0a1"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64af07dd9",
+      "name": "Verify Email",
+      "type": "frame",
+      "x": 3680,
+      "y": 160,
+      "width": 480,
+      "height": 320,
+      "rotation": 0,
+      "selrect": {
+        "x": 3680,
+        "y": 160,
+        "width": 480,
+        "height": 320,
+        "x1": 3680,
+        "y1": 160,
+        "x2": 4160,
+        "y2": 480
+      },
+      "points": [
+        {
+          "x": 3680,
+          "y": 160
+        },
+        {
+          "x": 4160,
+          "y": 160
+        },
+        {
+          "x": 4160,
+          "y": 480
+        },
+        {
+          "x": 3680,
+          "y": 480
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64af011e7",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64af011e7",
+      "flipX": null,
+      "flipY": null,
+      "hideFillOnExport": false,
+      "r2": 12,
+      "proportionLock": false,
+      "r3": 12,
+      "r1": 12,
+      "strokes": [],
+      "proportion": 1,
+      "r4": 12,
+      "fills": [
+        {
+          "fillColor": "#F7F8FA",
+          "fillOpacity": 1
+        }
+      ],
+      "shapes": [
+        "ce1379a2-f81f-8121-8008-e4e64af07ddb",
+        "ce1379a2-f81f-8121-8008-e4e64af07ddd",
+        "ce1379a2-f81f-8121-8008-e4e64af0d57d"
+      ]
+    },
+    {
+      "id": "ce1379a2-f81f-8121-8008-e4e64af07ddb",
+      "name": "Illustration",
+      "type": "circle",
+      "x": 3888,
+      "y": 216,
+      "width": 64,
+      "height": 64,
+      "rotation": 0,
+      "selrect": {
+        "x": 3888,
+        "y": 216,
+        "width": 64,
+        "height": 64,
+        "x1": 3888,
+        "y1": 216,
+        "x2": 3952,
+        "y2": 280
+      },
+      "points": [
+        {
+          "x": 3888,
+          "y": 216
+        },
+        {
+          "x": 3952,
+          "y": 216
+        },
+        {
+          "x": 3952,
+          "y": 280
+        },
+        {
+          "x": 3888,
+          "y": 280
+        }
+      ],
+      "transform": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "transformInverse": {
+        "a": 1,
+        "b": 0,
+        "c": 0,
+        "d": 1,
+        "e": 0,
+        "f": 0
+      },
+      "parentId": "ce1379a2-f81f-8121-8008-e4e64af07dd9",
+      "frameId": "ce1379a2-f81f-8121-8008-e4e64af07dd9",
+      "flipX": null,
+      "flipY": null,
+      "proportionLock": false,
+      "strokes": [],
+      "proportion": 1,
+      "fills": [
+        {
+          "fillColor": "#E2D6FF",
+          "fillOpacity": 1
+        }
+      ]
+    }
+  ],
+  "missing": [],
+  "truncated": false
+}

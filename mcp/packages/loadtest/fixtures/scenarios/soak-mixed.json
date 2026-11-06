@@ -1,0 +1,89 @@
+{
+  "name": "soak-mixed",
+  "description": "Plan 8.4 soak (D15): mixed load at 5 agents, each on its own file from the setup vars (agentFileIds, agentPageIds). One iteration makes 14 reads, 5 small writes (4 renames and the delete) and 1 batch write of 300 shapes (70 / 25 / 5 %), and each agent exports one board every 5 minutes (1 export a minute over 5 agents). The batch is deleted at the end of the iteration, so the files do not grow; the delete takes a snapshot, which the backend prunes to 20. Run with --duration 4h --metrics <url> --server-pid <pid>. Pass: backend heap after a full GC within +10 % of the 30-minute mark, MCP server RSS within +15 %, no growth in open DB connections, file_change rows pruned, sandbox count back to zero when the sessions end.",
+  "agents": 5,
+  "iterations": 1,
+  "steps": [
+    {
+      "name": "batch write 300 shapes",
+      "tool": "batch_create_shapes",
+      "rateLimitPerSecond": 2,
+      "args": {
+        "fileId": "${agentFileIds[agent]}",
+        "pageId": "${agentPageIds[agent]}",
+        "tree": [
+          {
+            "type": "board",
+            "name": "Soak ${runId} a${agent} i${iteration}",
+            "x": 0,
+            "y": 0,
+            "width": 1500,
+            "height": 1500,
+            "children": [
+              {
+                "$repeat": 299,
+                "as": "k",
+                "value": { "type": "rect", "name": "Soak rect ${k}", "x": "${k}", "y": 0, "width": 10, "height": 10 }
+              }
+            ]
+          }
+        ]
+      },
+      "capture": { "soakRootId": "$.result.result.createdIds[\"$tmp:n0\"]" }
+    },
+    {
+      "name": "outline",
+      "tool": "get_file_outline",
+      "rateLimitPerSecond": 2,
+      "args": { "fileId": "${agentFileIds[agent]}" }
+    },
+    {
+      "name": "page tree",
+      "tool": "get_page_tree",
+      "repeat": 5,
+      "rateLimitPerSecond": 2,
+      "args": { "fileId": "${agentFileIds[agent]}", "pageId": "${agentPageIds[agent]}", "depth": 3, "limit": 500 }
+    },
+    {
+      "name": "find rects",
+      "tool": "find_shapes",
+      "repeat": 4,
+      "rateLimitPerSecond": 2,
+      "args": { "fileId": "${agentFileIds[agent]}", "pageId": "${agentPageIds[agent]}", "type": "rect", "withinId": "${soakRootId}", "limit": 20 }
+    },
+    {
+      "name": "get shapes",
+      "tool": "get_shapes",
+      "repeat": 4,
+      "rateLimitPerSecond": 2,
+      "args": { "fileId": "${agentFileIds[agent]}", "pageId": "${agentPageIds[agent]}", "ids": ["${soakRootId}"] }
+    },
+    {
+      "name": "small write: rename the batch board",
+      "tool": "apply_operations",
+      "repeat": 4,
+      "rateLimitPerSecond": 2,
+      "args": {
+        "fileId": "${agentFileIds[agent]}",
+        "operations": [
+          { "op": "update_shape", "pageId": "${agentPageIds[agent]}", "id": "${soakRootId}", "props": { "name": "Soak ${runId} a${agent} i${iteration} r${index}" } }
+        ]
+      }
+    },
+    {
+      "name": "export the batch board every 5 minutes",
+      "tool": "export_shape",
+      "everyMs": 300000,
+      "args": { "fileId": "${agentFileIds[agent]}", "pageId": "${agentPageIds[agent]}", "shapeId": "${soakRootId}", "format": "png" }
+    },
+    {
+      "name": "delete the batch",
+      "tool": "apply_operations",
+      "rateLimitPerSecond": 2,
+      "args": {
+        "fileId": "${agentFileIds[agent]}",
+        "operations": [{ "op": "delete_shapes", "pageId": "${agentPageIds[agent]}", "ids": ["${soakRootId}"] }]
+      }
+    }
+  ]
+}

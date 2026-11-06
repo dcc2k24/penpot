@@ -40,6 +40,10 @@
 ;; Default absolute maximum session duration
 (def default-cookie-max-age-absolute (ct/duration {:days 30}))
 
+;; Lifetime of a session minted for an MCP render (the exporter). It is
+;; restricted to the render reads of its files, see `wrap-authz`.
+(def mcp-render-max-age (ct/duration {:minutes 10}))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; PROTOCOLS
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -67,7 +71,8 @@
    [:profile-id ::sm/uuid]
    [:user-agent {:optional true} ::sm/text]
    [:sso-provider-id {:optional true} ::sm/uuid]
-   [:sso-session-id {:optional true} :string]])
+   [:sso-session-id {:optional true} :string]
+   [:props {:optional true} :map]])
 
 (def ^:private valid-params?
   (sm/validator schema:params))
@@ -89,6 +94,9 @@
       (assert (valid-params? params) "expect valid session params")
 
       (let [now    (ct/now)
+            params (cond-> params
+                     (some? (:props params))
+                     (update :props db/tjson))
             params (-> params
                        (assoc :id (uuid/next))
                        (assoc :created-at now)
@@ -254,6 +262,37 @@
        (let [max-age (cf/get :auth-token-cookie-max-age default-cookie-max-age)]
          (pos? (compare (ct/now) (ct/plus modified-at max-age))))))
 
+(defn- mcp-render-expired?
+  "Whether `session` is an MCP render session past its absolute age. Any
+  other session has no absolute age: only the idle expiry applies to it."
+  [{:keys [created-at props]}]
+  (and (some? (:mcp-render props))
+       (ct/inst? created-at)
+       (pos? (compare (ct/now) (ct/plus created-at mcp-render-max-age)))))
+
+(defn- read-live-session
+  "The session `sid` names when it may authenticate, or nil. Idle-expired
+  sessions, and MCP render sessions past their absolute age, authenticate
+  like missing ones. The GC deletes the rows later."
+  [manager sid]
+  (let [session (some->> sid (read-session manager))]
+    (when-not (or (session-expired? session)
+                  (mcp-render-expired? session))
+      session)))
+
+(defn- assoc-session
+  "Puts the session and its MCP render restriction, when it has one, on
+  the request."
+  [request session]
+  (let [restriction (get-in session [:props :mcp-render])]
+    (cond-> request
+      (some? session)
+      (-> (assoc ::profile-id (:profile-id session))
+          (assoc ::session session))
+
+      (some? restriction)
+      (assoc ::restriction restriction))))
+
 (defn- wrap-authz
   [handler {:keys [::manager] :as cfg}]
   (assert (manager? manager) "expected valid session manager")
@@ -261,22 +300,17 @@
     (let [{:keys [type claims]} (get request ::http/auth-data)]
       (cond
         (= type :cookie)
-        (let [session (some->> (:sid claims) (read-session manager))
-              ;; Idle-expired sessions authenticate like missing ones:
-              ;; no profile, no renewal. The GC deletes the row later.
-              session (when-not (session-expired? session) session)
-
-              request
-              (cond-> request
-                (some? session)
-                (-> (assoc ::profile-id (:profile-id session))
-                    (assoc ::session session)))
+        (let [session     (read-live-session manager (:sid claims))
+              restriction (get-in session [:props :mcp-render])
+              request     (assoc-session request session)
 
               response
               (binding [ct/*clock* (clock/get-clock (:profile-id session))]
                 (handler request))]
 
-          (if (and session (renew-session? session))
+          ;; A restricted session is never renewed: a renewal mints a
+          ;; plain token, without the render expiry claim.
+          (if (and session (nil? restriction) (renew-session? session))
             (let [session (->> session
                                (update-session manager)
                                (assign-token cfg))]
@@ -284,13 +318,7 @@
             response))
 
         (= type :bearer)
-        (let [session (some->> (:sid claims) (read-session manager))
-              session (when-not (session-expired? session) session)
-              request (cond-> request
-                        (some? session)
-                        (-> (assoc ::profile-id (:profile-id session))
-                            (assoc ::session session)))]
-          (handler request))
+        (handler (assoc-session request (read-live-session manager (:sid claims))))
 
         :else
         (handler request)))))

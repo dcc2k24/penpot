@@ -15,6 +15,7 @@
    [app.http.session :as session]
    [app.mcp.oauth-clients :as clients]
    [app.mcp.oauth-state :as state]
+   [app.rpc :as-alias rpc]
    [app.rpc.commands.access-token :as access-token]
    [app.setup.clock :as clock]
    [app.util.json :as json]
@@ -46,18 +47,24 @@
         token   (:token (#'session/assign-token th/*system* session))]
     {(cf/get :auth-token-cookie-name) token}))
 
-(defn- begin [client]
-  (let [reply (request "/api/mcp/oauth/authorize"
-                       :query (form {:client_id (:client_id client)
-                                     :redirect_uri (first (:redirect_uris client))
-                                     :response_type "code" :scope "mcp"
-                                     :resource (oauth/resource)
-                                     :state "client-state"
-                                     :code_challenge (state/digest (apply str (repeat 43 "a")))
-                                     :code_challenge_method "S256"}))]
-    (t/is (= 303 (::yres/status reply)))
-    (get (uri/query-string->map (.getQuery (java.net.URI. (get-in reply [::yres/headers "location"]))))
-         :request)))
+(defn- authorize-query
+  [client scope]
+  (form {:client_id (:client_id client)
+         :redirect_uri (first (:redirect_uris client))
+         :response_type "code" :scope scope
+         :resource (oauth/resource)
+         :state "client-state"
+         :code_challenge (state/digest (apply str (repeat 43 "a")))
+         :code_challenge_method "S256"}))
+
+(defn- begin
+  ([client] (begin client "mcp"))
+  ([client scope]
+   (let [reply (request "/api/mcp/oauth/authorize"
+                        :query (authorize-query client scope))]
+     (t/is (= 303 (::yres/status reply)))
+     (get (uri/query-string->map (.getQuery (java.net.URI. (get-in reply [::yres/headers "location"]))))
+          :request))))
 
 (t/deftest discovery-and-registration
   (let [metadata   (body (request "/.well-known/oauth-authorization-server/api/mcp/oauth"))
@@ -68,6 +75,10 @@
                                                           :token_endpoint_auth_method "none"}))]
     (t/is (= (oauth/issuer) (:issuer metadata)))
     (t/is (= ["S256"] (:code_challenge_methods_supported metadata)))
+    (t/is (= ["mcp" "mcp:read" "mcp:write" "mcp:manage" "mcp:delete"]
+             (:scopes_supported metadata)))
+    (t/is (= ["mcp" "mcp:read" "mcp:write" "mcp:manage" "mcp:delete"]
+             (:scopes_supported resource)))
     (t/is (= (oauth/resource) (:resource resource)))
     (t/is (= 201 (::yres/status registered)))
     (t/is (= "none" (:token_endpoint_auth_method (body registered))))
@@ -251,3 +262,92 @@
                                       :redirect_uri "https://attacker.example/callback"}))]
     (t/is (= 400 (::yres/status reply)))
     (t/is (nil? (get-in reply [::yres/headers "location"])))))
+
+(t/deftest authorization-rejects-unsupported-scopes
+  (let [client (clients/register! th/*system* {:redirect_uris ["https://example.com/callback"]
+                                               :token_endpoint_auth_method "none"})
+        reply  (request "/api/mcp/oauth/authorize"
+                        :query (authorize-query client "mcp:read mcp:evil"))]
+    (t/is (= 400 (::yres/status reply)))
+    (t/is (= "invalid_request" (:error (body reply))))
+    (t/is (nil? (get-in reply [::yres/headers "location"])))))
+
+(t/deftest approved-scopes-are-granted-to-the-mcp-token
+  (let [profile  (th/create-profile* 1 {:is-active true})
+        cookies  (login-cookie profile)
+        client   (clients/register! th/*system* {:redirect_uris ["https://example.com/callback"]
+                                                 :token_endpoint_auth_method "none"})
+        handle   (begin client "mcp:write mcp:read")
+        details  (body (request "/api/mcp/oauth/request" :query (form {:request handle}) :cookies cookies))
+        origin   (str/replace (str (cf/get-public-uri)) #"/$" "")
+        approved (request "/api/mcp/oauth/decision" :method :post :cookies cookies
+                          :headers {"content-type" "application/x-www-form-urlencoded" "origin" origin}
+                          :body-bytes (form {:request handle :decision "approve"
+                                             :csrf (:csrf details)}))
+        callback (java.net.URI. (:redirect-uri (body approved)))
+        code     (:code (uri/query-string->map (.getQuery callback)))
+        exchange (request "/api/mcp/oauth/token" :method :post
+                          :headers {"content-type" "application/x-www-form-urlencoded"}
+                          :body-bytes (form {:grant_type "authorization_code" :code code
+                                             :client_id (:client_id client)
+                                             :redirect_uri "https://example.com/callback"
+                                             :resource (oauth/resource)
+                                             :code_verifier (apply str (repeat 43 "a"))}))
+        stored   (first (db/query th/*pool* :access-token {:profile-id (:id profile) :type "mcp"}))]
+    (t/is (= 200 (::yres/status approved)))
+    (t/is (= "mcp:read mcp:write" (:scope (body exchange))))
+    (t/is (contains? (set (db/decode-pgarray (:perms stored) [])) "mcp:write"))
+    (t/is (not (contains? (set (db/decode-pgarray (:perms stored) [])) "mcp:manage")))))
+
+(defn- approve!
+  "Approve the staged `handle` for `client` in the session of `cookies`, then
+  exchange the code. Returns the token response."
+  [cookies client handle]
+  (let [origin   (str/replace (str (cf/get-public-uri)) #"/$" "")
+        details  (body (request "/api/mcp/oauth/request" :query (form {:request handle}) :cookies cookies))
+        approved (request "/api/mcp/oauth/decision" :method :post :cookies cookies
+                          :headers {"content-type" "application/x-www-form-urlencoded" "origin" origin}
+                          :body-bytes (form {:request handle :decision "approve"
+                                             :csrf (:csrf details)}))
+        code     (:code (uri/query-string->map
+                         (.getQuery (java.net.URI. (:redirect-uri (body approved))))))]
+    (request "/api/mcp/oauth/token" :method :post
+             :headers {"content-type" "application/x-www-form-urlencoded"}
+             :body-bytes (form {:grant_type "authorization_code" :code code
+                                :client_id (:client_id client)
+                                :redirect_uri (first (:redirect_uris client))
+                                :resource (oauth/resource)
+                                :code_verifier (apply str (repeat 43 "a"))}))))
+
+(t/deftest approvals-accumulate-scopes-on-the-shared-token
+  (let [profile  (th/create-profile* 1 {:is-active true})
+        cookies  (login-cookie profile)
+        client-a (clients/register! th/*system* {:redirect_uris ["https://a.example/callback"]
+                                                 :token_endpoint_auth_method "none"})
+        client-b (clients/register! th/*system* {:redirect_uris ["https://b.example/callback"]
+                                                 :token_endpoint_auth_method "none"})
+        _        (approve! cookies client-a (begin client-a "mcp:write"))
+        handle-b (begin client-b "mcp")
+        consent  (body (request "/api/mcp/oauth/request" :query (form {:request handle-b})
+                                :cookies cookies))
+        token-b  (approve! cookies client-b handle-b)
+        ;; Overlapping request: the write scope is already on the token.
+        token-a  (approve! cookies client-a (begin client-a "mcp:write"))
+        stored   (first (db/query th/*pool* :access-token {:profile-id (:id profile) :type "mcp"}))
+        perms    (db/decode-pgarray (:perms stored) [])]
+    (t/is (= "mcp:read" (:scope consent)))
+    (t/is (= "mcp:read mcp:write" (:granted-scope consent)))
+    (t/is (= 200 (::yres/status token-b)))
+    (t/is (= "mcp:read mcp:write" (:scope (body token-b))))
+    (t/is (= "mcp:read mcp:write" (:scope (body token-a))))
+    (t/is (= (count perms) (count (distinct perms))))
+    (t/is (contains? (set perms) "mcp:write"))))
+
+(t/deftest update-mcp-token-scopes-requires-session
+  (let [profile (th/create-profile* 1 {:is-active true})
+        out     (th/command! {::th/type :update-mcp-token-scopes
+                              ::rpc/profile-id (:id profile)
+                              ::rpc/auth-type :token
+                              ::rpc/token-perms #{}
+                              :scopes ["mcp:write"]})]
+    (t/is (= :session-required (:code (ex-data (:error out)))))))

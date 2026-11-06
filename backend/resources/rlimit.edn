@@ -310,4 +310,25 @@
    :main/redeem-nitrate-activation-code
    :main/create-demo-profile
    :main/get-subscription-warning}
- [[:misc-light :bucket "100/50/1m"]]}
+ [[:misc-light :bucket "100/50/1m"]]
+
+ ;; ═══════════════════════════════════════════════
+ ;; MCP (backend mode)
+ ;; ═══════════════════════════════════════════════
+ #{:main/mcp-whoami
+   :main/get-mcp-file-outline
+   :main/get-mcp-page-tree
+   :main/get-mcp-shapes
+   :main/find-mcp-shapes
+   :main/get-mcp-library
+   :main/get-mcp-tokens
+   :main/create-mcp-render-session}
+ [[:mcp-read :bucket "6000/3000/1h"]]
+
+ #{:main/mcp-apply-changes
+   :main/mcp-apply-operations
+   :main/mcp-import-svg}
+ [[:mcp-write :bucket "1200/600/1h"]]
+
+ #{:main/update-mcp-token-scopes}
+ [[:access-token :bucket "60/30/1m"]]}

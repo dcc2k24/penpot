@@ -10,12 +10,14 @@
    [app.common.schema :as sm]
    [app.common.time :as ct]
    [app.common.uuid :as uuid]
+   [app.config :as cf]
    [app.db :as db]
    [app.http.access-token :as actoken]
    [app.main :as-alias main]
    [app.rpc :as-alias rpc]
    [app.rpc.commands.profile :as profile]
    [app.rpc.doc :as-alias doc]
+   [app.rpc.mcp-scope :as mcp-scope]
    [app.rpc.quotes :as quotes]
    [app.setup :as-alias setup]
    [app.tokens :as tokens]
@@ -24,6 +26,11 @@
 (defn- decode-row
   [row]
   (dissoc row :perms))
+
+(defn- mcp-scopes
+  "Sorted scope strings an MCP token with `perms` (a seq of strings) holds."
+  [perms]
+  (vec (sort (mcp-scope/effective-scopes perms))))
 
 (def ^:private sql:clean-old-mcp-tokens
   "DELETE FROM access_token
@@ -39,8 +46,17 @@
     ORDER BY created_at DESC
     LIMIT 1")
 
+(def ^:private sql:update-token-perms
+  "UPDATE access_token
+      SET perms = ?,
+          updated_at = now()
+    WHERE id = ?")
+
 (defn create-access-token
   "Create an access token with empty perms.
+
+  An MCP token without an explicit `expiration` gets the configured
+  `:mcp-token-max-age`, when there is one.
 
   Elevated permissions (e.g. error-reports:read) are not assignable via
   the public API; grant them with SQL or `repl:grant-access-token-perm`."
@@ -49,6 +65,9 @@
   (when (= type "mcp")
     (db/get-by-id conn :profile profile-id {::db/for-update true}))
   (let [token-id   (uuid/next)
+        expiration (or expiration
+                       (when (= type "mcp")
+                         (cf/get-mcp-token-max-age)))
         expires-at (some-> expiration (ct/in-future))
         created-at (ct/now)
         token-iss  (if (= type "mcp") actoken/mcp-token-issuer "access-token")
@@ -96,6 +115,34 @@
     (if token
       (decode-row token)
       (create-access-token cfg profile-id "MCP" nil "mcp"))))
+
+(defn get-granted-mcp-scopes
+  "Scopes the profile's MCP token holds once `scopes` are granted: the
+  effective scopes of its current perms, plus `scopes`. Read only. A profile
+  without a valid MCP token holds `mcp:read`, as a new token would."
+  [{:keys [::db/pool]} profile-id scopes]
+  (let [token (db/exec-one! pool [sql:get-valid-mcp-token profile-id])
+        perms (db/decode-pgarray (:perms token) [])]
+    (into (mcp-scope/effective-scopes perms) scopes)))
+
+(def ^:private sql:get-token-perms
+  "SELECT perms FROM access_token WHERE id = ?")
+
+(defn grant-mcp-scopes
+  "Enable MCP, then add `scopes` to the perms of the profile's MCP token and
+  return the token row. Scopes the token already holds stay, each written
+  once. Must run in a transaction: the profile lock of `ensure-mcp-access!`
+  covers the update."
+  [{:keys [::db/conn] :as cfg} profile-id scopes]
+  (let [token (ensure-mcp-access! cfg profile-id)
+        row   (db/exec-one! conn [sql:get-token-perms (:id token)])
+        perms (db/decode-pgarray (:perms row) [])
+        perms (mcp-scope/replace-scopes
+               perms (into (mcp-scope/effective-scopes perms) scopes))]
+    (db/exec! conn [sql:update-token-perms
+                    (db/create-array conn "text" perms)
+                    (:id token)])
+    token))
 
 (defn repl:create-access-token
   [cfg profile-id name expiration]
@@ -160,12 +207,48 @@ RETURNING id, perms")
                  {:profile-id profile-id}
                  {:order-by [[:expires-at :asc] [:created-at :asc]]
                   :columns [:id :name :perms :type :created-at :updated-at :expires-at :token]})
-       (map decode-row)
+       (map (fn [{:keys [type perms] :as row}]
+              (cond-> (decode-row row)
+                (= type "mcp") (assoc :scopes (mcp-scopes (db/decode-pgarray perms []))))))
        (map (fn [{:keys [type] :as row}]
               (if (not= type "mcp")
                 (dissoc row :token)
                 row)))
        (vec)))
+
+(defn- update-mcp-token-scopes
+  "Replace the `mcp:*` perms of the profile's valid MCP token. Other perms
+  stay. The profile lock serializes this with the token regeneration."
+  [{:keys [::db/conn]} profile-id scopes]
+  (db/get-by-id conn :profile profile-id {::db/for-update true})
+  (let [token (db/exec-one! conn [sql:get-valid-mcp-token profile-id])]
+    (when-not token
+      (ex/raise :type :not-found
+                :code :mcp-token-not-found
+                :hint "the profile has no valid MCP token"))
+    (let [perms (-> (db/decode-pgarray (:perms token) [])
+                    (mcp-scope/replace-scopes scopes))]
+      (db/exec! conn [sql:update-token-perms
+                      (db/create-array conn "text" perms)
+                      (:id token)])
+      {:id (:id token)
+       :scopes (mcp-scopes perms)})))
+
+(def ^:private schema:update-mcp-token-scopes
+  [:map {:title "update-mcp-token-scopes"}
+   [:scopes [::sm/vec [:enum "mcp:read" "mcp:write" "mcp:manage" "mcp:delete"]]]])
+
+(sv/defmethod ::update-mcp-token-scopes
+  "Replace the scopes of the caller's MCP token. Session auth only: MCP
+  tokens cannot run it, because the command has no MCP opt-in."
+  {::doc/added "2.21"
+   ::sm/params schema:update-mcp-token-scopes}
+  [cfg {:keys [::rpc/profile-id scopes] :as params}]
+  (when (= :token (::rpc/auth-type params))
+    (ex/raise :type :authorization
+              :code :session-required
+              :hint "only a session can change the MCP token scopes"))
+  (db/tx-run! cfg update-mcp-token-scopes profile-id scopes))
 
 (def ^:private schema:get-current-mcp-token
   [:map {:title "get-current-mcp-token"}])

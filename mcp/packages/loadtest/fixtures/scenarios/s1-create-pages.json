@@ -1,0 +1,29 @@
+{
+  "name": "S1-create-pages",
+  "description": "Plan 8.4 S1: create 50 pages, each with one board. Pass when the total is under 15 s and the file opens in the frontend without errors.",
+  "agents": 1,
+  "iterations": 1,
+  "steps": [
+    {
+      "name": "create page with one board",
+      "tool": "apply_operations",
+      "repeat": 50,
+      "args": {
+        "fileId": "${fileId}",
+        "operations": [
+          { "op": "create_page", "id": "$tmp:page", "name": "Perf page ${index}" },
+          {
+            "op": "create_board",
+            "pageId": "$tmp:page",
+            "id": "$tmp:board",
+            "name": "Board ${index}",
+            "x": 0,
+            "y": 0,
+            "width": 1440,
+            "height": 900
+          }
+        ]
+      }
+    }
+  ]
+}

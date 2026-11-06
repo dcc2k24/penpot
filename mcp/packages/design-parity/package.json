@@ -1,0 +1,34 @@
+{
+  "name": "mcp-design-parity",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Builds a design-system file through the backend MCP, pulls it back as a normalised model and verifies it",
+  "license": "MPL-2.0",
+  "type": "module",
+  "bin": {
+    "mcp-design-parity": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc --build",
+    "start": "tsx src/index.ts",
+    "test": "tsx --test \"src/**/*.test.ts\"",
+    "types:check": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "^2.3.1",
+    "mcp-loadtest": "workspace:*",
+    "pixelmatch": "^7.2.0",
+    "pngjs": "^7.0.0",
+    "tsx": "^4.23.15"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/pngjs": "^6.0.5",
+    "playwright": "1.62.1",
+    "typescript": "^6.0.3",
+    "vite": "8.3.5"
+  }
+}

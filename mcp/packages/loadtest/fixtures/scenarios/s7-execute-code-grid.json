@@ -1,0 +1,17 @@
+{
+  "name": "S7-execute-code-grid",
+  "description": "Plan 8.4 S7: an execute_code script that builds a 12-column grid of 792 rectangles (66 rows of 12) on one board, about 800 operations in all. Pass when it finishes in under 8 s and the result matches the typed-tool version of the same grid.",
+  "agents": 1,
+  "iterations": 1,
+  "steps": [
+    {
+      "name": "build 12-column grid with execute_code",
+      "tool": "execute_code",
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageId}",
+        "code": "const board = penpot.createBoard();\nboard.name = \"Grid 12 columns\";\nboard.resize(1440, 7300);\nfor (let row = 0; row < 66; row++) {\n  for (let column = 0; column < 12; column++) {\n    const cell = penpot.createRectangle();\n    cell.name = \"Cell \" + row + \"-\" + column;\n    cell.resize(100, 100);\n    cell.x = column * 110;\n    cell.y = row * 110;\n    board.appendChild(cell);\n  }\n}\nreturn \"ok\";"
+      }
+    }
+  ]
+}

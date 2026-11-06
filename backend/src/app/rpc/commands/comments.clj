@@ -230,7 +230,9 @@
    [::sm/contains-any #{:file-id :team-id}]])
 
 (sv/defmethod ::get-comment-threads
-  {::doc/added "1.15"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.15"
    ::sm/params schema:get-comment-threads}
   [cfg {:keys [::rpc/profile-id file-id share-id] :as params}]
   (db/run! cfg (fn [{:keys [::db/conn] :as cfg}]
@@ -331,7 +333,9 @@
   (get-comment-threads-sql "AND ct.file_id = ? AND ct.id = ?"))
 
 (sv/defmethod ::get-comment-thread
-  {::doc/added "1.15"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.15"
    ::sm/params schema:get-comment-thread}
   [cfg {:keys [::rpc/profile-id file-id id share-id] :as params}]
   (db/run! cfg (fn [{:keys [::db/conn] :as cfg}]
@@ -356,7 +360,9 @@
    [:share-id {:optional true} [:maybe ::sm/uuid]]])
 
 (sv/defmethod ::get-comments
-  {::doc/added "1.15"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.15"
    ::sm/params schema:get-comments}
   [cfg {:keys [::rpc/profile-id thread-id share-id]}]
   (db/run! cfg (fn [{:keys [::db/conn] :as cfg}]
@@ -469,7 +475,9 @@
       (assoc :owner-photo-id (:photo-id profile))))
 
 (sv/defmethod ::create-comment-thread
-  {::doc/added "1.15"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.15"
    ::webhooks/event? true
    ::rtry/enabled true
    ::rtry/when rtry/conflict-exception?
@@ -556,7 +564,9 @@
    [:share-id {:optional true} [:maybe ::sm/uuid]]])
 
 (sv/defmethod ::update-comment-thread-status
-  {::doc/added "1.15"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.15"
    ::sm/params schema:update-comment-thread-status
    ::db/transaction true}
   [{:keys [::db/conn] :as cfg} {:keys [::rpc/profile-id id share-id]}]
@@ -574,7 +584,9 @@
    [:share-id {:optional true} [:maybe ::sm/uuid]]])
 
 (sv/defmethod ::update-comment-thread
-  {::doc/added "1.15"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.15"
    ::sm/params schema:update-comment-thread
    ::db/transaction true}
   [{:keys [::db/conn] :as cfg} {:keys [::rpc/profile-id id is-resolved share-id]}]
@@ -596,7 +608,9 @@
    [:mentions {:optional true} [::sm/set ::sm/uuid]]])
 
 (sv/defmethod ::create-comment
-  {::doc/added "1.15"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.15"
    ::webhooks/event? true
    ::sm/params schema:create-comment
    ::db/transaction true}
@@ -668,7 +682,9 @@
 ;; TODO: Check if there are new mentions, if there are send the new emails.
 
 (sv/defmethod ::update-comment
-  {::doc/added "1.15"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.15"
    ::sm/params schema:update-comment
    ::db/transaction true}
   [{:keys [::db/conn] :as cfg} {:keys [::rpc/profile-id ::rpc/request-at id share-id content mentions]}]
@@ -712,7 +728,9 @@
    [:share-id {:optional true} [:maybe ::sm/uuid]]])
 
 (sv/defmethod ::delete-comment-thread
-  {::doc/added "1.15"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.15"
    ::sm/params schema:delete-comment-thread
    ::db/transaction true}
   [{:keys [::db/conn] :as cfg} {:keys [::rpc/profile-id id share-id]}]
@@ -735,7 +753,9 @@
    [:share-id {:optional true} [:maybe ::sm/uuid]]])
 
 (sv/defmethod ::delete-comment
-  {::doc/added "1.15"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.15"
    ::sm/params schema:delete-comment
    ::db/transaction true}
   [{:keys [::db/conn] :as cfg} {:keys [::rpc/profile-id id share-id]}]
@@ -765,7 +785,9 @@
    [:share-id {:optional true} [:maybe ::sm/uuid]]])
 
 (sv/defmethod ::update-comment-thread-position
-  {::doc/added "1.15"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.15"
    ::sm/params schema:update-comment-thread-position
    ::db/transaction true}
   [{:keys [::db/conn] :as cfg} {:keys [::rpc/profile-id ::rpc/request-at id position frame-id share-id]}]
@@ -789,7 +811,9 @@
    [:share-id {:optional true} [:maybe ::sm/uuid]]])
 
 (sv/defmethod ::update-comment-thread-frame
-  {::doc/added "1.15"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.15"
    ::sm/params schema:update-comment-thread-frame
    ::db/transaction true}
   [{:keys [::db/conn] :as cfg} {:keys [::rpc/profile-id ::rpc/request-at id frame-id share-id]}]

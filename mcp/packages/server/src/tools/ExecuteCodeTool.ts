@@ -35,13 +35,17 @@ export class ExecuteCodeTool extends Tool<ExecuteCodeArgs> {
      * Creates a new ExecuteCode tool instance.
      *
      * @param mcpServer - The MCP server instance
+     * @param toolName - The name the tool is registered under; `execute_code_in_tab` when backend tools own the plain name
      */
-    constructor(mcpServer: PenpotMcpServer) {
+    constructor(
+        mcpServer: PenpotMcpServer,
+        private readonly toolName: string = "execute_code"
+    ) {
         super(mcpServer, ExecuteCodeArgs.schema);
     }
 
     public getToolName(): string {
-        return "execute_code";
+        return this.toolName;
     }
 
     public getToolDescription(): string {

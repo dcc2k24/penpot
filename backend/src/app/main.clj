@@ -84,6 +84,25 @@
     ::mdef/labels ["outcome"]
     ::mdef/type :counter}
 
+   :mcp-tool-timing
+   {::mdef/name "penpot_mcp_tool_duration_seconds"
+    ::mdef/help "MCP tool call duration in seconds, by tool and outcome."
+    ::mdef/labels ["tool" "outcome"]
+    ::mdef/buckets [0.005 0.01 0.025 0.05 0.1 0.25 0.5 1 2.5 5 10 30 60]
+    ::mdef/type :histogram}
+
+   :mcp-changes-total
+   {::mdef/name "penpot_mcp_changes_total"
+    ::mdef/help "Changes applied through MCP tools, by tool and change type."
+    ::mdef/labels ["tool" "change_type"]
+    ::mdef/type :counter}
+
+   :mcp-errors-total
+   {::mdef/name "penpot_mcp_errors_total"
+    ::mdef/help "MCP tool calls that failed, by tool and error code."
+    ::mdef/labels ["tool" "code"]
+    ::mdef/type :counter}
+
    :rpc-main-timing
    {::mdef/name "penpot_rpc_main_timing"
     ::mdef/help "RPC command method call timing for main"

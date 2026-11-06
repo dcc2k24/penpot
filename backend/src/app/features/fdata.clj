@@ -54,7 +54,12 @@
   [file & _opts]
   (let [update-page
         (fn [page]
-          (update page :objects omap/wrap))
+          ;; An unloaded pointer page did not change in this call, so
+          ;; its stored fragment stays valid. Wrapping it would load it.
+          (if (and (pmap/pointer-map? page)
+                   (not (pmap/loaded? page)))
+            page
+            (update page :objects omap/wrap)))
 
         update-data
         (fn [fdata]

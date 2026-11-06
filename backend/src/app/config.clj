@@ -207,6 +207,8 @@
     [:error-report-webhook {:optional true} :string]
     [:user-feedback-destination {:optional true} :string]
     [:mcp-feedback-email {:optional true} ::sm/email]
+    [:mcp-token-max-age {:optional true} ::ct/duration]
+    [:mcp-max-compiled-changes {:optional true} ::sm/int]
 
     [:default-rpc-rlimit {:optional true} [::sm/vec :string]]
     [:rpc-rlimit-config {:optional true} ::fs/path]
@@ -438,6 +440,11 @@
   []
   (or (c/get config :file-clean-delay)
       (ct/duration {:days 2})))
+
+(defn get-mcp-token-max-age
+  "Lifetime given to new MCP tokens, or nil when they do not expire."
+  []
+  (c/get config :mcp-token-max-age))
 
 (defn join-uri
   "Join path segments onto a base URI, preserving a potential subpath

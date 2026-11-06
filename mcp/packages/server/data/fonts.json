@@ -1,0 +1,272 @@
+[
+  {
+    "family": "Roboto",
+    "id": "gfont-roboto",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Open Sans",
+    "id": "gfont-open-sans",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Lato",
+    "id": "gfont-lato",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Montserrat",
+    "id": "gfont-montserrat",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Source Sans Pro",
+    "id": "gfont-source-sans-pro",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Poppins",
+    "id": "gfont-poppins",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Oswald",
+    "id": "gfont-oswald",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Raleway",
+    "id": "gfont-raleway",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Noto Sans",
+    "id": "gfont-noto-sans",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Merriweather",
+    "id": "gfont-merriweather",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Playfair Display",
+    "id": "gfont-playfair-display",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Nunito",
+    "id": "gfont-nunito",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Ubuntu",
+    "id": "gfont-ubuntu",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "PT Sans",
+    "id": "gfont-pt-sans",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Inter",
+    "id": "gfont-inter",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Roboto Condensed",
+    "id": "gfont-roboto-condensed",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Rubik",
+    "id": "gfont-rubik",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Work Sans",
+    "id": "gfont-work-sans",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Fira Sans",
+    "id": "gfont-fira-sans",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Quicksand",
+    "id": "gfont-quicksand",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Karla",
+    "id": "gfont-karla",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "DM Sans",
+    "id": "gfont-dm-sans",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Mulish",
+    "id": "gfont-mulish",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Barlow",
+    "id": "gfont-barlow",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Source Serif Pro",
+    "id": "gfont-source-serif-pro",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Lora",
+    "id": "gfont-lora",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Inconsolata",
+    "id": "gfont-inconsolata",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Cabin",
+    "id": "gfont-cabin",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Bebas Neue",
+    "id": "gfont-bebas-neue",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  },
+  {
+    "family": "Anton",
+    "id": "gfont-anton",
+    "variants": [
+      "regular",
+      "italic",
+      "700"
+    ]
+  }
+]

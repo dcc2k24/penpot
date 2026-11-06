@@ -71,7 +71,9 @@
 
 (sv/defmethod ::export-binfile
   "Export a penpot file in a binary format."
-  {::doc/added "1.15"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.15"
    ::doc/changes [["2.12" "Remove version parameter, only one version is supported"]
                   ["2.19" "Deprecated `include-libraries` and `embed-assets` params"]]
    ::webhooks/event? true
@@ -175,7 +177,9 @@
   or as an `upload-id` referencing a completed chunked-upload session,
   which allows importing files larger than the multipart size limit.
   "
-  {::doc/added "1.15"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.15"
    ::doc/changes [["1.20" "Set default version to 3"]
                   ["2.15" "Add upload-id param for chunked upload support"]]
 

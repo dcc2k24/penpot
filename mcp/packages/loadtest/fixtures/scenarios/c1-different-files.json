@@ -1,0 +1,28 @@
+{
+  "name": "C1-different-files",
+  "description": "Plan 8.4 C1: N agents each write to their own file, 50 small writes per agent, 10 writes per second per agent. Run with --agents 1, 5, 10 and 20 and compare the p95 of the write step. Pass when throughput scales to 20 agents with p95 under 1.2 s and no climit queue errors. Agent i writes to agentFileIds[i] from the setup vars file.",
+  "agents": 5,
+  "iterations": 1,
+  "steps": [
+    {
+      "name": "small write to own file",
+      "tool": "apply_operations",
+      "repeat": 50,
+      "rateLimitPerSecond": 10,
+      "args": {
+        "fileId": "${agentFileIds[agent]}",
+        "operations": [
+          {
+            "op": "create_board",
+            "pageId": "${agentPageIds[agent]}",
+            "name": "Agent ${agent} board ${index}",
+            "x": 0,
+            "y": 0,
+            "width": 200,
+            "height": 200
+          }
+        ]
+      }
+    }
+  ]
+}

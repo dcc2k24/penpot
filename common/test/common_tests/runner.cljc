@@ -32,6 +32,7 @@
    [common-tests.geom-align-test]
    [common-tests.geom-bounds-layout-nil-test]
    [common-tests.geom-bounds-map-test]
+   [common-tests.geom-flex-layout-jvm-test]
    [common-tests.geom-flex-layout-test]
    [common-tests.geom-grid-layout-test]
    [common-tests.geom-grid-test]
@@ -80,6 +81,7 @@
    [common-tests.logic.variants-switch-test]
    [common-tests.logic.variants-test]
    [common-tests.math-test]
+   [common-tests.mcp.operations-test]
    [common-tests.media-test]
    [common-tests.path-names-test]
    [common-tests.path-names-tree-test]
@@ -140,6 +142,7 @@
    'common-tests.geom-align-test
    'common-tests.geom-bounds-layout-nil-test
    'common-tests.geom-bounds-map-test
+   'common-tests.geom-flex-layout-jvm-test
    'common-tests.geom-flex-layout-test
    'common-tests.geom-grid-layout-test
    'common-tests.geom-grid-test
@@ -188,6 +191,7 @@
    'common-tests.logic.variants-switch-test
    'common-tests.logic.variants-test
    'common-tests.math-test
+   'common-tests.mcp.operations-test
    'common-tests.media-test
    'common-tests.path-names-test
    'common-tests.path-names-tree-test

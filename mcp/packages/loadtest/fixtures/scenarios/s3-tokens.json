@@ -1,0 +1,116 @@
+{
+  "name": "S3-tokens",
+  "description": "Plan 8.4 S3: 10 token sets, 10 themes and 300 tokens in one apply_operations call, then 500 shapes created and one token applied to them in 20 calls. Pass when the token budgets of 8.1 hold and the frontend shows the applied values.",
+  "agents": 1,
+  "iterations": 1,
+  "freshPage": true,
+  "steps": [
+    {
+      "name": "token write: 10 sets, 300 tokens, 10 themes",
+      "tool": "apply_operations",
+      "args": {
+        "fileId": "${fileId}",
+        "operations": [
+          {
+            "$repeat": 10,
+            "as": "s",
+            "value": [
+              {
+                "op": "create_token_set",
+                "id": "$tmp:set${s}",
+                "name": "Set ${runId}-${s}",
+                "active": true
+              },
+              {
+                "$repeat": 30,
+                "as": "t",
+                "value": {
+                  "op": "create_token",
+                  "setId": "$tmp:set${s}",
+                  "id": "$tmp:tok${s}-${t}",
+                  "type": "color",
+                  "name": "c${s}-${t}",
+                  "value": "#336699"
+                }
+              }
+            ]
+          },
+          {
+            "$repeat": 10,
+            "as": "h",
+            "value": {
+              "op": "create_theme",
+              "id": "$tmp:theme${h}",
+              "group": "Perf",
+              "name": "Theme ${runId}-${h}",
+              "sets": [
+                "Set ${runId}-${h}"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "create 500 rects as token targets",
+      "tool": "batch_create_shapes",
+      "repeat": 2,
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageId}",
+        "tree": [
+          {
+            "$repeat": 250,
+            "as": "k",
+            "value": {
+              "type": "rect",
+              "name": "Token target ${index}-${k}",
+              "x": "${k}",
+              "y": 0,
+              "width": 40,
+              "height": 40
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "find the token targets",
+      "tool": "find_shapes",
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageId}",
+        "type": "rect",
+        "nameRegex": "^Token target",
+        "limit": 500
+      },
+      "capture": {
+        "shapeIds": "$.result.matches[*].id"
+      },
+      "expect": {
+        "path": "$.result.matches",
+        "length": 500
+      }
+    },
+    {
+      "name": "apply 20 tokens to 500 shapes",
+      "tool": "apply_operations",
+      "repeat": 20,
+      "args": {
+        "fileId": "${fileId}",
+        "operations": [
+          {
+            "op": "apply_token",
+            "pageId": "${pageId}",
+            "shapeIds": "${shapeIds}",
+            "tokenName": "c0-${index}",
+            "attributes": [
+              "fill"
+            ],
+            "resolvedValue": "#336699"
+          }
+        ]
+      }
+    }
+  ]
+}

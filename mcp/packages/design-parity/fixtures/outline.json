@@ -1,0 +1,52 @@
+{
+  "features": [
+    "components/v2",
+    "design-tokens/v1",
+    "fdata/objects-map",
+    "fdata/path-data",
+    "fdata/pointer-map",
+    "fdata/shape-data-type",
+    "layout/grid",
+    "plugins/runtime",
+    "render-wasm/v1",
+    "styles/v2",
+    "tokens/numeric-input",
+    "variants/v1"
+  ],
+  "teamId": "020d5db5-c02c-8099-8008-e4d59a5f6930",
+  "libraries": [],
+  "name": "Design Lab",
+  "revn": 21,
+  "colors": 0,
+  "modifiedAt": "2026-11-04T12:29:08.354091Z",
+  "typographies": 8,
+  "pages": [
+    {
+      "name": "Journey: Onboarding",
+      "shapeCount": 73,
+      "rootChildCount": 4,
+      "id": "ce1379a2-f81f-8121-8008-e4e6443e5084",
+      "index": 1
+    }
+  ],
+  "vern": 0,
+  "components": 47,
+  "id": "ce1379a2-f81f-8121-8008-e4e644135b2e",
+  "isShared": false,
+  "pointerMap": true,
+  "deletedComponents": 0,
+  "tokens": {
+    "sets": 1,
+    "themes": 1,
+    "tokens": 53,
+    "activeThemes": [
+      "ce1379a2-f81f-8121-8008-e4e644b2943e"
+    ],
+    "activeSets": [
+      "ce1379a2-f81f-8121-8008-e4e644af2d55"
+    ]
+  },
+  "version": 67,
+  "projectId": "020d5db5-c02c-8099-8008-e4d59a98a79f",
+  "media": 0
+}

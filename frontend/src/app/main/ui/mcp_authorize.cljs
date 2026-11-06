@@ -23,6 +23,7 @@
    [app.util.i18n :refer [tr]]
    [app.util.storage :as storage]
    [beicon.v2.core :as rx]
+   [cuerdas.core :as str]
    [rumext.v2 :as mf]))
 
 (defn- endpoint
@@ -55,6 +56,43 @@
                      (= method :post) (assoc :headers {"content-type" "application/x-www-form-urlencoded"}
                                              :body (uri/map->query-string params))))
        (rx/map #(update % :body js->clj :keywordize-keys true))))
+
+(defn- normalize-scopes
+  "Return the set of scope names in a space-separated scope string. A
+  bare `mcp` means `mcp:read`."
+  [scope]
+  (into #{}
+        (comp (remove str/blank?)
+              (map #(if (= "mcp" %) "mcp:read" %)))
+        (str/split (or scope "") #"\s+")))
+
+(defn- requested-scopes
+  "Return the scopes to show, in display order. A bare `mcp` means read,
+  and every write, manage or delete scope implies read, so read is
+  always listed."
+  [scope]
+  (let [requested (normalize-scopes scope)]
+    (filterv #(or (= "mcp:read" %) (contains? requested %))
+             ["mcp:read" "mcp:write" "mcp:manage" "mcp:delete"])))
+
+(defn- scope-label
+  [scope]
+  (case scope
+    "mcp:write"  (tr "mcp-authorize.scope.write")
+    "mcp:manage" (tr "mcp-authorize.scope.manage")
+    "mcp:delete" (tr "mcp-authorize.scope.delete")
+    (tr "mcp-authorize.scope.read")))
+
+(defn- extra-scopes
+  "Return the scopes the granted token holds beyond the requested ones."
+  [scope granted-scope]
+  (let [requested (set (requested-scopes scope))]
+    (filterv (complement requested) (requested-scopes granted-scope))))
+
+(defn- read-only-access?
+  "True when the client will hold read access only."
+  [details]
+  (= ["mcp:read"] (requested-scopes (or (:granted-scope details) (:scope details)))))
 
 (mf/defc client-logo*
   {::mf/private true}
@@ -148,11 +186,32 @@
              [:> text* {:typography typography/body-large :class (stl/css :client-text)}
               (tr "mcp.oauth.request" (or (:client-name @details) (:client-id @details)))]
              [:> text* {:typography typography/body-small :class (stl/css :client-text)}
-              (:client-id @details)]]]
+              (:client-id @details)]
+             [:ul {:class (stl/css :scope-list)}
+              (for [scope (requested-scopes (:scope @details))]
+                [:> text* {:as "li"
+                           :key scope
+                           :typography typography/body-medium
+                           :class (stl/css :client-text)}
+                 (scope-label scope)])]
+             (let [extra (extra-scopes (:scope @details) (:granted-scope @details))]
+               (when (seq extra)
+                 [:*
+                  [:> text* {:typography typography/body-medium :class (stl/css :client-text)}
+                   (tr "mcp-authorize.scope.also-granted")]
+                  [:ul {:class (stl/css :scope-list)}
+                   (for [scope extra]
+                     [:> text* {:as "li"
+                                :key scope
+                                :typography typography/body-medium
+                                :class (stl/css :client-text)}
+                      (scope-label scope)])]]))]]
            [:> text* {:typography typography/body-medium}
             (tr "mcp.oauth.account" (:email profile))]
            [:> text* {:typography typography/body-large}
-            (tr "mcp.oauth.access")]
+            (if (read-only-access? @details)
+              (tr "mcp.oauth.access.read-only")
+              (tr "mcp.oauth.access"))]
            [:> text* {:typography typography/body-medium}
             (tr "mcp.oauth.enable")]
            [:div {:class (stl/css :actions)}

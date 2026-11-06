@@ -145,6 +145,12 @@
   gap: var(--sp-l);
 }
 
+.mcp-server-write {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-s);
+}
+
 .mcp-server-regenerate {
   display: flex;
   align-items: center;

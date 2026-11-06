@@ -306,7 +306,9 @@
 
 (sv/defmethod ::get-project-files
   "Get all files for the specified project."
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.17"
    ::sm/params schema:get-project-files
    ::sm/result schema:files}
   [{:keys [::db/pool] :as cfg} {:keys [::rpc/profile-id project-id]}]
@@ -465,7 +467,9 @@
 
   Mainly used for rendering purposes on the exporter. It does not
   accepts client features."
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.17"
    ::sm/params schema:get-page}
   [cfg {:keys [::rpc/profile-id file-id share-id] :as params}]
   (db/tx-run! cfg
@@ -633,7 +637,9 @@
 
 (sv/defmethod ::get-team-shared-files
   "Get all file (libraries) for the specified team."
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.17"
    ::sm/params schema:get-team-shared-files}
   [cfg {:keys [::rpc/profile-id] :as params}]
   (db/tx-run! cfg get-team-shared-files (assoc params :profile-id profile-id)))
@@ -653,7 +659,9 @@
 
 (sv/defmethod ::get-file-summary
   "Retrieve a file summary by its ID. Only authenticated users."
-  {::doc/added "1.20"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.20"
    ::rpc/id-type :file
    ::sm/params schema:get-file-summary}
   [cfg {:keys [::rpc/profile-id id] :as params}]
@@ -722,7 +730,9 @@
    counts by type, component/color/typography counts, and inbound and
    outbound library reference counts. Cheap alternative to `get-file`
    when only metrics are needed."
-  {::doc/added "2.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "2.17"
    ::rpc/id-type :file
    ::sm/params schema:get-file-stats
    ::sm/result schema:get-file-stats-result
@@ -744,7 +754,9 @@
    stored on the file root through the Plugin API. Optionally narrowed
    to a single `namespace`. Lets external tooling read metadata such as
    issue or commit references without downloading the whole file."
-  {::doc/added "2.20"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "2.20"
    ::sm/params schema:get-file-plugin-data
    ::sm/result ctpg/schema:plugin-data
    ::db/transaction true}
@@ -767,7 +779,9 @@
    the file has none. Active themes and sets come from the file's
    tokens status. Cheap alternative to `get-file` when only the tokens
    are needed."
-  {::doc/added "2.20"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "2.20"
    ::sm/params schema:get-file-tokens
    ::sm/result [:maybe [:map-of :string :any]]}
   [cfg {:keys [::rpc/profile-id file-id]}]
@@ -787,7 +801,9 @@
 
 (sv/defmethod ::get-file-libraries
   "Get libraries used by the specified file."
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.17"
    ::sm/params schema:get-file-libraries}
   [cfg {:keys [::rpc/profile-id file-id]}]
   (bfc/check-file-exists cfg file-id)
@@ -858,7 +874,9 @@
    [:team-id ::sm/uuid]])
 
 (sv/defmethod ::get-team-recent-files
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.17"
    ::sm/params schema:get-team-recent-files}
   [{:keys [::db/pool] :as cfg} {:keys [::rpc/profile-id team-id]}]
   (dm/with-open [conn (db/open pool)]
@@ -904,7 +922,9 @@
    [:team-id ::sm/uuid]])
 
 (sv/defmethod ::get-team-deleted-files
-  {::doc/added "2.12"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "2.12"
    ::sm/params schema:get-team-deleted-files}
   [cfg {:keys [::rpc/profile-id team-id]}]
   (db/run! cfg (fn [{:keys [::db/conn] :as cfg}]
@@ -922,7 +942,9 @@
 
 (sv/defmethod ::get-file-info
   "Retrieve minimal file info by its ID."
-  {::rpc/auth false
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::rpc/auth false
    ::doc/added "2.2.0"
    ::sm/params schema:get-file}
   [cfg params]
@@ -943,7 +965,9 @@
               {::db/return-keys true}))
 
 (sv/defmethod ::rename-file
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.17"
    ::rpc/id-type :file
    ::webhooks/event? true
 
@@ -1115,7 +1139,9 @@
    [:is-shared ::sm/boolean]])
 
 (sv/defmethod ::set-file-shared
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.17"
    ::rpc/id-type :file
    ::webhooks/event? true
    ::sm/params schema:set-file-shared}
@@ -1178,7 +1204,9 @@
                       :deleted-at (:deleted-at file)}})))
 
 (sv/defmethod ::delete-file
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:delete"
+   ::doc/added "1.17"
    ::rpc/id-type :file
    ::webhooks/event? true
    ::sm/params schema:delete-file}
@@ -1226,7 +1254,9 @@
 
 (sv/defmethod ::link-file-to-library
   "Link a file to a library. Returns the recursive list of libraries used by that library"
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.17"
    ::webhooks/event? true
    ::sm/params schema:link-file-to-library
    ::db/transaction true}
@@ -1264,7 +1294,9 @@
    [:library-id ::sm/uuid]])
 
 (sv/defmethod ::unlink-file-from-library
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.17"
    ::webhooks/event? true
    ::sm/params schema:unlink-file-to-library
    ::db/transaction true}
@@ -1518,7 +1550,9 @@
 (sv/defmethod ::restore-deleted-team-files
   "Removes the deletion mark from the specified files (and respective
   projects) on the specified team."
-  {::doc/added "2.13"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "2.13"
    ::sse/stream? true
    ::sm/params schema:restore-deleted-team-files}
   [cfg params]

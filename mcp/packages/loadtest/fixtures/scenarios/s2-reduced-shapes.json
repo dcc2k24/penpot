@@ -1,0 +1,153 @@
+{
+  "name": "S2-reduced-shapes",
+  "description": "Plan 8.4 S2, reduced to about 1,000 shapes: four batch_create_shapes calls of three root trees each. Every tree has four levels (board, board, board, rect). The roots and frames then get flex layouts with set_flex_layout ops in one apply_operations call, using the ids that find_shapes captured. Pass when the bulk budget of 8.1 holds and the result renders like a plugin-built twin (9.3).",
+  "agents": 1,
+  "iterations": 1,
+  "freshPage": true,
+  "steps": [
+    {
+      "name": "batch_create_shapes 3 trees of 86 nodes",
+      "tool": "batch_create_shapes",
+      "repeat": 4,
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageId}",
+        "tree": [
+          {
+            "$repeat": 3,
+            "as": "r",
+            "value": {
+              "type": "board",
+              "name": "Batch ${index} root ${r}",
+              "x": 0,
+              "y": 0,
+              "width": 1200,
+              "height": 1600,
+              "children": [
+                {
+                  "$repeat": 5,
+                  "as": "a",
+                  "value": {
+                    "type": "board",
+                    "name": "Frame ${r}-${a}",
+                    "x": 0,
+                    "y": 0,
+                    "width": 1100,
+                    "height": 300,
+                    "children": [
+                      {
+                        "$repeat": 4,
+                        "as": "b",
+                        "value": {
+                          "type": "board",
+                          "name": "Section ${a}-${b}",
+                          "x": 0,
+                          "y": 0,
+                          "width": 260,
+                          "height": 280,
+                          "children": [
+                            {
+                              "$repeat": 3,
+                              "as": "c",
+                              "value": {
+                                "type": "rect",
+                                "name": "Rect ${b}-${c}",
+                                "x": 0,
+                                "y": 0,
+                                "width": 80,
+                                "height": 80
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "find the 12 root boards",
+      "tool": "find_shapes",
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageId}",
+        "type": "board",
+        "nameRegex": "^Batch .* root ",
+        "limit": 100
+      },
+      "capture": {
+        "rootIds": "$.result.matches[*].id"
+      },
+      "expect": {
+        "path": "$.result.matches",
+        "length": 12
+      }
+    },
+    {
+      "name": "find the 60 frame boards",
+      "tool": "find_shapes",
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageId}",
+        "type": "board",
+        "nameRegex": "^Frame ",
+        "limit": 100
+      },
+      "capture": {
+        "frameIds": "$.result.matches[*].id"
+      },
+      "expect": {
+        "path": "$.result.matches",
+        "length": 60
+      }
+    },
+    {
+      "name": "set flex layouts on 12 roots and 60 frames",
+      "tool": "apply_operations",
+      "args": {
+        "fileId": "${fileId}",
+        "operations": [
+          {
+            "$repeat": 12,
+            "as": "r",
+            "value": {
+              "op": "set_flex_layout",
+              "pageId": "${pageId}",
+              "id": "${rootIds[r]}",
+              "layoutFlexDir": "column",
+              "layoutGap": {
+                "rowGap": 16,
+                "columnGap": 16
+              },
+              "layoutPadding": {
+                "p1": 16,
+                "p2": 16,
+                "p3": 16,
+                "p4": 16
+              }
+            }
+          },
+          {
+            "$repeat": 60,
+            "as": "f",
+            "value": {
+              "op": "set_flex_layout",
+              "pageId": "${pageId}",
+              "id": "${frameIds[f]}",
+              "layoutFlexDir": "row",
+              "layoutGap": {
+                "rowGap": 8,
+                "columnGap": 8
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

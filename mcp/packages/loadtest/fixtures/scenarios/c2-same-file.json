@@ -1,0 +1,57 @@
+{
+  "name": "C2-same-file",
+  "description": "Plan 8.4 C2: N agents write to the same file, each in its own board with non-overlapping shapes. Each agent creates one board and then 100 rectangles inside it, and the last step checks that all 100 are present (no lost writes). Run with --agents 2 and 5. Pass when the check holds and the p95 of the write step is under 3 s.",
+  "agents": 2,
+  "iterations": 1,
+  "steps": [
+    {
+      "name": "create the agent board",
+      "tool": "apply_operations",
+      "rateLimitPerSecond": 10,
+      "args": {
+        "fileId": "${fileId}",
+        "operations": [
+          {
+            "op": "create_board",
+            "id": "$tmp:board",
+            "pageId": "${pageId}",
+            "name": "C2 agent ${agent}",
+            "x": 0,
+            "y": 0,
+            "width": 400,
+            "height": 400
+          }
+        ]
+      },
+      "capture": { "agentBoardId": "$.result.createdIds[\"$tmp:board\"]" }
+    },
+    {
+      "name": "create 100 rectangles in the agent board",
+      "tool": "apply_operations",
+      "repeat": 100,
+      "rateLimitPerSecond": 10,
+      "args": {
+        "fileId": "${fileId}",
+        "operations": [
+          {
+            "op": "create_rect",
+            "pageId": "${pageId}",
+            "parentId": "${agentBoardId}",
+            "name": "Agent ${agent} rect ${index}",
+            "x": "${index}",
+            "y": 10,
+            "width": 1,
+            "height": 10
+          }
+        ]
+      }
+    },
+    {
+      "name": "check that all rectangles are present",
+      "tool": "find_shapes",
+      "rateLimitPerSecond": 10,
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "withinId": "${agentBoardId}", "limit": 1000 },
+      "expect": { "path": "$.result.matches", "length": 100 }
+    }
+  ]
+}

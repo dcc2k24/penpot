@@ -672,6 +672,33 @@
    :justify-self :auto
    :shapes []})
 
+(def initial-flex-layout
+  {:layout                 :flex
+   :layout-flex-dir        :row
+   :layout-gap-type        :multiple
+   :layout-gap             {:row-gap 0 :column-gap 0}
+   :layout-align-items     :start
+   :layout-justify-content :start
+   :layout-align-content   :stretch
+   :layout-wrap-type       :nowrap
+   :layout-padding-type    :simple
+   :layout-padding         {:p1 0 :p2 0 :p3 0 :p4 0}})
+
+(def initial-grid-layout
+  {:layout :grid
+   :layout-grid-dir        :row
+   :layout-gap-type        :multiple
+   :layout-gap             {:row-gap 0 :column-gap 0}
+   :layout-align-items     :start
+   :layout-justify-items   :start
+   :layout-align-content   :stretch
+   :layout-justify-content :stretch
+   :layout-padding-type    :simple
+   :layout-padding         {:p1 0 :p2 0 :p3 0 :p4 0}
+   :layout-grid-cells      {}
+   :layout-grid-rows       []
+   :layout-grid-columns    []})
+
 (declare resize-cell-area)
 (declare cells-by-column)
 (declare cells-by-row)

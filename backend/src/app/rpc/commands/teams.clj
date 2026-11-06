@@ -194,7 +194,9 @@
   [:map {:title "get-teams"}])
 
 (sv/defmethod ::get-teams
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.17"
    ::sm/params schema:get-teams}
   [{:keys [::db/pool] :as cfg} {:keys [::rpc/profile-id] :as params}]
   (dm/with-open [conn (db/open pool)]
@@ -241,7 +243,9 @@
               (contains? params :file-id)))]])
 
 (sv/defmethod ::get-team
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.17"
    ::rpc/id-type :team
    ::sm/params schema:get-team}
   [cfg {:keys [::rpc/profile-id id file-id] :as params}]
@@ -529,7 +533,9 @@
    [:is-default {:optional true} :boolean]])
 
 (sv/defmethod ::create-team
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.17"
    ::doc/changes [["2.19" "The optional :id param is rejected with a params-validation error; the server always generates the identifier"]]
    ::sm/params schema:create-team}
   [cfg {:keys [::rpc/profile-id organization-id] :as params}]
@@ -762,7 +768,9 @@
    [:id ::sm/uuid]])
 
 (sv/defmethod ::update-team
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.17"
    ::rpc/id-type :team
    ::sm/params schema:update-team
    ::db/transaction true}

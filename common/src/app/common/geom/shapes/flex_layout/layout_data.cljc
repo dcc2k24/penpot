@@ -30,7 +30,12 @@
 
 (defn layout-bounds
   [parent shape-bounds]
-  (let [[pad-top pad-right pad-bottom pad-left] (ctl/paddings parent)]
+  (let [[pad-top pad-right pad-bottom pad-left] (ctl/paddings parent)
+        ;; JVM parity: ClojureScript coerces nil to 0 in the padding arithmetic
+        pad-top    (or pad-top 0)
+        pad-right  (or pad-right 0)
+        pad-bottom (or pad-bottom 0)
+        pad-left   (or pad-left 0)]
     (gpo/pad-points shape-bounds pad-top pad-right pad-bottom pad-left)))
 
 (defn init-layout-lines
@@ -60,10 +65,15 @@
         (persistent! (cond-> result (some? line-data) (conj! line-data)))
 
         (let [[child-bounds child] (first children)
+              ;; JVM parity: ClojureScript coerces nil to 0 in the arithmetic below
+              ;; (the first iteration has no line-data yet)
               {:keys [line-min-width line-min-height
                       line-max-width line-max-height
                       num-children
-                      children-data]} line-data
+                      children-data]
+               :or   {line-min-width  0
+                      line-min-height 0
+                      num-children    0}} line-data
 
               child-width      (gpo/width-points child-bounds)
               child-height     (gpo/height-points child-bounds)
@@ -141,8 +151,10 @@
 (defn add-space-to-items
   ;; Distributes the remainder space between the lines
   [prop prop-min prop-max to-share items]
-  (let [num-items (->> items (remove #(mth/close? (get % prop) (get % prop-max))) count)
-        per-line-target (/ to-share num-items)]
+  (let [;; JVM parity: ClojureScript coerces a nil prop to 0 in mth/close?
+        num-items (->> items (remove #(mth/close? (or (get % prop) 0) (get % prop-max))) count)
+        ;; JVM parity: ClojureScript tolerates division by zero here (no items to share with)
+        per-line-target (if (pos? num-items) (/ to-share num-items) 0)]
 
     (loop [items (seq items)
            remainder to-share
@@ -222,13 +234,15 @@
             num-lines (count layout-lines)
 
             ;; When align-items is stretch we need to adjust the main axis size to grow for the full content
+            ;; JVM parity: ClojureScript tolerates division by zero when there are no lines
             stretch-width-fix
-            (if (and col? (ctl/content-stretch? parent) (not auto-width?))
+            (if (and col? (ctl/content-stretch? parent) (not auto-width?) (pos? num-lines))
               (/ (- layout-width (* layout-gap-col (dec num-lines)) total-max-width) num-lines)
               0)
 
+            ;; JVM parity: ClojureScript tolerates division by zero when there are no lines
             stretch-height-fix
-            (if (and row? (ctl/content-stretch? parent) (not auto-height?))
+            (if (and row? (ctl/content-stretch? parent) (not auto-height?) (pos? num-lines))
               (/ (- layout-height (* layout-gap-row (dec num-lines)) total-max-height) num-lines)
               0)
 
@@ -360,7 +374,10 @@
               (/ (max layout-gap-col (/ (- width line-width) num-children)) 2)
 
               (and row? space-between? (not auto-width?))
-              (max layout-gap-col (/ (- width line-width) (dec num-children)))
+              ;; JVM parity: ClojureScript tolerates division by zero for a single child
+              (max layout-gap-col (if (pos? (dec num-children))
+                                    (/ (- width line-width) (dec num-children))
+                                    0))
 
               :else
               layout-gap-col)
@@ -373,7 +390,10 @@
               (/ (max layout-gap-row (/ (- height line-height) num-children)) 2)
 
               (and col? space-between? (not auto-height?))
-              (max layout-gap-row (/ (- height line-height) (dec num-children)))
+              ;; JVM parity: ClojureScript tolerates division by zero for a single child
+              (max layout-gap-row (if (pos? (dec num-children))
+                                    (/ (- height line-height) (dec num-children))
+                                    0))
 
               :else
               layout-gap-row)]

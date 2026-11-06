@@ -75,7 +75,9 @@
    [:search-term {:optional true} [:string {:max 250}]]])
 
 (sv/defmethod ::search-files
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.17"
    ::doc/module :files
    ::sm/params schema:search-files}
   [{:keys [::db/pool]} {:keys [::rpc/profile-id team-id search-term]}]

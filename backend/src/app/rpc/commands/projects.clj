@@ -109,7 +109,9 @@
    [:team-id ::sm/uuid]])
 
 (sv/defmethod ::get-projects
-  {::doc/added "1.18"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.18"
    ::doc/changes [["2.12" "This endpoint now return deleted but recoverable projects"]]
    ::sm/params schema:get-projects}
   [cfg {:keys [::rpc/profile-id team-id]}]
@@ -124,7 +126,9 @@
   [:map {:title "get-all-projects"}])
 
 (sv/defmethod ::get-all-projects
-  {::doc/added "1.18"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.18"
    ::sm/params schema:get-all-projects}
   [{:keys [::db/pool]} {:keys [::rpc/profile-id]}]
   (dm/with-open [conn (db/open pool)]
@@ -173,7 +177,9 @@
    [:id ::sm/uuid]])
 
 (sv/defmethod ::get-project
-  {::doc/added "1.18"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.18"
    ::rpc/id-type :project
    ::sm/params schema:get-project}
   [{:keys [::db/pool] :as cfg} {:keys [::rpc/profile-id id]}]
@@ -211,7 +217,9 @@
    [:name [:string {:max 250 :min 1}]]])
 
 (sv/defmethod ::create-project
-  {::doc/added "1.18"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.18"
    ::doc/changes [["2.19" "The optional :id param is rejected with a params-validation error; the server always generates the identifier"]]
    ::webhooks/event? true
    ::sm/params schema:create-project}
@@ -242,7 +250,9 @@
    [:id ::sm/uuid]])
 
 (sv/defmethod ::update-project-pin
-  {::doc/added "1.18"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.18"
    ::rpc/id-type :project
    ::sm/params schema:update-project-pin
    ::webhooks/batch-timeout (ct/duration "5s")
@@ -264,7 +274,9 @@
    [:id ::sm/uuid]])
 
 (sv/defmethod ::rename-project
-  {::doc/added "1.18"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.18"
    ::rpc/id-type :project
    ::sm/params schema:rename-project
    ::webhooks/event? true
@@ -308,7 +320,9 @@
    [:id ::sm/uuid]])
 
 (sv/defmethod ::delete-project
-  {::doc/added "1.18"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:delete"
+   ::doc/added "1.18"
    ::rpc/id-type :project
    ::sm/params schema:delete-project
    ::webhooks/event? true

@@ -1,0 +1,112 @@
+{
+  "name": "S9-hostile-code",
+  "description": "Plan 8.4 S9: hostile execute_code scripts. Each one must fail with the sandbox's own error inside its limit (10 s CPU, 128 MB heap, call stack, 5000 operations, no require, fetch, process or host handle, no await), and the plain script after it must still work. Pass when every step passes and, over many iterations, the MCP server RSS does not grow (run with --iterations 100 --server-pid <pid of the MCP server>).",
+  "agents": 1,
+  "iterations": 1,
+  "steps": [
+    {
+      "name": "plain script before",
+      "tool": "execute_code",
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "code": "return 1 + 1;" },
+      "expect": { "path": "$.result.result", "equals": 2 }
+    },
+    {
+      "name": "infinite loop stops at the CPU limit",
+      "tool": "execute_code",
+      "maxDurationMs": 15000,
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "code": "while (true) {}" },
+      "expectError": "CPU limit"
+    },
+    {
+      "name": "plain script after the loop",
+      "tool": "execute_code",
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "code": "return 1 + 1;" },
+      "expect": { "path": "$.result.result", "equals": 2 }
+    },
+    {
+      "name": "memory bomb stops at the memory limit",
+      "tool": "execute_code",
+      "maxDurationMs": 15000,
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageId}",
+        "code": "const hoard = [];\nwhile (true) {\n  hoard.push(new Array(1000000).fill(7));\n}"
+      },
+      "expectError": "memory limit|out of memory"
+    },
+    {
+      "name": "plain script after the memory bomb",
+      "tool": "execute_code",
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "code": "return 1 + 1;" },
+      "expect": { "path": "$.result.result", "equals": 2 }
+    },
+    {
+      "name": "deep recursion stops at the stack limit",
+      "tool": "execute_code",
+      "maxDurationMs": 15000,
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageId}",
+        "code": "function dive(depth) {\n  return dive(depth + 1) + 1;\n}\nreturn dive(0);"
+      },
+      "expectError": "stack"
+    },
+    {
+      "name": "plain script after the recursion",
+      "tool": "execute_code",
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "code": "return 1 + 1;" },
+      "expect": { "path": "$.result.result", "equals": 2 }
+    },
+    {
+      "name": "5001 operations exceed the operation cap",
+      "tool": "execute_code",
+      "maxDurationMs": 15000,
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageId}",
+        "code": "for (let i = 0; i < 5001; i++) {\n  const shape = penpot.createRectangle();\n  shape.name = \"S9 cap \" + i;\n}\nreturn \"sent\";"
+      },
+      "expectError": "at most 5000 operations"
+    },
+    {
+      "name": "require is not there",
+      "tool": "execute_code",
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "code": "const fs = require(\"fs\");\nreturn fs.readdirSync(\"/\");" },
+      "expectError": "not defined|not available"
+    },
+    {
+      "name": "fetch is not there",
+      "tool": "execute_code",
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "code": "return fetch(\"http://127.0.0.1:6061/metrics\");" },
+      "expectError": "not defined|not available"
+    },
+    {
+      "name": "process is not there",
+      "tool": "execute_code",
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "code": "return process.env;" },
+      "expectError": "not defined|not available"
+    },
+    {
+      "name": "the host handle is not reachable",
+      "tool": "execute_code",
+      "args": {
+        "fileId": "${fileId}",
+        "pageId": "${pageId}",
+        "code": "if (typeof __host !== \"undefined\") {\n  __host.rpc(\"delete-file\", JSON.stringify({ id: \"00000000-0000-0000-0000-000000000000\" }));\n}\nthrow new Error(\"no host handle\");"
+      },
+      "expectError": "no host handle|not available|not defined"
+    },
+    {
+      "name": "await is refused",
+      "tool": "execute_code",
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "code": "const value = await Promise.resolve(1);\nreturn value;" },
+      "expectError": "await"
+    },
+    {
+      "name": "plain script at the end",
+      "tool": "execute_code",
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "code": "return 1 + 1;" },
+      "expect": { "path": "$.result.result", "equals": 2 }
+    }
+  ]
+}

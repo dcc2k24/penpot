@@ -52,6 +52,14 @@
   margin: 0;
 }
 
+.scope-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-xs);
+  margin: 0;
+  padding-inline-start: var(--sp-l);
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;

@@ -48,7 +48,8 @@
         (gpt/add (vv free-height-gap))
 
         around?
-        (gpt/add (vv (max lines-gap-row (/ free-height num-lines 2))))
+        ;; JVM parity: ClojureScript tolerates division by zero when there are no lines
+        (gpt/add (vv (max lines-gap-row (if (pos? num-lines) (/ free-height num-lines 2) 0))))
 
         evenly?
         (gpt/add (vv (max lines-gap-row (/ free-height (inc num-lines))))))
@@ -61,7 +62,8 @@
         (gpt/add (hv free-width-gap))
 
         around?
-        (gpt/add (hv (max lines-gap-col (/ free-width num-lines 2))))
+        ;; JVM parity: ClojureScript tolerates division by zero when there are no lines
+        (gpt/add (hv (max lines-gap-col (if (pos? num-lines) (/ free-width num-lines 2) 0))))
 
         evenly?
         (gpt/add (hv (max lines-gap-col (/ free-width (inc num-lines)))))))))
@@ -99,7 +101,8 @@
           (/ free-width num-lines)
 
           between?
-          (/ free-width (dec num-lines))
+          ;; JVM parity: ClojureScript tolerates division by zero for a single line
+          (if (pos? (dec num-lines)) (/ free-width (dec num-lines)) 0)
 
           around?
           (/ free-width num-lines)
@@ -119,7 +122,8 @@
           (/ free-height num-lines)
 
           between?
-          (/ free-height (dec num-lines))
+          ;; JVM parity: ClojureScript tolerates division by zero for a single line
+          (if (pos? (dec num-lines)) (/ free-height (dec num-lines)) 0)
 
           around?
           (/ free-height num-lines)

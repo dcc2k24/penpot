@@ -1,0 +1,66 @@
+{
+  "name": "S8-snapshot-cost",
+  "description": "Plan 8.4 S8 on the generated large file (run generate-large first and pass its vars file). Each iteration makes four small writes on one page: a rename with no snapshot, the same rename with snapshot true, a new rect with no snapshot, and the delete of that rect, which always takes a snapshot. The added snapshot cost is p50/p95 of step 2 minus step 1, and of step 4 minus step 3. The last step lists the file's snapshots; the mcp/ snapshots are pruned to 20. Run with --iterations 20 or more.",
+  "agents": 1,
+  "iterations": 20,
+  "setupPer": "agent",
+  "setup": [
+    {
+      "name": "find a target rect",
+      "tool": "find_shapes",
+      "args": { "fileId": "${fileId}", "pageId": "${pageId}", "type": "rect", "limit": 1 },
+      "capture": { "targetId": "$.result.matches[0].id" }
+    }
+  ],
+  "steps": [
+    {
+      "name": "rename, no snapshot",
+      "tool": "apply_operations",
+      "args": {
+        "fileId": "${fileId}",
+        "snapshot": false,
+        "operations": [
+          { "op": "update_shape", "pageId": "${pageId}", "id": "${targetId}", "props": { "name": "S8 plain ${runId} ${iteration}" } }
+        ]
+      }
+    },
+    {
+      "name": "rename, snapshot true",
+      "tool": "apply_operations",
+      "args": {
+        "fileId": "${fileId}",
+        "snapshot": true,
+        "operations": [
+          { "op": "update_shape", "pageId": "${pageId}", "id": "${targetId}", "props": { "name": "S8 snap ${runId} ${iteration}" } }
+        ]
+      },
+      "expect": { "path": "$.result.snapshotId", "length": 36 }
+    },
+    {
+      "name": "create rect, no snapshot",
+      "tool": "apply_operations",
+      "args": {
+        "fileId": "${fileId}",
+        "snapshot": false,
+        "operations": [
+          { "op": "create_rect", "id": "$tmp:r", "pageId": "${pageId}", "name": "S8 rect ${runId} ${iteration}", "x": -500, "y": -500, "width": 20, "height": 20 }
+        ]
+      },
+      "capture": { "rectId": "$.result.createdIds[\"$tmp:r\"]" }
+    },
+    {
+      "name": "delete rect, snapshot by delete",
+      "tool": "apply_operations",
+      "args": {
+        "fileId": "${fileId}",
+        "operations": [{ "op": "delete_shapes", "pageId": "${pageId}", "ids": ["${rectId}"] }]
+      },
+      "expect": { "path": "$.result.snapshotId", "length": 36 }
+    },
+    {
+      "name": "list snapshots",
+      "tool": "manage_versions",
+      "args": { "fileId": "${fileId}", "action": "list" }
+    }
+  ]
+}

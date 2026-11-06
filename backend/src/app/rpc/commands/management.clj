@@ -98,7 +98,9 @@
 
 (sv/defmethod ::duplicate-file
   "Duplicate a single file in the same team."
-  {::doc/added "1.16"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.16"
    ::webhooks/event? true
    ::sm/params schema:duplicate-file}
   [cfg {:keys [::rpc/profile-id file-id] :as params}]
@@ -176,7 +178,9 @@
 
 (sv/defmethod ::duplicate-project
   "Duplicate an entire project with all the files"
-  {::doc/added "1.16"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.16"
    ::webhooks/event? true
    ::sm/params schema:duplicate-project}
   [cfg {:keys [::rpc/profile-id] :as params}]
@@ -350,7 +354,9 @@
 
 (sv/defmethod ::move-files
   "Move a set of files from one project to other."
-  {::doc/added "1.16"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.16"
    ::webhooks/event? true
    ::sm/params schema:move-files}
   [cfg {:keys [::rpc/profile-id] :as params}]
@@ -419,7 +425,9 @@
 
 (sv/defmethod ::move-project
   "Move projects between teams"
-  {::doc/added "1.16"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.16"
    ::webhooks/event? true
    ::sm/params schema:move-project}
   [cfg {:keys [::rpc/profile-id] :as params}]

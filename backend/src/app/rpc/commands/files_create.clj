@@ -79,7 +79,9 @@
    [:features {:optional true} ::cfeat/features]])
 
 (sv/defmethod ::create-file
-  {::doc/added "1.17"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:manage"
+   ::doc/added "1.17"
    ::doc/changes [["2.19" "The optional :id param is rejected with a params-validation error; the server always generates the identifier"]]
    ::doc/module :files
    ::webhooks/event? true

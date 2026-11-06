@@ -4,9 +4,9 @@ import { ImageContent, PNGResponse, TextContent, TextResponse, ToolResponse } fr
 import "reflect-metadata";
 import { PenpotMcpServer } from "../PenpotMcpServer";
 import { ExecuteCodePluginTask } from "../tasks/ExecuteCodePluginTask";
-import { createLogger } from "../logger";
+import { ExportConcurrency } from "../utils/ExportConcurrency";
 import { FileUtils } from "../utils/FileUtils";
-import { Semaphore } from "../utils/Semaphore";
+import { ExportDirectory } from "../utils/ExportDirectory";
 import sharp from "sharp";
 
 /**
@@ -55,43 +55,15 @@ export class ExportShapeArgs {
  */
 export class ExportShapeTool extends Tool<ExportShapeArgs> {
     /**
-     * Maximum number of image-export operations that may run concurrently in multi-user mode.
-     * Configurable via the PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS environment variable;
-     * defaults to 0, meaning no limit.
-     *
-     * When set to a positive value (and combined with the plugin-side per-response cap
-     * MAX_TASK_RESPONSE_SIZE_REMOTE_MCP, ~15 MB JSON), this caps the in-flight memory
-     * footprint of image exports at roughly N x cap on the centrally hosted MCP server.
-     */
-    private static readonly MAX_PARALLEL_EXPORTS = parseInt(
-        process.env.PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS ?? "0",
-        10
-    );
-
-    /**
-     * Gates concurrent export operations across all tool instances (one per session in
-     * multi-user mode). Static because instances are per-session, but the bound has to
-     * apply across the whole process. Permits beyond the maximum queue in FIFO order.
-     * Undefined when MAX_PARALLEL_EXPORTS is non-positive, indicating no limit.
-     */
-    private static readonly parallelismSemaphore: Semaphore | undefined =
-        ExportShapeTool.MAX_PARALLEL_EXPORTS > 0
-            ? new Semaphore("ExportShapeTool", ExportShapeTool.MAX_PARALLEL_EXPORTS)
-            : undefined;
-
-    static {
-        createLogger("ExportShapeTool").info(
-            "Max parallel exports (multi-user mode): %d (0 = unbounded)",
-            ExportShapeTool.MAX_PARALLEL_EXPORTS
-        );
-    }
-
-    /**
      * Creates a new ExecuteCode tool instance.
      *
      * @param mcpServer - The MCP server instance
+     * @param toolName - The name the tool is registered under; `export_shape_from_tab` when backend tools own the plain name
      */
-    constructor(mcpServer: PenpotMcpServer) {
+    constructor(
+        mcpServer: PenpotMcpServer,
+        private readonly toolName: string = "export_shape"
+    ) {
         let schema: any = ExportShapeArgs.schema;
         if (!mcpServer.isFileSystemAccessEnabled()) {
             // remove filePath key from schema
@@ -102,7 +74,7 @@ export class ExportShapeTool extends Tool<ExportShapeArgs> {
     }
 
     public getToolName(): string {
-        return "export_shape";
+        return this.toolName;
     }
 
     public getToolDescription(): string {
@@ -119,8 +91,8 @@ export class ExportShapeTool extends Tool<ExportShapeArgs> {
         // bound concurrent exports in multi-user mode to keep peak server memory under control;
         // in single-user mode (or when no limit is configured) the gate is irrelevant
         // and the export runs directly
-        if (this.mcpServer.isMultiUserMode() && ExportShapeTool.parallelismSemaphore) {
-            return ExportShapeTool.parallelismSemaphore.withPermit(() => this.exportImage(args));
+        if (this.mcpServer.isMultiUserMode()) {
+            return ExportConcurrency.withPermit(() => this.exportImage(args));
         } else {
             return this.exportImage(args);
         }
@@ -138,6 +110,7 @@ export class ExportShapeTool extends Tool<ExportShapeArgs> {
         // check arguments
         if (args.filePath) {
             FileUtils.checkPathIsAbsolute(args.filePath);
+            ExportDirectory.assertInside(args.filePath, process.env);
         }
 
         // create code for exporting the shape

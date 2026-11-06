@@ -65,13 +65,17 @@ export class ImportImageTool extends Tool<ImportImageArgs> {
      * Creates a new ImportImage tool instance.
      *
      * @param mcpServer - The MCP server instance
+     * @param toolName - The name the tool is registered under; `import_image_in_tab` when backend tools own the plain name
      */
-    constructor(mcpServer: PenpotMcpServer) {
+    constructor(
+        mcpServer: PenpotMcpServer,
+        private readonly toolName: string = "import_image"
+    ) {
         super(mcpServer, ImportImageArgs.schema);
     }
 
     public getToolName(): string {
-        return "import_image";
+        return this.toolName;
     }
 
     public getToolDescription(): string {

@@ -1,0 +1,50 @@
+{
+  "name": "S5-read-exports",
+  "description": "Plan 8.4 S5 with the optional exports: the read path of s5-read-large, then 10 PNG exports of whole pages. Export latency has its own budget in 8.1 (export_shape, 1440x900 PNG).",
+  "agents": 1,
+  "iterations": 1,
+  "steps": [
+    {
+      "name": "file outline",
+      "tool": "get_file_outline",
+      "rateLimitPerSecond": 10,
+      "args": { "fileId": "${fileId}" },
+      "capture": { "pageIds": "$.result.pages[*].id" }
+    },
+    {
+      "name": "page tree of each page",
+      "tool": "get_page_tree",
+      "repeat": 20,
+      "rateLimitPerSecond": 10,
+      "args": { "fileId": "${fileId}", "pageId": "${pageIds[index]}", "depth": 3, "limit": 500 }
+    },
+    {
+      "name": "find shapes for get_shapes",
+      "tool": "find_shapes",
+      "rateLimitPerSecond": 10,
+      "args": { "fileId": "${fileId}", "pageId": "${pageIds[0]}", "type": "rect", "limit": 200 },
+      "capture": { "shapeIds": "$.result.matches[*].id" }
+    },
+    {
+      "name": "get_shapes one id",
+      "tool": "get_shapes",
+      "repeat": 200,
+      "rateLimitPerSecond": 10,
+      "args": { "fileId": "${fileId}", "pageId": "${pageIds[0]}", "ids": ["${shapeIds[index]}"] }
+    },
+    {
+      "name": "find_shapes one page",
+      "tool": "find_shapes",
+      "repeat": 50,
+      "rateLimitPerSecond": 10,
+      "args": { "fileId": "${fileId}", "pageId": "${pageIds[index]}", "type": "frame", "nameRegex": "^Board", "limit": 100 }
+    },
+    {
+      "name": "export page as PNG",
+      "tool": "export_shape",
+      "repeat": 10,
+      "rateLimitPerSecond": 2,
+      "args": { "fileId": "${fileId}", "pageId": "${pageIds[index]}", "shapeId": "page", "format": "png" }
+    }
+  ]
+}

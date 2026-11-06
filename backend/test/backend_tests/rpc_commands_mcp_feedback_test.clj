@@ -170,7 +170,7 @@
 (t/deftest mcp-token-does-not-authorize-ordinary-rpc
   (let [{:keys [token]} (create-identity)]
     (t/is (= 403 (::yres/status
-                  (request (:token token) {} {:path "/api/rpc/command/get-teams"}))))))
+                  (request (:token token) {} {:path "/api/rpc/command/get-access-tokens"}))))))
 
 (t/deftest does-not-acknowledge-a-failed-queue-submission
   (let [{:keys [token]} (create-identity)]

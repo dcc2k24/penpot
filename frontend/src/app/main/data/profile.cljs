@@ -529,3 +529,19 @@
         (->> (rp/cmd! :delete-access-token params)
              (rx/tap on-success)
              (rx/catch on-error))))))
+
+;; --- EVENT: update-mcp-token-scopes
+
+(defn update-mcp-token-scopes
+  "Replace the MCP scopes of the current MCP token. `scopes` is a
+  vector of scope strings such as [\"mcp:read\" \"mcp:write\"]."
+  [{:keys [scopes] :as params}]
+  (ptk/reify ::update-mcp-token-scopes
+    ptk/WatchEvent
+    (watch [_ _ _]
+      (let [{:keys [on-success on-error]
+             :or {on-success identity
+                  on-error rx/throw}} (meta params)]
+        (->> (rp/cmd! :update-mcp-token-scopes {:scopes scopes})
+             (rx/tap on-success)
+             (rx/catch on-error))))))

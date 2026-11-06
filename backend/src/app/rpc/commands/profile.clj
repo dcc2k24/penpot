@@ -124,7 +124,9 @@
 
 
 (sv/defmethod ::get-profile
-  {::rpc/auth false
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::rpc/auth false
    ::doc/added "1.18"
    ::sm/params [:map]
    ::sm/result schema:profile}

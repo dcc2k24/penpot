@@ -80,14 +80,36 @@ export class PNGImageContent extends ImageContent {
 export class ToolResponse implements CallToolResult {
     [x: string]: unknown;
     content: CallToolContent[]; // <- IMPORTANT: protocol’s union
-    constructor(content: CallToolContent[]) {
+    /** Set only on a failed call, as the MCP specification requires. */
+    isError?: boolean;
+    /**
+     * @param content - the content items of the response
+     * @param isError - whether the response reports a failed tool call
+     */
+    constructor(content: CallToolContent[], isError: boolean = false) {
         this.content = content;
+        if (isError) {
+            this.isError = true;
+        }
     }
 }
 
 export class TextResponse extends ToolResponse {
-    constructor(text: string) {
-        super([new TextContent(text)]);
+    /**
+     * @param text - the text of the response
+     * @param isError - whether the response reports a failed tool call
+     */
+    constructor(text: string, isError: boolean = false) {
+        super([new TextContent(text)], isError);
+    }
+
+    /**
+     * Creates the response of a failed tool call, which keeps the text and sets `isError`.
+     *
+     * @param text - the failure message shown to the client
+     */
+    public static failure(text: string): TextResponse {
+        return new TextResponse(text, true);
     }
 
     /**

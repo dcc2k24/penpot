@@ -31,7 +31,9 @@
    [:file-id ::sm/uuid]])
 
 (sv/defmethod ::get-file-snapshots
-  {::doc/added "1.20"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:read"
+   ::doc/added "1.20"
    ::sm/params schema:get-file-snapshots}
   [cfg {:keys [::rpc/profile-id file-id] :as params}]
   (db/run! cfg (fn [{:keys [::db/conn] :as cfg}]
@@ -81,7 +83,9 @@
    [:label {:optional true} :string]])
 
 (sv/defmethod ::create-file-snapshot
-  {::doc/added "1.20"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.20"
    ::sm/params schema:create-file-snapshot
    ::climit/id [[:create-file-snapshot/by-profile ::rpc/profile-id]
                 [:create-file-snapshot/global]]}
@@ -109,7 +113,9 @@
    [:id ::sm/uuid]])
 
 (sv/defmethod ::restore-file-snapshot
-  {::doc/added "1.20"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.20"
    ::sm/params schema:restore-file-snapshot
    ::climit/id [[:restore-file-snapshot/by-profile ::rpc/profile-id]
                 [:restore-file-snapshot/global]]}
@@ -155,7 +161,9 @@
    [:label ::sm/text]])
 
 (sv/defmethod ::update-file-snapshot
-  {::doc/added "1.20"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.20"
    ::sm/params schema:update-file-snapshot
    ::db/transaction true}
   [{:keys [::db/conn]} {:keys [::rpc/profile-id id label]}]
@@ -168,7 +176,9 @@
    [:id ::sm/uuid]])
 
 (sv/defmethod ::delete-file-snapshot
-  {::doc/added "1.20"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.20"
    ::sm/params schema:remove-file-snapshot
    ::db/transaction true}
   [{:keys [::db/conn] :as cfg} {:keys [::rpc/profile-id id]}]
@@ -203,7 +213,9 @@
    [:id ::sm/uuid]])
 
 (sv/defmethod ::lock-file-snapshot
-  {::doc/added "1.20"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.20"
    ::sm/params schema:lock-file-snapshot
    ::db/transaction true}
   [{:keys [::db/conn]} {:keys [::rpc/profile-id id]}]
@@ -242,7 +254,9 @@
    [:id ::sm/uuid]])
 
 (sv/defmethod ::unlock-file-snapshot
-  {::doc/added "1.20"
+  {::rpc/allow-token-types #{"mcp"}
+   ::rpc/mcp-scope "mcp:write"
+   ::doc/added "1.20"
    ::sm/params schema:unlock-file-snapshot
    ::db/transaction  true}
   [{:keys [::db/conn]} {:keys [::rpc/profile-id id]}]
