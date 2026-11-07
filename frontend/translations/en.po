@@ -2498,6 +2498,24 @@ msgstr ""
 "The Penpot MCP Server enables MCP clients to interact directly with Penpot "
 "design files."
 
+msgid "integrations.mcp-key.allow-delete"
+msgstr "Allow MCP to delete"
+
+msgid "integrations.mcp-key.allow-delete.help"
+msgstr "Lets agents delete files, comments and snapshots."
+
+msgid "integrations.mcp-key.allow-manage"
+msgstr "Allow MCP to manage files and projects"
+
+msgid "integrations.mcp-key.allow-manage.help"
+msgstr "Lets agents create, rename and move files and projects."
+
+msgid "integrations.mcp-key.allow-read"
+msgstr "Allow MCP to read designs"
+
+msgid "integrations.mcp-key.allow-read.help"
+msgstr "Always on. Every MCP key can read, export and download designs."
+
 #: src/app/main/ui/settings/integrations.cljs:461
 msgid "integrations.mcp-key.allow-write"
 msgstr "Allow MCP to edit designs"
@@ -2526,6 +2544,15 @@ msgstr ""
 msgid "integrations.mcp-server.mcp-keys.help"
 msgstr "How to configure MCP clients"
 
+msgid "integrations.mcp-server.clients.title"
+msgstr "Connected clients"
+
+msgid "integrations.mcp-server.clients.help"
+msgstr "Each client has its own key. Revoking one client leaves the others connected."
+
+msgid "integrations.mcp-server.clients.scopes"
+msgstr "Scopes"
+
 #: src/app/main/ui/settings/integrations.cljs:568
 msgid "integrations.mcp-server.mcp-keys.info"
 msgstr ""
@@ -2539,6 +2566,11 @@ msgstr "Regenerate MCP key"
 #: src/app/main/ui/settings/integrations.cljs:541
 msgid "integrations.mcp-server.mcp-keys.title"
 msgstr "MCP key"
+
+msgid "integrations.mcp-server.mcp-keys.token-info"
+msgstr ""
+"Send this key in the Authorization header as a Bearer token. Do not put it in "
+"the URL."
 
 #: src/app/main/ui/settings/integrations.cljs:549
 msgid "integrations.mcp-server.mcp-keys.tootip"
@@ -2568,6 +2600,11 @@ msgstr ""
 "Please regenerate the MCP key and update your client configuration with the "
 "new key."
 
+msgid "integrations.mcp-server.switch.help"
+msgstr ""
+"Turning this off stops every MCP client, including clients that already have "
+"a key."
+
 #: src/app/main/ui/settings/integrations.cljs:489
 msgid "integrations.mcp-server.title"
 msgstr "MCP Server"
@@ -2591,6 +2628,9 @@ msgstr "No expiration date"
 #: src/app/main/ui/settings/integrations.cljs:478
 msgid "integrations.notification.success.copied-link"
 msgstr "Link copied to clipboard"
+
+msgid "integrations.notification.success.copied-token"
+msgstr "MCP key copied"
 
 #: src/app/main/ui/settings/integrations.cljs:241, src/app/main/ui/settings/integrations.cljs:274, src/app/main/ui/settings/integrations.cljs:319
 msgid "integrations.notification.success.created"
@@ -9744,7 +9784,7 @@ msgid "mcp.oauth.access.read-only"
 msgstr "This client can read designs and export or download them through MCP connections established from Penpot."
 
 msgid "mcp.oauth.enable"
-msgstr "Allowing access enables the MCP integration and creates your MCP token if needed."
+msgstr "Allowing access enables the MCP integration and creates a key for this client."
 
 msgid "mcp.oauth.approve"
 msgstr "Allow access"
@@ -9758,6 +9798,11 @@ msgstr "Connection cancelled"
 #: src/app/main/ui/mcp_authorize.cljs:84
 msgid "mcp-authorize.scope.read"
 msgstr "Read designs, export and download"
+
+msgid "mcp-authorize.scope.shared-key"
+msgstr ""
+"These scopes apply to this client only. Approving again replaces any earlier "
+"approval of this client."
 
 #: src/app/main/ui/mcp_authorize.cljs:81
 msgid "mcp-authorize.scope.write"
@@ -9773,4 +9818,4 @@ msgstr "Delete projects and files"
 
 #: src/app/main/ui/mcp_authorize.cljs:201
 msgid "mcp-authorize.scope.also-granted"
-msgstr "Your MCP key already holds these permissions, which this client will also receive:"
+msgstr "This client will receive these permissions:"

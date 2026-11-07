@@ -194,6 +194,8 @@
                            :typography typography/body-medium
                            :class (stl/css :client-text)}
                  (scope-label scope)])]
+             [:> text* {:typography typography/body-small :class (stl/css :client-text)}
+              (tr "mcp-authorize.scope.shared-key")]
              (let [extra (extra-scopes (:scope @details) (:granted-scope @details))]
                (when (seq extra)
                  [:*

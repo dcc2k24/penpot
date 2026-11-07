@@ -2536,6 +2536,25 @@ msgstr ""
 "El servidor MCP de Penpot permite a los clientes MCP interactuar "
 "directamente con los archivos de diseño de Penpot."
 
+msgid "integrations.mcp-key.allow-delete"
+msgstr "Permitir que MCP elimine"
+
+msgid "integrations.mcp-key.allow-delete.help"
+msgstr "Permite a los agentes eliminar archivos, comentarios y versiones guardadas."
+
+msgid "integrations.mcp-key.allow-manage"
+msgstr "Permitir que MCP gestione archivos y proyectos"
+
+msgid "integrations.mcp-key.allow-manage.help"
+msgstr "Permite a los agentes crear, renombrar y mover archivos y proyectos."
+
+msgid "integrations.mcp-key.allow-read"
+msgstr "Permitir que MCP lea diseños"
+
+msgid "integrations.mcp-key.allow-read.help"
+msgstr ""
+"Siempre activo. Cualquier clave MCP puede leer, exportar y descargar diseños."
+
 #: src/app/main/ui/settings/integrations.cljs:461
 msgid "integrations.mcp-key.allow-write"
 msgstr "Permitir que MCP edite diseños"
@@ -2565,6 +2584,15 @@ msgstr ""
 msgid "integrations.mcp-server.mcp-keys.help"
 msgstr "Cómo configurar clientes MCP"
 
+msgid "integrations.mcp-server.clients.title"
+msgstr "Clientes conectados"
+
+msgid "integrations.mcp-server.clients.help"
+msgstr "Cada cliente tiene su propia clave. Revocar uno no desconecta a los demás."
+
+msgid "integrations.mcp-server.clients.scopes"
+msgstr "Permisos"
+
 #: src/app/main/ui/settings/integrations.cljs:568
 msgid "integrations.mcp-server.mcp-keys.info"
 msgstr ""
@@ -2578,6 +2606,11 @@ msgstr "Regenerar clave MCP"
 #: src/app/main/ui/settings/integrations.cljs:541
 msgid "integrations.mcp-server.mcp-keys.title"
 msgstr "Clave MCP"
+
+msgid "integrations.mcp-server.mcp-keys.token-info"
+msgstr ""
+"Envía esta clave en la cabecera Authorization como token Bearer. No la pongas "
+"en la URL."
 
 #: src/app/main/ui/settings/integrations.cljs:549
 msgid "integrations.mcp-server.mcp-keys.tootip"
@@ -2607,6 +2640,11 @@ msgstr ""
 "Por favor, regenera la clave MCP y actualiza la configuración de tu cliente "
 "con la nueva clave."
 
+msgid "integrations.mcp-server.switch.help"
+msgstr ""
+"Al desactivarlo, se detienen todos los clientes MCP, incluidos los que ya "
+"tienen una clave."
+
 #: src/app/main/ui/settings/integrations.cljs:489
 msgid "integrations.mcp-server.title"
 msgstr "Servidor MCP"
@@ -2630,6 +2668,9 @@ msgstr "Sin fecha de expiración"
 #: src/app/main/ui/settings/integrations.cljs:478
 msgid "integrations.notification.success.copied-link"
 msgstr "Enlace copiado al portapapeles"
+
+msgid "integrations.notification.success.copied-token"
+msgstr "Clave MCP copiada"
 
 #: src/app/main/ui/settings/integrations.cljs:241, src/app/main/ui/settings/integrations.cljs:274, src/app/main/ui/settings/integrations.cljs:319
 msgid "integrations.notification.success.created"
@@ -9832,6 +9873,15 @@ msgstr "Si quieres aumentar este límite, contáctanos en [support@penpot.app](%
 msgid "workspace.versions.warning.text"
 msgstr "Los autoguardados duran %s días."
 
+msgid "mcp.oauth.title"
+msgstr "Conectar con Penpot MCP"
+
+msgid "mcp.oauth.request"
+msgstr "%s quiere conectarse a Penpot."
+
+msgid "mcp.oauth.account"
+msgstr "Has iniciado sesión como %s."
+
 msgid "mcp.oauth.access"
 msgstr "Este cliente puede leer y modificar diseños mediante conexiones MCP establecidas desde Penpot."
 
@@ -9839,12 +9889,26 @@ msgstr "Este cliente puede leer y modificar diseños mediante conexiones MCP est
 msgid "mcp.oauth.access.read-only"
 msgstr "Este cliente puede leer diseños, exportar y descargar mediante conexiones MCP establecidas desde Penpot."
 
+msgid "mcp.oauth.enable"
+msgstr "Permitir el acceso activa la integración de MCP y crea una clave para este cliente."
+
+msgid "mcp.oauth.approve"
+msgstr "Permitir acceso"
+
+msgid "mcp.oauth.failed"
+msgstr "Esta solicitud ha caducado, ya se ha usado o no se pudo completar. Vuelve a iniciar la conexión desde tu cliente de MCP."
+
 msgid "mcp.oauth.cancelled"
 msgstr "Conexión cancelada"
 
 #: src/app/main/ui/mcp_authorize.cljs:84
 msgid "mcp-authorize.scope.read"
 msgstr "Leer diseños, exportar y descargar"
+
+msgid "mcp-authorize.scope.shared-key"
+msgstr ""
+"Estos permisos se aplican solo a este cliente. Aprobar de nuevo reemplaza "
+"cualquier aprobación anterior de este cliente."
 
 #: src/app/main/ui/mcp_authorize.cljs:81
 msgid "mcp-authorize.scope.write"
@@ -9860,4 +9924,4 @@ msgstr "Eliminar proyectos y archivos"
 
 #: src/app/main/ui/mcp_authorize.cljs:201
 msgid "mcp-authorize.scope.also-granted"
-msgstr "Tu clave MCP ya tiene estos permisos, que este cliente también recibirá:"
+msgstr "Este cliente recibirá estos permisos:"

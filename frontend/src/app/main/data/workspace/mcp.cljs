@@ -195,7 +195,8 @@
 
 (defn- init-mcp-state
   [access-tokens]
-  (let [token  (d/seek #(= "mcp" (:type %)) access-tokens)
+  (let [;; The bridge uses the hand-made token only, never a client's.
+        token  (d/seek #(and (= "mcp" (:type %)) (nil? (:client-id %))) access-tokens)
         valid? (and token
                     (as-> (get token :expires-at) expires-at
                       (or (nil? expires-at)

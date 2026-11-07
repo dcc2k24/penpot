@@ -35,6 +35,7 @@
    [app.util.dom :as dom]
    [app.util.forms :as fm]
    [app.util.i18n :as i18n :refer [tr]]
+   [clojure.string :as str]
    [rumext.v2 :as mf]))
 
 (def notification-timeout 7000)
@@ -296,8 +297,15 @@
                            :on-created on-created}])]]))
 
 (defn- mcp-access-token?
+  "The hand-made MCP token. The tokens of OAuth clients carry a client id."
   [atoken]
-  (= "mcp" (:type atoken)))
+  (and (= "mcp" (:type atoken))
+       (nil? (:client-id atoken))))
+
+(defn- mcp-client-token?
+  [atoken]
+  (and (= "mcp" (:type atoken))
+       (some? (:client-id atoken))))
 
 (mf/defc regenerate-mcp-token-modal
   {::mf/register modal/components
@@ -415,26 +423,25 @@
         (> expires-at (ct/now)))
     false))
 
-(defn- mcp-scopes-with-write
-  "Return the scopes for an MCP token with `mcp:write` set to `write?`.
-  `mcp:manage` and `mcp:delete` are kept when the token already has them."
-  [scopes write?]
-  (let [current (set scopes)]
-    (cond-> (if write? ["mcp:read" "mcp:write"] ["mcp:read"])
-      (contains? current "mcp:manage") (conj "mcp:manage")
-      (contains? current "mcp:delete") (conj "mcp:delete"))))
+(defn- mcp-scopes-toggle
+  "Return the scopes of an MCP token with `scope` set to `on?`.
+  The other scopes are kept as they are, and `mcp:read` is always held."
+  [scopes scope on?]
+  (let [current (cond-> (set scopes)
+                  on?       (conj scope)
+                  (not on?) (disj scope))]
+    (vec (conj current "mcp:read"))))
 
-(mf/defc mcp-write-access*
+(mf/defc mcp-scope-switch*
   {::mf/private true}
-  [{:keys [token]}]
-  (let [scopes     (:scopes token)
-        write?     (contains? (set scopes) "mcp:write")
-        busy*      (mf/use-state false)
+  [{:keys [scopes scope label help read-only?]}]
+  (let [enabled?  (or read-only? (contains? (set scopes) scope))
+        busy*     (mf/use-state false)
         ;; Bumped on failure so the switch remounts with the stored value.
-        revision*  (mf/use-state 0)
-        busy?      (deref busy*)
-        revision   (deref revision*)
-        help-id    (mf/use-id)
+        revision* (mf/use-state 0)
+        busy?     (deref busy*)
+        revision  (deref revision*)
+        help-id   (mf/use-id)
 
         on-error
         (mf/use-fn
@@ -446,10 +453,10 @@
 
         on-change
         (mf/use-fn
-         (mf/deps scopes on-error)
-         (fn [enabled?]
+         (mf/deps scopes scope on-error)
+         (fn [on?]
            (reset! busy* true)
-           (let [params {:scopes (mcp-scopes-with-write scopes enabled?)}
+           (let [params {:scopes (mcp-scopes-toggle scopes scope on?)}
                  mdata  {:on-success (fn [_]
                                        (reset! busy* false)
                                        (st/emit! (du/fetch-access-tokens)))
@@ -458,16 +465,39 @@
 
     [:div {:class (stl/css :mcp-server-write)}
      [:> switch* {:key revision
-                  :label (tr "integrations.mcp-key.allow-write")
-                  :default-checked write?
-                  :disabled busy?
+                  :label label
+                  :default-checked enabled?
+                  :disabled (or read-only? busy?)
                   :aria-describedby help-id
                   :on-change on-change}]
      [:> text* {:as "div"
                 :id help-id
                 :typography t/body-small
                 :class (stl/css :color-secondary)}
-      (tr "integrations.mcp-key.allow-write.help")]]))
+      help]]))
+
+(mf/defc mcp-scopes-access*
+  {::mf/private true}
+  [{:keys [token]}]
+  (let [scopes (:scopes token)]
+    [:div {:class (stl/css :mcp-server-scopes)}
+     [:> mcp-scope-switch* {:scopes scopes
+                            :scope "mcp:read"
+                            :read-only? true
+                            :label (tr "integrations.mcp-key.allow-read")
+                            :help (tr "integrations.mcp-key.allow-read.help")}]
+     [:> mcp-scope-switch* {:scopes scopes
+                            :scope "mcp:write"
+                            :label (tr "integrations.mcp-key.allow-write")
+                            :help (tr "integrations.mcp-key.allow-write.help")}]
+     [:> mcp-scope-switch* {:scopes scopes
+                            :scope "mcp:manage"
+                            :label (tr "integrations.mcp-key.allow-manage")
+                            :help (tr "integrations.mcp-key.allow-manage.help")}]
+     [:> mcp-scope-switch* {:scopes scopes
+                            :scope "mcp:delete"
+                            :label (tr "integrations.mcp-key.allow-delete")
+                            :help (tr "integrations.mcp-key.allow-delete.help")}]]))
 
 (mf/defc mcp-server-section*
   {::mf/private true}
@@ -478,11 +508,14 @@
                         (when-let [token (d/seek mcp-access-token? access-tokens)]
                           (assoc token :is-valid (valid-mcp-token? token))))
 
+        clients       (mf/with-memo [access-tokens]
+                        (filterv mcp-client-token? access-tokens))
+
         token-valid?  (get token :is-valid)
         token-str     (get token :token)
         enabled?      (-> profile :props :mcp-enabled boolean)
 
-        url           (dm/str cf/mcp-server-url "?userToken=" token-str)
+        url           cf/mcp-server-url
 
         show-enabled? (and enabled? token-valid?)
         tooltip-id    (mf/use-id)
@@ -521,6 +554,15 @@
                        (du/update-profile-props {:mcp-enabled false})
                        (mbc/event :mcp/disable {})))))
 
+        ;; Revokes one connected client only. The hand-made token and
+        ;; the MCP switch stay as they are.
+        handle-delete-client
+        (mf/use-fn
+         (fn [id]
+           (let [params {:id id}
+                 mdata  {:on-success #(st/emit! (du/fetch-access-tokens))}]
+             (st/emit! (du/delete-access-token (with-meta params mdata))))))
+
         on-copy-to-clipboard
         (mf/use-fn
          (mf/deps url)
@@ -532,6 +574,19 @@
                                 :content (tr "integrations.notification.success.copied-link")
                                 :timeout notification-timeout})
                      (ev/event {::ev/name "copy-mcp-url"
+                                ::ev/origin "integrations"}))))
+
+        on-copy-token-to-clipboard
+        (mf/use-fn
+         (mf/deps token-str)
+         (fn [event]
+           (dom/prevent-default event)
+           (clipboard/to-clipboard token-str)
+           (st/emit! (ntf/show {:level :info
+                                :type :toast
+                                :content (tr "integrations.notification.success.copied-token")
+                                :timeout notification-timeout})
+                     (ev/event {::ev/name "copy-mcp-token"
                                 ::ev/origin "integrations"}))))]
 
     [:section {:class (stl/css :mcp-server-section)}
@@ -585,7 +640,12 @@
 
         (when (and token (not token-valid?))
           [:div {:class (stl/css :mcp-server-switch-cover)
-                 :on-click handle-open-modal-regenerate}])]]]
+                 :on-click handle-open-modal-regenerate}])]
+
+       [:> text* {:as "div"
+                  :typography t/body-small
+                  :class (stl/css :color-secondary)}
+        (tr "integrations.mcp-server.switch.help")]]]
 
      (when (some? token)
        [:div {:class (stl/css :mcp-server-key)}
@@ -611,7 +671,32 @@
                            :name (:name token)
                            :expires-at (:expires-at token)
                            :on-delete handle-delete}]]
-         [:> mcp-write-access* {:token token}]]])
+         [:> mcp-scopes-access* {:token token}]]])
+
+     (when (seq clients)
+       [:div {:class (stl/css :mcp-server-key)}
+        [:> text* {:as "h3"
+                   :typography t/headline-small
+                   :class (stl/css :color-primary)}
+         (tr "integrations.mcp-server.clients.title")]
+
+        [:> text* {:as "div"
+                   :typography t/body-medium
+                   :class (stl/css :color-secondary)}
+         (tr "integrations.mcp-server.clients.help")]
+
+        [:div {:class (stl/css :list)}
+         (for [{:keys [id client-name scopes expires-at]} clients]
+           [:div {:key (dm/str id)}
+            [:> token-item* {:id id
+                             :name (or client-name id)
+                             :expires-at expires-at
+                             :on-delete handle-delete-client}]
+            [:> text* {:as "div"
+                       :typography t/body-small
+                       :class (stl/css :color-secondary)}
+             (str (tr "integrations.mcp-server.clients.scopes") ": "
+                  (str/join " " scopes))]])]])
 
      [:> notification-pill* {:level :default
                              :type :context}
@@ -625,6 +710,16 @@
        (when token
          [:> input-copy* {:value url
                           :on-copy-to-clipboard on-copy-to-clipboard}])
+
+       (when token
+         [:> text* {:as "div"
+                    :typography t/body-medium
+                    :class (stl/css :color-secondary)}
+          (tr "integrations.mcp-server.mcp-keys.token-info")])
+
+       (when token-str
+         [:> input-copy* {:value token-str
+                          :on-copy-to-clipboard on-copy-token-to-clipboard}])
 
        [:> text* {:as "div"
                   :typography t/body-medium
