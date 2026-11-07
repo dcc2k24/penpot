@@ -15,7 +15,10 @@
 - When public registration is disabled, invitation-based password registration also requires a matching, non-expired `team_invitation` row; registration revalidates it under a row lock before creating the profile.
 - Access tokens (`app.http.access-token`): personal tokens have JWT issuer `access-token` and DB type other than `mcp`; MCP tokens have issuer `urn:penpot:mcp-token` (`actoken/mcp-token-issuer`) and DB type `mcp`. Authentication requires issuer and type to agree, and the claim `uid` to match the row's profile; other issuers and undecryptable tokens are treated as anonymous.
 - Personal tokens need flag `:access-tokens`. MCP tokens need `:mcp` or `:access-tokens`, and only on routes whose `actoken/authz` gets `::actoken/allow-mcp true` (the RPC routes); elsewhere (e.g. assets) they are anonymous.
-- On RPC, an MCP token reaches only commands with `::rpc/token-type "mcp"` (`wrap-authentication` in `app.rpc`); every other command answers 403 `:token-auth-required`. A command with that metadata also rejects sessions and personal tokens. Currently only `send-mcp-feedback`. Blocking a profile invalidates sessions, not tokens, so such commands check `:is-blocked`/`:is-active` themselves.
+- On RPC, an MCP token reaches only commands that name it (`wrap-authentication` in `app.rpc`). `::rpc/token-type "mcp"`: MCP tokens only; sessions and personal tokens get `:token-auth-required`. `::rpc/allow-token-types #{"mcp"}`: MCP tokens next to sessions and personal tokens. Every other command answers `:token-auth-required`.
+- Flag `enable-mcp-backend` (off by default): off, an MCP token reaches only `send-mcp-feedback` (`::rpc/mcp-bridge`); other MCP commands answer `:mcp-backend-disabled`. On, the backend MCP commands are open, each gated by its `::rpc/mcp-scope` (`wrap-mcp-scope`). Command list, scopes and flags: `mem:backend/mcp`.
+- Profile prop `mcp-enabled` (`rpc.clj`, `profile-mcp-disabled?`): when `false`, every MCP-token call is refused with `:mcp-disabled` (restriction), client tokens included, except the bridge (`send-mcp-feedback`). The profile's MCP render sessions die too (`mem:backend/mcp`).
+- Blocking a profile invalidates sessions, not tokens, so MCP commands check `:is-blocked`/`:is-active` themselves.
 - HTTP/session parsing details such as cookie/header precedence, JWT session token versions, and SameSite behavior are in `mem:backend/subtleties`.
 
 ## Permission model
@@ -25,6 +28,17 @@
 - File/project role rows only count with a live team membership: the file/project permission queries require a matching `team_profile_rel` row, and leaving or removing a member deletes their team-scoped `file`/`project`/`team-project-profile-rel` rows (GHSA-v9r9-h77c-55m2).
 - File/project/comment checks are implemented in the owning command namespaces, often via helpers imported from `files`, `teams`, or `projects`; do not bypass those helpers with direct DB lookups unless preserving their not-found semantics.
 - Comment permission includes both logged-in state and the file/team comment policy. Shared viewer paths may pass `share-id`; preserve that path when changing comment queries.
+
+## MCP tokens of OAuth clients
+
+- Hand-made MCP token (settings page): `access_token.client_id` is NULL. Regenerating it (`create-access-token`) deletes older hand-made MCP tokens only (`sql:clean-old-mcp-tokens`). Scope edits (`update-mcp-token-scopes`) touch only that token.
+- Client token: `client_id` (the OAuth client id) and `client_name` (shown in settings). Migration `0158-add-client-to-access-token.sql` adds both, each at most 512 bytes, and a unique index on (`profile_id`, `client_id`) where `client_id` is not null.
+- One MCP token per client per profile. OAuth approval (`http/mcp_oauth.clj`, in a transaction with `access-token/grant-client-mcp-scopes`) deletes that client's earlier MCP token and inserts one holding exactly the effective scopes. Re-approval replaces the token. The hand-made token and other clients' tokens are not touched.
+- Approval also turns the profile's `mcp-enabled` on when it is off.
+- At most 20 client tokens per profile (`max-client-mcp-tokens`). The count leaves out the approving client, so re-approval never hits the limit. A new client over the limit gets `:mcp-client-limit` (restriction).
+- A client token gets the `:mcp-token-max-age` expiry, as any new MCP token without an explicit expiry (`mem:backend/mcp`).
+- Settings page (`frontend/src/app/main/ui/settings/integrations.cljs`): lists client tokens by `client_name` with their scopes, and revokes one through `delete-access-token`. That RPC deletes any row of the caller's profile by id.
+- `get-access-tokens` returns `:token` only for the hand-made MCP token. Client tokens and other tokens drop it. MCP tokens also get `:scopes`.
 
 ## Teams, projects, and invitations
 

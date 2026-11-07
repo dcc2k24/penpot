@@ -983,6 +983,96 @@ set, and sends it through the [email configuration](#email-configuration). Each
 email carries the name and email address of the user who sent it, and uses that
 address as reply-to.
 
+#### MCP server variables
+
+These variables set the MCP server process. They do not go on the backend. Backend
+mode means the `backend` or `both` value of `PENPOT_MCP_MODE`. Bridge mode means the
+`bridge` or `both` value.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PENPOT_MCP_MODE` | `bridge` | Tools the server offers: `bridge` (plugin tools), `backend` (backend tools only) or `both`. `backend` and `both` need `PENPOT_MCP_BACKEND_URI`. Setting the backend URI alone does not change the mode. |
+| `PENPOT_MCP_BACKEND_URI` | (unset) | Base URI of the Penpot backend. Required for backend mode. |
+| `PENPOT_MCP_EXPORTER_URI` | `http://localhost:6061/` | Base URI of the exporter service. Backend mode. |
+| `PENPOT_MCP_ASSETS_URI` | (unset) | Public base URI that serves `/assets/by-id/`. Backend mode. When unset, downloads use the origin that the exporter returns. |
+| `PENPOT_MCP_ALLOW_QUERY_TOKEN` | `true` in bridge mode, `false` in backend mode | Accepts the MCP token in the `userToken` query parameter. Set `false` to accept only the `Authorization` header. |
+| `PENPOT_MCP_RATE_LIMIT_RPS` | `10` | Sustained requests per second for each MCP token. Backend mode. |
+| `PENPOT_MCP_RATE_LIMIT_BURST` | `20` | Requests that each MCP token may send at once. Backend mode. |
+| `PENPOT_MCP_BACKEND_TIMEOUT_S` | `55` | Timeout, in seconds, for each backend call. Backend mode. |
+| `PENPOT_MCP_BACKEND_MAX_RESPONSE_MB` | `8` | Cap, in megabytes, on the body of one backend or exporter response. A larger response fails. Backend mode. |
+| `PENPOT_MCP_MAX_BODY_MB` | `32` | Largest HTTP request body, in megabytes. A request without a token gets 4 MB. The same cap limits the inline base64 of `import_archive` and `import_image`. |
+| `PENPOT_MCP_MAX_TOOL_RESPONSE_KB` | `100` | Largest JSON answer of one backend tool, in kilobytes (1 to 10000). Longer answers are cut. Backend mode. |
+| `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` | `0` (no limit), or `4` in backend mode | Most export shape requests that run at once. Zero means no limit. |
+| `PENPOT_MCP_SANDBOX_TIMEOUT_S` | `3` | CPU time, in seconds, that one `execute_code` call may use. Backend mode. |
+| `PENPOT_MCP_SANDBOX_WALL_S` | `120` | Wall-clock limit, in seconds, of one `execute_code` call. Backend mode. |
+| `PENPOT_MCP_SANDBOX_IDLE_MIN` | `30` | Minutes without a call after which a session's sandbox is dropped. Backend mode. |
+| `PENPOT_MCP_SANDBOX_MAX_HOST_CALLS` | `1000` | Most host calls that one script may make. Backend mode. |
+| `PENPOT_MCP_SANDBOX_MAX_SESSIONS` | `20` | Most live sandbox runtimes, and most saved `storage` copies. Backend mode. |
+| `PENPOT_MCP_SANDBOX_MAX_CONCURRENT` | `4` | Most `execute_code` calls that run at once. Backend mode. |
+| `PENPOT_MCP_SANDBOX_WORKERS` | `true` | Runs each sandbox script in a worker thread. `false` runs it on the server thread. Backend mode. |
+| `PENPOT_MCP_EXPORT_DIR` | `penpot-exports` in the home directory | Absolute path. Export tools may write only inside it. Paths through a symbolic link are refused. |
+| `PENPOT_MCP_IMPORT_DIR` | `penpot-imports` in the home directory | Absolute path. Import tools may read only files inside it. Paths through a symbolic link are refused. |
+| `PENPOT_MCP_SERVER_HOST` | `localhost` | Address that the MCP HTTP server listens on. |
+| `PENPOT_MCP_SERVER_PORT` | `4401` | Port of the MCP HTTP server. |
+| `PENPOT_MCP_WEBSOCKET_PORT` | `4402` | Port of the WebSocket server for the plugin. Bridge mode. |
+| `PENPOT_MCP_REPL_HOST` | `localhost` | Address that the REPL server listens on. |
+| `PENPOT_MCP_REPL_PORT` | `4403` | Port of the REPL server. |
+| `PENPOT_MCP_REPL_ENABLE` | (unset) | `true` starts the REPL server. When unset, the value of `PENPOT_MCP_DEVENV` decides. |
+| `PENPOT_MCP_DEVENV` | `false` | `true` turns on Penpot developer tools in single-user mode. |
+| `PENPOT_MCP_REMOTE_MODE` | `false` | `true` turns off file system access. Multi-user mode always runs in remote mode. |
+| `PENPOT_MCP_TOOL_TIMEOUT_S` | `120` | Timeout, in seconds, for tool calls sent to the plugin. Bridge mode. |
+| `PENPOT_MCP_AUTH_URI` | (unset) | Public base URI of the OAuth service. Setting it turns on OAuth. It needs multi-user mode and HTTPS, or HTTP on loopback. |
+| `PENPOT_MCP_REDIS_URI` | (unset) | Redis URI for routing tasks between several server instances. Multi-user mode only. |
+| `PENPOT_MCP_LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn` or `error`. |
+| `PENPOT_MCP_LOG_DIR` | (unset) | Directory for log files. Log files are written only when this is set to a non-empty path. |
+
+#### MCP backend flags
+
+Set these flags on the backend, next to `enable-mcp`:
+
+```bash
+# Backend
+PENPOT_FLAGS: [...] enable-mcp enable-mcp-backend enable-mcp-raw-changes
+```
+
+- `enable-mcp-backend`: Turns on the backend commands that the MCP server uses in backend
+  mode. Off by default.
+- `enable-mcp-raw-changes`: Turns on the raw-changes tool. Off by default.
+
+#### MCP backend keys
+
+```bash
+# Backend
+# Lifetime of MCP tokens that have no explicit expiry. Default: 2160h (90 days)
+PENPOT_MCP_TOKEN_MAX_AGE: 2160h
+
+# Most changes that one MCP write call may compile to. Default: 100000
+PENPOT_MCP_MAX_COMPILED_CHANGES: 100000
+```
+
+Durations use the same form as the session settings above, for example `2160h`.
+
+#### Upgrading the MCP service
+
+Upgrade the backend first, then the MCP adapter. In backend and both mode, the adapter
+calls backend commands that an older backend does not have.
+
+#### Rolling back the MCP service
+
+If you roll back the backend, existing tokens keep their `mcp:*` scopes, and session
+rows keep their render props. Both are harmless, so you do not need to clean them up.
+
+#### MCP health endpoints
+
+The MCP server serves these endpoints without a token:
+
+- `/healthz`: Returns `ok` while the process is up. It does not check the backend.
+- `/readyz`: Returns `ready` with HTTP 200 when the backend passes its readiness check.
+  Otherwise it returns `not ready` with HTTP 503. Without `PENPOT_MCP_BACKEND_URI`, it
+  returns `ready` while the process is up. The answer is kept for 5 seconds.
+- `/metrics`: Returns metrics in the Prometheus text format. The metrics include
+  `penpot_mcp_active_sandboxes`, the number of sandbox runtimes that the server holds.
+
 ### Internal resolver
 
 The frontend container resolves the backend, exporter and MCP service names with the

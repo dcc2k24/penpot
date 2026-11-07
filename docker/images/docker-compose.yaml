@@ -216,13 +216,34 @@ services:
   penpot-mcp:
     image: "penpotapp/mcp:${PENPOT_VERSION:-2.18}"
     restart: always
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:4401/healthz', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
     networks:
       - penpot
 
     # environment:
+      ## Backend mode is off by default. The backend needs enable-mcp-backend in
+      ## PENPOT_FLAGS (set in the x-flags anchor above) to serve it. Add
+      ## enable-mcp-raw-changes there too for the raw-changes tool.
+      ## Serves the backend tools only, with no plugin bridge. Unset means bridge.
+      # PENPOT_MCP_MODE: backend
+
       ## Offers the submit_feedback tool, which emails agent feedback through the
       ## backend. Set it together with PENPOT_MCP_FEEDBACK_EMAIL on the backend.
       # PENPOT_MCP_BACKEND_URI: http://penpot-backend:6060/
+
+      ## Base URI of the exporter. The export_shape tool posts to it. The default
+      ## is localhost, so compose needs this value.
+      # PENPOT_MCP_EXPORTER_URI: http://penpot-exporter:6061/
+
+      ## Public base URI that serves /assets/by-id/, used to download export results.
+      # PENPOT_MCP_ASSETS_URI: http://penpot-frontend:8080/
 
   penpot-exporter:
     image: "penpotapp/exporter:${PENPOT_VERSION:-2.18}"

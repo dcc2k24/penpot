@@ -113,9 +113,11 @@ From the `mcp/` directory, run
 
 - Authorization/discovery URLs, self-contained client IDs, consent and PKCE/code binding, backend Redis state, deployment wiring, and compatibility limits: `mem:mcp/oauth`.
 
-## Backend tools (`submit_feedback`)
+## Backend tools and modes (`submit_feedback`)
 
-- Tools that call the Penpot backend directly (not through the plugin) register only when `PENPOT_MCP_BACKEND_URI` is nonblank (`PenpotMcpServer.initTools`). Currently only `SubmitFeedbackTool`.
+- `PENPOT_MCP_MODE` picks the tool set: `bridge` (default, plugin tools only), `backend` (backend tools only), `both` (backend tools keep the plain names, plugin tools get `_in_tab` names). `backend` and `both` need `PENPOT_MCP_BACKEND_URI` (`PenpotMcpServer.resolveMode`). The URI alone keeps `bridge`.
+- The backend client exists when `PENPOT_MCP_BACKEND_URI` is nonblank (`PenpotMcpServer.initializeBackendParts`). `submit_feedback` (`SubmitFeedbackTool`) registers whenever the client exists. The backend tool set (`BackendToolSet`) registers outside `bridge` mode (`PenpotMcpServer.initTools`).
+- Backend MCP commands, their scopes and the flag that opens them (`enable-mcp-backend`): `mem:backend/mcp`.
 - `PenpotBackendClient` owns the HTTP call and the status-to-message mapping; it posts to `api/main/methods/send-mcp-feedback` with `Authorization: Token <MCP user token>`. The token comes from the session context (OAuth bearer or `?userToken=`); without one the tool fails before calling the backend.
 - Tool zod schemas mirror the backend malli schema (lengths, blank, control characters); keep both in sync. The backend is the authority.
 - Success means the mail job was queued, not delivered; the tool text says so. `formatArgs` hides the feedback from logs.
