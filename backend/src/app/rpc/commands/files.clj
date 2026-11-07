@@ -467,9 +467,7 @@
 
   Mainly used for rendering purposes on the exporter. It does not
   accepts client features."
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:read"
-   ::doc/added "1.17"
+  {::doc/added "1.17"
    ::sm/params schema:get-page}
   [cfg {:keys [::rpc/profile-id file-id share-id] :as params}]
   (db/tx-run! cfg
@@ -659,9 +657,7 @@
 
 (sv/defmethod ::get-file-summary
   "Retrieve a file summary by its ID. Only authenticated users."
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:read"
-   ::doc/added "1.20"
+  {::doc/added "1.20"
    ::rpc/id-type :file
    ::sm/params schema:get-file-summary}
   [cfg {:keys [::rpc/profile-id id] :as params}]
@@ -730,9 +726,7 @@
    counts by type, component/color/typography counts, and inbound and
    outbound library reference counts. Cheap alternative to `get-file`
    when only metrics are needed."
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:read"
-   ::doc/added "2.17"
+  {::doc/added "2.17"
    ::rpc/id-type :file
    ::sm/params schema:get-file-stats
    ::sm/result schema:get-file-stats-result
@@ -754,9 +748,7 @@
    stored on the file root through the Plugin API. Optionally narrowed
    to a single `namespace`. Lets external tooling read metadata such as
    issue or commit references without downloading the whole file."
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:read"
-   ::doc/added "2.20"
+  {::doc/added "2.20"
    ::sm/params schema:get-file-plugin-data
    ::sm/result ctpg/schema:plugin-data
    ::db/transaction true}
@@ -779,9 +771,7 @@
    the file has none. Active themes and sets come from the file's
    tokens status. Cheap alternative to `get-file` when only the tokens
    are needed."
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:read"
-   ::doc/added "2.20"
+  {::doc/added "2.20"
    ::sm/params schema:get-file-tokens
    ::sm/result [:maybe [:map-of :string :any]]}
   [cfg {:keys [::rpc/profile-id file-id]}]
@@ -801,9 +791,7 @@
 
 (sv/defmethod ::get-file-libraries
   "Get libraries used by the specified file."
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:read"
-   ::doc/added "1.17"
+  {::doc/added "1.17"
    ::sm/params schema:get-file-libraries}
   [cfg {:keys [::rpc/profile-id file-id]}]
   (bfc/check-file-exists cfg file-id)
@@ -942,9 +930,7 @@
 
 (sv/defmethod ::get-file-info
   "Retrieve minimal file info by its ID."
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:read"
-   ::rpc/auth false
+  {::rpc/auth false
    ::doc/added "2.2.0"
    ::sm/params schema:get-file}
   [cfg params]

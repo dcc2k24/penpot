@@ -16,6 +16,7 @@
    com.github.benmanes.caffeine.cache.Caffeine
    com.github.benmanes.caffeine.cache.RemovalListener
    com.github.benmanes.caffeine.cache.stats.CacheStats
+   com.github.benmanes.caffeine.cache.Weigher
    java.time.Duration
    java.util.concurrent.Executor
    java.util.function.Function))
@@ -24,8 +25,10 @@
 
 (defprotocol ICache
   (get [_ k] [_ k load-fn] "get cache entry")
+  (put [_ k v] "store value v under k, replacing any entry")
   (invalidate [_] [_ k] "invalidate cache")
-  (invalidate-if [_ pred] "invalidate all entries whose value satisfies pred"))
+  (invalidate-if [_ pred] "invalidate all entries whose value satisfies pred")
+  (cleanup [_] "run pending evictions now; Caffeine runs them off the caller's thread"))
 
 (defprotocol ICacheStats
   (stats [_] "get stats"))
@@ -46,23 +49,40 @@
      :miss-count (.missCount stats)
      :miss-rate  (.missRate stats)}))
 
+(defn- create-weigher
+  [f]
+  (reify Weigher
+    (weigh [_ _ v]
+      (int (f v)))))
+
 (defn create
   "Build an in-memory cache. Loads run synchronously on the calling
   thread, so when a load fn throws or returns nil the entry is not
-  stored — concurrent loads for the same key still deduplicate."
-  [& {:keys [executor on-remove max-size keepalive expire]}]
+  stored — concurrent loads for the same key still deduplicate.
+
+  The cache is bounded by entry count (`max-size`), or by weight when
+  both `weigher` and `max-weight` are given: `weigher` takes a value and
+  returns its weight, and the cache keeps the total under `max-weight`.
+  Weight is for values whose size varies, such as pages of shapes."
+  [& {:keys [executor on-remove max-size max-weight weigher keepalive expire]}]
   (let [cache (as-> (Caffeine/newBuilder) builder
                 (if (fn? on-remove) (.removalListener builder (create-listener on-remove)) builder)
                 (if executor  (.executor builder ^Executor (px/resolve-executor executor)) builder)
                 (if keepalive (.expireAfterAccess builder ^Duration (ct/duration keepalive)) builder)
                 (if expire    (.expireAfterWrite  builder ^Duration (ct/duration expire)) builder)
-                (if (int? max-size) (.maximumSize builder (long max-size)) builder)
+                (if (and (fn? weigher) (int? max-weight))
+                  (doto builder
+                    (.weigher (create-weigher weigher))
+                    (.maximumWeight (long max-weight)))
+                  (if (int? max-size) (.maximumSize builder (long max-size)) builder))
                 (.recordStats builder)
                 (.build builder))]
     (reify
       ICache
       (get [_ k]
         (.getIfPresent ^Cache cache ^Object k))
+      (put [_ k v]
+        (.put ^Cache cache ^Object k ^Object v))
       (get [_ k load-fn]
         (.get ^Cache cache
               ^Object k
@@ -77,6 +97,8 @@
         (doseq [[k v] (.asMap ^Cache cache)]
           (when (pred v)
             (.invalidate ^Cache cache ^Object k))))
+      (cleanup [_]
+        (.cleanUp ^Cache cache))
 
       ICacheStats
       (stats [_]

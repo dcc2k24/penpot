@@ -52,6 +52,16 @@
               :required scope
               :granted (vec (sort (effective-scopes perms))))))
 
+(defn token-fingerprint
+  "The first eight hex chars of the SHA-256 of the token id, or nil when
+  there is no token id. Logs carry this in place of the token id, so the
+  token itself never reaches a log line."
+  [token-id]
+  (when (some? token-id)
+    (let [digest (.digest (java.security.MessageDigest/getInstance "SHA-256")
+                          (.getBytes (str token-id) "UTF-8"))]
+      (apply str (map #(format "%02x" (bit-and % 0xff)) (take 4 digest))))))
+
 (defn replace-scopes
   "Perms with every `mcp:*` entry replaced by `scopes`."
   [perms scopes]

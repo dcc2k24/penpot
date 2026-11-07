@@ -243,9 +243,7 @@
               (contains? params :file-id)))]])
 
 (sv/defmethod ::get-team
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:read"
-   ::doc/added "1.17"
+  {::doc/added "1.17"
    ::rpc/id-type :team
    ::sm/params schema:get-team}
   [cfg {:keys [::rpc/profile-id id file-id] :as params}]

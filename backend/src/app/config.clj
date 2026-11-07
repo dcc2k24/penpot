@@ -81,6 +81,8 @@
    :jobs-retention (ct/duration {:days 7})
    :jobs-user-ttl (ct/duration {:days 7})
    :jobs-request-timeout (ct/duration {:minutes 2})
+   ;; MCP tokens without an explicit expiry expire after this age.
+   :mcp-token-max-age (ct/duration {:days 90})
 
    :media-max-file-size (* 1024 1024 30) ; 30MiB
    :font-max-file-size  (* 1024 1024 30) ; 30MiB

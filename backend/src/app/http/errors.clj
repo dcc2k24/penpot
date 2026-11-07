@@ -58,6 +58,18 @@
   {::yres/status 403
    ::yres/body (ex-data err)})
 
+;; A conflict is the caller's state against the stored one (a stale
+;; revn, a busy file lock); it is not a server fault, so it is not
+;; logged as one.
+(defmethod handle-error :conflict
+  [err _ _]
+  (let [data (ex-data err)]
+    (l/dbg :hint "conflict" :code (:code data))
+    {::yres/status 409
+     ::yres/body (-> data
+                     (strip-internal-fields)
+                     (assoc :type :conflict))}))
+
 (defmethod handle-error :restriction
   [err request _]
   (let [data    (ex-data err)

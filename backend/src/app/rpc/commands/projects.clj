@@ -126,9 +126,7 @@
   [:map {:title "get-all-projects"}])
 
 (sv/defmethod ::get-all-projects
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:read"
-   ::doc/added "1.18"
+  {::doc/added "1.18"
    ::sm/params schema:get-all-projects}
   [{:keys [::db/pool]} {:keys [::rpc/profile-id]}]
   (dm/with-open [conn (db/open pool)]
@@ -177,9 +175,7 @@
    [:id ::sm/uuid]])
 
 (sv/defmethod ::get-project
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:read"
-   ::doc/added "1.18"
+  {::doc/added "1.18"
    ::rpc/id-type :project
    ::sm/params schema:get-project}
   [{:keys [::db/pool] :as cfg} {:keys [::rpc/profile-id id]}]

@@ -32,25 +32,77 @@
   [perms]
   (vec (sort (mcp-scope/effective-scopes perms))))
 
+;; The hand-made token has no client. Its regeneration and scope edits
+;; never touch the tokens of OAuth clients (client_id not NULL).
 (def ^:private sql:clean-old-mcp-tokens
   "DELETE FROM access_token
     WHERE profile_id = ?
       AND id != ?
-      AND type = 'mcp'")
+      AND type = 'mcp'
+      AND client_id IS NULL")
 
 (def ^:private sql:get-valid-mcp-token
   "SELECT * FROM access_token
     WHERE profile_id = ?
       AND type = 'mcp'
+      AND client_id IS NULL
       AND (expires_at IS NULL OR expires_at > now())
     ORDER BY created_at DESC
     LIMIT 1")
+
+;; Most connected clients one profile may hold. A further client is refused.
+(def ^:const max-client-mcp-tokens 20)
+
+(def ^:private sql:count-other-client-mcp-tokens
+  "SELECT count(*) AS total
+     FROM access_token
+    WHERE profile_id = ?
+      AND type = 'mcp'
+      AND client_id IS NOT NULL
+      AND client_id <> ?")
+
+(def ^:private sql:delete-client-mcp-tokens
+  "DELETE FROM access_token
+    WHERE profile_id = ?
+      AND client_id = ?
+      AND type = 'mcp'")
 
 (def ^:private sql:update-token-perms
   "UPDATE access_token
       SET perms = ?,
           updated_at = now()
     WHERE id = ?")
+
+(defn- insert-access-token!
+  "Insert one access token row and return it. `client` is nil for the
+  hand-made tokens, or a map with `:client-id`, `:client-name` and `:perms`
+  for the token of an OAuth client. Expiry: an explicit `expiration`, or the
+  configured MCP lifetime for MCP tokens."
+  [{:keys [::db/conn] :as cfg} profile-id name expiration type client]
+  (let [token-id   (uuid/next)
+        expiration (or expiration
+                       (when (= type "mcp")
+                         (cf/get-mcp-token-max-age)))
+        expires-at (some-> expiration (ct/in-future))
+        created-at (ct/now)
+        token-iss  (if (= type "mcp") actoken/mcp-token-issuer "access-token")
+        token      (tokens/generate cfg {:iss token-iss
+                                         :uid profile-id
+                                         :iat created-at
+                                         :tid token-id})]
+    (db/insert! conn :access-token
+                (cond-> {:id token-id
+                         :name name
+                         :token token
+                         :type type
+                         :profile-id profile-id
+                         :created-at created-at
+                         :updated-at created-at
+                         :expires-at expires-at
+                         :perms (db/create-array conn "text" (or (:perms client) []))}
+                  (some? client)
+                  (assoc :client-id (:client-id client)
+                         :client-name (:client-name client))))))
 
 (defn create-access-token
   "Create an access token with empty perms.
@@ -64,85 +116,39 @@
   ;; Serialize regeneration with OAuth provisioning for the same profile.
   (when (= type "mcp")
     (db/get-by-id conn :profile profile-id {::db/for-update true}))
-  (let [token-id   (uuid/next)
-        expiration (or expiration
-                       (when (= type "mcp")
-                         (cf/get-mcp-token-max-age)))
-        expires-at (some-> expiration (ct/in-future))
-        created-at (ct/now)
-        token-iss  (if (= type "mcp") actoken/mcp-token-issuer "access-token")
-        token      (tokens/generate cfg {:iss token-iss
-                                         :uid profile-id
-                                         :iat created-at
-                                         :tid token-id})
-
-        token      (db/insert! conn :access-token
-                               {:id token-id
-                                :name name
-                                :token token
-                                :type type
-                                :profile-id profile-id
-                                :created-at created-at
-                                :updated-at created-at
-                                :expires-at expires-at
-                                :perms (db/create-array conn "text" [])})]
-
-    ;; If the created token is of mcp type, we should proceed to
-    ;; delete all other mcp tokens on the table for the current
-    ;; profile.
+  (let [token (insert-access-token! cfg profile-id name expiration type nil)]
+    ;; A new hand-made MCP token replaces the older hand-made ones. The
+    ;; client tokens stay.
     (when (= type "mcp")
       (db/exec! conn [sql:clean-old-mcp-tokens profile-id (:id token)]))
 
     (decode-row token)))
 
-(defn ensure-mcp-access!
-  "Enable MCP and return the profile's unexpired token, creating it if absent.
-  Must run in a transaction. Lock the profile even when no token exists, so
-  concurrent approvals and settings regeneration use the same lock. Enabling
-  MCP must not regenerate a token already held by a connected client; an
-  expired token is replaced because no client can use it, and so is a token
-  issued before MCP tokens had their own issuer, or one this instance cannot
-  decrypt, because the backend rejects both."
-  [{:keys [::db/conn] :as cfg} profile-id]
-  (let [profile (profile/get-profile conn profile-id ::db/for-update true)
-        token   (db/exec-one! conn [sql:get-valid-mcp-token profile-id])
-        ;; A token this instance cannot decrypt is as unusable as an expired one
-        token   (when (= actoken/mcp-token-issuer
-                         (ex/ignoring (:iss (tokens/decode cfg (:token token)))))
-                  token)]
+(defn grant-client-mcp-scopes
+  "Enable MCP, then give OAuth client `client-id` one MCP token that holds
+  exactly the effective `scopes`, with the configured expiry. An earlier
+  token of the same client is replaced. The hand-made token and the tokens
+  of other clients are not touched. Returns the new row. Must run in a
+  transaction: the profile lock covers the change."
+  [{:keys [::db/conn] :as cfg} profile-id client-id client-name scopes]
+  (let [profile (profile/get-profile conn profile-id ::db/for-update true)]
     (when-not (:mcp-enabled (:props profile))
-      (profile/update-profile-props cfg profile-id {:mcp-enabled true}))
-    (if token
-      (decode-row token)
-      (create-access-token cfg profile-id "MCP" nil "mcp"))))
-
-(defn get-granted-mcp-scopes
-  "Scopes the profile's MCP token holds once `scopes` are granted: the
-  effective scopes of its current perms, plus `scopes`. Read only. A profile
-  without a valid MCP token holds `mcp:read`, as a new token would."
-  [{:keys [::db/pool]} profile-id scopes]
-  (let [token (db/exec-one! pool [sql:get-valid-mcp-token profile-id])
-        perms (db/decode-pgarray (:perms token) [])]
-    (into (mcp-scope/effective-scopes perms) scopes)))
-
-(def ^:private sql:get-token-perms
-  "SELECT perms FROM access_token WHERE id = ?")
-
-(defn grant-mcp-scopes
-  "Enable MCP, then add `scopes` to the perms of the profile's MCP token and
-  return the token row. Scopes the token already holds stay, each written
-  once. Must run in a transaction: the profile lock of `ensure-mcp-access!`
-  covers the update."
-  [{:keys [::db/conn] :as cfg} profile-id scopes]
-  (let [token (ensure-mcp-access! cfg profile-id)
-        row   (db/exec-one! conn [sql:get-token-perms (:id token)])
-        perms (db/decode-pgarray (:perms row) [])
-        perms (mcp-scope/replace-scopes
-               perms (into (mcp-scope/effective-scopes perms) scopes))]
-    (db/exec! conn [sql:update-token-perms
-                    (db/create-array conn "text" perms)
-                    (:id token)])
-    token))
+      (profile/update-profile-props cfg profile-id {:mcp-enabled true})))
+  (let [{:keys [total]} (db/exec-one! conn [sql:count-other-client-mcp-tokens
+                                            profile-id client-id])]
+    (when (>= total max-client-mcp-tokens)
+      (ex/raise :type :restriction
+                :code :mcp-client-limit
+                :hint "too many connected MCP clients for this profile"
+                :limit max-client-mcp-tokens)))
+  (db/exec! conn [sql:delete-client-mcp-tokens profile-id client-id])
+  (let [name  (or client-name client-id)
+        perms (mcp-scopes scopes)]
+    (-> (insert-access-token! cfg profile-id name nil "mcp"
+                              {:client-id client-id
+                               :client-name client-name
+                               :perms perms})
+        (decode-row))))
 
 (defn repl:create-access-token
   [cfg profile-id name expiration]
@@ -206,12 +212,15 @@ RETURNING id, perms")
   (->> (db/query pool :access-token
                  {:profile-id profile-id}
                  {:order-by [[:expires-at :asc] [:created-at :asc]]
-                  :columns [:id :name :perms :type :created-at :updated-at :expires-at :token]})
+                  :columns [:id :name :perms :type :created-at :updated-at :expires-at :token
+                            :client-id :client-name]})
        (map (fn [{:keys [type perms] :as row}]
               (cond-> (decode-row row)
                 (= type "mcp") (assoc :scopes (mcp-scopes (db/decode-pgarray perms []))))))
-       (map (fn [{:keys [type] :as row}]
-              (if (not= type "mcp")
+       ;; Only the hand-made MCP token shows its secret. Client tokens
+       ;; never do: the settings page does not show them.
+       (map (fn [{:keys [type client-id] :as row}]
+              (if (or (not= type "mcp") (some? client-id))
                 (dissoc row :token)
                 row)))
        (vec)))
@@ -258,11 +267,13 @@ RETURNING id, perms")
    ::doc/deprecated true
    ::sm/params schema:get-current-mcp-token}
   [{:keys [::db/pool]} {:keys [::rpc/profile-id ::rpc/request-at]}]
-  (->> (db/query pool :access-token
-                 {:profile-id profile-id
-                  :type "mcp"}
-                 {:order-by [[:expires-at :asc] [:created-at :asc]]
-                  :columns [:token :expires-at]})
+  (->> (db/exec! pool
+                 ["SELECT token, expires_at FROM access_token
+                    WHERE profile_id = ?
+                      AND type = 'mcp'
+                      AND client_id IS NULL
+                    ORDER BY expires_at ASC NULLS LAST, created_at ASC"
+                  profile-id])
        (remove #(and (some? (:expires-at %))
                      (ct/is-after? request-at (:expires-at %))))
        (map decode-row)

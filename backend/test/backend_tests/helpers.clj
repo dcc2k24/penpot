@@ -86,6 +86,8 @@
    :enable-quotes
    :enable-rpc-climit
    :enable-auto-file-snapshot
+   :enable-mcp-backend
+   :enable-mcp-raw-changes
    :disable-file-validation])
 
 (defn init-config

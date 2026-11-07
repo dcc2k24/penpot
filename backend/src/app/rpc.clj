@@ -92,6 +92,16 @@
         (handle-response-transformation request mdata)
         (handle-before-comple-hook mdata))))
 
+(defn- request-id-header
+  "The request id a client sent in `x-request-id`, or nil. A usable id is
+  1 to 64 chars of letters, digits, dot, underscore or dash. Anything else
+  is ignored, so a client cannot write odd text into the logs."
+  [request]
+  (let [value (yreq/get-header request "x-request-id")]
+    (when (and (string? value)
+               (re-matches #"[A-Za-z0-9._-]{1,64}" value))
+      value)))
+
 (defn make-rpc-handler
   "Ring handler that dispatches cmd requests and convert between
   internal async flow into ring async flow."
@@ -115,7 +125,8 @@
                              (assoc ::handler-name handler-name)
                              (assoc ::ip-addr ip-addr)
                              (assoc ::request-at (ct/now))
-                             (assoc ::request-id (uuid/next))
+                             (assoc ::request-id (or (request-id-header request)
+                                                     (uuid/next)))
                              (assoc ::session-id (some-> session-id uuid/parse*))
                              (assoc ::cond/key etag)
                              (cond-> (uuid? profile-id)
@@ -126,7 +137,9 @@
                                           (uuid? token-pid))
                                (-> (assoc ::auth-type :token)
                                    (assoc ::token-perms (set (::actoken/perms request #{})))
-                                   (assoc ::token-type (::actoken/type request))))
+                                   (assoc ::token-type (::actoken/type request))
+                                   (cond-> (some? (::actoken/mcp-enabled request))
+                                     (assoc ::mcp-enabled (::actoken/mcp-enabled request)))))
                              (cond-> key-id
                                (assoc ::auth-key-id key-id))
                              ;; Server-side only, like the ids above: a
@@ -174,6 +187,24 @@
                       :val (inst-ms (tp))
                       :labels labels)))))))
 
+(defn- note-refusal!
+  "Counts and logs one call the backend refused, by `reason`. The log line
+  names the command, the token fingerprint and the request id. It never
+  holds the token itself. These refusals happen before the audit and the
+  metrics wrappers, so they are recorded here."
+  [cfg reason mdata params]
+  (when-let [metrics (::mtx/metrics cfg)]
+    (mtx/run! metrics
+              :id :mcp-refusals-total
+              :labels [reason]
+              :inc 1))
+  (l/inf :hint "mcp refused"
+         :reason reason
+         :cmd (::sv/name mdata)
+         :token-fp (mcp-scope/token-fingerprint
+                    (-> (meta params) (get ::http/request) (get ::actoken/id)))
+         :request-id (str (::request-id params))))
+
 (defn- resolve-mcp-scope
   "The scope a request needs: `::mcp-scope` as given, or the value of
   the function it holds for these params. Commands that declare none need
@@ -198,7 +229,8 @@
         required-auth-type  (::auth-type mdata)
         required-token-type (::token-type mdata)
         allow-token-types   (set (::allow-token-types mdata))
-        required-perms      (into #{} (::perms mdata))]
+        required-perms      (into #{} (::perms mdata))
+        bridge?             (true? (::mcp-bridge mdata))]
     (fn [cfg params]
       (let [profile-id  (::profile-id params)
             auth-type   (::auth-type params)
@@ -209,6 +241,21 @@
           (ex/raise :type :authentication
                     :code :authentication-required
                     :hint "authentication required for this endpoint")
+
+          ;; With backend MCP mode off, an MCP token reaches no MCP command
+          ;; except the bridge (`::mcp-bridge`, send-mcp-feedback). A
+          ;; restriction, not an authentication error: the token is valid,
+          ;; the adapter must not treat it as bad.
+          (and (= token-type "mcp")
+               (not bridge?)
+               (not (contains? cf/flags :mcp-backend))
+               (or (= required-token-type "mcp")
+                   (contains? allow-token-types "mcp")))
+          (do
+            (note-refusal! cfg "backend-disabled" mdata params)
+            (ex/raise :type :restriction
+                      :code :mcp-backend-disabled
+                      :hint "backend MCP mode is disabled"))
 
           (or (and (= required-auth-type :token)
                    (not= auth-type :token))
@@ -221,6 +268,19 @@
           (ex/raise :type :authorization
                     :code :token-auth-required
                     :hint "access token authentication required for this endpoint")
+
+          ;; A profile that turned MCP off loses every MCP token at once,
+          ;; the client tokens included, whatever the command. The flag comes
+          ;; with the token row (see `app.http.access-token`), after the
+          ;; token-type decision above.
+          (and (= token-type "mcp")
+               (not bridge?)
+               (false? (::mcp-enabled params)))
+          (do
+            (note-refusal! cfg "mcp-disabled" mdata params)
+            (ex/raise :type :restriction
+                      :code :mcp-disabled
+                      :hint "MCP is disabled for this profile"))
 
           (and (seq required-perms)
                (not= auth-type :token))
@@ -245,8 +305,11 @@
   [_ f mdata]
   (fn [cfg params]
     (when (= (::token-type params) "mcp")
-      (mcp-scope/check-scope! (set (::token-perms params #{}))
-                              (resolve-mcp-scope (::mcp-scope mdata) params)))
+      (let [perms (set (::token-perms params #{}))
+            scope (resolve-mcp-scope (::mcp-scope mdata) params)]
+        (when-not (mcp-scope/granted? perms scope)
+          (note-refusal! cfg "scope" mdata params))
+        (mcp-scope/check-scope! perms scope)))
     (f cfg params)))
 
 (def ^:private render-session-commands
@@ -277,13 +340,17 @@
   `::session-restriction` only when the request authenticated with one.
   A call that also carries a shared key (`::auth-key-id`, the exporter
   uploading its render to the management API) is authenticated by that
-  key, so the restriction does not apply to it."
+  key, so the restriction does not apply to it.
+
+  The session middleware already hides a render session from every route
+  that does not opt in. This check is the second line of defence."
   [_ f mdata]
   (let [cmd (keyword (::sv/name mdata))]
     (fn [cfg params]
       (when-let [restriction (when-not (::auth-key-id params)
                                (::session-restriction params))]
         (when-not (render-scope? cmd params (:file-ids restriction))
+          (note-refusal! cfg "restricted" mdata params)
           (ex/raise :type :authorization
                     :code :session-restricted
                     :hint "session is restricted to MCP render calls")))
@@ -364,8 +431,9 @@
    Once the context is resolved, checks if the user is authorized within that organization's
    SSO session using nitrate/sso-session-authorized?, against the organization when it is
    known and against the team otherwise. The team is resolved either way, so the raised
-   error can carry it. Authorized results are cached by [profile-id cache-ref] for 15
-   minutes to avoid repeated lookups.
+   error can carry it. Authorized results are cached by [profile-id credential cache-ref]
+   for 15 minutes to avoid repeated lookups. The credential is :session, :token or
+   :restricted, so one kind of credential never reuses another's result.
 
    Only activates when:
    - Nitrate flag is enabled
@@ -395,8 +463,13 @@
         (if (and profile-id
                  (or organization-id team-id project-id file-id))
           (let [cache-ref  (or organization-id team-id project-id file-id)
-
-                cache-key  [profile-id cache-ref]
+                ;; The credential kind is part of the key. A token call must
+                ;; not reuse a result the owner's browser session cached.
+                credential (cond
+                             (some? (::session-restriction params)) :restricted
+                             (= :token (::auth-type params)) :token
+                             :else :session)
+                cache-key  [profile-id credential cache-ref]
                 cached     (cache/get organization-sso-auth-cache cache-key)
                 result     (if (some? cached)
                              cached
@@ -459,9 +532,23 @@
     (wrap-params-validation cfg $ mdata)
     (wrap-authentication cfg $ mdata)))
 
+(defn- check-mcp-scope!
+  "Throw at startup when an MCP command declares no `::mcp-scope`. Without
+  one the scope falls back to `mcp:read`, so a later write command could
+  fail open for read-only tokens. There is no allowance by name: a name
+  prefix would let a future `get-mcp-...` command skip the check."
+  [mdata]
+  (let [cmd  (::sv/name mdata)
+        mcp? (or (= "mcp" (::token-type mdata))
+                 (contains? (set (::allow-token-types mdata)) "mcp"))]
+    (when (and mcp? (nil? (::mcp-scope mdata)))
+      (throw (IllegalStateException.
+              (str "MCP command " cmd " declares no ::rpc/mcp-scope"))))))
+
 (defn- process-method
   [cfg wrap-fn [f mdata]]
   (l/trc :hint "add method" :module (::module cfg) :type (::type cfg) :name (::sv/name mdata))
+  (check-mcp-scope! mdata)
   (let [f (wrap-fn cfg f mdata)
         k (keyword (::sv/name mdata))]
     [k [mdata (partial f cfg)]]))
@@ -600,7 +687,7 @@
    ["/management"
     ["/methods/:method-name"
      {:middleware [[mw/shared-key-auth shared-keys]
-                   [session/authz cfg]]
+                   [session/authz (assoc cfg ::session/allow-restricted true)]]
       :handler (make-rpc-handler management-methods)}]
 
     (doc/routes :methods management-methods
@@ -612,7 +699,7 @@
     ["/methods/:method-name"
      {:middleware [[mw/cors]
                    [sec/client-header-check]
-                   [session/authz cfg]
+                   [session/authz (assoc cfg ::session/allow-restricted true)]
                    [actoken/authz (assoc cfg ::actoken/allow-mcp true)]]
       :handler (make-rpc-handler methods)}]
 
@@ -630,6 +717,6 @@
    ["/rpc/command/:method-name"
     {:middleware [[mw/cors]
                   [sec/client-header-check]
-                  [session/authz cfg]
+                  [session/authz (assoc cfg ::session/allow-restricted true)]
                   [actoken/authz (assoc cfg ::actoken/allow-mcp true)]]
      :handler (make-rpc-handler methods)}]])

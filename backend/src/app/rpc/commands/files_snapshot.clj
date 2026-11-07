@@ -114,7 +114,7 @@
 
 (sv/defmethod ::restore-file-snapshot
   {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:write"
+   ::rpc/mcp-scope "mcp:delete"
    ::doc/added "1.20"
    ::sm/params schema:restore-file-snapshot
    ::climit/id [[:restore-file-snapshot/by-profile ::rpc/profile-id]
@@ -177,7 +177,7 @@
 
 (sv/defmethod ::delete-file-snapshot
   {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:write"
+   ::rpc/mcp-scope "mcp:delete"
    ::doc/added "1.20"
    ::sm/params schema:remove-file-snapshot
    ::db/transaction true}

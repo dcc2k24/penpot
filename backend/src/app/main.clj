@@ -103,6 +103,12 @@
     ::mdef/labels ["tool" "code"]
     ::mdef/type :counter}
 
+   :mcp-refusals-total
+   {::mdef/name "penpot_mcp_refusals_total"
+    ::mdef/help "MCP calls the backend refused before running, by reason (scope, restricted, backend-disabled)."
+    ::mdef/labels ["reason"]
+    ::mdef/type :counter}
+
    :rpc-main-timing
    {::mdef/name "penpot_rpc_main_timing"
     ::mdef/help "RPC command method call timing for main"

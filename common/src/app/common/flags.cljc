@@ -195,6 +195,16 @@
     :admin-console-bulk-create-profiles
 
     :mcp
+
+    ;; Off by default. Lets MCP tokens reach the backend's own MCP
+    ;; commands (reads, writes, exports). With it off, an MCP token
+    ;; reaches only the commands that name the MCP token type.
+    :mcp-backend
+
+    ;; Off by default. Allows the raw change records of the MCP write
+    ;; commands (`mcp-apply-changes`).
+    :mcp-raw-changes
+
     :background-blur
     :available-viewer-wasm
     :stroke-path

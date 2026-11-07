@@ -106,8 +106,7 @@
 
 (t/deftest mcp-token-runs-opted-in-commands
   (let [profile (create-profile)]
-    (t/is (nil? (:error (mcp-call profile :get-teams #{} {}))))
-    (t/is (nil? (:error (mcp-call profile :get-profile #{} {}))))))
+    (t/is (nil? (:error (mcp-call profile :get-teams #{} {}))))))
 
 (t/deftest mcp-token-is-refused-on-commands-not-opted-in
   (let [profile (create-profile)]
@@ -269,9 +268,12 @@
         (t/is (ct/is-after? (ct/in-future "2h") (:expires-at token)))
         (t/is (ct/is-after? (:expires-at token) (ct/in-future "30m")))))))
 
-(t/deftest mcp-token-max-age-is-unset-by-default
-  (let [profile (create-profile)]
-    (t/is (nil? (:expires-at (create-mcp-token profile))))))
+(t/deftest mcp-token-max-age-defaults-to-ninety-days
+  (let [profile (create-profile)
+        token   (create-mcp-token profile)]
+    (t/is (some? (:expires-at token)))
+    (t/is (ct/is-after? (ct/in-future (ct/duration {:days 91})) (:expires-at token)))
+    (t/is (ct/is-after? (:expires-at token) (ct/in-future (ct/duration {:days 89}))))))
 
 (t/deftest mcp-token-max-age-does-not-touch-personal-tokens
   (let [profile (create-profile)]

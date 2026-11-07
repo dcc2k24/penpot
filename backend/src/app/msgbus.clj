@@ -17,7 +17,8 @@
    [app.worker :as wrk]
    [integrant.core :as ig]
    [promesa.exec :as px]
-   [promesa.exec.csp :as sp]))
+   [promesa.exec.csp :as sp]
+   [promesa.protocols :as pt]))
 
 (set! *warn-on-reflection* true)
 (def ^:private prefix (cfg/get :tenant))
@@ -66,12 +67,51 @@
   [_ params]
   (assert (sm/check schema:params params)))
 
+;; A publish buffer that counts the messages it drops. The dropping
+;; buffer accepts every offer and drops silently, so the drop is logged
+;; here, before the buffer takes the message.
+(defn- drop-log-due?
+  "True when a drop warning is due: the last one is at least a second old.
+  Keeps a burst of drops from writing a line per message."
+  [last-ms now-ms]
+  (>= (- now-ms last-ms) 1000))
+
+(defn- logging-dropping-buffer
+  "A dropping buffer of `n` messages that logs a warning when it drops a
+  message, at most once a second, with the count dropped since the last
+  warning. Its offers always succeed, as a dropping buffer's do."
+  [n]
+  (let [buf      (sp/dropping-buffer n)
+        dropped  (atom 0)
+        last-log (atom 0)]
+    (reify
+      pt/IBuffer
+      (-full? [_] (pt/-full? buf))
+      (-poll [_] (pt/-poll buf))
+      (-offer [_ o]
+        (when (>= (pt/-size buf) n)
+          (swap! dropped inc)
+          (let [now (System/currentTimeMillis)]
+            (when (drop-log-due? @last-log now)
+              (let [count @dropped]
+                (reset! dropped 0)
+                (reset! last-log now)
+                (l/wrn :hint "msgbus publish buffer full, messages dropped"
+                       :buffer-size n
+                       :dropped count)))))
+        (pt/-offer buf o))
+      (-size [_] (pt/-size buf))
+
+      pt/ICloseable
+      (-closed? [_] (pt/-closed? buf))
+      (-close [_] (pt/-close buf)))))
+
 (defmethod ig/init-key ::msgbus
   [_ {:keys [::buffer-size ::wrk/executor ::timeout] :as cfg}]
   (l/info :hint "initialize msgbus" :buffer-size buffer-size)
   (let [cmd-ch (sp/chan :buf buffer-size)
         rcv-ch (sp/chan :buf (sp/dropping-buffer buffer-size))
-        pub-ch (sp/chan :buf (sp/dropping-buffer buffer-size)
+        pub-ch (sp/chan :buf (logging-dropping-buffer buffer-size)
                         :xf  xform-prefix-topic)
         state  (agent {})
 

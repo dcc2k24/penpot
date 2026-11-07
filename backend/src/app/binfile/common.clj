@@ -89,7 +89,11 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (declare get-resolved-file-libraries)
+(declare pointer-loader)
 (declare update-file!)
+(declare encode-file)
+(declare file->params)
+(declare file->file-data-params)
 
 (def file-attrs
   (sm/keys ctf/schema:file))
@@ -237,11 +241,35 @@
           FROM files AS f
          WHERE f.id = ?"))
 
+(defn- update-migrated-file!
+  "Writes a migrated `file` only while its stored revn is still `read-revn`,
+  the revn the read saw. A commit that moved the revn meanwhile wins, so
+  the migration is skipped and the file migrates again on a later read.
+  The file row is updated first, so a skipped write encodes nothing and
+  writes no fragment. Returns true when the file was written."
+  [cfg {:keys [id] :as file} read-revn]
+  (let [conn (::db/conn cfg)
+        updated (db/get-update-count
+                 (db/update! conn :file (d/update-when (file->params (dissoc file :id)) :features into-array)
+                             {:id id :revn read-revn}
+                             {::db/return-keys false}))]
+    (if (pos? updated)
+      (let [file (encode-file cfg file)]
+        (fmigr/upsert-migrations! conn file)
+        (fdata/upsert! cfg (file->file-data-params file))
+        true)
+      (do
+        (l/dbg :hint "migrate-on-read skipped, the file changed"
+               :file-id (str id)
+               :read-revn read-revn)
+        false))))
+
 (defn- migrate-file
   [{:keys [::db/conn] :as cfg} {:keys [read-only?]} {:keys [id] :as file}]
-  (binding [pmap/*load-fn* (partial fdata/load-pointer cfg id)
+  (binding [pmap/*load-fn* (pointer-loader cfg id)
             pmap/*tracked* (pmap/create-tracked)]
-    (let [libs (delay (get-resolved-file-libraries cfg file))
+    (let [read-revn (:revn file)
+          libs (delay (get-resolved-file-libraries cfg file))
           ;; For avoid unnecesary overhead of creating multiple
           ;; pointers and handly internally with objects map in their
           ;; worst case (when probably all shapes and all pointers
@@ -252,11 +280,12 @@
 
       (if (or read-only? (db/read-only? conn))
         file
-        (do ;; When file is migrated, we break the rule of no
-          ;; perform mutations on get operations and update the
-          ;; file with all migrations applied
-          (update-file! cfg file)
-          (fmigr/resolve-applied-migrations cfg file))))))
+        ;; When file is migrated, we break the rule of no
+        ;; perform mutations on get operations and update the
+        ;; file with all migrations applied
+        (if (update-migrated-file! cfg file read-revn)
+          (fmigr/resolve-applied-migrations cfg file)
+          file)))))
 
 (defn- get-file*
   [{:keys [::db/conn] :as cfg} id
@@ -929,6 +958,24 @@
   (into []
         (map decode-row-features)
         (db/exec! conn [sql:get-file-libraries file-id file-id file-id])))
+
+(defn pointer-loader
+  "The pointer loader of a read of `file-id`. A pointer is looked up in the
+  file first. A pointer of a linked library is a miss there, so the lookup
+  then tries the file and its libraries, named by id. The library query
+  runs only on a miss, so a read that finds its pointers in the file costs
+  no extra query."
+  [cfg file-id]
+  (let [file-ids (delay (into [file-id]
+                              (map :id)
+                              (get-file-libraries (::db/conn cfg) file-id)))]
+    (fn [id]
+      (try
+        (fdata/load-pointer cfg file-id id)
+        (catch clojure.lang.ExceptionInfo cause
+          (if (= :fragment-not-found (:code (ex-data cause)))
+            (fdata/load-pointer-of-files cfg @file-ids id)
+            (throw cause)))))))
 
 (defn get-resolved-file-libraries
   "Get all file libraries including itself. Returns an instance of

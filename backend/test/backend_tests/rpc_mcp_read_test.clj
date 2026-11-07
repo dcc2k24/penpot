@@ -12,6 +12,7 @@
    [app.common.json :as json]
    [app.common.logging :as l]
    [app.common.math :as mth]
+   [app.common.mcp.operations :as operations]
    [app.common.time :as ct]
    [app.common.types.shape :as cts]
    [app.common.types.shape.layout :as ctl]
@@ -24,9 +25,13 @@
    [app.http.access-token :as-alias actoken]
    [app.http.session :as session]
    [app.rpc :as-alias rpc]
+   [app.rpc.commands.access-token :as access-token]
    [app.rpc.commands.mcp :as mcp]
+   [app.rpc.commands.profile :as profile]
    [app.setup :as-alias setup]
    [app.tokens :as tokens]
+   [app.util.cache :as cache]
+   [app.util.pointer-map :as pmap]
    [backend-tests.helpers :as th]
    [clojure.test :as t]
    [ring.core.protocols :as rcp]
@@ -36,14 +41,25 @@
                        (partial th/init-config [:enable-access-tokens
                                                 :enable-client-header-check-middleware])
                        th/init-system))
-(t/use-fixtures :each th/database-reset)
+
+(defn- clear-mcp-caches
+  "Empties the MCP caches between tests. Test files reuse the same file
+  ids (`mk-uuid \"file\" i`), so a root cached by one test would answer
+  for another test's file with the same revision."
+  [f]
+  (doseq [c [@#'mcp/root-cache @#'mcp/page-cache @#'mcp/outline-cache]]
+    (cache/invalidate c))
+  (f))
+
+(t/use-fixtures :each th/database-reset clear-mcp-caches)
 
 ;; --- HELPERS
 
 (defn- call!
   "Runs an MCP read command as `profile`, authenticated with an MCP token
-  of `perms`. `token-id` is passed as the id of the request's token."
-  [profile method params & {:keys [perms token-id]}]
+  of `perms`. `token-id` is passed as the id of the request's token, and
+  `expires-at` as the expiry the access-token middleware read for it."
+  [profile method params & {:keys [perms token-id expires-at]}]
   (let [data (merge {::th/type method
                      ::rpc/profile-id (:id profile)
                      ::rpc/auth-type :token
@@ -53,8 +69,11 @@
     (th/command!
      (cond-> data
        (some? token-id)
-       (vary-meta assoc :app.http/request {:headers {}
-                                           ::actoken/id token-id})))))
+       (vary-meta assoc :app.http/request
+                  (cond-> {:headers {}
+                           ::actoken/id token-id}
+                    (some? expires-at)
+                    (assoc ::actoken/expires-at expires-at)))))))
 
 (defn- current-revn
   [file-id]
@@ -732,7 +751,11 @@
       (t/is (true? (:active (first (:themes result)))))
       (t/is (= ["token-radius"] (map :name (:tokens result))))
       (t/is (= 10 (:value (first (:tokens result)))))
-      (t/is (some? (:dtcg result)))
+      (t/is (nil? (:dtcg result)) "the flat list is the default, the DTCG form is not sent too")
+
+      (let [dtcg (:result (call! profile :get-mcp-tokens {:file-id file-id :format "dtcg"}))]
+        (t/is (some? (:dtcg dtcg)))
+        (t/is (nil? (:tokens dtcg))))
       (t/is (= {:sets 1 :themes 1 :tokens 1}
                (select-keys (:tokens outline) [:sets :themes :tokens]))))))
 
@@ -808,9 +831,14 @@
     (get (json/decode (str out)) "code")))
 
 (defn- render-token
-  "The token of a render session for `file-id`, minted as the exporter does."
+  "The token of a render session for `file-id`, minted as the exporter does.
+  The session is bound to a live MCP access token row, as a real call is:
+  a render session without one fails closed."
   [profile file-id]
-  (:token (:result (call! profile :create-mcp-render-session {:file-id file-id}))))
+  (let [token (db/tx-run! th/*system* access-token/create-access-token
+                          (:id profile) "MCP" nil "mcp")]
+    (:token (:result (call! profile :create-mcp-render-session {:file-id file-id}
+                            :token-id (:id token))))))
 
 (t/deftest render-session-reads-its-file
   (let [{:keys [profile file-id page1]} (create-fixture)
@@ -920,3 +948,324 @@
                 {:id sid})
     (t/is (= 401 (::yres/status (http-call "get-page" token {:fileId (str file-id)
                                                              :pageId (str page1)}))))))
+
+;; --- WRITE-SIZED REPLIES, FIELDS AND FILTERS
+
+(t/deftest page-cache-keeps-a-pointer-page-across-revisions
+  (let [{:keys [profile file-id page1 page2 board2]} (create-fixture)
+        decodes  (atom 0)
+        original @#'mcp/load-page
+        read!    #(call! profile :get-mcp-shapes {:file-id file-id
+                                                  :page-id page1
+                                                  :ids [uuid/zero]})]
+    (with-redefs [mcp/load-page (fn [& args]
+                                  (swap! decodes inc)
+                                  (apply original args))]
+      (read!)
+      (t/is (= 1 @decodes))
+
+      ;; a write to page two moves the revision, not the pointer of page one
+      (apply-changes! profile file-id
+                      [(add-obj page2 (uuid/next) board2 board2 {:type :rect :name "Late"})])
+      (read!)
+      (t/is (= 1 @decodes) "page one is served from the cache at the new revision")
+
+      ;; page two has a new pointer, so it is decoded again
+      (call! profile :get-mcp-shapes {:file-id file-id :page-id page2 :ids [uuid/zero]})
+      (t/is (= 2 @decodes)))))
+
+(t/deftest page-tree-cursor-survives-a-write-to-another-page
+  (let [{:keys [profile file-id page1 page2 board2]} (create-fixture)
+        first-page (call! profile :get-mcp-page-tree {:file-id file-id
+                                                      :page-id page1
+                                                      :depth 3
+                                                      :limit 2})
+        cursor     (get-in first-page [:result :next-cursor])]
+    (t/is (string? cursor))
+    (apply-changes! profile file-id
+                    [(add-obj page2 (uuid/next) board2 board2 {:type :rect :name "Late"})])
+    (let [out (call! profile :get-mcp-page-tree {:file-id file-id
+                                                 :page-id page1
+                                                 :depth 3
+                                                 :limit 2
+                                                 :cursor cursor})]
+      (t/is (nil? (:error out)))
+      (t/is (= page1 (:page-id (:result out)))))))
+
+(t/deftest shapes-reply-stops-at-the-byte-budget
+  (let [{:keys [profile file-id page1 board1 rect1 text1]} (create-fixture)
+        out (with-redefs [mcp/response-byte-budget 1]
+              (call! profile :get-mcp-shapes {:file-id file-id
+                                              :page-id page1
+                                              :ids [board1 rect1 text1]}))]
+    (t/is (nil? (:error out)))
+    (t/is (true? (:truncated (:result out))))
+    (t/is (= [board1] (map :id (:shapes (:result out)))))))
+
+(t/deftest page-tree-stops-at-the-byte-budget-and-walks-on
+  (let [{:keys [profile file-id page1]} (create-fixture)]
+    (with-redefs [mcp/response-byte-budget 1]
+      (loop [cursor nil
+             calls  0]
+        (let [params (cond-> {:file-id file-id :page-id page1 :depth 3 :limit 500}
+                       (some? cursor) (assoc :cursor cursor))
+              out    (call! profile :get-mcp-page-tree params)
+              result (:result out)]
+          (t/is (nil? (:error out)))
+          (when (zero? calls)
+            (t/is (true? (:truncated result)))
+            (t/is (string? (:next-cursor result))))
+          (if (or (not (:truncated result)) (>= calls 20))
+            (t/is (false? (:truncated result)) "the walk ends within 20 replies")
+            (recur (:next-cursor result) (inc calls))))))))
+
+(t/deftest tree-refuses-heavy-fields-and-shapes-return-them-by-name
+  (let [{:keys [profile file-id page1 text1]} (create-fixture)
+        refused (call! profile :get-mcp-page-tree {:file-id file-id
+                                                   :page-id page1
+                                                   :fields [:content]})
+        plain   (read-shape profile file-id page1 text1)
+        named   (read-shape profile file-id page1 text1 :fields [:content])]
+    (t/is (some? (:error refused)))
+    (t/is (not (contains? plain :content)))
+    (t/is (not (contains? plain :position-data)))
+    (t/is (= "Hello Penpot" (:characters plain)))
+    (t/is (contains? named :content))))
+
+(t/deftest shapes-refuse-attributes-outside-the-enum
+  (let [{:keys [profile file-id page1 rect1]} (create-fixture)
+        out (call! profile :get-mcp-shapes {:file-id file-id
+                                            :page-id page1
+                                            :ids [rect1]
+                                            :fields [:not-an-attribute]})]
+    (t/is (some? (:error out)))))
+
+(t/deftest tokens-filter-by-set
+  (let [{:keys [profile file-id]} (create-fixture)
+        set-a  (uuid/next)
+        set-b  (uuid/next)
+        tokens (-> (ctob/make-tokens-lib)
+                   (ctob/add-set (ctob/make-token-set :id set-a :name "set-a"))
+                   (ctob/add-set (ctob/make-token-set :id set-b :name "set-b"))
+                   (ctob/add-token set-a (ctob/make-token :name "radius-a"
+                                                          :type :border-radius
+                                                          :value 1))
+                   (ctob/add-token set-b (ctob/make-token :name "radius-b"
+                                                          :type :border-radius
+                                                          :value 2)))]
+    (th/update-file*
+     {:file-id file-id
+      :profile-id (:id profile)
+      :revn (current-revn file-id)
+      :changes (-> (pcb/empty-changes nil)
+                   (pcb/with-library-data (:data (bfc/get-file th/*system* file-id)))
+                   (pcb/set-tokens-lib tokens)
+                   (pcb/set-tokens-status (ctos/make-tokens-status))
+                   (:redo-changes))})
+    (let [only-a (:result (call! profile :get-mcp-tokens {:file-id file-id :set-id set-a}))
+          absent (call! profile :get-mcp-tokens {:file-id file-id :set-id (uuid/next)})]
+      (t/is (= ["set-a"] (map :name (:sets only-a))))
+      (t/is (= ["radius-a"] (map :name (:tokens only-a))))
+      (t/is (= :token-set-not-found (th/ex-code (:error absent)))))))
+
+(t/deftest library-reports-totals-and-truncation
+  (let [{:keys [profile file-id page1 board1 page2 board2]} (create-fixture)]
+    (apply-changes! profile file-id
+                    [{:type :add-component :path "" :name "Board"
+                      :main-instance-id board1 :main-instance-page page1
+                      :id (uuid/next) :anotation nil}
+                     {:type :add-component :path "" :name "Board 2"
+                      :main-instance-id board2 :main-instance-page page2
+                      :id (uuid/next) :anotation nil}])
+    (let [cut  (:result (call! profile :get-mcp-library {:file-id file-id :limit 1}))
+          full (:result (call! profile :get-mcp-library {:file-id file-id}))]
+      (t/is (= 1 (count (:components cut))))
+      (t/is (= 2 (get-in cut [:totals :components])))
+      (t/is (true? (:truncated cut)))
+      (t/is (false? (:truncated full))))))
+
+(t/deftest find-refuses-a-type-outside-the-shape-types
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        out (call! profile :find-mcp-shapes {:file-id file-id
+                                             :page-id page1
+                                             :type :rectangle})
+        ok  (call! profile :find-mcp-shapes {:file-id file-id
+                                             :page-id page1
+                                             :type :rect})]
+    (t/is (some? (:error out)))
+    (t/is (nil? (:error ok)))
+    (t/is (= ["Rect A"] (map :name (:matches (:result ok)))))))
+
+(t/deftest find-maps-a-stack-overflow-to-an-invalid-pattern
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        out (with-redefs [mcp/match-predicate
+                          (fn [& _] (fn [_] (throw (StackOverflowError.))))]
+              (call! profile :find-mcp-shapes {:file-id file-id :page-id page1}))]
+    (t/is (= :mcp-invalid-pattern (th/ex-code (:error out))))))
+
+(t/deftest whoami-reports-the-contract-and-the-write-limits
+  (let [{:keys [profile]} (create-fixture)
+        result (:result (call! profile :mcp-whoami {}))]
+    (t/is (= 1 (:contract-version result)))
+    (t/is (= operations/operation-names (:operations result)))
+    (t/is (= 2000 (get-in result [:limits :max-operations])))
+    (t/is (pos? (get-in result [:limits :max-payload-bytes])))
+    (t/is (pos? (get-in result [:limits :max-compiled-changes])))))
+
+(t/deftest whoami-reports-the-token-expiry-from-the-request
+  (let [{:keys [profile]} (create-fixture)
+        expires (ct/plus (ct/now) (ct/duration 3600000))
+        result  (:result (call! profile :mcp-whoami {}
+                                :token-id (uuid/next)
+                                :expires-at expires))]
+    (t/is (= expires (:expires-at result)))))
+
+(t/deftest mcp-refuses-a-profile-that-switched-mcp-off
+  (let [{:keys [profile file-id]} (create-fixture)
+        set-props! (fn [props]
+                     (db/tx-run! th/*system*
+                                 (fn [cfg]
+                                   (profile/update-profile-props cfg (:id profile) props))))]
+    (set-props! {:mcp-enabled false})
+    (let [whoami  (call! profile :mcp-whoami {})
+          outline (call! profile :get-mcp-file-outline {:file-id file-id})]
+      (t/is (= :mcp-disabled (th/ex-code (:error whoami))))
+      (t/is (= :restriction (th/ex-type (:error whoami))))
+      (t/is (= :mcp-disabled (th/ex-code (:error outline)))))
+    (set-props! {:mcp-enabled true})
+    (t/is (nil? (:error (call! profile :mcp-whoami {}))))))
+
+(t/deftest render-session-stores-the-token-id
+  (let [{:keys [profile file-id]} (create-fixture)
+        token-id (uuid/next)
+        out      (call! profile :create-mcp-render-session {:file-id file-id}
+                        :token-id token-id)
+        sid      (:sid (session/decode-token th/*system* (:token (:result out))))
+        row      (th/db-get :http-session-v2 {:id sid})
+        props    (db/decode-transit-pgobject (:props row))]
+    (t/is (nil? (:error out)))
+    (t/is (= token-id (:token-id props)))))
+
+(t/deftest reads-share-the-decoded-root-of-a-pointer-file
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        loads    (atom 0)
+        original bfc/get-file
+        read!    #(call! profile :get-mcp-page-tree {:file-id file-id :page-id page1})]
+    (with-redefs [bfc/get-file (fn [& args]
+                                 (swap! loads inc)
+                                 (apply original args))]
+      (read!)
+      (read!)
+      (t/is (= 1 @loads)))))
+
+(t/deftest tool-calls-carry-the-request-id
+  (let [{:keys [profile file-id]} (create-fixture)
+        request-id (uuid/next)
+        out        (call! profile :get-mcp-file-outline {:file-id file-id
+                                                         ::rpc/request-id request-id})
+        props      (:app.loggers.audit/replace-props (meta (:result out)))]
+    (t/is (= request-id (:request-id props)))))
+
+;; --- REVIEW FIXES: CACHED ROOT, FIELDS FROM THE SCHEMA
+
+(t/deftest pages-of-the-cached-root-stay-unloaded
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        _    (call! profile :get-mcp-page-tree {:file-id file-id :page-id page1})
+        row  (th/db-get :file {:id file-id})
+        root (cache/get @#'mcp/root-cache [file-id (:revn row) (:vern row)])
+        pages (vals (get-in root [:data :pages-index]))]
+    (t/is (some? root) "the root of the file is cached after a read")
+    (t/is (seq pages))
+    (t/is (every? #(not (pmap/loaded? %)) pages)
+          "a page read must not load the pointers held by the cached root")
+    ;; a second read still works from the unloaded root
+    (let [out (call! profile :get-mcp-page-tree {:file-id file-id :page-id page1})]
+      (t/is (nil? (:error out)))
+      (t/is (= page1 (:page-id (:result out)))))))
+
+(t/deftest fields-enum-follows-the-shape-schema
+  (let [{:keys [profile file-id page1 rect1]} (create-fixture)
+        shapes (call! profile :get-mcp-shapes {:file-id file-id
+                                               :page-id page1
+                                               :ids [rect1]
+                                               :fields [:svg-attrs :svg-viewbox :variant-name]})
+        tree   (call! profile :get-mcp-page-tree {:file-id file-id
+                                                  :page-id page1
+                                                  :fields [:svg-viewbox :variant-id]})]
+    (t/is (nil? (:error shapes)) "svg and variant attributes are listed")
+    (t/is (nil? (:error tree)) "the tree accepts the same attributes, minus the heavy ones")))
+
+;; --- REVIEW FIXES ROUND 2: FRESH PAGES AND STALE ROOTS
+
+(t/deftest pages-created-by-apply-operations-are-read
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        _    (call! profile :get-mcp-page-tree {:file-id file-id :page-id page1})
+        out  (call! profile :mcp-apply-operations
+                    {:file-id file-id
+                     :operations [{:op "create_page" :id "$tmp:new" :name "Fresh"}]}
+                    :perms #{"mcp:write"})
+        new-page (get-in out [:result :created-ids "$tmp:new"])
+        shapes   (call! profile :get-mcp-shapes {:file-id file-id
+                                                 :page-id new-page
+                                                 :ids [uuid/zero]})
+        tree     (call! profile :get-mcp-page-tree {:file-id file-id :page-id new-page})]
+    (t/is (nil? (:error out)))
+    (t/is (uuid? new-page))
+    (t/is (nil? (:error shapes)) "the page made by a write is found at once")
+    (t/is (nil? (:error tree)))
+    (t/is (= new-page (:page-id (:result tree))))))
+
+(t/deftest a-stale-cached-root-without-the-page-is-reloaded
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        _    (call! profile :get-mcp-page-tree {:file-id file-id :page-id page1})
+        row  (th/db-get :file {:id file-id})
+        key  [file-id (:revn row) (:vern row)]
+        root (cache/get @#'mcp/root-cache key)]
+    (t/is (some? root))
+    ;; a root of another file answers for this key: it has no pages
+    (cache/put @#'mcp/root-cache key (assoc-in root [:data :pages-index] {}))
+    (let [out (call! profile :get-mcp-page-tree {:file-id file-id :page-id page1})]
+      (t/is (nil? (:error out)))
+      (t/is (= page1 (:page-id (:result out)))))))
+
+;; --- NAMED FIELDS ARE ALWAYS PRESENT
+
+(t/deftest tree-returns-every-named-field-on-every-node
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        out   (call! profile :get-mcp-page-tree {:file-id file-id
+                                                 :page-id page1
+                                                 :depth 3
+                                                 :fields [:hidden :blocked :opacity
+                                                          :component-id]})
+        nodes (tree-seq (comp seq :children) :children (:root (:result out)))]
+    (t/is (nil? (:error out)))
+    (t/is (= 4 (count nodes)))
+    (doseq [node nodes]
+      (t/is (contains? node :hidden) (str "hidden on " (:id node)))
+      (t/is (contains? node :blocked) (str "blocked on " (:id node)))
+      (t/is (contains? node :opacity) (str "opacity on " (:id node)))
+      (t/is (contains? node :component-id) (str "component-id on " (:id node)))
+      (t/is (false? (:hidden node)))
+      (t/is (false? (:blocked node)))
+      (t/is (= 1 (:opacity node))))))
+
+(t/deftest tree-omits-the-attributes-nobody-named
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        out   (call! profile :get-mcp-page-tree {:file-id file-id
+                                                 :page-id page1
+                                                 :depth 3})
+        nodes (tree-seq (comp seq :children) :children (:root (:result out)))]
+    (t/is (seq nodes))
+    (doseq [node nodes]
+      (t/is (not (contains? node :opacity)) "the default tree does not name opacity")
+      (t/is (not (contains? node :fills))))))
+
+(t/deftest shapes-return-every-named-field
+  (let [{:keys [profile file-id page1 rect1]} (create-fixture)
+        shape (read-shape profile file-id page1 rect1
+                          :fields [:hidden :blocked :opacity :component-id])]
+    (t/is (false? (:hidden shape)))
+    (t/is (false? (:blocked shape)))
+    (t/is (= 1 (:opacity shape)))
+    (t/is (contains? shape :component-id) "an absent attribute named by the caller is nil")
+    (t/is (nil? (:component-id shape)))))

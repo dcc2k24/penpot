@@ -177,7 +177,11 @@
   "Profile and login-session identity used to bind one approval request."
   [request]
   (let [session (session/get-session request)]
-    (when-not (:profile-id session) (clients/invalid! "login_required" 401))
+    ;; A render session can never approve: it would grant scopes without
+    ;; the user seeing the consent page.
+    (when (or (not (:profile-id session))
+              (some? (get-in session [:props :mcp-render])))
+      (clients/invalid! "login_required" 401))
     {:profile-id (str (:profile-id session))
      :session-id (state/digest (str (:id session)))}))
 
@@ -187,12 +191,10 @@
   (str/join " " (sort scopes)))
 
 (defn- granted-scope
-  "Scopes the MCP token of the bound profile holds once the staged request is
-  approved: its current scopes plus the requested ones. The token is shared by
-  every client, so the consent page must show what it will end up with."
-  [cfg {:keys [profile-id]} value]
-  (scope-text (access-token/get-granted-mcp-scopes
-               cfg (uuid/parse profile-id) (str/split (:scope value) #" "))))
+  "Scopes this client gets once the staged request is approved. Each client
+  has its own token, so the consent page shows the requested scopes only."
+  [_cfg _binding value]
+  (scope-text (mcp-scope/effective-scopes (str/split (:scope value) #" "))))
 
 (defn- approval-request
   "Bind a pending request to its first authenticated session and return UI data.
@@ -246,17 +248,27 @@
     (let [result (if (= "deny" (:decision params))
                    {:error "access_denied"}
                    (let [scopes (str/split (normalize-scope (:scope value)) #" ")
-                         token  (db/tx-run! cfg access-token/grant-mcp-scopes
-                                            (uuid/parse (:profile-id value))
-                                            scopes)
-                         ;; Retain the token row ID, never the fixed token itself.
-                         code  (state/create! cfg :code
-                                              (-> value
-                                                  (dissoc :csrf :session-id :client-name
-                                                          :granted-scope)
-                                                  (assoc :token-id (str (:id token))))
-                                              120)]
-                     {:code code}))]
+                         token  (try
+                                  (db/tx-run! cfg access-token/grant-client-mcp-scopes
+                                              (uuid/parse (:profile-id value))
+                                              (:client-id value)
+                                              (:client-name value)
+                                              scopes)
+                                  (catch clojure.lang.ExceptionInfo cause
+                                    (if (= :mcp-client-limit (:code (ex-data cause)))
+                                      ::limit
+                                      (throw cause))))]
+                     (if (= ::limit token)
+                       {:error "access_denied"
+                        :error_description "too many connected clients for this account"}
+                       (let [;; Retain the token row ID, never the fixed token itself.
+                             code (state/create! cfg :code
+                                                 (-> value
+                                                     (dissoc :csrf :session-id :client-name
+                                                             :granted-scope)
+                                                     (assoc :token-id (str (:id token))))
+                                                 120)]
+                         {:code code}))))]
       (response {:redirect-uri (append-query (:redirect-uri value)
                                              (merge result {:state (:state value)
                                                             :iss (issuer)}))}))))
@@ -322,9 +334,11 @@
     (let [row (db/exec-one! (::db/pool cfg)
                             [(str "SELECT token, perms FROM access_token"
                                   " WHERE id = ? AND profile_id = ? AND type = 'mcp'"
+                                  " AND client_id = ?"
                                   " AND (expires_at IS NULL OR expires_at > now())")
                              (uuid/parse (:token-id value))
-                             (uuid/parse (:profile-id value))])]
+                             (uuid/parse (:profile-id value))
+                             (:client-id value)])]
       (when-not row (clients/invalid! "invalid_grant"))
       ;; The scope the token holds now, which can be wider than this approval's.
       (response {:access_token (:token row)

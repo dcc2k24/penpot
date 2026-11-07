@@ -21,15 +21,19 @@
    [backend-tests.storage-test :as stt]
    [clojure.string :as str]
    [clojure.test :as t]
-   [yetti.response :as-alias yres])
-  (:import
-   java.util.UUID))
+   [yetti.response :as-alias yres]))
 
 (t/use-fixtures :once (t/compose-fixtures
                        (partial th/init-config [:enable-access-tokens
-                                                :enable-client-header-check-middleware])
+                                                :enable-client-header-check-middleware
+                                                :enable-mcp-raw-changes])
                        th/init-system))
-(t/use-fixtures :each th/database-reset)
+(t/use-fixtures :each
+  th/database-reset
+  ;; Calls split into batches of 300 changes here, so 701
+  ;; creations make three commits. The 2000 bound is tested in
+  ;; the unit tests that set it.
+  (fn [f] (with-redefs-fn {#'mcp-write/notify-changes 300} f)))
 
 ;; --- HELPERS
 
@@ -165,13 +169,6 @@
    :x (* 10 (mod i 100)) :y (* 10 (quot i 100))
    :width 5 :height 5})
 
-(defn- session-id-of
-  "The session id the MCP commits of `request-id` carry when the request has
-  no token (see `session-id` in the command namespace)."
-  [request-id]
-  (UUID/nameUUIDFromBytes
-   (.getBytes ^String (str "penpot-mcp:" nil ":" request-id) "UTF-8")))
-
 (def ^:private svg-text
   "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\" viewBox=\"0 0 100 100\"><rect x=\"10\" y=\"10\" width=\"20\" height=\"20\" fill=\"red\"/><circle cx=\"60\" cy=\"60\" r=\"10\" fill=\"blue\"/></svg>")
 
@@ -217,11 +214,11 @@
     ;; The call's own rows are not echoed back, only counted when they come
     ;; from other sessions.
     (t/is (not (contains? (:result out) :lagged)))
-    (t/is (= 0 (:lagged-count (:result out))))
-    (t/is (= {:ok true} (:validation (:result out))))
-    (t/is (= 1 (count (filter #(and (= (session-id-of request) (:session-id %))
-                                    (nil? (:label %)))
-                              (file-changes file-id)))))))
+    (t/is (= {:ok true :checks ["affected" "schema"]}
+             (:validation (:result out))))
+    ;; A fresh file: the one change row of this call is the only one
+    ;; without a label.
+    (t/is (= 1 (count (filter (comp nil? :label) (file-changes file-id)))))))
 
 (t/deftest apply-changes-dry-run-leaves-revn
   (let [{:keys [profile file-id page-id]} (create-fixture)
@@ -234,10 +231,10 @@
                         :changes [(add-frame page-id board)]})]
     (t/is (nil? (:error out)))
     (t/is (true? (:dry-run (:result out))))
-    (t/is (= 0 (:lagged-count (:result out))))
     (t/is (= before (:revn (:result out))))
     (t/is (= before (revn file-id)))
-    (t/is (= {:ok true} (:validation (:result out))))
+    (t/is (= {:ok true :checks ["affected" "schema"]}
+             (:validation (:result out))))
     (t/is (= rows0 (change-rows file-id)))))
 
 (t/deftest apply-changes-refuses-change-types
@@ -375,7 +372,8 @@
     (t/is (= #{"$tmp:board" "$tmp:a" "$tmp:b"}
              (set (keys (:created-ids result)))))
     (t/is (every? uuid? (vals (:created-ids result))))
-    (t/is (= {"add-obj" 3 "mod-obj" 3} (:change-types result)))
+    ;; Three object creations and no reflow changes: the tree has no layout.
+    (t/is (= {"add-obj" 3} (:change-types result)))
     (t/is (= 1 (:commits result)))
     (t/is (= (revn file-id) (:revn result)))))
 

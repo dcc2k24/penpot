@@ -78,14 +78,26 @@
  :profile-plugin-ops/by-profile
  {:permits 1 :queue 2 :timeout 30000}
 
+ ;; One permit: the write path also takes mcp-update-file/by-profile, which
+ ;; has one permit, so one profile runs one agent write at a time anyway.
  :mcp-apply/by-profile
- {:permits 2 :queue 10 :timeout 60000}
+ {:permits 1 :queue 5 :timeout 60000}
 
+ ;; The root limits are shared with people, so MCP takes a small share.
  :mcp-apply/global
- {:permits 10 :queue 50 :timeout 60000}
+ {:permits 6 :queue 50 :timeout 60000}
+
+ ;; Agent writes have their own single permit per profile, so an agent
+ ;; write does not hold the owner's own save (update-file/by-profile).
+ :mcp-update-file/by-profile
+ {:permits 1 :queue 5 :timeout 60000}
 
  :mcp-read/by-profile
  {:permits 4 :queue 20 :timeout 30000}
 
  :mcp-read/global
- {:permits 16 :queue 64 :timeout 30000}}
+ {:permits 8 :queue 64 :timeout 30000}
+
+ ;; Search can use seconds of CPU, so each file gets two at a time.
+ :mcp-find/by-file
+ {:permits 2 :queue 10 :timeout 30000}}

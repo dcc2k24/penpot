@@ -315,6 +315,15 @@
  ;; ═══════════════════════════════════════════════
  ;; MCP (backend mode)
  ;; ═══════════════════════════════════════════════
+ ;; Bucket figures are capacity/refill/interval. The bucket script adds
+ ;; whole tokens each second, so a long interval refills nothing under
+ ;; steady use: keep the interval at a minute or less.
+ ;; Reads: 10 per second, the adapter limit per token (its own limiter
+ ;; allows 10 requests per second), so the backend never refuses a call the
+ ;; adapter lets through. Writes: 1 per second steady, 120 burst. A write
+ ;; can hold the file for up to 9.5 seconds, so the backend keeps the
+ ;; steady rate low on purpose. These buckets are per profile: every MCP
+ ;; client of one profile shares them.
  #{:main/mcp-whoami
    :main/get-mcp-file-outline
    :main/get-mcp-page-tree
@@ -323,12 +332,12 @@
    :main/get-mcp-library
    :main/get-mcp-tokens
    :main/create-mcp-render-session}
- [[:mcp-read :bucket "6000/3000/1h"]]
+ [[:mcp-read :bucket "1200/600/1m"]]
 
  #{:main/mcp-apply-changes
    :main/mcp-apply-operations
    :main/mcp-import-svg}
- [[:mcp-write :bucket "1200/600/1h"]]
+ [[:mcp-write :bucket "120/60/1m"]]
 
  #{:main/update-mcp-token-scopes}
  [[:access-token :bucket "60/30/1m"]]}

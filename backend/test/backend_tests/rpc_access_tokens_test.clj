@@ -6,18 +6,11 @@
 
 (ns backend-tests.rpc-access-tokens-test
   (:require
-   [app.common.time :as ct]
-   [app.common.uuid :as uuid]
    [app.db :as db]
-   [app.http :as http]
    [app.http.access-token :as actoken]
    [app.rpc :as-alias rpc]
-   [app.rpc.commands.access-token :as access-token]
-   [app.storage :as sto]
-   [app.tokens :as tokens]
    [backend-tests.helpers :as th]
-   [clojure.test :as t]
-   [mockery.core :refer [with-mocks]]))
+   [clojure.test :as t]))
 
 (t/use-fixtures :once th/state-init)
 (t/use-fixtures :each th/database-reset)
@@ -235,71 +228,3 @@
             decoded (actoken/decode-token cfg access-token)]
         (t/is (some? decoded))
         (t/is (= (:id prof) (:uid decoded)))))))
-
-(t/deftest oauth-mcp-token-provisioning
-  (let [prof (th/create-profile* 1 {:is-active true})
-        cfg th/*system*
-        provision #(db/tx-run! cfg access-token/ensure-mcp-access! (:id prof))]
-    (t/testing "approval enables MCP and creates a fixed token"
-      (let [token (provision)
-            props (-> (th/db-get :profile {:id (:id prof)})
-                      :props db/decode-transit-pgobject)]
-        (t/is (string? (:token token)))
-        (t/is (nil? (:expires-at token)))
-        (t/is (true? (:mcp-enabled props)))
-        (t/is (= token (provision)))))
-    (t/testing "approval preserves a token generated in settings"
-      (let [{:keys [result error]}
-            (th/command! {::th/type :create-access-token
-                          ::rpc/profile-id (:id prof)
-                          :type "mcp"
-                          :name "From settings"})]
-        (t/is (nil? error))
-        (t/is (= (:token result) (:token (provision))))))
-    (t/testing "approval replaces an expired token"
-      (db/exec! th/*pool* [(str "UPDATE access_token SET expires_at = now() - interval '1 day'"
-                                " WHERE profile_id = ?")
-                           (:id prof)])
-      (let [expired (first (db/query th/*pool* :access-token {:profile-id (:id prof) :type "mcp"}))
-            token   (provision)]
-        (t/is (not= (:token expired) (:token token)))
-        (t/is (nil? (:expires-at token)))
-        (t/is (= [(:id token)]
-                 (map :id (db/query th/*pool* :access-token {:profile-id (:id prof) :type "mcp"}))))))
-    (t/testing "approval replaces a token issued with the personal-token issuer"
-      (db/delete! th/*pool* :access-token {:profile-id (:id prof)})
-      (let [token-id (uuid/next)
-            now      (ct/now)
-            old      (tokens/generate cfg {:iss "access-token" :uid (:id prof)
-                                           :iat now :tid token-id})]
-        (db/tx-run! cfg (fn [{:keys [::db/conn]}]
-                          (db/insert! conn :access-token
-                                      {:id token-id :name "MCP" :token old :type "mcp"
-                                       :profile-id (:id prof) :created-at now :updated-at now
-                                       :perms (db/create-array conn "text" [])})))
-        (let [token (provision)]
-          (t/is (not= old (:token token)))
-          (t/is (= actoken/mcp-token-issuer
-                   (:iss (actoken/decode-token cfg (:token token)))))
-          (t/is (= [(:id token)]
-                   (map :id (db/query th/*pool* :access-token
-                                      {:profile-id (:id prof) :type "mcp"})))))))
-    (t/testing "approval replaces a token this instance cannot decrypt"
-      (db/delete! th/*pool* :access-token {:profile-id (:id prof)})
-      (let [now (ct/now)]
-        (db/tx-run! cfg (fn [{:keys [::db/conn]}]
-                          (db/insert! conn :access-token
-                                      {:id (uuid/next) :name "MCP" :token "not-a-jwe" :type "mcp"
-                                       :profile-id (:id prof) :created-at now :updated-at now
-                                       :perms (db/create-array conn "text" [])})))
-        (let [token (provision)]
-          (t/is (not= "not-a-jwe" (:token token)))
-          (t/is (= [(:id token)]
-                   (map :id (db/query th/*pool* :access-token
-                                      {:profile-id (:id prof) :type "mcp"})))))))
-    (t/testing "concurrent approvals share one token"
-      (db/delete! th/*pool* :access-token {:profile-id (:id prof)})
-      (let [results (mapv deref (repeatedly 4 #(future (provision))))]
-        (t/is (= 1 (count (set (map :token results)))))
-        (t/is (= 1 (count (db/query th/*pool* :access-token
-                                    {:profile-id (:id prof) :type "mcp"}))))))))

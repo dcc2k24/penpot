@@ -266,16 +266,19 @@
 ;; POINTER-MAP
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defn load-pointer
-  "A database loader pointer helper"
-  [cfg file-id id]
-  (let [fragment (some-> (db/get* cfg :file-data
-                                  {:id id :file-id file-id :type "fragment"}
-                                  {::sql/columns [:data :backend :id :metadata]})
-                         (update :metadata decode-metadata))]
+(def ^:private sql:fragment-of-files
+  "select f.data, f.backend, f.id, f.metadata
+     from file_data as f
+    where f.id = ?
+      and f.type = 'fragment'
+      and f.file_id = any(?)")
 
+(defn- decode-fragment
+  "The data of `fragment`, a row of the file data table. Raises
+  `:fragment-not-found` for a missing row."
+  [cfg where id fragment]
+  (let [fragment (some-> fragment (update :metadata decode-metadata))]
     (l/trc :hint "load pointer"
-           :file-id (str file-id)
            :id (str id)
            :found (some? fragment))
 
@@ -283,12 +286,32 @@
       (ex/raise :type :internal
                 :code :fragment-not-found
                 :hint "fragment not found"
-                :file-id file-id
-                :fragment-id id))
+                :fragment-id id
+                ;; `where` names the files searched: :file-id or :file-ids.
+                :file-id (:file-id where)
+                :file-ids (:file-ids where)))
 
     (-> (resolve-file-data cfg fragment)
         (get :data)
         (blob/decode))))
+
+(defn load-pointer
+  "A database loader pointer helper. The fragment must belong to `file-id`."
+  [cfg file-id id]
+  (decode-fragment cfg {:file-id file-id} id
+                   (db/get* cfg :file-data
+                            {:id id :file-id file-id :type "fragment"}
+                            {::sql/columns [:data :backend :id :metadata]})))
+
+(defn load-pointer-of-files
+  "A loader for the pointers of a file and of its libraries: `file-ids`
+  names every file the pointer may belong to. The lookup names those
+  files, so Postgres reads only their partitions."
+  [cfg file-ids id]
+  (let [conn     (::db/conn cfg)
+        fragment (db/exec-one! conn [sql:fragment-of-files id
+                                     (db/create-array conn "uuid" (vec file-ids))])]
+    (decode-fragment cfg {:file-ids (vec file-ids)} id fragment)))
 
 (defn persist-pointers!
   "Persist all currently tracked pointer objects"

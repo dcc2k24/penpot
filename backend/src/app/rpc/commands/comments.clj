@@ -333,9 +333,7 @@
   (get-comment-threads-sql "AND ct.file_id = ? AND ct.id = ?"))
 
 (sv/defmethod ::get-comment-thread
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:read"
-   ::doc/added "1.15"
+  {::doc/added "1.15"
    ::sm/params schema:get-comment-thread}
   [cfg {:keys [::rpc/profile-id file-id id share-id] :as params}]
   (db/run! cfg (fn [{:keys [::db/conn] :as cfg}]
@@ -564,9 +562,7 @@
    [:share-id {:optional true} [:maybe ::sm/uuid]]])
 
 (sv/defmethod ::update-comment-thread-status
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:write"
-   ::doc/added "1.15"
+  {::doc/added "1.15"
    ::sm/params schema:update-comment-thread-status
    ::db/transaction true}
   [{:keys [::db/conn] :as cfg} {:keys [::rpc/profile-id id share-id]}]
@@ -682,9 +678,7 @@
 ;; TODO: Check if there are new mentions, if there are send the new emails.
 
 (sv/defmethod ::update-comment
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:write"
-   ::doc/added "1.15"
+  {::doc/added "1.15"
    ::sm/params schema:update-comment
    ::db/transaction true}
   [{:keys [::db/conn] :as cfg} {:keys [::rpc/profile-id ::rpc/request-at id share-id content mentions]}]
@@ -729,7 +723,7 @@
 
 (sv/defmethod ::delete-comment-thread
   {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:write"
+   ::rpc/mcp-scope "mcp:delete"
    ::doc/added "1.15"
    ::sm/params schema:delete-comment-thread
    ::db/transaction true}
@@ -754,7 +748,7 @@
 
 (sv/defmethod ::delete-comment
   {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:write"
+   ::rpc/mcp-scope "mcp:delete"
    ::doc/added "1.15"
    ::sm/params schema:delete-comment
    ::db/transaction true}
@@ -811,9 +805,7 @@
    [:share-id {:optional true} [:maybe ::sm/uuid]]])
 
 (sv/defmethod ::update-comment-thread-frame
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:write"
-   ::doc/added "1.15"
+  {::doc/added "1.15"
    ::sm/params schema:update-comment-thread-frame
    ::db/transaction true}
   [{:keys [::db/conn] :as cfg} {:keys [::rpc/profile-id ::rpc/request-at id frame-id share-id]}]

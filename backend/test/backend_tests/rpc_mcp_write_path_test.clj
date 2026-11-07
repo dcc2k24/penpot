@@ -23,6 +23,7 @@
    [app.msgbus :as mbus]
    [app.rpc :as-alias rpc]
    [app.rpc.commands.files-update :as files-update]
+   [app.rpc.commands.mcp-limits :as mcp-limits]
    [app.rpc.commands.mcp-write :as mcp-write]
    [app.util.pointer-map :as pmap]
    [backend-tests.helpers :as th]
@@ -30,9 +31,15 @@
 
 (t/use-fixtures :once (t/compose-fixtures
                        (partial th/init-config [:enable-access-tokens
-                                                :enable-client-header-check-middleware])
+                                                :enable-client-header-check-middleware
+                                                :enable-mcp-raw-changes])
                        th/init-system))
-(t/use-fixtures :each th/database-reset)
+(t/use-fixtures :each
+  th/database-reset
+  ;; Small calls split into batches of 300 changes, so the split
+  ;; tests need no 2000 operations. The 2000 bound is tested in
+  ;; the unit tests that set it.
+  (fn [f] (with-redefs-fn {#'mcp-write/notify-changes 300} f)))
 
 ;; --- HELPERS
 
@@ -155,17 +162,17 @@
         rows0  (change-rows file-id)
         pubs   (atom [])
         calls  (atom 0)
-        orig   files-update/update-file!
+        orig   files-update/apply-batch!
         ;; One board and 301 rects: 302 object creations, so two batches.
         ops    (into [(op-board page-id)]
                      (map #(op-rect page-id (str "$tmp:r" %) %))
                      (range 301))
         out    (with-redefs [mbus/pub! (fn [& args] (swap! pubs conj args))
-                             files-update/update-file!
-                             (fn [cfg params]
+                             files-update/apply-batch!
+                             (fn [ctx changes opts]
                                ;; The first batch runs for real, the second fails.
                                (if (= 1 (swap! calls inc))
-                                 (orig cfg params)
+                                 (orig ctx changes opts)
                                  (ex/raise :type :validation
                                            :code :boom-second-batch
                                            :hint "boom")))]
@@ -181,14 +188,14 @@
 (t/deftest error-path-keeps-the-original-error
   (let [{:keys [profile file-id page-id]} (create-fixture)
         ;; Aborts the PostgreSQL transaction, then raises a Penpot error.
-        fake (fn [cfg _params]
+        fake (fn [ctx _changes _opts]
                (try
-                 (db/exec! (::db/conn cfg) ["select 1/0"])
+                 (db/exec! (::db/conn (:cfg ctx)) ["select 1/0"])
                  (catch Throwable _ nil))
                (ex/raise :type :validation
                          :code :fake-batch-failure
                          :hint "fake"))
-        out  (with-redefs [files-update/update-file! fake]
+        out  (with-redefs [files-update/apply-batch! fake]
                (call! profile :mcp-apply-operations
                       {:file-id file-id
                        :operations [(op-board page-id)
@@ -220,25 +227,34 @@
           counts))
 
 (t/deftest split-batches-keep-operations-whole
-  (let [split (fn [counts reflow]
-                (let [{:keys [changes ranges]} (ops-changes counts)]
-                  (#'mcp-write/split-batches
-                   (into changes (repeat reflow {:type :mod-obj}))
-                   ranges)))
-        spans (fn [batches] (mapv (juxt :first-op :last-op) batches))
-        big   (split [150 200 350] 0)
-        fits  (split [100 100 100] 0)
-        exact (split [300 1] 0)
-        tail  (split [150 200 350] 5)
-        fits-tail (split [100 100 100] 5)]
-    (t/is (= [[0 0] [1 1] [2 2]] (spans big)))
-    (t/is (= [[0 2]] (spans fits)))
-    (t/is (= [[0 0] [1 1]] (spans exact)))
-    (t/is (= [[0 0] [1 1] [2 2]] (spans tail)))
-    (t/is (= 355 (count (:changes (last tail)))))
-    (t/is (= (repeat 5 :mod-obj) (map :type (take-last 5 (:changes (last tail))))))
-    (t/is (= [[0 2]] (spans fits-tail)))
-    (t/is (= 305 (count (:changes (first fits-tail)))))))
+  ;; The real bound: a batch holds at most 2000 changes of any kind.
+  (with-redefs-fn {#'mcp-write/notify-changes 2000}
+    (fn []
+      (let [split (fn [counts reflow]
+                    (let [{:keys [changes ranges]} (ops-changes counts)]
+                      (#'mcp-write/split-batches
+                       (into changes (repeat reflow {:type :mod-obj}))
+                       ranges)))
+            spans (fn [batches] (mapv (juxt :first-op :last-op) batches))
+            big   (split [1500 600 900] 0)
+            fits  (split [600 600 700] 0)
+            exact (split [2000 1] 0)
+            oversize (split [2500 10] 0)
+            tail  (split [1500 600 900] 5)
+            fits-tail (split [600 600 700] 5)]
+        ;; 1500 + 600 is over the bound, so 600 starts a batch.
+        (t/is (= [[0 0] [1 2]] (spans big)))
+        (t/is (= [[0 2]] (spans fits)))
+        (t/is (= [[0 0] [1 1]] (spans exact)))
+        ;; An operation over the bound gets a batch of its own.
+        (t/is (= [[0 0] [1 1]] (spans oversize)))
+        (t/is (= 2500 (count (:changes (first oversize)))))
+        ;; The reflow goes into the last batch.
+        (t/is (= [[0 0] [1 2]] (spans tail)))
+        (t/is (= 1505 (count (:changes (last tail)))))
+        (t/is (= (repeat 5 :mod-obj) (map :type (take-last 5 (:changes (last tail))))))
+        (t/is (= [[0 2]] (spans fits-tail)))
+        (t/is (= 1905 (count (:changes (first fits-tail)))))))))
 
 (t/deftest allow-split-commits-whole-operations
   (let [{:keys [profile file-id page-id]} (create-fixture)
@@ -279,16 +295,16 @@
   (let [{:keys [profile file-id page-id]} (create-fixture)
         before (revn file-id)
         calls  (atom 0)
-        orig   files-update/update-file!
+        orig   files-update/apply-batch!
         ;; Board is op 0, rect i is op i + 1. The first batch holds ops 0
         ;; to 299 (300 creations), the second ops 300 and 301.
         ops    (into [(op-board page-id)]
                      (map #(op-rect page-id (str "$tmp:r" %) %))
                      (range 301))
-        out    (with-redefs [files-update/update-file!
-                             (fn [cfg params]
+        out    (with-redefs [files-update/apply-batch!
+                             (fn [ctx changes opts]
                                (if (= 1 (swap! calls inc))
-                                 (orig cfg params)
+                                 (orig ctx changes opts)
                                  (ex/raise :type :validation
                                            :code :boom-second-batch
                                            :hint "boom")))]
@@ -300,7 +316,7 @@
     (t/is (= :boom-second-batch (:code data)))
     (t/is (= 300 (:failed-operation-index data)))
     (t/is (= 301 (:failed-operation-last-index data)))
-    (t/is (= before (:last-committed-revn data)))
+    (t/is (= before (:revn-before-call data)))
     (t/is (= before (revn file-id)))))
 
 (t/deftest invalid-operation-fails-with-its-index
@@ -344,7 +360,6 @@
                       :base-revn (revn file-id)
                       :changes [(add-rect page-id (uuid/next) board)]})]
     (t/is (nil? (:error out)))
-    (t/is (= 0 (:lagged-count (:result out))))
     (t/is (not (:lagged-truncated (:result out))))))
 
 (t/deftest undecodable-lag-row-does-not-fail-the-write
@@ -429,14 +444,16 @@
 (t/deftest compiled-change-cap-refuses-before-write
   (let [{:keys [profile file-id page-id]} (create-fixture)
         before (revn file-id)
+        ;; Four object creations: more than the cap of three.
         ops    [(op-board page-id)
                 (op-rect page-id "$tmp:a" 1)
-                (op-rect page-id "$tmp:b" 2)]
-        out    (with-redefs-fn {#'mcp-write/max-compiled-changes (fn [] 3)}
+                (op-rect page-id "$tmp:b" 2)
+                (op-rect page-id "$tmp:c" 3)]
+        out    (with-redefs-fn {#'mcp-limits/max-compiled-changes (fn [] 3)}
                  (fn []
                    (call! profile :mcp-apply-operations
                           {:file-id file-id :operations ops})))
-        dry    (with-redefs-fn {#'mcp-write/max-compiled-changes (fn [] 3)}
+        dry    (with-redefs-fn {#'mcp-limits/max-compiled-changes (fn [] 3)}
                  (fn []
                    (call! profile :mcp-apply-operations
                           {:file-id file-id :dry-run true :operations ops})))]
@@ -554,18 +571,21 @@
         [page1 page2 page3] pages
         fragments (page-pointer-ids file-id)
         loads     (atom [])
-        load-orig fdata/load-pointer
+        load-orig fdata/load-pointer-of-files
         ;; The test config snapshots every revn, and a snapshot loads
         ;; every page by design, so the automatic snapshot is off here.
         out       (with-redefs [cf/flags (disj cf/flags :auto-file-snapshot)
-                                fdata/load-pointer
-                                (fn [cfg file-id id]
+                                fdata/load-pointer-of-files
+                                (fn [cfg file-ids id]
                                   (swap! loads conj id)
-                                  (load-orig cfg file-id id))]
-                    (call! profile :mcp-apply-changes
+                                  (load-orig cfg file-ids id))]
+                    ;; An operation, not raw changes: raw changes force the
+                    ;; schema check, which reads every page of the file.
+                    (call! profile :mcp-apply-operations
                            {:file-id file-id
                             :snapshot false
-                            :changes [(rename-shape page1 (first rects) "Renamed")]}))
+                            :operations [{:op "update_shape" :page-id page1
+                                          :id (first rects) :props {:x 50}}]}))
         loaded    (into #{} (keep fragments) @loads)]
     (t/is (= 3 (count fragments)))
     (t/is (nil? (:error out)))

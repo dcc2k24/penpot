@@ -219,21 +219,60 @@
     (t/is (= before (stored-revn file-id)))
     (t/is (empty? (filter (comp mcp-label? :label) (all-snapshot-rows file-id))))))
 
+(defn- read-changed
+  "The `read-changed-shapes` result for commits after `since`, leaving out
+  the rows of `session` (nil leaves out none)."
+  [file-id since session]
+  (db/tx-run! th/*system*
+              (fn [cfg]
+                (files-update/read-changed-shapes (::db/conn cfg) file-id since
+                                                  (stored-revn file-id) session))))
+
 (t/deftest changed-shape-ids-since-a-revn
   (let [ctx     (setup-file)
+        file-id (:file-id ctx)
         shape-a (uuid/next)
         shape-b (uuid/next)
-        before  (stored-revn (:file-id ctx))]
+        before  (stored-revn file-id)
+        own     (uuid/random)]
 
     ;; an earlier commit, with a revn before it
     (commit! ctx before [(add-rect (:page-id ctx) shape-a)])
 
-    (let [out (commit! ctx (stored-revn (:file-id ctx))
-                       [(add-rect (:page-id ctx) shape-b)]
-                       ::files-update/changed-shape-ids-since before)
-          ids (:changed-shape-ids out)]
+    ;; the call's own commit, with its own session id
+    (commit! ctx (stored-revn file-id) [(add-rect (:page-id ctx) shape-b)]
+             :session-id own)
+
+    (let [out (read-changed file-id before own)]
       ;; the earlier commit's shape is in the result
-      (t/is (contains? ids shape-a))
-      ;; the shape added by this call's own commit is not
-      (t/is (not (contains? ids shape-b)))
-      (t/is (= #{shape-a} ids)))))
+      (t/is (= #{shape-a} (:shape-ids out)))
+      ;; the shape of the own session is left out
+      (t/is (not (contains? (:shape-ids out) shape-b)))
+      (t/is (false? (:truncated? out))))))
+
+(t/deftest changed-shape-ids-truncated-when-a-commit-is-missing
+  (let [ctx     (setup-file)
+        file-id (:file-id ctx)
+        before  (stored-revn file-id)]
+    (commit! ctx before [(add-rect (:page-id ctx) (uuid/next))])
+    (commit! ctx (stored-revn file-id) [(add-rect (:page-id ctx) (uuid/next))])
+    (commit! ctx (stored-revn file-id) [(add-rect (:page-id ctx) (uuid/next))])
+
+    (t/is (false? (:truncated? (read-changed file-id before nil))))
+
+    ;; Remove the change row of the middle commit, as an expired row would be.
+    (let [rows   (sort-by :revn (filter :changes (th/db-query :file-change {:file-id file-id})))
+          middle (second rows)]
+      (th/db-delete! :file-change {:id (:id middle)})
+      (t/is (true? (:truncated? (read-changed file-id before nil)))))))
+
+(t/deftest changed-shape-ids-truncated-by-the-byte-budget
+  (let [ctx     (setup-file)
+        file-id (:file-id ctx)
+        before  (stored-revn file-id)]
+    (commit! ctx before [(add-rect (:page-id ctx) (uuid/next))])
+    (commit! ctx (stored-revn file-id) [(add-rect (:page-id ctx) (uuid/next))])
+
+    (t/is (false? (:truncated? (read-changed file-id before nil))))
+    (with-redefs [files-update/changed-bytes-limit 1]
+      (t/is (true? (:truncated? (read-changed file-id before nil)))))))

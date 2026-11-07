@@ -270,15 +270,67 @@
        (ct/inst? created-at)
        (pos? (compare (ct/now) (ct/plus created-at mcp-render-max-age)))))
 
+(def ^:private sql:live-access-token
+  "The token row, when it is still usable: not deleted and not expired."
+  "SELECT id FROM access_token
+    WHERE id = ?
+      AND (expires_at IS NULL OR expires_at > now())")
+
+(defn- mcp-disabled-for-render?
+  "Whether `session` is an MCP render session whose profile has MCP turned
+  off since it was minted. The render session lives up to its age, so the
+  profile setting is read on every use. Fails closed without a pool or a
+  profile row. Other sessions are not checked."
+  [pool {:keys [profile-id props]}]
+  (boolean
+   (and (some? (:mcp-render props))
+        (or (nil? pool)
+            (let [row (db/exec-one! pool ["select props from profile where id = ?"
+                                          profile-id])]
+              (if (nil? row)
+                true
+                (let [profile-props (:props row)
+                      profile-props (cond-> profile-props
+                                      (db/pgobject? profile-props "jsonb")
+                                      (db/decode-transit-pgobject))]
+                  (false? (:mcp-enabled profile-props)))))))))
+
+(defn- mcp-render-token-revoked?
+  "Whether `session` is an MCP render session that must not authenticate
+  because its access token is gone or expired. The render session outlives
+  the token that minted it by up to its age, so the token is checked on
+  every use. A render session without a `:token-id` prop fails closed too.
+  Without a pool the check fails closed as well."
+  [pool {:keys [props]}]
+  (let [token-id (:token-id props)]
+    (boolean
+     (and (some? (:mcp-render props))
+          (or (nil? pool)
+              (nil? token-id)
+              (nil? (db/exec-one! pool [sql:live-access-token token-id])))))))
+
 (defn- read-live-session
   "The session `sid` names when it may authenticate, or nil. Idle-expired
-  sessions, and MCP render sessions past their absolute age, authenticate
-  like missing ones. The GC deletes the rows later."
-  [manager sid]
+  sessions, MCP render sessions past their absolute age and render
+  sessions whose token is gone authenticate like missing ones. The GC
+  deletes the rows later."
+  [manager pool sid]
   (let [session (some->> sid (read-session manager))]
     (when-not (or (session-expired? session)
-                  (mcp-render-expired? session))
+                  (mcp-render-expired? session)
+                  (mcp-render-token-revoked? pool session)
+                  (mcp-disabled-for-render? pool session))
       session)))
+
+(defn- visible-session
+  "The session a route may see. An MCP render session is seen only by the
+  routes that opt in with `::allow-restricted`. Every other route sees no
+  session, so the render session authenticates as nobody there."
+  [session allow-restricted?]
+  (if (and (some? (get-in session [:props :mcp-render]))
+           (not allow-restricted?))
+    nil
+    session))
 
 (defn- assoc-session
   "Puts the session and its MCP render restriction, when it has one, on
@@ -294,14 +346,17 @@
       (assoc ::restriction restriction))))
 
 (defn- wrap-authz
-  [handler {:keys [::manager] :as cfg}]
+  [handler {:keys [::manager ::db/pool ::allow-restricted] :as cfg}]
   (assert (manager? manager) "expected valid session manager")
   (fn [request]
     (let [{:keys [type claims]} (get request ::http/auth-data)]
       (cond
         (= type :cookie)
-        (let [session     (read-live-session manager (:sid claims))
-              restriction (get-in session [:props :mcp-render])
+        (let [live        (read-live-session manager pool (:sid claims))
+              ;; The restriction is read before the visibility check, so
+              ;; a render session that is hidden is still never renewed.
+              restriction (get-in live [:props :mcp-render])
+              session     (visible-session live allow-restricted)
               request     (assoc-session request session)
 
               response
@@ -318,7 +373,8 @@
             response))
 
         (= type :bearer)
-        (handler (assoc-session request (read-live-session manager (:sid claims))))
+        (let [live (read-live-session manager pool (:sid claims))]
+          (handler (assoc-session request (visible-session live allow-restricted))))
 
         :else
         (handler request)))))
@@ -379,19 +435,26 @@
                ::tasks/max-age-absolute max-age-absolute}
               (d/without-nils v))}))
 
+;; Render rows are matched by their props key. The props column is jsonb
+;; and transit keys carry a "~:" prefix. `jsonb_exists` is used because a
+;; bare `?` would clash with the JDBC placeholders.
 (def ^:private
   sql:delete-expired-v2
   "DELETE FROM http_session_v2
     WHERE modified_at < ?::timestamptz
-       OR created_at  < ?::timestamptz")
+       OR created_at  < ?::timestamptz
+       OR (jsonb_exists(props, '~:mcp-render')
+           AND created_at < ?::timestamptz)")
 
 (defn- collect-expired-tasks
   [{:keys [::db/conn ::tasks/max-age ::tasks/max-age-absolute]}]
-  (let [idle-threshold (ct/minus (ct/now) max-age)
-        abs-threshold  (ct/minus (ct/now) max-age-absolute)
-        result         (-> (db/exec-one! conn [sql:delete-expired-v2
-                                               idle-threshold abs-threshold])
-                           (db/get-update-count))]
+  (let [idle-threshold   (ct/minus (ct/now) max-age)
+        abs-threshold    (ct/minus (ct/now) max-age-absolute)
+        render-threshold (ct/minus (ct/now) mcp-render-max-age)
+        result           (-> (db/exec-one! conn [sql:delete-expired-v2
+                                                 idle-threshold abs-threshold
+                                                 render-threshold])
+                             (db/get-update-count))]
     (l/dbg :task "gc"
            :hint "clean http sessions"
            :deleted result)

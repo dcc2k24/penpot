@@ -177,12 +177,13 @@
 
 (t/deftest confidential-client-exchange
   (let [profile  (th/create-profile* 1 {:is-active true})
-        stored   (db/tx-run! th/*system* access-token/ensure-mcp-access! (:id profile))
         verifier (apply str (repeat 43 "a"))]
     (doseq [method ["client_secret_basic" "client_secret_post"]]
       (let [client (clients/register! th/*system*
                                       {:redirect_uris ["https://example.com/callback"]
                                        :token_endpoint_auth_method method})
+            stored (db/tx-run! th/*system* access-token/grant-client-mcp-scopes
+                               (:id profile) (:client_id client) "client" ["mcp:read"])
             code   (state/create! th/*system* :code
                                   {:client-id (:client_id client)
                                    :redirect-uri "https://example.com/callback"
@@ -209,10 +210,11 @@
 
 (t/deftest exchange-rejects-expired-token
   (let [profile  (th/create-profile* 1 {:is-active true})
-        stored   (db/tx-run! th/*system* access-token/ensure-mcp-access! (:id profile))
         verifier (apply str (repeat 43 "a"))
         client   (clients/register! th/*system* {:redirect_uris ["https://example.com/callback"]
                                                  :token_endpoint_auth_method "none"})
+        stored   (db/tx-run! th/*system* access-token/grant-client-mcp-scopes
+                             (:id profile) (:client_id client) "client" ["mcp:read"])
         code     (state/create! th/*system* :code
                                 {:client-id (:client_id client)
                                  :redirect-uri "https://example.com/callback"
@@ -319,7 +321,12 @@
                                 :resource (oauth/resource)
                                 :code_verifier (apply str (repeat 43 "a"))}))))
 
-(t/deftest approvals-accumulate-scopes-on-the-shared-token
+(defn- client-row
+  [profile client]
+  (first (filter #(= (:client_id client) (:client-id %))
+                 (db/query th/*pool* :access-token {:profile-id (:id profile) :type "mcp"}))))
+
+(t/deftest approvals-do-not-change-other-clients-tokens
   (let [profile  (th/create-profile* 1 {:is-active true})
         cookies  (login-cookie profile)
         client-a (clients/register! th/*system* {:redirect_uris ["https://a.example/callback"]
@@ -331,17 +338,31 @@
         consent  (body (request "/api/mcp/oauth/request" :query (form {:request handle-b})
                                 :cookies cookies))
         token-b  (approve! cookies client-b handle-b)
-        ;; Overlapping request: the write scope is already on the token.
-        token-a  (approve! cookies client-a (begin client-a "mcp:write"))
-        stored   (first (db/query th/*pool* :access-token {:profile-id (:id profile) :type "mcp"}))
-        perms    (db/decode-pgarray (:perms stored) [])]
+        perms-a  (db/decode-pgarray (:perms (client-row profile client-a)) [])]
+    ;; The consent page shows what this client gets, not the other clients'.
     (t/is (= "mcp:read" (:scope consent)))
-    (t/is (= "mcp:read mcp:write" (:granted-scope consent)))
+    (t/is (= "mcp:read" (:granted-scope consent)))
     (t/is (= 200 (::yres/status token-b)))
-    (t/is (= "mcp:read mcp:write" (:scope (body token-b))))
-    (t/is (= "mcp:read mcp:write" (:scope (body token-a))))
-    (t/is (= (count perms) (count (distinct perms))))
-    (t/is (contains? (set perms) "mcp:write"))))
+    (t/is (= "mcp:read" (:scope (body token-b))))
+    ;; Client A keeps the write scope it was approved with.
+    (t/is (contains? (set perms-a) "mcp:write"))
+    (t/is (= 2 (count (db/query th/*pool* :access-token {:profile-id (:id profile) :type "mcp"}))))))
+
+(t/deftest re-approval-narrows-only-that-clients-token
+  (let [profile  (th/create-profile* 1 {:is-active true})
+        cookies  (login-cookie profile)
+        client-a (clients/register! th/*system* {:redirect_uris ["https://a.example/callback"]
+                                                 :token_endpoint_auth_method "none"})
+        client-b (clients/register! th/*system* {:redirect_uris ["https://b.example/callback"]
+                                                 :token_endpoint_auth_method "none"})
+        _        (approve! cookies client-a (begin client-a "mcp:write"))
+        _        (approve! cookies client-b (begin client-b "mcp:write"))
+        token-a  (approve! cookies client-a (begin client-a "mcp"))
+        perms-a  (db/decode-pgarray (:perms (client-row profile client-a)) [])
+        perms-b  (db/decode-pgarray (:perms (client-row profile client-b)) [])]
+    (t/is (= "mcp:read" (:scope (body token-a))))
+    (t/is (= ["mcp:read"] (vec (filter #(str/starts-with? % "mcp:") perms-a))))
+    (t/is (contains? (set perms-b) "mcp:write"))))
 
 (t/deftest update-mcp-token-scopes-requires-session
   (let [profile (th/create-profile* 1 {:is-active true})
@@ -351,3 +372,31 @@
                               ::rpc/token-perms #{}
                               :scopes ["mcp:write"]})]
     (t/is (= :session-required (:code (ex-data (:error out)))))))
+
+(t/deftest exchange-refuses-another-clients-token
+  ;; The code names client B, but its token id is client A's row.
+  (let [profile  (th/create-profile* 1 {:is-active true})
+        verifier (apply str (repeat 43 "a"))
+        client-a (clients/register! th/*system* {:redirect_uris ["https://a.example/callback"]
+                                                 :token_endpoint_auth_method "none"})
+        client-b (clients/register! th/*system* {:redirect_uris ["https://b.example/callback"]
+                                                 :token_endpoint_auth_method "none"})
+        row-a    (db/tx-run! th/*system* access-token/grant-client-mcp-scopes
+                             (:id profile) (:client_id client-a) "A" ["mcp:read"])
+        _        (db/tx-run! th/*system* access-token/grant-client-mcp-scopes
+                             (:id profile) (:client_id client-b) "B" ["mcp:read"])
+        code     (state/create! th/*system* :code
+                                {:client-id (:client_id client-b)
+                                 :redirect-uri "https://b.example/callback"
+                                 :resource (oauth/resource)
+                                 :challenge (state/digest verifier)
+                                 :profile-id (str (:id profile))
+                                 :token-id (str (:id row-a))}
+                                120)
+        reply    (request "/api/mcp/oauth/token" :method :post
+                          :headers {"content-type" "application/x-www-form-urlencoded"}
+                          :body-bytes (form {:grant_type "authorization_code" :code code
+                                             :client_id (:client_id client-b) :code_verifier verifier
+                                             :redirect_uri "https://b.example/callback"}))]
+    (t/is (= 400 (::yres/status reply)))
+    (t/is (= "invalid_grant" (:error (body reply))))))

@@ -34,6 +34,9 @@
 
 (sv/defmethod ::send-mcp-feedback
   {::rpc/token-type "mcp"
+   ::rpc/mcp-scope "mcp:read"
+   ;; The one MCP command that stays reachable with backend MCP mode off.
+   ::rpc/mcp-bridge true
    ::db/transaction true
    ::doc/added "2.20"
    ::sm/params schema:send-mcp-feedback}

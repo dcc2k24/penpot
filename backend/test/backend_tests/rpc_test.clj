@@ -10,6 +10,7 @@
    [app.common.schema :as sm]
    [app.common.time :as ct]
    [app.common.uuid :as uuid]
+   [app.config :as cf]
    [app.http :as http]
    [app.http.access-token :as actoken]
    [app.http.session :as session]
@@ -905,23 +906,25 @@
 ;; --- TOKEN TYPE RESTRICTIONS
 
 (t/deftest mcp-token-authentication
-  (let [pid     (uuid/custom 1 1)
-        method  (fn [mdata]
-                  (rpc/make-rpc-handler
-                   {:test-method [mdata (partial (#'rpc/wrap-authentication
-                                                  nil (fn [_ params] params) mdata)
-                                                 nil)]}))
-        handler (method {::rpc/auth-type :token ::rpc/token-type "mcp"})]
-    (doseq [extras [{::session/profile-id pid}
-                    {::actoken/profile-id pid}
-                    {::actoken/profile-id pid ::actoken/type "personal"}]]
-      (t/is (th/ex-of-code? (call-ex handler {:extras extras}) :token-auth-required)))
-    (let [extras {::actoken/profile-id pid ::actoken/type "mcp"}]
-      (t/is (= "mcp" (::rpc/token-type (call-body handler {:extras extras}))))
-      (t/is (th/ex-of-code? (call-ex (method {}) {:extras extras}) :token-auth-required)))
-    (t/is (= pid (::rpc/profile-id
-                  (call-body (method {}) {:extras {::actoken/profile-id pid
-                                                   ::actoken/type "personal"}}))))))
+  ;; These are token-type rules, so backend MCP mode is on for them.
+  (with-redefs [cf/flags (conj cf/flags :mcp-backend)]
+    (let [pid     (uuid/custom 1 1)
+          method  (fn [mdata]
+                    (rpc/make-rpc-handler
+                     {:test-method [mdata (partial (#'rpc/wrap-authentication
+                                                    nil (fn [_ params] params) mdata)
+                                                   nil)]}))
+          handler (method {::rpc/auth-type :token ::rpc/token-type "mcp"})]
+      (doseq [extras [{::session/profile-id pid}
+                      {::actoken/profile-id pid}
+                      {::actoken/profile-id pid ::actoken/type "personal"}]]
+        (t/is (th/ex-of-code? (call-ex handler {:extras extras}) :token-auth-required)))
+      (let [extras {::actoken/profile-id pid ::actoken/type "mcp"}]
+        (t/is (= "mcp" (::rpc/token-type (call-body handler {:extras extras}))))
+        (t/is (th/ex-of-code? (call-ex (method {}) {:extras extras}) :token-auth-required)))
+      (t/is (= pid (::rpc/profile-id
+                    (call-body (method {}) {:extras {::actoken/profile-id pid
+                                                     ::actoken/type "personal"}})))))))
 
 ;; --- PARAMS VALIDATION: SERVER AUTH CONTEXT VS CLIENT PARAMS
 

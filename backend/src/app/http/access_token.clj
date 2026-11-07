@@ -36,6 +36,20 @@
       AND (expires_at IS NULL
            OR (expires_at > now()));")
 
+(def ^:private sql:get-profile-mcp-enabled
+  "SELECT props FROM profile WHERE id = ?")
+
+(defn- profile-mcp-enabled?
+  "Whether the profile of an MCP token has MCP on. Read with the token, once
+  per request. A profile that cannot be read counts as off."
+  [pool profile-id]
+  (let [row   (db/exec-one! pool [sql:get-profile-mcp-enabled profile-id])
+        props (cond-> (:props row)
+                (db/pgobject? (:props row) "jsonb")
+                (db/decode-transit-pgobject))]
+    (and (some? row)
+         (not (false? (:mcp-enabled props))))))
+
 (defn- get-token-data
   [pool claims]
   (when-not (db/read-only? pool)
@@ -45,7 +59,11 @@
             mcp-token?  (= "mcp" (:type token))]
         (when (and (= (:uid claims) (:profile-id token))
                    (= mcp-claims? mcp-token?))
-          (update token :perms db/decode-pgarray #{}))))))
+          (cond-> (update token :perms db/decode-pgarray #{})
+            ;; The profile's MCP switch, read with the token: an MCP call
+            ;; of a profile that turned MCP off is refused.
+            mcp-token?
+            (assoc :mcp-enabled (profile-mcp-enabled? pool (:profile-id token)))))))))
 
 (defn- wrap-authz
   "Authenticate requests carrying an access token. Personal tokens need the
@@ -63,11 +81,15 @@
                  (if (= mcp-token-issuer (:iss claims))
                    mcp-enabled?
                    personal-enabled?))
-          (let [{:keys [perms profile-id expires-at type]} (some->> claims (get-token-data pool))
+          (let [{:keys [perms profile-id expires-at type mcp-enabled]}
+                (some->> claims (get-token-data pool))
                 token-id (get claims :tid)]
             (handler (cond-> request
                        (some? perms)
                        (assoc ::perms perms)
+
+                       (some? mcp-enabled)
+                       (assoc ::mcp-enabled mcp-enabled)
                        (some? profile-id)
                        (assoc ::profile-id profile-id)
                        (some? expires-at)

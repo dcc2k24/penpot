@@ -71,9 +71,7 @@
 
 (sv/defmethod ::export-binfile
   "Export a penpot file in a binary format."
-  {::rpc/allow-token-types #{"mcp"}
-   ::rpc/mcp-scope "mcp:read"
-   ::doc/added "1.15"
+  {::doc/added "1.15"
    ::doc/changes [["2.12" "Remove version parameter, only one version is supported"]
                   ["2.19" "Deprecated `include-libraries` and `embed-assets` params"]]
    ::webhooks/event? true

@@ -189,10 +189,13 @@
 (def ^:private valid-access-tokens-per-profile-quote?
   (sm/lazy-validator schema:access-tokens-per-profile))
 
+;; Counts the hand-made tokens only. The tokens of OAuth clients are
+;; capped on their own, in `grant-client-mcp-scopes`.
 (def ^:private sql:get-access-tokens-per-profile
   "SELECT count(*) AS total
      FROM access_token
-    WHERE profile_id = ?")
+    WHERE profile_id = ?
+      AND client_id IS NULL")
 
 (defmethod check-quote ::access-tokens-per-profile
   [{:keys [::profile-id ::target] :as cfg}]

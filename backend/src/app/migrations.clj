@@ -532,7 +532,13 @@
     :fn (mg/resource "app/migrations/sql/0156-reset-pg-storage-defaults.sql")}
 
    {:name "0157-add-audit-log-pending-table"
-    :fn (mg/resource "app/migrations/sql/0157-add-audit-log-pending-table.sql")}])
+    :fn (mg/resource "app/migrations/sql/0157-add-audit-log-pending-table.sql")}
+
+   {:name "0158-add-client-to-access-token"
+    :fn (mg/resource "app/migrations/sql/0158-add-client-to-access-token.sql")}
+
+   {:name "0159-add-file-change-indexes"
+    :fn (mg/resource "app/migrations/sql/0159-add-file-change-indexes.sql")}])
 
 (defn apply-migrations!
   [pool name migrations]

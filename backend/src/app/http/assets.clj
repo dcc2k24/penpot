@@ -212,6 +212,15 @@
       :else
       (serve-object-measured cfg "by-id" obj))))
 
+(defn- render-covers?
+  "Whether the request may read media of `file-id`. A render session
+  (MCP) reads only the files its restriction names: the file and its
+  libraries. Other requests are not limited here."
+  [request file-id]
+  (if-let [restriction (::session/restriction request)]
+    (contains? (set (:file-ids restriction)) file-id)
+    true))
+
 (defn- generic-handler
   "A generic handler helper/common code for file-media based handlers."
   [{:keys [::sto/storage] :as cfg} request route kf]
@@ -227,7 +236,8 @@
                            (::actoken/profile-id request))
             share-id   (get-share-id request)
             perms      (perms/get-file-read-permissions pool profile-id file-id share-id)]
-        (if-not (:can-read perms)
+        (if-not (and (:can-read perms)
+                     (render-covers? request file-id))
           ;; The response stays 404 to avoid leaking existence, but the
           ;; metric records the internal 403 outcome.
           (do
@@ -261,7 +271,9 @@
 
 (defmethod ig/init-key ::routes
   [_ cfg]
-  ["/assets" {:middleware [[session/authz cfg]
+  ;; The exporter fetches its assets with the render session cookie, so
+  ;; this route opts in to render sessions.
+  ["/assets" {:middleware [[session/authz (assoc cfg ::session/allow-restricted true)]
                            [actoken/authz cfg]]}
    ["/by-id/:id" {:handler (partial objects-handler cfg)}]
    ["/by-file-media-id/:id" {:handler (partial file-objects-handler cfg)}]

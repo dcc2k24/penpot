@@ -273,11 +273,19 @@
     (into [] (map #(assoc % ::method sname)) limits)))
 
 (defn- get-uid
-  [{:keys [::rpc/profile-id] :as params}]
+  "The id a rate limit counts a call under. A call made with an MCP token
+  counts under `<profile-id>.mcp`, apart from the owner's own calls, so an
+  agent cannot spend the budget of the owner's browser session."
+  [{:keys [::rpc/profile-id ::rpc/token-type] :as params}]
   (let [request (-> params meta ::http/request)]
-    (or profile-id
-        (some-> request inet/parse-request)
-        uuid/zero)))
+    (cond
+      (and (some? profile-id) (= "mcp" token-type))
+      (str profile-id ".mcp")
+
+      :else
+      (or profile-id
+          (some-> request inet/parse-request)
+          uuid/zero))))
 
 (defn- process-request'
   [cfg limits params]
