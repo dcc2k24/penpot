@@ -167,7 +167,7 @@ export async function runLoop(maxIterations: number, all = false): Promise<numbe
         const order = allTargets(model).map((target) => target.id);
         const rerun = chooseRerunIds(readReport(REPORT_FILE), model.pulledAt, order, all);
         console.log(`[loop] rerun ${rerun.length} of ${order.length} targets: ${rerun.join(", ")}`);
-        const count = await runCompare({ targets: rerun, pixel: false });
+        const { domMismatches: count } = await runCompare({ targets: rerun, pixel: false });
         console.log(`[loop] iteration ${iteration}: ${count} DOM mismatches`);
         if (count === 0) {
             console.log(`[loop] converged after ${iteration} iteration(s)`);

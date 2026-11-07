@@ -6,18 +6,22 @@ the app against the design.
 ## Prerequisites
 
 - The backend MCP runs at `http://127.0.0.1:4405/mcp`. Set `PENPOT_MCP_URL` to use another address.
-- A token file holds the MCP access token. Set `DESIGN_PARITY_TOKEN_FILE` to use another file. The package reads the
-  token and never prints it.
-- A vars file is a JSON object with a `projectId` string. Set `DESIGN_PARITY_VARS_FILE` to use another file.
+- `DESIGN_PARITY_TOKEN_FILE` names the file that holds the MCP access token. It is required by `build`, `pull` and
+  the MCP step of `compare`. The package reads the token and never prints it.
+- `DESIGN_PARITY_VARS_FILE` names a JSON file with a `projectId` string. It is required by `build`.
+- `PENPOT_FONT_DIR` names the folder of the Penpot font files. It is required by `generate`.
 
-The defaults are `mcp-token.txt` and `vars.json` in the session scratchpad folder. Both paths are in `src/Paths.ts`.
+None of the three has a default, so the package holds no path of one machine. A command that needs a variable that is
+not set stops with a message that names it. `verify` needs none of them.
+
+The commands run from any directory, through the root script: `pnpm --dir C:/dev/penpot/mcp run design-parity <command>`.
 
 ## Commands
 
-Run every command from `C:/dev/penpot/mcp`:
+Run every command as shown in Prerequisites, from any directory:
 
 ```sh
-npx pnpm --filter mcp-design-parity run start <command>
+pnpm --dir C:/dev/penpot/mcp run design-parity <command>
 ```
 
 | Command    | Reads                                                | Writes                                |
@@ -29,7 +33,10 @@ npx pnpm --filter mcp-design-parity run start <command>
 | `compare`  | `out/design.json`, `app/`                            | `out/compare/`                        |
 | `loop`     | `out/design.json`, `app/`, `out/compare/report.json` | `app/`, `out/compare/`                |
 
-Run the commands in this order: `build`, then `pull`, then `verify`.
+Run the commands in this order: `build`, then `pull`, then `generate`, then `verify` and `compare`. `generate` writes
+the app that `compare` serves. `verify` reads only `out/design.json`, so it runs without the app. `compare` stops with
+`app not generated: run generate first` when the app is missing. The generated files in `app/` are not committed: see
+`.gitignore`. A fresh checkout runs `generate` before `compare`.
 
 ### build
 
@@ -62,9 +69,12 @@ older build.
 - `src/tokens.css`, `src/typography.css`, `src/routes.tsx`, `src/runtime.ts` and `index.html`.
 - `app/public/fonts/`: copies of the font files that the app uses.
 
+It prints each file it wrote, with the count, so that a run shows what changed. The generated paths are listed in
+`.gitignore`. `src/generate/testdata/ButtonPrimaryMD.golden.tsx` stays tracked, because a test checks the output against it.
+
 `src/typography.css` starts with the `@font-face` rules for Source Sans Pro. The rules load the copies from `/fonts/`.
-The generator copies the files from `PENPOT_FONT_DIR`, which defaults to `frontend/resources/fonts` in the Penpot
-repository. It stops with a message when a file is missing. The copies are not committed, because `.gitignore` lists
+The generator copies the files from `PENPOT_FONT_DIR`, which must be set, for example to `frontend/resources/fonts` in the
+Penpot repository. It stops with a message when a file is missing. The copies are not committed, because `.gitignore` lists
 `app/public/fonts/`.
 
 It never touches `app/package.json`, `app/tsconfig.json`, `app/vite.config.ts` or `app/src/main.tsx`. The output is
@@ -86,10 +96,13 @@ against the model:
 A text box whose size differs gives an info line, not a mismatch. The backend does not return opacity (gap 12), so
 opacity gives an info line too.
 
-The exit code is the DOM gate. It is 0 when there are no DOM mismatches, and 1 otherwise.
+The exit code is 1 when there is a DOM mismatch, or when a pixel target fails the pixel gate: it is over its budget,
+or it could not be compared. It is 0 otherwise. `--advisory` leaves the pixel results out of the exit code. The DOM
+mismatches still count.
 
 `--screen` takes a route id, such as `onboarding/welcome`, or a target name, such as `Button/Primary/MD`. `--no-pixel`
-skips the pixel step. `--scale` sets the device scale of the pixel step: 1, 2 or 3. The default is 2. The DOM check
+skips the pixel step. `--pixel-budget-components <percent>` and `--pixel-budget-screens <percent>` set the budgets; they
+default to 1 and 0.5, and must be 0 or more. `--scale` sets the device scale of the pixel step: 1, 2 or 3. The default is 2. The DOM check
 always uses CSS pixels, with the 0.5 px tolerance.
 
 The pixel step fetches the Penpot PNG of each board with `export_shape`, at the same scale. It takes a Playwright
@@ -97,8 +110,10 @@ screenshot of the same board, with the device scale factor set to the same scale
 step flattens both images over white, pads both to the larger size, and compares them with pixelmatch at threshold
 0.1. Percentages are relative to the scaled image.
 
-The budgets are 1.0 percent for a component and 0.5 percent for a screen. A target over its budget shows OVER BUDGET
-in the table and in the HTML report. The report also shows the cause note from `src/compare/PixelCauses.ts`.
+The budgets default to 1 percent for a component and 0.5 percent for a screen. The table prints each pixel result as its
+measured percent and its budget, for example `0.8% (budget 0.5%)`. A target over its budget shows OVER BUDGET in the
+table and in the HTML report. The gate uses the results of the targets this run compared, so a `--no-pixel` run does not
+fail on pixel results kept from an earlier report. The report also shows the cause note from `src/compare/PixelCauses.ts`.
 
 After pixelmatch, the mask holds the red pixels. Pure red marks a differing pixel. Yellow marks anti-aliasing and is not
 in the mask. Connected pixels form clusters, with 8-neighbour connectivity. For each target, the step records the size
@@ -106,7 +121,7 @@ of the largest cluster in pixels (`largestCluster`) and the number of clusters (
 mismatch when its largest cluster is above 12 pixels at the scale used. The threshold is in `src/compare/Clusters.ts`
 (`REAL_MISMATCH_CLUSTER`). It is a guess, not a calibrated value.
 
-The real mismatch flag does not separate glyph anti-aliasing from real errors. Text-heavy targets form large clusters
+The real mismatch flag is an advisory note. It does not set the exit code. It does not separate glyph anti-aliasing from real errors. Text-heavy targets form large clusters
 even when the percent is small, so most targets are flagged. Read the flag as a sign to look, not a verdict. See
 `PARITY-NOTES.md` for the table.
 
@@ -114,8 +129,7 @@ Chromium runs with LCD text off, so glyphs are greyscale like the Penpot export.
 on each side by the stroke that lies outside it: `ceil(w/2)` for a centred stroke, `w` for an outer stroke and 0 for
 any other. Penpot's export includes that outside part, so the two images match in size.
 
-Pixel results never change the exit code. When the export returns an empty PNG (gap 15), the target shows as
-unavailable.
+When the export returns an empty PNG (gap 15), the target shows as unavailable, and that fails the pixel gate.
 
 ### loop
 

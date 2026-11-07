@@ -1,4 +1,4 @@
-import { McpLoadClient } from "mcp-loadtest/dist/McpLoadClient.js";
+import { McpLoadClient, type ToolCallOutcome } from "mcp-loadtest/dist/McpLoadClient.js";
 
 /** Waits in milliseconds between the attempts of a transient failure. The last entry is the final wait. */
 export const RETRY_DELAYS_MS: readonly number[] = [2000, 4000, 8000, 16000, 32000];
@@ -6,14 +6,52 @@ export const RETRY_DELAYS_MS: readonly number[] = [2000, 4000, 8000, 16000, 3200
 /** Prefix of the text the backend returns when a command fails. */
 const BACKEND_FAILURE_PREFIX = "Tool execution failed:";
 
+/** Retries of one call that the adapter rate-limited. The call did not run, so every tool may be retried. */
+export const RATE_LIMIT_RETRIES = 5;
+
+/** Wait before a rate-limited call is retried, when the error names no time. */
+export const DEFAULT_RATE_WAIT_MS = 1000;
+
 /**
- * Failure of one MCP tool call. The `transient` flag tells whether a retry may help.
+ * Reads the wait that a rate-limit error asks for. The adapter says "retry after N s". The text is compared in lower
+ * case and no regular expression is used.
+ *
+ * @param text - text of the failed call
+ * @returns the wait in milliseconds, or undefined when the text is not a rate-limit error
+ */
+export function rateLimitWaitOf(text: string): number | undefined {
+    const lower = text.toLowerCase();
+    if (!lower.includes("rate limited") && !lower.includes("ratelimiterror")) {
+        return undefined;
+    }
+    const marker = "retry after ";
+    const at = lower.indexOf(marker);
+    if (at < 0) {
+        return DEFAULT_RATE_WAIT_MS;
+    }
+    const rest = lower.slice(at + marker.length).trim();
+    let end = 0;
+    while (end < rest.length && "0123456789.".includes(rest[end])) {
+        end++;
+    }
+    const amount = Number(rest.slice(0, end));
+    if (end === 0 || !Number.isFinite(amount)) {
+        return DEFAULT_RATE_WAIT_MS;
+    }
+    return rest.slice(end).trimStart().startsWith("ms") ? amount : amount * 1000;
+}
+
+/**
+ * Failure of one MCP tool call. The `transient` flag tells whether a retry may help. A rate-limited call has a
+ * `retryAfterMs` wait.
  */
 export class McpToolError extends Error {
     /** Name of the tool that failed. */
     readonly tool: string;
     /** True for a lost connection or a backend that gave no response; false for a rejected request. */
     readonly transient: boolean;
+    /** Wait before the call may be retried, when the adapter rate-limited it. */
+    readonly retryAfterMs: number | undefined;
 
     /**
      * Creates the error.
@@ -21,13 +59,33 @@ export class McpToolError extends Error {
      * @param tool - name of the tool that failed
      * @param message - backend error text or description of the transport failure
      * @param transient - whether a retry may succeed
+     * @param retryAfterMs - wait before a retry, set when the adapter rate-limited the call
      */
-    constructor(tool: string, message: string, transient: boolean) {
+    constructor(tool: string, message: string, transient: boolean, retryAfterMs?: number) {
         super(message);
         this.name = "McpToolError";
         this.tool = tool;
         this.transient = transient;
+        this.retryAfterMs = retryAfterMs;
     }
+}
+
+/** The part of McpLoadClient that a session uses. Tests replace it with a fake. */
+export interface ToolClient {
+    /** Opens the session. */
+    connect(url: string, token: string): Promise<void>;
+    /** Calls one tool. */
+    callTool(name: string, args: Record<string, unknown>): Promise<ToolCallOutcome>;
+    /** Closes the session. */
+    close(): Promise<void>;
+}
+
+/** Collaborators of a session that tests replace. */
+export interface SessionDeps {
+    /** Builds a client for one connection. */
+    createClient?: () => ToolClient;
+    /** Waits for the given milliseconds. */
+    wait?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -44,7 +102,10 @@ export interface CallResult {
  * Options of one tool call.
  */
 export interface CallOptions {
-    /** Retries transient failures with the backoff schedule when true, the default. Writes pass false. */
+    /**
+     * Retries transient failures with the backoff schedule when true, the default. Writes pass false. A rate-limited
+     * call is retried whatever this flag says, because the adapter refused it before it ran.
+     */
     readonly retryTransient?: boolean;
 }
 
@@ -54,17 +115,22 @@ export interface CallOptions {
 export class McpSession {
     private readonly url: string;
     private readonly token: string;
-    private client: McpLoadClient | undefined;
+    private readonly createClient: () => ToolClient;
+    private readonly wait: (ms: number) => Promise<void>;
+    private client: ToolClient | undefined;
 
     /**
      * Creates a session that is not yet connected.
      *
      * @param url - Streamable HTTP endpoint of the MCP server
      * @param token - MCP access token, sent as a bearer token and never logged
+     * @param deps - collaborators, replaced in tests
      */
-    constructor(url: string, token: string) {
+    constructor(url: string, token: string, deps: SessionDeps = {}) {
         this.url = url;
         this.token = token;
+        this.createClient = deps.createClient ?? (() => new McpLoadClient());
+        this.wait = deps.wait ?? delay;
         this.client = undefined;
     }
 
@@ -106,22 +172,34 @@ export class McpSession {
     }
 
     /**
-     * Runs one operation, retrying transient failures when `retry` is true.
+     * Runs one operation. A rate-limited call waits the time the adapter names, at most RATE_LIMIT_RETRIES times. A
+     * transient failure waits on the backoff schedule when `retry` is true.
      *
      * @param tool - tool name used in errors
      * @param retry - whether transient failures are retried
      * @param run - the operation to run
      */
     private async retrying<T>(tool: string, retry: boolean, run: () => Promise<T>): Promise<T> {
-        for (let attempt = 0; ; attempt++) {
+        let transientRetries = 0;
+        let rateRetries = 0;
+        for (;;) {
             try {
                 return await run();
             } catch (error) {
                 const failure = McpSession.toToolError(tool, error);
-                if (!failure.transient || !retry || attempt >= RETRY_DELAYS_MS.length) {
+                if (failure.retryAfterMs !== undefined) {
+                    if (rateRetries >= RATE_LIMIT_RETRIES) {
+                        throw failure;
+                    }
+                    rateRetries++;
+                    await this.wait(failure.retryAfterMs);
+                    continue;
+                }
+                if (!failure.transient || !retry || transientRetries >= RETRY_DELAYS_MS.length) {
                     throw failure;
                 }
-                await delay(RETRY_DELAYS_MS[attempt] ?? 0);
+                await this.wait(RETRY_DELAYS_MS[transientRetries] ?? 0);
+                transientRetries++;
             }
         }
     }
@@ -146,6 +224,12 @@ export class McpSession {
             throw new McpToolError(tool, `transport failure: ${outcome.error}`, true);
         }
         const text = outcome.text.trim();
+        if (outcome.isError || text.startsWith(BACKEND_FAILURE_PREFIX)) {
+            const waitMs = rateLimitWaitOf(text);
+            if (waitMs !== undefined) {
+                throw new McpToolError(tool, text, false, waitMs);
+            }
+        }
         if (text.startsWith(BACKEND_FAILURE_PREFIX)) {
             throw new McpToolError(tool, text, /got no response/.test(text));
         }
@@ -162,7 +246,7 @@ export class McpSession {
      * Opens a new client and stores it, replacing any previous client.
      */
     private async open(): Promise<void> {
-        const client = new McpLoadClient();
+        const client = this.createClient();
         try {
             await client.connect(this.url, this.token);
         } catch (error) {

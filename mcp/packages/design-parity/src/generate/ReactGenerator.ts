@@ -2,7 +2,7 @@ import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node
 import { dirname, join, posix } from "node:path";
 import type { DesignModel, NodeModel } from "../DesignModel.js";
 import { FONT_FILES } from "../FontMap.js";
-import { PENPOT_FONT_DIR } from "../Paths.js";
+import { penpotFontDir } from "../Paths.js";
 import { type ComponentTarget, componentTargets, type ScreenTarget, screenTargets } from "../Targets.js";
 import { NodeEmitter, type ResolvedInstance } from "./NodeEmitter.js";
 import { renderTokensCss } from "./TokenCss.js";
@@ -123,12 +123,12 @@ export class ReactGenerator {
      *
      * @param model - pulled design model
      * @param appDir - app folder to write into
-     * @param fontDir - folder of the Penpot font files that the app copies. Defaults to PENPOT_FONT_DIR.
+     * @param fontDir - folder of the Penpot font files that the app copies. Defaults to PENPOT_FONT_DIR, which must be set.
      */
     public constructor(
         private readonly model: DesignModel,
         private readonly appDir: string,
-        private readonly fontDir: string = PENPOT_FONT_DIR
+        private readonly fontDir: string = penpotFontDir()
     ) {}
 
     /**
@@ -401,6 +401,12 @@ function checkCycles(components: ComponentTarget[], resolve: Resolver): void {
             throw new Error(`component cycle: ${[...stack, name].join(" -> ")}`);
         }
         for (const copy of topLevelCopies(board)) {
+            // The root of a component is rendered as its own element, never as a copy. A root that refers to its own
+            // component (a main board with the main-instance flag missing) is not a dependency. A nested copy of the
+            // component itself is still a cycle.
+            if (copy === board) {
+                continue;
+            }
             const resolved = resolve(copy);
             if (resolved !== undefined) {
                 visit(resolved.componentName, resolved.main, [...stack, name]);

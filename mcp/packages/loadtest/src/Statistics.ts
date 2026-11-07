@@ -10,6 +10,38 @@ export interface LatencySummary {
     p99: number;
     /** Largest sample. */
     max: number;
+    /** False when the sample count is too small for that percentile. */
+    reliable: PercentileReliability;
+}
+
+/** Whether each percentile rests on enough samples. */
+export interface PercentileReliability {
+    p50: boolean;
+    p95: boolean;
+    p99: boolean;
+}
+
+/**
+ * Fewest samples a percentile needs before it is reported as measured. With fewer, the nearest-rank value is
+ * one of the largest samples and says little about the tail.
+ */
+export const MIN_SAMPLES: Readonly<Record<keyof PercentileReliability, number>> = {
+    p50: 20,
+    p95: 200,
+    p99: 200,
+};
+
+/**
+ * Tells which percentiles a sample count supports.
+ *
+ * @param count - number of samples the percentiles rest on
+ */
+export function percentileReliability(count: number): PercentileReliability {
+    return {
+        p50: count >= MIN_SAMPLES.p50,
+        p95: count >= MIN_SAMPLES.p95,
+        p99: count >= MIN_SAMPLES.p99,
+    };
 }
 
 /**
@@ -51,7 +83,8 @@ export class LatencyRecorder {
     }
 
     /**
-     * Percentiles and maximum of the samples. An empty recorder reports zeros.
+     * Percentiles and maximum of the samples. An empty recorder reports zeros. A percentile with too few samples
+     * is still given, but its reliable flag is false.
      */
     summary(): LatencySummary {
         const sorted = [...this.samples].sort((a, b) => a - b);
@@ -61,6 +94,17 @@ export class LatencyRecorder {
             p95: percentile(sorted, 95),
             p99: percentile(sorted, 99),
             max: sorted.length === 0 ? 0 : sorted[sorted.length - 1],
+            reliable: percentileReliability(sorted.length),
         };
     }
+}
+
+/**
+ * Text printed after a percentile that rests on too few samples, or an empty string when it is reliable.
+ *
+ * @param name - which percentile
+ * @param count - number of samples it rests on
+ */
+export function percentileNote(name: keyof PercentileReliability, count: number): string {
+    return percentileReliability(count)[name] ? "" : ` (unreliable: ${count} samples, needs ${MIN_SAMPLES[name]})`;
 }

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { DesignModel } from "../DesignModel.js";
 import { APP_DIR, COMPARE_DIR, DESIGN_FILE } from "../Paths.js";
 import { allTargets, VIEWPORT, type DesignTarget } from "../Targets.js";
-import { PIXEL_BUDGETS } from "./Budget.js";
+import { DEFAULT_PIXEL_BUDGETS, type PixelBudgets } from "./Budget.js";
 import type { PixelResult } from "./PixelCompare.js";
 import type { AppBrowser } from "./Screenshots.js";
 import { isRealMismatch, mergeReports, readReport, ReportWriter, type CompareReport } from "./Report.js";
@@ -143,6 +143,37 @@ export function formatCompareTable(report: CompareReport): string {
     return lines.join("\n");
 }
 
+/** Failing checks of one compare run. */
+export interface CompareOutcome {
+    /** DOM mismatches in the merged report. */
+    domMismatches: number;
+    /** Pixel results of this run that fail the pixel gate: over budget, or not compared. */
+    pixelFailures: number;
+}
+
+/**
+ * Counts the pixel results that fail the gate: a target over its budget, or a target that could not be compared.
+ *
+ * @param pixel - pixel results of the run, or null when the pixel step did not run
+ * @returns the number of failing targets, 0 when the pixel step did not run
+ */
+export function countPixelFailures(pixel: PixelResult[] | null): number {
+    return (pixel ?? []).filter((result) => result.status !== "ok" || result.overBudget === true).length;
+}
+
+/**
+ * Turns the failing checks of a run into an exit code. A DOM mismatch always fails. A pixel failure fails too, unless
+ * the run is advisory.
+ *
+ * @param outcome - failing checks of the run
+ * @param advisory - true to report the pixel results without failing on them
+ * @returns 1 when the run fails, otherwise 0
+ */
+export function compareExitCode(outcome: CompareOutcome, advisory: boolean): number {
+    const failed = outcome.domMismatches > 0 || (!advisory && outcome.pixelFailures > 0);
+    return failed ? 1 : 0;
+}
+
 /**
  * Runs the comparison of the design file against the generated app. It checks the design file, starts the app
  * server, runs the DOM and pixel comparators, merges the result into the report and prints the merged table. Targets
@@ -152,7 +183,7 @@ export function formatCompareTable(report: CompareReport): string {
  *   pixel comparison, and `scale` is the device scale of the pixel comparison, an integer from MIN_SCALE to MAX_SCALE
  *   (default DEFAULT_SCALE), and `appBrowser` is where the pixel screenshots are taken (default local). Without
  *   `screen` and `targets` every target runs.
- * @returns the number of DOM mismatches in the merged report, used as the exit code by the caller
+ * @returns the DOM mismatches of the merged report and the pixel failures of this run, used by the caller for the exit code
  * @throws Error when the scale is not an integer from MIN_SCALE to MAX_SCALE, when the design file is missing or has
  *   another format version, when a filter matches no target, when no target is selected, or when the app has not been
  *   generated
@@ -163,9 +194,11 @@ export async function runCompare(args: {
     pixel: boolean;
     scale?: number;
     appBrowser?: AppBrowser;
-}): Promise<number> {
+    budgets?: PixelBudgets;
+}): Promise<CompareOutcome> {
     const appBrowser: AppBrowser = args.appBrowser ?? { mode: "local" };
     const scale = args.scale ?? DEFAULT_SCALE;
+    const budgets: PixelBudgets = { ...(args.budgets ?? DEFAULT_PIXEL_BUDGETS) };
     if (!Number.isInteger(scale) || scale < MIN_SCALE || scale > MAX_SCALE) {
         throw new Error(`scale must be an integer from ${MIN_SCALE} to ${MAX_SCALE}, found ${scale}`);
     }
@@ -208,14 +241,14 @@ export async function runCompare(args: {
         }
         const pixel =
             args.pixel && pixelUrl !== undefined
-                ? await new PixelComparator().run(model, targets, pixelUrl, log, scale, appBrowser)
+                ? await new PixelComparator().run(model, targets, pixelUrl, log, scale, appBrowser, budgets)
                 : null;
         const fresh: CompareReport = {
             generatedFrom: model.pulledAt,
             viewport: { width: VIEWPORT.width, height: VIEWPORT.height },
             dom,
             pixel,
-            budgets: { ...PIXEL_BUDGETS },
+            budgets,
             scale,
         };
         const report = mergeReports(
@@ -228,7 +261,7 @@ export async function runCompare(args: {
         console.log(formatCompareTable(report));
         console.log(`report json: ${paths.json}`);
         console.log(`report html: ${paths.html}`);
-        return report.dom.mismatches.length;
+        return { domMismatches: report.dom.mismatches.length, pixelFailures: countPixelFailures(pixel) };
     } finally {
         await server.close();
     }

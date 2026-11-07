@@ -11,11 +11,13 @@ import {
     type GeneratorResult,
 } from "./LargeFileGenerator.js";
 import { McpLoadClient } from "./McpLoadClient.js";
+import { parseWarmup } from "./Pacing.js";
 import { PgStats, type PgStatsTarget } from "./PgStats.js";
 import { formatMegabytes, HtmlReport, summaryLines } from "./Report.js";
 import { ResultFile, type RunResult } from "./ResultFile.js";
 import { ScenarioLoader, type Scenario } from "./Scenario.js";
 import { ScenarioRunner, type RunOptions } from "./Runner.js";
+import { percentileNote } from "./Statistics.js";
 import { VarsFile } from "./VarsFile.js";
 
 /** Endpoint of a local devenv MCP server. */
@@ -58,6 +60,10 @@ const OPTIONS = {
     compare: { type: "string" },
     results: { type: "string" },
     "machine-note": { type: "string" },
+    "arrival-rate": { type: "string" },
+    warmup: { type: "string" },
+    "backend-flags": { type: "string" },
+    "db-pool-size": { type: "string" },
     "fail-on-regression": { type: "boolean" },
     threshold: { type: "string" },
     "team-id": { type: "string" },
@@ -82,6 +88,7 @@ const USAGE = `Usage:
                     [--pg-stats docker:<container>:<database>[:user]] [--server-pid <n>]
                     [--sample-interval 5s] [--pg-settle 11s] [--compare <result.json>]
                     [--results <dir>] [--machine-note <text>] [--fail-on-regression]
+                    [--arrival-rate n] [--warmup 60s|200] [--backend-flags <text>] [--db-pool-size n]
   pnpm loadtest compare <baseline.json> <candidate.json> [--threshold 0.2] [--fail-on-regression]
   pnpm loadtest setup --tokens <file> [--url <mcp url>] [--team-id <id>] [--project-id <id>]
                       [--files n] [--out <vars.json>]
@@ -91,7 +98,8 @@ const USAGE = `Usage:
                       [--pg-stats docker:<container>:<database>[:user]]
 
 Environment: PENPOT_LOADTEST_URL, PENPOT_LOADTEST_TOKENS (tokens file), PENPOT_LOADTEST_MACHINE_NOTE,
-PENPOT_LOADTEST_PG_STATS (same form as --pg-stats), and PENPOT_LOADTEST_<NAME> for each scenario variable
+PENPOT_LOADTEST_BACKEND_FLAGS (the flags the backend was started with), PENPOT_LOADTEST_PG_STATS (same form as
+--pg-stats), and PENPOT_LOADTEST_<NAME> for each scenario variable
 such as PENPOT_LOADTEST_FILE_ID.
 Scenarios: a bundled fixture name (see fixtures/scenarios) or a path to a JSON file.`;
 
@@ -152,7 +160,7 @@ export class LoadTestCli {
         await HtmlReport.write(htmlFile, output.result, comparison);
 
         LoadTestCli.printSummary(output.result, file, htmlFile, comparison);
-        return values["fail-on-regression"] === true && comparison !== undefined && comparison.regressions > 0 ? 1 : 0;
+        return values["fail-on-regression"] === true && comparison !== undefined && gateFails(comparison) ? 1 : 0;
     }
 
     /**
@@ -175,7 +183,7 @@ export class LoadTestCli {
             basename(positionals[1])
         );
         console.log(ResultComparison.format(report));
-        return values["fail-on-regression"] === true && report.regressions > 0 ? 1 : 0;
+        return values["fail-on-regression"] === true && gateFails(report) ? 1 : 0;
     }
 
     /**
@@ -356,6 +364,16 @@ export class LoadTestCli {
             pgSettleMs:
                 values["pg-settle"] === undefined ? undefined : parseDuration(values["pg-settle"], "--pg-settle"),
             machineNote: values["machine-note"] ?? process.env.PENPOT_LOADTEST_MACHINE_NOTE,
+            arrivalRatePerSecond:
+                values["arrival-rate"] === undefined
+                    ? undefined
+                    : parsePositiveNumber(values["arrival-rate"], "--arrival-rate"),
+            warmup: values.warmup === undefined ? undefined : parseWarmup(values.warmup),
+            backendFlags: values["backend-flags"] ?? process.env.PENPOT_LOADTEST_BACKEND_FLAGS,
+            dbPoolSize:
+                values["db-pool-size"] === undefined
+                    ? undefined
+                    : parsePositiveInteger(values["db-pool-size"], "--db-pool-size"),
         };
     }
 
@@ -407,7 +425,9 @@ export class LoadTestCli {
             [
                 `scenario ${result.scenario} on commit ${result.commit.slice(0, 10)}`,
                 `agents ${result.agents}, iterations ${result.iterations}, calls ${result.calls}, errors ${result.errors}`,
-                `p50 ${result.p50.toFixed(1)} ms, p95 ${result.p95.toFixed(1)} ms, p99 ${result.p99.toFixed(1)} ms, ` +
+                `p50 ${result.p50.toFixed(1)} ms${percentileNote("p50", result.calls)}, ` +
+                    `p95 ${result.p95.toFixed(1)} ms${percentileNote("p95", result.calls)}, ` +
+                    `p99 ${result.p99.toFixed(1)} ms${percentileNote("p99", result.calls)}, ` +
                     `max ${result.max.toFixed(1)} ms`,
                 ...summaryLines(result),
                 `json ${file}`,
@@ -418,6 +438,16 @@ export class LoadTestCli {
             console.log("\n" + ResultComparison.format(comparison));
         }
     }
+}
+
+/**
+ * Tells whether a comparison fails the gate. A regression fails it, and so does a figure that is not measured:
+ * too few samples is not a pass.
+ *
+ * @param report - comparison of two runs
+ */
+function gateFails(report: ComparisonReport): boolean {
+    return report.regressions > 0 || report.notMeasured > 0;
 }
 
 /**

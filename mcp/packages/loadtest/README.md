@@ -84,7 +84,7 @@ HTML page has no external resources. The `results/` folder is git-ignored. Commi
 
 | Command | Options |
 |---|---|
-| `run <scenario>` | `--tokens <file>` (required), `--url <mcp url>` (default `http://localhost:4401/mcp`), `--vars <file>`, `--agents <n>` (default: the scenario's own count), `--iterations <n>` (default: the scenario's own count), `--rate <n>` (calls per second per agent, a cap on every step), `--duration <30m>` (repeat the step list until the time is up; a number without a unit means seconds), `--metrics <url>` (backend Prometheus endpoint), `--pg-stats docker:<container>:<database>[:<user>]` (Postgres counters through `docker exec psql`), `--server-pid <pid>` (MCP server process whose memory to watch), `--sample-interval <5s>`, `--pg-settle <11s>`, `--compare <result.json>`, `--fail-on-regression`, `--results <dir>`, `--machine-note <text>` |
+| `run <scenario>` | `--tokens <file>` (required), `--url <mcp url>` (default `http://localhost:4401/mcp`), `--vars <file>`, `--agents <n>` (default: the scenario's own count), `--iterations <n>` (default: the scenario's own count), `--rate <n>` (calls per second per agent, a cap on every step), `--duration <30m>` (repeat the step list until the time is up; a number without a unit means seconds), `--metrics <url>` (backend Prometheus endpoint), `--pg-stats docker:<container>:<database>[:<user>]` (Postgres counters through `docker exec psql`), `--server-pid <pid>` (MCP server process whose memory to watch), `--sample-interval <5s>`, `--pg-settle <11s>`, `--compare <result.json>`, `--fail-on-regression`, `--results <dir>`, `--machine-note <text>`, `--arrival-rate <n>` (open loop, calls per second per agent), `--warmup <n | 30s>`, `--backend-flags <text>`, `--db-pool-size <n>` |
 | `compare <a.json> <b.json>` | `--threshold <0.2>`, `--fail-on-regression` |
 | `setup` | `--tokens <file>` (required), `--url`, `--team-id`, `--project-id`, `--files <n>`, `--out <vars.json>` |
 | `generate-large` | `--tokens <file>` (required, the first token is used), `--url`, `--vars <file>` or `--project-id <id>`, `--shapes <100000>`, `--pages <40>`, `--batch <300>`, `--components <50>`, `--instances <20>` (copies per page), `--seed <1>`, `--name <file name>`, `--out <large-vars.json>`, `--pg-stats <target>` (to print the stored size), `--without-pointer-map` (prints why the harness cannot build that variant) |
@@ -117,9 +117,17 @@ environment.
 | C4 (MCP side) | `c4-same-shape` | Two writers on one fill: the stale write gets a `revn-lag` warning that names the shape, `failOnConflict` is refused, the last writer wins. The human tab half needs a browser |
 | C5 | `c5-large-readers` | 20 agents read the large file (outline, 20 page trees, 50 `get_shapes`, 20 `find_shapes` each). Run with `--metrics` for the heap peak |
 | Soak | `soak-mixed` | 5 agents, 70 % reads, 25 % small writes, 5 % batch writes of 300 shapes, one export a minute. Run with `--duration 4h` |
+| C6 | `c6-linked-library` | Links a new file to the large library (`${libraryId}`), then 100 small writes at 10 per second. Needs `libraryId` in the vars file or `PENPOT_LOADTEST_LIBRARYID`, and `projectId` |
+| C7 | `c7-shared-profile` | 10 agents on one profile: put the same token on every line of the tokens file. Needs the `setup` vars file (`agentFileIds`, `agentPageIds`) for 10 agents |
 
 Not covered: the browser actor of C3, C4 and C5 (the human edits, the human save p95 and the human open time),
-component variants in S4, the archive of S6, and a large file without pointer-map (see below).
+component variants in S4, the archive of S6, and a large file without pointer-map (see below). C6 and C7 are written but
+not yet run against a live stack.
+
+C6 and C7 need these inputs. C6 links the run file to an existing library, so it needs the large file id as
+`libraryId`, and a `projectId`; it creates its own file. C7 reuses the setup files, so run `setup` with at least as
+many `--files` as agents. Its tokens file repeats one token on each line, so the agents share one profile and
+one set of per-profile limits.
 
 ## Large reference file
 
@@ -255,6 +263,28 @@ Each result file follows the schema in `src/ResultFile.ts` (`schemaVersion` 1):
 
 Percentiles use the nearest rank over all samples. `--compare` flags a latency figure that rises by more than 20 %,
 and any rise in the error count.
+
+### Sample rule and warm-up
+
+A percentile needs enough samples to mean something: p50 needs 20 and p95 and p99 need 200. With fewer, the summary and
+the step table print the value with `(unreliable: n samples, needs m)`. A comparison does not pass or fail such a figure:
+it is marked `NOT MEASURED`, and `--fail-on-regression` exits 1 for it.
+
+`--warmup <n | 30s>` leaves out the first calls of the run: a whole number counts calls over all agents, and a time with a
+unit (`s`, `m`, `h`) counts the calls that finish before it ends. The warm-up calls still run and their captures still
+count. The result records the setting and how many calls it excluded.
+
+### Open loop
+
+By default each agent waits for its last call before it sends the next one (closed loop). `--arrival-rate <n>` sets
+a fixed schedule of n calls per second for each agent: call k is due at start + k / n, and its latency counts from the
+due time, so a call that starts late shows the wait it had. `--rate` still caps the calls.
+
+### Provenance
+
+Every result records the commit, whether the git tree was dirty (`treeDirty`; a warning is printed), `backendFlags`
+(from `--backend-flags` or `PENPOT_LOADTEST_BACKEND_FLAGS`, else `unknown`), and `dbPoolSize` when `--db-pool-size` is given.
+Figures from an uncommitted tree are not reproducible from the commit alone.
 
 ## Assumptions about tool results
 

@@ -1,0 +1,28 @@
+{
+  "name": "C7-shared-profile",
+  "description": "Plan 8.4 C7: several agents on one profile and one token, to reach the per-profile limits that C1 does not reach (each C1 agent has its own profile). Agent i writes to agentFileIds[i] from the setup vars file, 50 small writes each at 10 per second. Run with --agents 10 or more, and a tokens file that repeats the one token on every line. Compare the errors, the climit queue and the p95 with C1 at the same agent count.",
+  "agents": 10,
+  "iterations": 1,
+  "steps": [
+    {
+      "name": "small write to the file of this agent",
+      "tool": "apply_operations",
+      "repeat": 50,
+      "rateLimitPerSecond": 10,
+      "args": {
+        "fileId": "${agentFileIds[agent]}",
+        "operations": [
+          {
+            "op": "create_board",
+            "pageId": "${agentPageIds[agent]}",
+            "name": "C7 agent ${agent} board ${index}",
+            "x": 0,
+            "y": 0,
+            "width": 200,
+            "height": 200
+          }
+        ]
+      }
+    }
+  ]
+}

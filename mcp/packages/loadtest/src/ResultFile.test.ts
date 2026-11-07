@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, test } from "node:test";
 import { ResultComparison } from "./Compare.js";
-import { ResultFile, RESULT_SCHEMA_VERSION } from "./ResultFile.js";
+import { ResultFile, RESULT_SCHEMA_VERSION, type RunResult } from "./ResultFile.js";
 import { sampleResult } from "./testing/SampleResult.js";
 
 const directories: string[] = [];
@@ -124,9 +124,19 @@ describe("ResultFile", () => {
 });
 
 describe("ResultComparison", () => {
+    /** A sample with 200 calls in the total and in each step, so that every percentile is measured. */
+    function sampled(overrides: Partial<RunResult> = {}): RunResult {
+        const base = sampleResult();
+        return sampleResult({
+            calls: 200,
+            steps: base.steps.map((step) => ({ ...step, calls: 200 })),
+            ...overrides,
+        });
+    }
+
     test("flags a latency rise above the threshold and not one below it", () => {
-        const baseline = sampleResult();
-        const candidate = sampleResult({ p95: 250, p50: 110 });
+        const baseline = sampled();
+        const candidate = sampled({ p95: 250, p50: 110 });
         const report = new ResultComparison(0.2).compare(baseline, candidate, "a.json", "b.json");
         const p95 = report.rows.find((row) => row.scope === "total" && row.metric === "p95");
         const p50 = report.rows.find((row) => row.scope === "total" && row.metric === "p50");
@@ -137,23 +147,23 @@ describe("ResultComparison", () => {
     });
 
     test("a fall in latency is never a regression", () => {
-        const report = new ResultComparison().compare(sampleResult(), sampleResult({ p99: 10 }), "a", "b");
+        const report = new ResultComparison().compare(sampled(), sampled({ p99: 10 }), "a", "b");
         assert.equal(report.rows.find((row) => row.metric === "p99" && row.scope === "total")?.regression, false);
     });
 
     test("more errors than the baseline is a regression at any size", () => {
-        const report = new ResultComparison().compare(sampleResult(), sampleResult({ errors: 1 }), "a", "b");
+        const report = new ResultComparison().compare(sampled(), sampled({ errors: 1 }), "a", "b");
         const row = report.rows.find((item) => item.scope === "total" && item.metric === "errors");
         assert.equal(row?.regression, true);
     });
 
     test("steps are matched by name and steps that are missing on one side are left out", () => {
-        const candidate = sampleResult({
+        const candidate = sampled({
             steps: [
                 {
                     name: "2. second",
                     tool: "apply_operations",
-                    calls: 10,
+                    calls: 200,
                     errors: 0,
                     bytes: 1,
                     p50: 110,
@@ -163,7 +173,7 @@ describe("ResultComparison", () => {
                 },
             ],
         });
-        const report = new ResultComparison().compare(sampleResult(), candidate, "a", "b");
+        const report = new ResultComparison().compare(sampled(), candidate, "a", "b");
         const scopes = new Set(report.rows.map((row) => row.scope));
         assert.deepEqual([...scopes].sort(), ["2. second", "total"]);
         assert.equal(report.rows.find((row) => row.scope === "2. second" && row.metric === "p95")?.regression, true);
@@ -177,15 +187,10 @@ describe("ResultComparison", () => {
     });
 
     test("the text table names the regressions", () => {
-        const report = new ResultComparison().compare(
-            sampleResult(),
-            sampleResult({ p95: 900 }),
-            "base.json",
-            "cand.json"
-        );
+        const report = new ResultComparison().compare(sampled(), sampled({ p95: 900 }), "base.json", "cand.json");
         const text = ResultComparison.format(report);
         assert.match(text, /baseline:\s+base\.json/);
         assert.match(text, /REGRESSION/);
-        assert.match(text, /\d+ regression\(s\)$/);
+        assert.match(text, /\d+ regression\(s\)/);
     });
 });

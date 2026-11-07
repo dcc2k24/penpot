@@ -10,9 +10,9 @@
   },
   "scripts": {
     "build": "tsc --build",
-    "start": "tsx src/index.ts",
     "test": "tsx --test \"src/**/*.test.ts\"",
-    "types:check": "tsc --noEmit"
+    "types:check": "tsc --noEmit",
+    "cli": "tsx src/index.ts"
   },
   "engines": {
     "node": ">=24"

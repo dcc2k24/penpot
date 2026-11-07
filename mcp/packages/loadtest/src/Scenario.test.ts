@@ -96,6 +96,8 @@ describe("bundled fixtures", () => {
             "c3-agent-with-human",
             "c4-same-shape",
             "c5-large-readers",
+            "c6-linked-library",
+            "c7-shared-profile",
             "s1-create-pages",
             "s2-reduced-shapes",
             "s3-tokens",

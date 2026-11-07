@@ -272,8 +272,9 @@ export class DesignNormaliser {
      * @param shape - raw shape
      */
     private normaliseLayoutItem(shape: RawRecord): LayoutItemModel | null {
-        const hSizing = this.asString(shape.hSizing);
-        const vSizing = this.asString(shape.vSizing);
+        // The backend names the layout item sizing attributes with the layout-item prefix.
+        const hSizing = this.asString(shape.layoutItemHSizing);
+        const vSizing = this.asString(shape.layoutItemVSizing);
         if (hSizing === undefined && vSizing === undefined) {
             return null;
         }

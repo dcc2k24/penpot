@@ -1,0 +1,48 @@
+{
+  "name": "C6-linked-library",
+  "description": "Plan 8.4 C6: a write on a file linked to a large library. Step 1 links the run file to the library, step 2 creates one rectangle, and step 3 changes it 100 times at 10 writes per second. Compare the step 1 cost and the step 3 p95 with a run on an unlinked file. Needs ${libraryId} (the large file, for example from the large-vars file) and ${projectId}. Each write realises every linked library in full, so the p95 of step 3 shows the cost (SYS-06).",
+  "agents": 1,
+  "iterations": 1,
+  "steps": [
+    {
+      "name": "create the run file",
+      "tool": "manage_files",
+      "args": { "action": "create_file", "projectId": "${projectId}", "name": "C6 linked ${runId}" },
+      "capture": { "fileId": "$.result.id" }
+    },
+    {
+      "name": "read the run file outline",
+      "tool": "get_file_outline",
+      "args": { "fileId": "${fileId}" },
+      "capture": { "pageId": "$.result.pages[0].id" }
+    },
+    {
+      "name": "link the file to the large library",
+      "tool": "manage_files",
+      "args": { "action": "link_library", "fileId": "${fileId}", "libraryId": "${libraryId}" }
+    },
+    {
+      "name": "create the rectangle to change",
+      "tool": "apply_operations",
+      "args": {
+        "fileId": "${fileId}",
+        "operations": [
+          { "op": "create_rect", "id": "$tmp:r", "pageId": "${pageId}", "name": "C6 rect ${runId}", "x": 0, "y": 0, "width": 100, "height": 100 }
+        ]
+      },
+      "capture": { "rectId": "$.result.createdIds[\"$tmp:r\"]" }
+    },
+    {
+      "name": "small change to the rectangle on the linked file",
+      "tool": "apply_operations",
+      "repeat": 100,
+      "rateLimitPerSecond": 10,
+      "args": {
+        "fileId": "${fileId}",
+        "operations": [
+          { "op": "update_shape", "pageId": "${pageId}", "id": "${rectId}", "props": { "name": "C6 rect ${runId} ${index}" } }
+        ]
+      }
+    }
+  ]
+}

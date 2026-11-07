@@ -4,8 +4,11 @@ import { join } from "node:path";
 import { type BackendFigures } from "./BackendWatch.js";
 import { type PgCounters } from "./PgStats.js";
 
-/** Version of the result document. Bump it when a field changes meaning. */
-export const RESULT_SCHEMA_VERSION = 1;
+/**
+ * Version of the result document. Bump it when a field changes meaning.
+ * Version 2 added the provenance fields (treeDirty, backendFlags, dbPoolSize), arrivalRatePerSecond and warmup.
+ */
+export const RESULT_SCHEMA_VERSION = 2;
 
 /** Hardware and software that produced a result. Results from different specs are not compared directly. */
 export interface MachineSpec {
@@ -79,6 +82,25 @@ export interface RunResult {
     iterations: number;
     /** Per-agent call rate cap from the command line, or null when none was set. */
     rateLimitPerSecond: number | null;
+    /**
+     * Per-agent arrival rate of open-loop mode, or null for the closed loop. Latency then counts from the intended
+     * send time. Absent in results written before schema 2.
+     */
+    arrivalRatePerSecond?: number | null;
+    /**
+     * Warm-up that was left out of the statistics: its setting as typed, and how many calls it excluded. Absent when
+     * the run had no warm-up.
+     */
+    warmup?: { spec: string; excludedCalls: number };
+    /**
+     * True when the git tree had uncommitted changes, false when it was clean, null when git could not tell.
+     * Absent in results written before schema 2.
+     */
+    treeDirty?: boolean | null;
+    /** Flags the backend was started with, as the user gave them, or "unknown". Absent in results before schema 2. */
+    backendFlags?: string;
+    /** Size of the backend database pool, when the user gave it. */
+    dbPoolSize?: number;
     /** Hardware and software of the load driver. */
     machineSpec: MachineSpec;
     /** Calls made over all steps. */
@@ -222,6 +244,7 @@ export class ResultFile {
         if (root.rateLimitPerSecond !== null && typeof root.rateLimitPerSecond !== "number") {
             problems.push("rateLimitPerSecond must be a number or null");
         }
+        ResultFile.expectOptionalProvenance(root, problems);
         if (!Array.isArray(root.steps)) {
             problems.push("steps must be an array");
         } else {
@@ -392,6 +415,38 @@ export class ResultFile {
             const value = target[key];
             if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value))) {
                 problems.push(`${prefix}${key} must be a finite number when present`);
+            }
+        }
+    }
+
+    /**
+     * Checks the fields added in schema 2. Each one may be absent, as in results written before it existed.
+     *
+     * @param root - the whole document
+     * @param problems - list that receives the problems
+     */
+    private static expectOptionalProvenance(root: Record<string, unknown>, problems: string[]): void {
+        const { arrivalRatePerSecond, treeDirty, backendFlags, dbPoolSize, warmup } = root;
+        if (
+            arrivalRatePerSecond !== undefined &&
+            arrivalRatePerSecond !== null &&
+            typeof arrivalRatePerSecond !== "number"
+        ) {
+            problems.push("arrivalRatePerSecond must be a number or null when present");
+        }
+        if (treeDirty !== undefined && treeDirty !== null && typeof treeDirty !== "boolean") {
+            problems.push("treeDirty must be a boolean or null when present");
+        }
+        if (backendFlags !== undefined && typeof backendFlags !== "string") {
+            problems.push("backendFlags must be a string when present");
+        }
+        ResultFile.expectOptionalNumber({ dbPoolSize }, ["dbPoolSize"], problems);
+        if (warmup !== undefined) {
+            const figures = warmup as Record<string, unknown> | null;
+            if (figures === null || typeof figures !== "object" || typeof figures.spec !== "string") {
+                problems.push("warmup must be an object with a spec string when present");
+            } else {
+                ResultFile.expectNumber(figures, ["excludedCalls"], problems, "warmup.");
             }
         }
     }

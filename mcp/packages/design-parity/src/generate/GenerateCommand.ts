@@ -30,6 +30,10 @@ export async function runGenerate(): Promise<number> {
     try {
         const summary = new ReactGenerator(parsed, APP_DIR).generate();
         console.log(`generated ${summary.components} components and ${summary.screens} screens into ${APP_DIR}`);
+        console.log(`wrote ${summary.files.length} files:`);
+        for (const file of summary.files) {
+            console.log(`  ${file}`);
+        }
         for (const warning of summary.warnings) {
             console.log(warning);
         }

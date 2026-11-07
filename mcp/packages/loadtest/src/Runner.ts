@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { BackendWatch, type BackendFigures, type BackendWatchOptions } from "./BackendWatch.js";
 import { JsonPath } from "./JsonPath.js";
 import { McpLoadClient, type ToolCallOutcome } from "./McpLoadClient.js";
+import { ArrivalSchedule, WarmupGate, type WarmupSpec, describeWarmup, waitUntil } from "./Pacing.js";
 import { type PgStatsTarget } from "./PgStats.js";
 import { RESULT_SCHEMA_VERSION, type RunResult, type StepResult } from "./ResultFile.js";
 import { type Scenario, type ScenarioExpectation, type ScenarioStep } from "./Scenario.js";
@@ -39,6 +40,19 @@ export interface RunOptions {
     commit?: string;
     /** Free text recorded in the machine spec. */
     machineNote?: string;
+    /**
+     * Per-agent calls per second in open-loop mode. Each call is due at a fixed interval from the start, and its
+     * latency counts from the due time. Closed loop (each agent waits for its last call) when unset.
+     */
+    arrivalRatePerSecond?: number;
+    /** Warm-up whose calls are left out of the statistics. Off when unset. */
+    warmup?: WarmupSpec;
+    /** Flags the backend was started with, as the user gave them. Recorded as "unknown" when unset. */
+    backendFlags?: string;
+    /** Size of the backend database pool, recorded when set. */
+    dbPoolSize?: number;
+    /** Whether the git tree is dirty. Read from git when unset. */
+    treeDirty?: boolean | null;
 }
 
 /** The part of BackendWatch that a run uses. Tests replace the watch with a fake that has this shape. */
@@ -96,10 +110,14 @@ export class ScenarioRunner {
             throw new Error(`${agents} agents need ${agents} tokens, but the tokens file has ${tokens.length}`);
         }
         const runId = randomUUID().slice(0, 8);
-        const recorder = new RunRecorder(scenario.steps);
-        const setupRecorder = new RunRecorder(scenario.setup, SETUP_MESSAGE_PREFIX);
         const memory = new ProcessMemorySampler();
         const warnings: string[] = [];
+        const treeDirty = this.options.treeDirty !== undefined ? this.options.treeDirty : SystemInfo.treeDirty();
+        if (treeDirty === true) {
+            warnings.push(
+                "the git tree had uncommitted changes, so these figures cannot be reproduced from the commit"
+            );
+        }
         const watch = this.watchFactory({
             metricsUrl: this.options.metricsUrl,
             pgStats: this.options.pgStats,
@@ -117,6 +135,9 @@ export class ScenarioRunner {
         const startedAt = new Date();
         const started = performance.now();
         const deadline = this.options.durationMs === undefined ? undefined : started + this.options.durationMs;
+        const warmup = new WarmupGate(this.options.warmup, started);
+        const recorder = new RunRecorder(scenario.steps, "", warmup);
+        const setupRecorder = new RunRecorder(scenario.setup, SETUP_MESSAGE_PREFIX);
         memory.start();
         try {
             await Promise.all(simulated.map((agent) => agent.connect()));
@@ -144,6 +165,9 @@ export class ScenarioRunner {
             agents,
             iterations: recorder.completedIterations,
             rateLimitPerSecond: this.options.rateLimitPerSecond ?? null,
+            arrivalRatePerSecond: this.options.arrivalRatePerSecond ?? null,
+            treeDirty,
+            backendFlags: this.options.backendFlags ?? "unknown",
             machineSpec: SystemInfo.machineSpec(this.options.machineNote),
             calls: total.calls,
             errors: total.errors + setupTotal.errors,
@@ -163,6 +187,12 @@ export class ScenarioRunner {
         };
         if (scenario.setup.length > 0) {
             result.setupSteps = setupRecorder.steps();
+        }
+        if (this.options.dbPoolSize !== undefined) {
+            result.dbPoolSize = this.options.dbPoolSize;
+        }
+        if (this.options.warmup !== undefined) {
+            result.warmup = { spec: describeWarmup(this.options.warmup), excludedCalls: warmup.excludedCalls };
         }
         if (backend !== undefined) {
             copyBackendFigures(result, backend);
@@ -227,6 +257,8 @@ class SimulatedAgent {
     private readonly resolver: VariableResolver;
     /** The one rate limiter of this agent, shared by every step and every iteration. */
     private readonly limiter = new RateLimiter();
+    /** Due times of this agent's calls in open-loop mode, or undefined in closed-loop mode. Set when play starts. */
+    private arrivals: ArrivalSchedule | undefined;
     /** Start time of the last run of each step by this agent, read by steps that set everyMs. */
     private readonly lastRunAt = new Map<ScenarioStep, number>();
 
@@ -274,6 +306,9 @@ class SimulatedAgent {
         setupRecorder: RunRecorder,
         deadline: number | undefined
     ): Promise<void> {
+        if (this.options.arrivalRatePerSecond !== undefined) {
+            this.arrivals = new ArrivalSchedule(this.options.arrivalRatePerSecond, performance.now());
+        }
         let abortedInRow = 0;
         let setupDone = false;
         for (let iteration = 0; ; iteration++) {
@@ -346,8 +381,13 @@ class SimulatedAgent {
                 if (this.pastDeadline(deadline)) {
                     return false;
                 }
+                // Setup steps run in the closed loop, so only the scenario steps take the arrival schedule.
+                const dueAt = stopOnAnyFailure ? undefined : this.arrivals?.reserve();
                 await this.limiter.wait(this.effectiveRate(step));
-                const passed = await this.callStep(step, stepIndex, iteration, copy, accumulate, recorder);
+                if (dueAt !== undefined) {
+                    await waitUntil(dueAt);
+                }
+                const passed = await this.callStep(step, stepIndex, iteration, copy, accumulate, recorder, dueAt);
                 if (!passed && (stopOnAnyFailure || Object.keys(step.capture).length > 0)) {
                     return false;
                 }
@@ -360,6 +400,7 @@ class SimulatedAgent {
      * Substitutes the arguments of one call, makes the call, checks it, records it and captures from it.
      *
      * @param accumulate - true when the step repeats, so captured values are appended to arrays
+     * @param dueAt - intended send time in open-loop mode, from which latency is counted; undefined in closed loop
      * @returns true when the call passed its checks and its captures were stored
      */
     private async callStep(
@@ -368,7 +409,8 @@ class SimulatedAgent {
         iteration: number,
         copy: number,
         accumulate: boolean,
-        recorder: RunRecorder
+        recorder: RunRecorder,
+        dueAt: number | undefined
     ): Promise<boolean> {
         let args: Record<string, unknown>;
         try {
@@ -377,7 +419,8 @@ class SimulatedAgent {
             recorder.fail(stepIndex, error);
             return false;
         }
-        const outcome = await this.client.callTool(step.tool, args);
+        const sent = await this.client.callTool(step.tool, args);
+        const outcome = dueAt === undefined ? sent : { ...sent, durationMs: performance.now() - dueAt };
         const failure = this.judge(step, outcome, iteration, copy);
         recorder.record(stepIndex, outcome, failure);
         if (failure !== undefined) {
@@ -642,10 +685,12 @@ class RunRecorder {
     /**
      * @param steps - steps of the scenario, in order
      * @param messagePrefix - text put in front of every failure message kept in the result
+     * @param warmup - decides which calls are warm-up and left out of every figure, or undefined for none
      */
     constructor(
         steps: readonly ScenarioStep[],
-        private readonly messagePrefix = ""
+        private readonly messagePrefix = "",
+        private readonly warmup?: WarmupGate
     ) {
         this.perStep = steps.map((step, index) => ({
             name: `${index + 1}. ${step.name}`,
@@ -665,6 +710,9 @@ class RunRecorder {
      * @param failure - why the call counts as an error, or undefined when it does not
      */
     record(stepIndex: number, outcome: ToolCallOutcome, failure?: string): void {
+        if (this.warmup?.excludes(performance.now()) === true) {
+            return;
+        }
         const step = this.perStep[stepIndex];
         step.latency.add(outcome.durationMs);
         step.calls++;

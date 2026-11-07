@@ -169,9 +169,11 @@ describe("HtmlReport", () => {
                     candidate: candidate.p95,
                     changePct: 3.5,
                     regression: true,
+                    notMeasured: false,
                 },
             ],
             regressions: 1,
+            notMeasured: 0,
         };
         const html = HtmlReport.render(candidate, report);
         assert.match(html, /Compared with base\.json/);

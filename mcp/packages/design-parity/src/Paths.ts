@@ -22,18 +22,50 @@ export const COMPARE_DIR: string = join(OUT_DIR, "compare");
 /** Known limitations of the MCP tools met while building the file. */
 export const KNOWN_GAPS_FILE: string = join(PACKAGE_ROOT, "KNOWN_GAPS.md");
 
-/** File that holds the MCP access token. Override with DESIGN_PARITY_TOKEN_FILE. */
-export const TOKEN_FILE: string =
-    process.env.DESIGN_PARITY_TOKEN_FILE ??
-    "C:/Users/colli/AppData/Local/Temp/claude/C--dev-penpot/367536da-914a-442d-83aa-fee0ff1931ef/scratchpad/mcp-token.txt";
-
-/** File that holds the ids of the live stack, with `projectId`. Override with DESIGN_PARITY_VARS_FILE. */
-export const VARS_FILE: string =
-    process.env.DESIGN_PARITY_VARS_FILE ??
-    "C:/Users/colli/AppData/Local/Temp/claude/C--dev-penpot/367536da-914a-442d-83aa-fee0ff1931ef/scratchpad/vars.json";
-
 /** Streamable HTTP endpoint of the backend-mode MCP server. Override with PENPOT_MCP_URL. */
 export const MCP_URL: string = process.env.PENPOT_MCP_URL ?? "http://127.0.0.1:4405/mcp";
 
-/** Folder of the Penpot font files, which the generator copies into the app. Override with PENPOT_FONT_DIR. */
-export const PENPOT_FONT_DIR: string = process.env.PENPOT_FONT_DIR ?? "C:/dev/penpot/frontend/resources/fonts";
+/**
+ * Reads a setting that has no default. The setting must name a value, so that no machine path is built into the
+ * package.
+ *
+ * @param name - name of the environment variable
+ * @returns the trimmed value
+ * @throws Error that names the variable when it is missing or empty
+ */
+export function requiredSetting(name: string): string {
+    const value = process.env[name]?.trim();
+    if (value === undefined || value === "") {
+        throw new Error(`${name} is not set. Set it to the value that the README describes.`);
+    }
+    return value;
+}
+
+/**
+ * Path of the file that holds the MCP access token. Read from DESIGN_PARITY_TOKEN_FILE, which is required.
+ *
+ * @throws Error that names DESIGN_PARITY_TOKEN_FILE when it is not set
+ */
+export function tokenFilePath(): string {
+    return requiredSetting("DESIGN_PARITY_TOKEN_FILE");
+}
+
+/**
+ * Path of the file that holds the ids of the live stack, with `projectId`. Read from DESIGN_PARITY_VARS_FILE, which
+ * is required.
+ *
+ * @throws Error that names DESIGN_PARITY_VARS_FILE when it is not set
+ */
+export function varsFilePath(): string {
+    return requiredSetting("DESIGN_PARITY_VARS_FILE");
+}
+
+/**
+ * Folder of the Penpot font files, which the generator copies into the app. Read from PENPOT_FONT_DIR, which is
+ * required.
+ *
+ * @throws Error that names PENPOT_FONT_DIR when it is not set
+ */
+export function penpotFontDir(): string {
+    return requiredSetting("PENPOT_FONT_DIR");
+}

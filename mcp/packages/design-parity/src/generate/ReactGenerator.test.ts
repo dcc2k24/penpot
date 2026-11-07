@@ -485,12 +485,14 @@ function strokedModel(strokes: StrokeModel[], children: NodeModel[] = []): Desig
  */
 function generateStroked(model: DesignModel): { source: string; warnings: string[] } {
     const dir = tempDir();
+    const fonts = fontSource();
     try {
-        const summary = new ReactGenerator(model, dir).generate();
+        const summary = new ReactGenerator(model, dir, fonts).generate();
         const source = readFileSync(join(dir, "src", "components", "Stroked.tsx"), "utf8");
         return { source, warnings: summary.warnings };
     } finally {
         rmSync(dir, { recursive: true, force: true });
+        rmSync(fonts, { recursive: true, force: true });
     }
 }
 
@@ -520,3 +522,66 @@ function placementLines(source: string, name: string): string[] {
         .map((line) => line.trim())
         .filter((line) => /^(left|top):/.test(line));
 }
+
+/**
+ * Finds the node with an id in a list of nodes and their descendants.
+ *
+ * @param nodes - nodes to search
+ * @param id - id to find
+ */
+function findNodeById(nodes: readonly NodeModel[], id: string): NodeModel | undefined {
+    for (const node of nodes) {
+        if (node.id === id) {
+            return node;
+        }
+        const found = findNodeById(node.children, id);
+        if (found !== undefined) {
+            return found;
+        }
+    }
+    return undefined;
+}
+
+describe("ReactGenerator component cycles", () => {
+    it("treats a main board that refers to its own component as its root, not as a cycle", () => {
+        const model = loadFixture();
+        const component = model.components[0];
+        const board = findNodeById(
+            model.pages.flatMap((page) => page.boards),
+            component.mainInstanceId
+        );
+        assert.ok(board, "the fixture has the main board of its first component");
+        // A main board whose main-instance flag is missing looks like a copy of its own component.
+        Object.assign(board, { component: { componentId: component.id, mainInstance: false, componentRoot: true } });
+        const fonts = fontSource();
+        const dir = tempDir();
+        try {
+            const summary = new ReactGenerator(model, dir, fonts).generate();
+            assert.ok(summary.components > 0);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+            rmSync(fonts, { recursive: true, force: true });
+        }
+    });
+
+    it("still reports a nested copy of a component inside that component as a cycle", () => {
+        const model = loadFixture();
+        const component = model.components[0];
+        const board = findNodeById(
+            model.pages.flatMap((page) => page.boards),
+            component.mainInstanceId
+        );
+        assert.ok(board && board.children.length > 0, "the main board has a child");
+        Object.assign(board.children[0], {
+            component: { componentId: component.id, mainInstance: false, componentRoot: false },
+        });
+        const fonts = fontSource();
+        const dir = tempDir();
+        try {
+            assert.throws(() => new ReactGenerator(model, dir, fonts).generate(), /component cycle/);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+            rmSync(fonts, { recursive: true, force: true });
+        }
+    });
+});

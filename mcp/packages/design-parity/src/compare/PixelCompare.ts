@@ -4,7 +4,7 @@ import { chromium, type Browser } from "playwright";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { McpImageClient } from "./McpExport.js";
-import { budgetOf } from "./Budget.js";
+import { budgetOf, DEFAULT_PIXEL_BUDGETS, type PixelBudgets } from "./Budget.js";
 import { causeOf } from "./PixelCauses.js";
 import { clusterMask, REAL_MISMATCH_CLUSTER } from "./Clusters.js";
 import { COMPARE_DIR, MCP_URL } from "../Paths.js";
@@ -105,6 +105,7 @@ export class PixelComparator {
      * @param log - receives one line per target
      * @param scale - device scale of the export and the screenshot, an integer from 1 to 3
      * @param appBrowser - where the app is screenshotted (default local)
+     * @param budgets - pixel budget of each target kind, in percent (default DEFAULT_PIXEL_BUDGETS)
      * @throws Error when the model has no Components page, or when the MCP server or the browser cannot start
      */
     async run(
@@ -113,7 +114,8 @@ export class PixelComparator {
         baseUrl: string,
         log: (line: string) => void,
         scale: number,
-        appBrowser: AppBrowser = { mode: "local" }
+        appBrowser: AppBrowser = { mode: "local" },
+        budgets: Readonly<PixelBudgets> = DEFAULT_PIXEL_BUDGETS
     ): Promise<PixelResult[]> {
         const componentsPage = model.pages.find((page) => page.name === COMPONENTS_PAGE_NAME);
         if (componentsPage === undefined) {
@@ -166,7 +168,7 @@ export class PixelComparator {
                         results.push({ targetId: target.id, status: "unavailable", reason });
                         continue;
                     }
-                    results.push(this.compareImages(target, outcome.png, shot, log));
+                    results.push(this.compareImages(target, outcome.png, shot, log, budgets));
                 }
             } else {
                 // --disable-lcd-text turns off subpixel (LCD) antialiasing, so glyphs are greyscale like the export.
@@ -186,7 +188,7 @@ export class PixelComparator {
                             continue;
                         }
                         const shot = await this.screenshotTarget(browser, target, baseUrl, scale);
-                        results.push(this.compareImages(target, exported.png, shot, log));
+                        results.push(this.compareImages(target, exported.png, shot, log, budgets));
                     }
                 } finally {
                     await browser.close();
@@ -253,7 +255,8 @@ export class PixelComparator {
         target: DesignTarget,
         exported: Buffer,
         shot: Buffer,
-        log: (line: string) => void
+        log: (line: string) => void,
+        budgets: Readonly<PixelBudgets>
     ): PixelResult {
         const targetId = target.id;
         const prefix = target.id.replace(/\//g, "-");
@@ -286,7 +289,7 @@ export class PixelComparator {
         writeFileSync(appFile, PNG.sync.write(appCanvas));
         writeFileSync(diffFile, PNG.sync.write(diff));
 
-        const budget = budgetOf(target.kind);
+        const budget = budgetOf(target.kind, budgets);
         const result: PixelResult = {
             targetId,
             status: "ok",

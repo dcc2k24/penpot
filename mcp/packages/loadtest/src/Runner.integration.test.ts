@@ -257,6 +257,7 @@ function runOptions(agents: number, extra: Partial<RunOptions> = {}): RunOptions
         vars: {},
         env: {},
         commit: "x",
+        treeDirty: false,
         ...extra,
     };
 }
@@ -579,5 +580,63 @@ describe("ScenarioRunner with a backend watch", () => {
         assert.equal(result.dbStatements, undefined);
         assert.equal(result.warnings.length, 1, JSON.stringify(result.warnings));
         assert.match(result.warnings[0], /^metrics scrape failed: /);
+    });
+});
+
+describe("warm-up, open-loop pacing and provenance", () => {
+    test("the first calls of a warm-up are left out of the figures but still run", async () => {
+        const { result, captured } = await new ScenarioRunner(runOptions(3, { warmup: { calls: 2 } })).run(
+            twoStepScenario()
+        );
+        assert.equal(result.calls, 4, "6 calls made, 2 excluded");
+        assert.deepEqual(result.warmup, { spec: "2 calls", excludedCalls: 2 });
+        assert.equal(
+            result.steps.reduce((sum, step) => sum + step.calls, 0),
+            4
+        );
+        assert.equal(result.errors, 0);
+        assert.equal(captured.profileId, "stub-profile");
+    });
+
+    test("a duration warm-up that covers the whole run leaves every call out", async () => {
+        const { result } = await new ScenarioRunner(runOptions(1, { warmup: { durationMs: 60_000 } })).run(
+            twoStepScenario()
+        );
+        assert.equal(result.calls, 0);
+        assert.deepEqual(result.warmup, { spec: "60 s", excludedCalls: 2 });
+        assert.equal(result.p95, 0);
+    });
+
+    test("no warm-up leaves the warmup field out", async () => {
+        const { result } = await new ScenarioRunner(runOptions(1)).run(twoStepScenario());
+        assert.equal(result.warmup, undefined);
+        assert.equal(result.arrivalRatePerSecond, null);
+        assert.equal(result.backendFlags, "unknown");
+        assert.equal(result.dbPoolSize, undefined);
+    });
+
+    test("the backend flags and pool size are recorded as given", async () => {
+        const { result } = await new ScenarioRunner(
+            runOptions(1, { backendFlags: "enable-feature-x", dbPoolSize: 16 })
+        ).run(twoStepScenario());
+        assert.equal(result.backendFlags, "enable-feature-x");
+        assert.equal(result.dbPoolSize, 16);
+    });
+
+    test("a dirty tree is recorded and warned about", async () => {
+        const { result } = await new ScenarioRunner(runOptions(1, { treeDirty: true })).run(twoStepScenario());
+        assert.equal(result.treeDirty, true);
+        assert.equal(result.warnings.length, 1);
+        assert.match(result.warnings[0], /uncommitted changes/);
+    });
+
+    test("open loop: calls are due at the arrival rate, so the run takes at least the schedule", async () => {
+        // Two calls at 20 per second: the second call is due 50 ms after the first.
+        const started = performance.now();
+        const { result } = await new ScenarioRunner(runOptions(1, { arrivalRatePerSecond: 20 })).run(twoStepScenario());
+        assert.ok(performance.now() - started >= 45, "the schedule holds the second call back");
+        assert.equal(result.arrivalRatePerSecond, 20);
+        assert.equal(result.calls, 2, "one agent, two steps, one iteration");
+        assert.equal(result.errors, 0);
     });
 });

@@ -1,7 +1,7 @@
 import { Client, StreamableHTTPClientTransport, type CallToolResult } from "@modelcontextprotocol/client";
 import { existsSync, readFileSync } from "node:fs";
-import { delay, RETRY_DELAYS_MS } from "../McpSession.js";
-import { TOKEN_FILE } from "../Paths.js";
+import { delay, RATE_LIMIT_RETRIES, rateLimitWaitOf, RETRY_DELAYS_MS } from "../McpSession.js";
+import { tokenFilePath } from "../Paths.js";
 
 /** Prefix of the text the backend returns when a command fails. */
 const BACKEND_FAILURE_PREFIX = "Tool execution failed:";
@@ -16,12 +16,13 @@ const EXPORT_TOOL = "export_shape";
  * @throws Error when the file is missing or empty
  */
 function readToken(): string {
-    if (!existsSync(TOKEN_FILE)) {
-        throw new Error(`token file not found: ${TOKEN_FILE}`);
+    const tokenFile = tokenFilePath();
+    if (!existsSync(tokenFile)) {
+        throw new Error(`token file not found: ${tokenFile}`);
     }
-    const token = readFileSync(TOKEN_FILE, "utf8").trim();
+    const token = readFileSync(tokenFile, "utf8").trim();
     if (token === "") {
-        throw new Error(`token file is empty: ${TOKEN_FILE}`);
+        throw new Error(`token file is empty: ${tokenFile}`);
     }
     return token;
 }
@@ -36,6 +37,61 @@ function recordOf(block: unknown): { type?: unknown; text?: unknown; data?: unkn
         return {};
     }
     return block as { type?: unknown; text?: unknown; data?: unknown };
+}
+
+/**
+ * Runs one tool call with the same retries as the session. A rejected call waits on the backoff schedule. A call that
+ * the adapter rate-limited waits the time it names, at most RATE_LIMIT_RETRIES times, and the rate-limited call did not
+ * run, so it is safe to repeat.
+ *
+ * @param call - makes one attempt of the call
+ * @param wait - waits for the given milliseconds, replaced in tests
+ * @returns the result of the first attempt that was not rejected or rate-limited
+ * @throws the last rejection when every retry failed
+ */
+export async function callWithRetry(
+    call: () => Promise<CallToolResult>,
+    wait: (ms: number) => Promise<void> = delay
+): Promise<CallToolResult> {
+    let transientRetries = 0;
+    let rateRetries = 0;
+    for (;;) {
+        let result: CallToolResult;
+        try {
+            result = await call();
+        } catch (error) {
+            if (transientRetries >= RETRY_DELAYS_MS.length) {
+                throw error;
+            }
+            await wait(RETRY_DELAYS_MS[transientRetries] ?? 0);
+            transientRetries++;
+            continue;
+        }
+        const text = textOf(result);
+        const failed = result.isError === true || text.startsWith(BACKEND_FAILURE_PREFIX);
+        const waitMs = failed ? rateLimitWaitOf(text) : undefined;
+        if (waitMs !== undefined && rateRetries < RATE_LIMIT_RETRIES) {
+            rateRetries++;
+            await wait(waitMs);
+            continue;
+        }
+        return result;
+    }
+}
+
+/**
+ * Joins the text blocks of a tool result.
+ *
+ * @param result - tool result
+ */
+function textOf(result: CallToolResult): string {
+    const blocks: unknown[] = Array.isArray(result.content) ? result.content : [];
+    return blocks
+        .flatMap((block) => {
+            const candidate = recordOf(block);
+            return candidate.type === "text" && typeof candidate.text === "string" ? [candidate.text] : [];
+        })
+        .join("\n");
 }
 
 /**
@@ -86,7 +142,12 @@ export class McpImageClient {
         if (client === undefined) {
             throw new Error("exportPng was called before connect");
         }
-        const result = await McpImageClient.callWithRetry(client, fileId, pageId, shapeId, scale);
+        const result = await callWithRetry(() =>
+            client.callTool({
+                name: EXPORT_TOOL,
+                arguments: { fileId, pageId, shapeId, format: "png", scale },
+            })
+        );
         const blocks: unknown[] = Array.isArray(result.content) ? result.content : [];
         const texts = blocks.flatMap((block) => {
             const candidate = recordOf(block);
@@ -108,39 +169,6 @@ export class McpImageClient {
             return "empty";
         }
         return Buffer.from(data, "base64");
-    }
-
-    /**
-     * Calls the export tool. A rejected call is retried after each wait of the backoff schedule,
-     * and the last rejection is thrown when every retry failed.
-     *
-     * @param client - connected MCP client
-     * @param fileId - id of the file that holds the shape
-     * @param pageId - id of the page that holds the shape
-     * @param shapeId - id of the shape to export
-     * @param scale - device scale of the export
-     * @returns the tool result
-     */
-    private static async callWithRetry(
-        client: Client,
-        fileId: string,
-        pageId: string,
-        shapeId: string,
-        scale: number
-    ): Promise<CallToolResult> {
-        for (let attempt = 0; ; attempt++) {
-            try {
-                return await client.callTool({
-                    name: EXPORT_TOOL,
-                    arguments: { fileId, pageId, shapeId, format: "png", scale },
-                });
-            } catch (error) {
-                if (attempt >= RETRY_DELAYS_MS.length) {
-                    throw error;
-                }
-                await delay(RETRY_DELAYS_MS[attempt] ?? 0);
-            }
-        }
     }
 
     /**

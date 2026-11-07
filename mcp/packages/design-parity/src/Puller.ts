@@ -3,6 +3,8 @@ import { dirname, join } from "node:path";
 import type { DesignModel } from "./DesignModel.js";
 import { expectArray, expectRecord, McpSession } from "./McpSession.js";
 import { DesignNormaliser, type NormaliserInput } from "./Normaliser.js";
+import { assertCovered, FieldCoverage, observeTree, SHAPE_FIELDS, TREE_FIELDS } from "./PullFields.js";
+import { fetchShapeChunks } from "./ShapeChunks.js";
 import { DESIGN_FILE, OUT_DIR } from "./Paths.js";
 
 /** Id of the root of every page tree. The root is not a shape of the page. */
@@ -13,9 +15,6 @@ const TREE_DEPTH = 20;
 
 /** Maximum number of nodes that get_page_tree returns in one response. */
 const TREE_LIMIT = 5000;
-
-/** Maximum number of ids that get_shapes takes in one call. */
-const SHAPES_CHUNK = 200;
 
 /** Raw JSON object as the backend returns it. */
 type RawRecord = Record<string, unknown>;
@@ -76,6 +75,11 @@ export class DesignPuller {
             pageRoots.set(page.id, root);
             trees.set(page.id, { root });
         }
+        const treeCoverage = new FieldCoverage(TREE_FIELDS);
+        for (const root of pageRoots.values()) {
+            observeTree(root, treeCoverage);
+        }
+        assertCovered("get_page_tree", treeCoverage);
         this.report("trees", step, `${pages.length} pages`);
 
         step = performance.now();
@@ -84,6 +88,11 @@ export class DesignPuller {
             const root = pageRoots.get(page.id) ?? {};
             await this.fetchShapes(page, this.collectIds(root), shapes);
         }
+        const shapeCoverage = new FieldCoverage(SHAPE_FIELDS);
+        for (const shape of shapes.values()) {
+            shapeCoverage.observe(shape);
+        }
+        assertCovered("get_shapes", shapeCoverage);
         this.report("shapes", step, `${shapes.size} shapes`);
 
         step = performance.now();
@@ -148,6 +157,7 @@ export class DesignPuller {
                 pageId: page.id,
                 depth: TREE_DEPTH,
                 limit: TREE_LIMIT,
+                fields: [...TREE_FIELDS],
             };
             if (cursor !== undefined) {
                 args.cursor = cursor;
@@ -165,34 +175,48 @@ export class DesignPuller {
     }
 
     /**
-     * Fetches the shapes of one page in chunks of 200 ids and adds them to the shared map.
+     * Fetches the shapes of one page. The ids go out in chunks, and a cut answer is asked again in halves, so the
+     * shapes are read whatever the size limit is. The shapes go into the shared map in the order of the ids.
      *
      * @param page - page the ids belong to
      * @param ids - ids of the page tree, root excluded
      * @param shapes - shared map from id to raw shape, filled in place
-     * @throws Error when a response is truncated
+     * @throws Error when a single shape is cut at the size limit, or a response is malformed
      */
     private async fetchShapes(page: PageRef, ids: string[], shapes: Map<string, RawRecord>): Promise<void> {
         const slug = slugOf(page.name);
-        let chunkNumber = 0;
-        for (let start = 0; start < ids.length; start += SHAPES_CHUNK) {
-            chunkNumber += 1;
-            const chunk = ids.slice(start, start + SHAPES_CHUNK);
-            const result = await this.session.call("get_shapes", { fileId: this.fileId, pageId: page.id, ids: chunk });
-            const response = expectRecord(result.json, `get_shapes for page ${page.name}`);
-            this.writeRaw(`shapes-${slug}-${chunkNumber}.json`, response);
-            if (response.truncated === true) {
-                throw new Error(`get_shapes truncated for page ${page.name}`);
+        let requestNumber = 0;
+        const result = await fetchShapeChunks(
+            ids,
+            async (chunk) => {
+                requestNumber += 1;
+                const answer = await this.session.call("get_shapes", {
+                    fileId: this.fileId,
+                    pageId: page.id,
+                    ids: chunk,
+                    fields: [...SHAPE_FIELDS],
+                });
+                const response = expectRecord(answer.json, `get_shapes for page ${page.name}`);
+                this.writeRaw(`shapes-${slug}-${requestNumber}.json`, response);
+                const entries = expectArray(response.shapes, `get_shapes shapes for page ${page.name}`);
+                return {
+                    shapes: entries.filter(isRecord),
+                    missing: Array.isArray(response.missing)
+                        ? response.missing.filter((id): id is string => typeof id === "string")
+                        : [],
+                    truncated: response.truncated === true,
+                };
+            },
+            `page ${page.name}`
+        );
+        for (const id of ids) {
+            const shape = result.shapes.get(id);
+            if (shape !== undefined) {
+                shapes.set(id, shape);
             }
-            for (const entry of expectArray(response.shapes, `get_shapes shapes for page ${page.name}`)) {
-                if (isRecord(entry) && typeof entry.id === "string") {
-                    shapes.set(entry.id, entry);
-                }
-            }
-            const missing = expectArray(response.missing, `get_shapes missing for page ${page.name}`);
-            if (missing.length > 0) {
-                this.log(`[pull] shapes: ${missing.length} ids missing`);
-            }
+        }
+        if (result.missing.length > 0) {
+            this.log(`[pull] shapes: ${result.missing.length} ids missing`);
         }
     }
 

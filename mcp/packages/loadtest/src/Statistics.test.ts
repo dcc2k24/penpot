@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { LatencyRecorder, percentile } from "./Statistics.js";
+import { LatencyRecorder, percentile, percentileReliability } from "./Statistics.js";
 
 describe("percentile", () => {
     test("uses the nearest rank over sorted samples", () => {
@@ -28,6 +28,22 @@ describe("percentile", () => {
     });
 });
 
+describe("percentileReliability", () => {
+    test("p50 needs 20 samples", () => {
+        assert.deepEqual(percentileReliability(19), { p50: false, p95: false, p99: false });
+        assert.deepEqual(percentileReliability(20), { p50: true, p95: false, p99: false });
+    });
+
+    test("p95 and p99 need 200 samples", () => {
+        assert.deepEqual(percentileReliability(199), { p50: true, p95: false, p99: false });
+        assert.deepEqual(percentileReliability(200), { p50: true, p95: true, p99: true });
+    });
+
+    test("seven samples give no reliable percentile", () => {
+        assert.deepEqual(percentileReliability(7), { p50: false, p95: false, p99: false });
+    });
+});
+
 describe("LatencyRecorder", () => {
     test("summarises unsorted samples", () => {
         const recorder = new LatencyRecorder();
@@ -35,10 +51,37 @@ describe("LatencyRecorder", () => {
             recorder.add(value);
         }
         assert.equal(recorder.count, 4);
-        assert.deepEqual(recorder.summary(), { count: 4, p50: 20, p95: 40, p99: 40, max: 40 });
+        assert.deepEqual(recorder.summary(), {
+            count: 4,
+            p50: 20,
+            p95: 40,
+            p99: 40,
+            max: 40,
+            reliable: { p50: false, p95: false, p99: false },
+        });
+    });
+
+    test("marks p50 reliable from 20 samples and the tail only from 200", () => {
+        const recorder = new LatencyRecorder();
+        for (let index = 0; index < 200; index++) {
+            recorder.add(index);
+        }
+        assert.deepEqual(recorder.summary().reliable, { p50: true, p95: true, p99: true });
+        const small = new LatencyRecorder();
+        for (let index = 0; index < 25; index++) {
+            small.add(index);
+        }
+        assert.deepEqual(small.summary().reliable, { p50: true, p95: false, p99: false });
     });
 
     test("an empty recorder summarises to zeros", () => {
-        assert.deepEqual(new LatencyRecorder().summary(), { count: 0, p50: 0, p95: 0, p99: 0, max: 0 });
+        assert.deepEqual(new LatencyRecorder().summary(), {
+            count: 0,
+            p50: 0,
+            p95: 0,
+            p99: 0,
+            max: 0,
+            reliable: { p50: false, p95: false, p99: false },
+        });
     });
 });

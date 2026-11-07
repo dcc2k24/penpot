@@ -3,3 +3,12 @@ dist/
 app/node_modules/
 app/dist/
 app/public/fonts/
+
+# Written by `generate`, which rebuilds them from out/design.json. Only app/src/main.tsx and the app config stay tracked.
+app/src/components/
+app/src/screens/
+app/src/routes.tsx
+app/src/runtime.ts
+app/src/tokens.css
+app/src/typography.css
+app/index.html

@@ -5,10 +5,11 @@ import { DESIGN_SPEC } from "./DesignSpec.js";
 import { IdsStore } from "./IdsStore.js";
 import { McpSession } from "./McpSession.js";
 import { DesignPuller } from "./Puller.js";
-import { DESIGN_FILE, KNOWN_GAPS_FILE, MCP_URL, TOKEN_FILE, VARS_FILE } from "./Paths.js";
+import { DESIGN_FILE, KNOWN_GAPS_FILE, MCP_URL, tokenFilePath, varsFilePath } from "./Paths.js";
 import { DesignVerifier } from "./Verifier.js";
 import { runGenerate } from "./generate/GenerateCommand.js";
-import { DEFAULT_SCALE, MAX_SCALE, MIN_SCALE, runCompare } from "./compare/CompareCommand.js";
+import { compareExitCode, DEFAULT_SCALE, MAX_SCALE, MIN_SCALE, runCompare } from "./compare/CompareCommand.js";
+import { DEFAULT_PIXEL_BUDGETS, parseBudgetOption, type PixelBudgets } from "./compare/Budget.js";
 import { containerRunning, defaultAppBrowser, EXPORTER_CONTAINER, parseAppBrowser } from "./compare/Screenshots.js";
 import { runLoop } from "./LoopCommand.js";
 
@@ -21,12 +22,13 @@ const EXIT_FAILURE = 1;
  * @throws Error when the file is missing or empty
  */
 function readToken(): string {
-    if (!existsSync(TOKEN_FILE)) {
-        throw new Error(`token file not found: ${TOKEN_FILE}`);
+    const tokenFile = tokenFilePath();
+    if (!existsSync(tokenFile)) {
+        throw new Error(`token file not found: ${tokenFile}`);
     }
-    const token = readFileSync(TOKEN_FILE, "utf8").trim();
+    const token = readFileSync(tokenFile, "utf8").trim();
     if (token === "") {
-        throw new Error(`token file is empty: ${TOKEN_FILE}`);
+        throw new Error(`token file is empty: ${tokenFile}`);
     }
     return token;
 }
@@ -37,14 +39,15 @@ function readToken(): string {
  * @throws Error when the file is missing or has no projectId
  */
 function readProjectId(): string {
-    if (!existsSync(VARS_FILE)) {
-        throw new Error(`vars file not found: ${VARS_FILE}`);
+    const varsFile = varsFilePath();
+    if (!existsSync(varsFile)) {
+        throw new Error(`vars file not found: ${varsFile}`);
     }
-    const parsed: unknown = JSON.parse(readFileSync(VARS_FILE, "utf8"));
+    const parsed: unknown = JSON.parse(readFileSync(varsFile, "utf8"));
     const projectId =
         typeof parsed === "object" && parsed !== null ? (parsed as { projectId?: unknown }).projectId : undefined;
     if (typeof projectId !== "string") {
-        throw new Error(`vars file has no projectId: ${VARS_FILE}`);
+        throw new Error(`vars file has no projectId: ${varsFile}`);
     }
     return projectId;
 }
@@ -198,7 +201,9 @@ function runVerify(): number {
 }
 
 /**
- * Parses the options of the compare command and runs it. The exit code is 1 when the DOM compare has any mismatch.
+ * Parses the options of the compare command and runs it. The exit code is 1 when the DOM compare has any mismatch, or
+ * when a target is over its pixel budget or could not be compared. `--advisory` leaves the pixel results out of the
+ * exit code.
  *
  * @param args - command line options after the command name
  * @returns the process exit code
@@ -208,10 +213,20 @@ async function runCompareCommand(args: string[]): Promise<number> {
     let pixel = true;
     let scale: number = DEFAULT_SCALE;
     let appBrowserSpec: string | undefined = undefined;
+    let advisory = false;
+    const budgets: PixelBudgets = { ...DEFAULT_PIXEL_BUDGETS };
     for (let index = 0; index < args.length; index++) {
         const arg = args[index];
         if (arg === "--no-pixel") {
             pixel = false;
+        } else if (arg === "--advisory") {
+            advisory = true;
+        } else if (arg === "--pixel-budget-components" && args[index + 1] !== undefined) {
+            budgets.component = parseBudgetOption(args[index + 1], "--pixel-budget-components");
+            index++;
+        } else if (arg === "--pixel-budget-screens" && args[index + 1] !== undefined) {
+            budgets.screen = parseBudgetOption(args[index + 1], "--pixel-budget-screens");
+            index++;
         } else if (arg === "--screen" && args[index + 1] !== undefined) {
             screen = args[index + 1];
             index++;
@@ -238,8 +253,8 @@ async function runCompareCommand(args: string[]): Promise<number> {
             appBrowserSpec !== undefined
                 ? parseAppBrowser(appBrowserSpec)
                 : defaultAppBrowser(pixel && (await containerRunning(EXPORTER_CONTAINER)));
-        const mismatches = await runCompare({ screen, pixel, scale, appBrowser });
-        return mismatches > 0 ? EXIT_FAILURE : 0;
+        const outcome = await runCompare({ screen, pixel, scale, appBrowser, budgets });
+        return compareExitCode(outcome, advisory);
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`compare failed: ${message}`);

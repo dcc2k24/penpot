@@ -47,6 +47,25 @@ export class SystemInfo {
             return "unknown";
         }
     }
+
+    /**
+     * Tells whether the git tree has uncommitted changes, including untracked files.
+     *
+     * @param directory - directory inside the checkout, defaults to this package
+     * @returns true when dirty, false when clean, or null when git cannot tell
+     */
+    static treeDirty(directory: string = SystemInfo.PACKAGE_ROOT): boolean | null {
+        try {
+            const status = execFileSync("git", ["status", "--porcelain"], {
+                cwd: directory,
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "ignore"],
+            });
+            return status.trim() !== "";
+        } catch {
+            return null;
+        }
+    }
 }
 
 /**

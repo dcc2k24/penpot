@@ -1,6 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import { type ComparisonReport } from "./Compare.js";
 import { type MemoryFigures, type RunResult } from "./ResultFile.js";
+import { percentileNote } from "./Statistics.js";
 
 /**
  * Renders a run as one self-contained HTML page: inline styles, no scripts and no external resources.
@@ -71,15 +72,36 @@ export class HtmlReport {
             ["Agents", String(result.agents)],
             ["Iterations", String(result.iterations)],
             ["Rate cap per agent", result.rateLimitPerSecond === null ? "none" : `${result.rateLimitPerSecond} /s`],
+            ["Arrival rate per agent", HtmlReport.arrivalText(result)],
+            [
+                "Warm-up",
+                result.warmup === undefined
+                    ? "none"
+                    : `${result.warmup.spec}, ${result.warmup.excludedCalls} calls excluded`,
+            ],
+            [
+                "Tree",
+                result.treeDirty === true ? "uncommitted changes" : result.treeDirty === false ? "clean" : "unknown",
+            ],
+            ["Backend flags", result.backendFlags ?? "unknown"],
+            ["DB pool size", result.dbPoolSize === undefined ? "not given" : String(result.dbPoolSize)],
             ["Calls", String(result.calls)],
             ["Errors", String(result.errors)],
             ["Payload", formatBytes(result.bytes)],
-            ["p50", formatMs(result.p50)],
-            ["p95", formatMs(result.p95)],
-            ["p99", formatMs(result.p99)],
+            ["p50", formatMs(result.p50) + percentileNote("p50", result.calls)],
+            ["p95", formatMs(result.p95) + percentileNote("p95", result.calls)],
+            ["p99", formatMs(result.p99) + percentileNote("p99", result.calls)],
             ["max", formatMs(result.max)],
             ["DB statements", result.dbStatements === undefined ? "not sampled" : String(result.dbStatements)],
         ])}`;
+    }
+
+    /**
+     * Text of the arrival rate: the open-loop rate, or the closed loop when none was set.
+     */
+    private static arrivalText(result: RunResult): string {
+        const rate = result.arrivalRatePerSecond;
+        return rate === undefined || rate === null ? "closed loop" : `${rate} /s (open loop, latency from due time)`;
     }
 
     /**
@@ -101,7 +123,9 @@ export class HtmlReport {
             return (
                 `<tr><td>${esc(step.name)}</td><td><code>${esc(step.tool)}</code></td><td>${step.calls}</td>` +
                 `<td class="${step.errors > 0 ? "bad" : ""}">${step.errors}</td><td>${formatBytes(step.bytes)}</td>` +
-                `<td>${formatMs(step.p50)}</td><td>${formatMs(step.p95)}</td><td>${formatMs(step.p99)}</td>` +
+                `<td>${formatMs(step.p50) + percentileNote("p50", step.calls)}</td>` +
+                `<td>${formatMs(step.p95) + percentileNote("p95", step.calls)}</td>` +
+                `<td>${formatMs(step.p99) + percentileNote("p99", step.calls)}</td>` +
                 `<td>${formatMs(step.max)}</td></tr>`
             );
         });
@@ -132,12 +156,13 @@ export class HtmlReport {
             return (
                 `<tr class="${row.regression ? "bad" : ""}"><td>${esc(row.scope)}</td><td>${esc(row.metric)}</td>` +
                 `<td>${row.baseline}</td><td>${row.candidate}</td><td>${change}</td>` +
-                `<td>${row.regression ? "REGRESSION" : ""}</td></tr>`
+                `<td>${row.notMeasured ? "NOT MEASURED" : row.regression ? "REGRESSION" : ""}</td></tr>`
             );
         });
         return (
             `<h2>Compared with ${esc(comparison.baseline)}</h2><p>Threshold ` +
-            `${(comparison.threshold * 100).toFixed(0)} %, ${comparison.regressions} regression(s).</p>` +
+            `${(comparison.threshold * 100).toFixed(0)} %, ${comparison.regressions} regression(s), ` +
+            `${comparison.notMeasured} figure(s) not measured (too few samples).</p>` +
             `<table><thead><tr><th>Scope</th><th>Metric</th><th>Baseline</th><th>Candidate</th><th>Change</th>` +
             `<th>Flag</th></tr></thead><tbody>${rows.join("")}</tbody></table>`
         );

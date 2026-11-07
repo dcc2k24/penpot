@@ -115,7 +115,9 @@ await step("get_page_tree", "get_page_tree", { fileId, pageId, depth: 3 }, (j) =
     return names.includes("Card") && names.includes("Accent") ? `root children ok` : false;
 });
 
-await step("get_shapes rect", "get_shapes", { fileId, pageId, ids: [rectId] }, (j) => {
+// get_shapes returns only the default fields unless fields names more, so the fill is asked for by name. With fields
+// set, the answer holds only what is named, so x and width are named too.
+await step("get_shapes rect", "get_shapes", { fileId, pageId, ids: [rectId], fields: ["fills", "x", "width"] }, (j) => {
     const s = j.shapes?.[0];
     return s && s.width === 64 && s.fills?.[0]?.fillColor === "#3366FF" ? `rect ok x=${s.x}` : false;
 });
@@ -231,18 +233,44 @@ await step(
     (j) => typeof j.revn === "number"
 );
 
-await step("get_tokens", "get_tokens", { fileId }, (j) =>
-    (j.tokens?.length ?? 0) >= 2 ? `tokens=${j.tokens.length}` : false
-);
+// get_tokens takes only the file id and has no set filter. The adapter cuts an answer above 100 kB into a
+// { truncated, note, partial } shape, and this file holds many tokens from earlier runs. A cut answer cannot show the
+// tokens of this run, so the check then reports that it was not verified rather than passing on the content.
+const SMOKE_TOKENS = ["brand.primary", "space.md"];
+await step("get_tokens", "get_tokens", { fileId }, (j) => {
+    if (j.truncated === true) {
+        if (typeof j.note !== "string" || j.partial === undefined) {
+            return false;
+        }
+        const seen = SMOKE_TOKENS.filter((name) => JSON.stringify(j.partial).includes(name));
+        return `truncated answer, smoke tokens seen ${seen.length}/${SMOKE_TOKENS.length}, not verified`;
+    }
+    const names = new Set((j.tokens ?? []).map((token) => token.name));
+    const missing = SMOKE_TOKENS.filter((name) => !names.has(name));
+    return missing.length === 0 ? `tokens=${j.tokens.length}, smoke tokens found` : false;
+});
 
 await step("get_library", "get_library", { fileId }, (j) => j && "components" in j);
+
+// The script runs on a page of its own, as the scenarios do with freshPage, so the test file's main page stays as it is.
+const scriptPage = await step(
+    "fresh page for execute_code",
+    "apply_operations",
+    {
+        fileId,
+        snapshot: false,
+        operations: [{ op: "create_page", id: "$tmp:page", name: `smoke execute_code ${Date.now()}` }],
+    },
+    (j) => (j.createdIds?.["$tmp:page"] ? true : false)
+);
+const scriptPageId = scriptPage?.createdIds?.["$tmp:page"];
 
 await step(
     "execute_code create+read",
     "execute_code",
     {
         fileId,
-        pageId,
+        pageId: scriptPageId,
         code: `const b = penpot.createBoard(); b.name = "FromScript"; b.resize(200, 120); b.x = 800; b.y = 100;
            const r = penpot.createRectangle(); r.resize(50, 50); b.appendChild(r); r.fills = [{fillColor: "#00AA55", fillOpacity: 1}];
            return { boardId: b.id, width: b.width, children: penpot.currentPage.findShapes().length };`,

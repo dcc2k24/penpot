@@ -115,6 +115,19 @@ the harness, so they include the adapter.
   perf file only). It now spreads its 50 `find_shapes` calls over the first 20 pages in three passes and reads 200
   shapes of any type from page 0.
 
+## How to read the table
+
+- Sample rule: p50 needs at least 20 calls, and p95 and p99 need at least 200. A figure with fewer samples is printed
+  with `(unreliable: n samples, needs m)` and is not a result. Read a p95 from 7 calls as the maximum, not as a tail.
+  A comparison marks such a figure `NOT MEASURED`; it neither passes nor fails.
+- Closed loop is the default: each agent waits for its last call. Under saturation this hides queueing delay. Runs
+  with `--arrival-rate` are open loop, and their latency counts from the intended send time.
+- Warm-up: the rows below were measured before `--warmup` and `--arrival-rate` existed. They are closed loop and
+  include every call. A run with `--warmup` lists the excluded calls in its summary.
+- Provenance: the commit is the tree that was tested. A run on an uncommitted tree is marked, and its figures are not
+  reproducible from the commit alone. Compare two figures only when the commit, the backend flags, the DB pool size and
+  the machine note match.
+
 ## Last run
 
 Every run used `--metrics http://localhost:6061/metrics --pg-stats docker:penpot-penpot-postgres-1:penpot_mcpdev`
