@@ -5,15 +5,17 @@
 ;; Copyright (c) KALEIDOS SUBSIDIARY SL
 
 (ns app.common.logic.token-application
-  "Pure mapping from resolved design token values to shape data.
+  "Mapping from resolved design token values to shape data.
 
   Ports the token-to-shape mapping of the frontend
-  (`app.main.data.workspace.tokens.application`) without re-frame, so
-  that backend operations can apply tokens. Shape functions take a
-  shape and return a shape. Geometry (size and rotation) is returned
-  as a change map for the caller to apply through the geometry
-  modifiers."
+  (`app.main.data.workspace.tokens.application`), so that backend
+  operations can apply tokens. Shape functions take a shape and return
+  a shape. The namespace keeps no state of its own: the ids of new
+  shadows come from the id function the caller passes. Geometry (size
+  and rotation) is returned as a change map for the caller to apply
+  through the geometry modifiers."
   (:require
+   [app.common.colors :as clr]
    [app.common.data :as d]
    [app.common.types.fills :as ctf]
    [app.common.types.shape.layout :as ctsl]
@@ -22,7 +24,6 @@
    [app.common.types.text :as txt]
    [app.common.types.token :as ctt]
    [app.common.types.typography :as cty]
-   [app.common.uuid :as uuid]
    [clojure.set :as set]
    [clojure.string :as str]))
 
@@ -129,15 +130,18 @@
                   1)})))
 
 (defn parse-color
-  "Parses a CSS hex or rgb()/rgba() colour string into
-  `{:color \"#rrggbb\" :opacity n}`. Returns nil for any other value.
-  Named colours are not supported."
+  "Parses a CSS colour string into `{:color \"#rrggbb\" :opacity n}`: a hex
+  colour, an rgb() or rgba() colour, or a colour name that `app.common.colors`
+  knows. Returns nil for any other value, such as hsl(), so the caller can
+  report that the token did not apply."
   [value]
   (when (string? value)
     (let [s (str/trim value)]
       (if-let [[_ digits] (re-matches hex-re s)]
         (hex->color digits)
-        (some-> (re-matches rgb-re s) rgb->color)))))
+        (or (some-> (re-matches rgb-re s) rgb->color)
+            (when-let [hex (clr/parse s)]
+              {:color hex :opacity 1}))))))
 
 (defn- color->fill
   "Fill map for a colour map, as the frontend builds it."
@@ -243,10 +247,11 @@
     (assoc shape :strokes (into [stroke] (rest strokes)))))
 
 (defn- value->shadow
-  "Converts a shadow token value (a sequence of shadow maps) to shape shadows."
-  [shadows]
+  "Converts a shadow token value (a sequence of shadow maps) to shape shadows.
+  `new-id-fn` makes the id of each shadow."
+  [new-id-fn shadows]
   (mapv (fn [{:keys [offset-x offset-y blur spread color inset]}]
-          {:id (uuid/next)
+          {:id (new-id-fn)
            :hidden false
            :offset-x offset-x
            :offset-y offset-y
@@ -263,24 +268,38 @@
           shape
           limits))
 
-(defn- apply-text-value
-  "Applies a text token value. `attrs` holds the typography attributes."
-  [shape value attrs]
-  (let [single (set/intersection attrs text-attr-keys)]
-    (cond
-      (and (contains? attrs :typography) (map? value))
-      (apply-text-attrs shape (typography->text-attrs value))
+(defn- text-step
+  "Applies a text token value to `shape`, where `written` holds the attrs
+  written so far. Returns `[shape written]`. A typography value writes the
+  text attrs of its parts, and then all its token attrs count as written. A
+  single attr counts only when its value fits it."
+  [[shape written] attrs value]
+  (if (and (contains? attrs :typography) (map? value))
+    (let [node-attrs (typography->text-attrs value)]
+      (if (seq node-attrs)
+        [(apply-text-attrs shape node-attrs) (into written attrs)]
+        [shape written]))
+    (let [single (set/intersection attrs text-attr-keys)
+          fits   (filterv #(some? (text-node-attr % value)) single)]
+      (if (seq fits)
+        [(apply-text-attrs shape (into {} (keep #(text-node-attr % value)) fits))
+         (into written fits)]
+        [shape written]))))
 
-      (seq single)
-      (apply-text-attrs shape (into {} (keep #(text-node-attr % value)) single))
-
-      :else
-      shape)))
+(defn- write-step
+  "Runs `f` on the shape of `[shape written]` when `ok?` holds, and adds
+  `attr-set` to `written`. Returns the pair."
+  [[shape written] ok? attr-set f]
+  (if ok?
+    [(f shape) (into written attr-set)]
+    [shape written]))
 
 (defn- apply-values
   "Writes `value` into the shape attributes in `attrs`, one group at a time.
-  Geometry (size and rotation) is not written here; see `token-geometry-changes`."
-  [shape value attrs objects]
+  Returns `[shape written]`, where `written` is the set of the attrs that were
+  written. An attr whose value does not fit it is not written. Geometry (size
+  and rotation) is not written here; see `token-geometry-changes`."
+  [shape value attrs objects new-id-fn]
   (let [layout?       (ctsl/any-layout? shape)
         layout-child? (ctsl/any-layout-immediate-child? objects shape)
         radius        (set/intersection attrs ctt/border-radius-keys)
@@ -290,66 +309,79 @@
         limits        (set/intersection attrs ctt/sizing-layout-item-keys)
         strokes       (set/intersection attrs ctt/stroke-width-keys)
         color         (parse-color value)]
-    (cond-> shape
-      (and (seq radius) (number? value))
-      (apply-radius radius value)
+    (-> [shape #{}]
+        (write-step (and (seq radius) (number? value))
+                    radius
+                    #(apply-radius % radius value))
 
-      (and (contains? attrs :fill) color)
-      (apply-fill color)
+        (write-step (and (contains? attrs :fill) color)
+                    #{:fill}
+                    #(apply-fill % color))
 
-      (and (contains? attrs :stroke-color) color)
-      (apply-stroke-color color)
+        (write-step (and (contains? attrs :stroke-color) color)
+                    #{:stroke-color}
+                    #(apply-stroke-color % color))
 
-      (and (seq strokes) (number? value))
-      (apply-stroke-width strokes (->number (max 0 value)))
+        (write-step (and (seq strokes) (number? value))
+                    strokes
+                    #(apply-stroke-width % strokes (->number (max 0 value))))
 
-      (and (contains? attrs :shadow) (sequential? value))
-      (assoc :shadow (value->shadow value))
+        (write-step (and (contains? attrs :shadow) (sequential? value))
+                    #{:shadow}
+                    #(assoc % :shadow (value->shadow new-id-fn value)))
 
-      (and (contains? attrs :opacity) (number? value) (<= 0 value 1))
-      (assoc :opacity (->number value))
+        (write-step (and (contains? attrs :opacity) (number? value) (<= 0 value 1))
+                    #{:opacity}
+                    #(assoc % :opacity (->number value)))
 
-      (and (seq padding) (number? value) layout?)
-      (update :layout-padding merge (zipmap padding (repeat (->number (max 0 value)))))
+        (write-step (and (seq padding) (number? value) layout?)
+                    padding
+                    #(update % :layout-padding merge (zipmap padding (repeat (->number (max 0 value))))))
 
-      (and (seq gaps) (number? value) layout?)
-      (update :layout-gap merge (zipmap gaps (repeat (->number (max 0 value)))))
+        (write-step (and (seq gaps) (number? value) layout?)
+                    gaps
+                    #(update % :layout-gap merge (zipmap gaps (repeat (->number (max 0 value))))))
 
-      (and (seq margins) (number? value) layout-child?)
-      (update :layout-item-margin merge (zipmap margins (repeat (->number value))))
+        (write-step (and (seq margins) (number? value) layout-child?)
+                    margins
+                    #(update % :layout-item-margin merge (zipmap margins (repeat (->number value)))))
 
-      (and (seq limits) (number? value))
-      (apply-limits limits value)
+        (write-step (and (seq limits) (number? value))
+                    limits
+                    #(apply-limits % limits value))
 
-      (or (contains? attrs :typography)
-          (seq (set/intersection attrs text-attr-keys)))
-      (apply-text-value value attrs))))
+        (text-step attrs value))))
 
 ;; Public API -------------------------------------------------------------------
 
 (defn apply-token-to-shape
-  "Returns `shape` with the token `token-name` applied.
+  "Returns `[shape written]`: `shape` with the token `token-name` applied, and
+  the set of the attributes that were written.
 
   `token-type` is the frontend token type keyword (e.g. `:spacing`,
   `:sizing`, `:border-radius`, `:color`, `:typography`). `resolved-value`
   is the resolved token value. `attributes` is the token attribute set
   (e.g. `#{:p1 :p2}`). `objects` is the page object map, used to check
-  layout parents and children.
+  layout parents and children. `new-id-fn` makes the ids of new shadows.
 
-  Only the attributes the shape can take are written. Each one is
-  recorded in `:applied-tokens` as `attribute -> token-name`.
-  Geometry is not changed here. Returns `shape` unchanged when the
-  attributes do not fit the token type or the shape.
+  Only the attributes that the shape can take and whose value fits are
+  written. Each written one is recorded in `:applied-tokens` as
+  `attribute -> token-name`; an attribute that was not written is not
+  recorded. Geometry is not changed here. When nothing is written, the
+  shape comes back as it was and `written` is empty, so the caller can
+  report that the token did not apply.
 
   Does not set `:ignore-touched`: the frontend passes that as an option
   to the update, so the caller must do it."
-  [shape token-name token-type resolved-value attributes objects]
+  [shape token-name token-type resolved-value attributes objects new-id-fn]
   (let [attrs (applicable-attrs shape attributes objects)]
     (if (and (seq attrs) (token-type-appliable? token-type attributes))
-      (-> shape
-          (apply-values resolved-value attrs objects)
-          (update :applied-tokens merge (zipmap attrs (repeat token-name))))
-      shape)))
+      (let [[shape written] (apply-values shape resolved-value attrs objects new-id-fn)]
+        (if (seq written)
+          [(update shape :applied-tokens merge (zipmap written (repeat token-name)))
+           written]
+          [shape #{}]))
+      [shape #{}])))
 
 (defn token-geometry-changes
   "Returns a map with any of `:width`, `:height`, `:rotation` that a

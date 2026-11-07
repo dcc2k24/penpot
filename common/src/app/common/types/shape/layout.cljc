@@ -1787,3 +1787,62 @@
     (assoc :layout-item-h-sizing :fix)
     (= (:layout-item-v-sizing shape) :fill)
     (assoc :layout-item-v-sizing :fix)))
+
+;; Sizing fix-ups for the children and the parent of a layout change. They
+;; are the editor's own fix-ups, from `shape_layout`. The compiler calls them too.
+
+(defn fix-child-sizing
+  "The child `shape` with its sizing fixed for the layout of its parent, which
+  the `parent-changes` give. A hug parent takes a fixed child when the children
+  fill it."
+  [objects parent-changes shape]
+  (let [parent       (-> (cfh/get-parent objects (:id shape))
+                         (d/deep-merge parent-changes))
+        auto-width?  (auto-width? parent)
+        auto-height? (auto-height? parent)
+        col?         (col? parent)
+        row?         (row? parent)
+        all-children (->> parent
+                          :shapes
+                          (map (d/getf objects))
+                          (remove position-absolute?))]
+    (cond-> shape
+      (and col? auto-width? (every? fill-width? all-children))
+      (assoc :layout-item-h-sizing :fix)
+
+      (and col? auto-height? (fill-height? shape))
+      (assoc :layout-item-v-sizing :fix)
+
+      (and row? auto-width? (fill-width? shape))
+      (assoc :layout-item-h-sizing :fix)
+
+      (and row? auto-height? (every? fill-height? all-children))
+      (assoc :layout-item-v-sizing :fix))))
+
+(defn fix-parent-sizing
+  "The `parent` with its sizing fixed, once the children in `ids-set` take the
+  `changes`. A hug parent becomes fixed when its children fill it."
+  [parent objects ids-set changes]
+  (let [auto-width?  (auto-width? parent)
+        auto-height? (auto-height? parent)
+        col?         (col? parent)
+        row?         (row? parent)
+        all-children (->> parent
+                          :shapes
+                          (map (d/getf objects))
+                          (map (fn [shape]
+                                 (if (contains? ids-set (:id shape))
+                                   (d/deep-merge shape changes)
+                                   shape))))]
+    (cond-> parent
+      (and col? auto-width? (every? fill-width? all-children))
+      (assoc :layout-item-h-sizing :fix)
+
+      (and col? auto-height? (some fill-height? all-children))
+      (assoc :layout-item-v-sizing :fix)
+
+      (and row? auto-width? (some fill-width? all-children))
+      (assoc :layout-item-h-sizing :fix)
+
+      (and row? auto-height? (every? fill-height? all-children))
+      (assoc :layout-item-v-sizing :fix))))

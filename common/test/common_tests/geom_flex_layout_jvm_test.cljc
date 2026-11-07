@@ -315,3 +315,75 @@
     (t/is (= 4 (count after)))
     (doseq [shape (vals after)]
       (assert-real-geometry shape))))
+
+;; ---- small layouts with the child boxes that they give ----
+;;
+;; The boxes are checked on both runtimes, so a result that differs between
+;; the JVM and ClojureScript fails here. Each child box is [x y width height]
+;; in the order the children are created. A flex board lists its children in
+;; reverse visual order, so the table is in visual order too.
+
+(def ^:private small-layout-cases
+  [{:label "flex row, one child, space-between"
+    :board {:layout-flex-dir :row :layout-justify-content :space-between}
+    :children [[50 50]]
+    :expected [[0 0 50 50]]}
+
+   {:label "flex column with wrap"
+    :board {:layout-flex-dir :column :layout-wrap-type :wrap
+            :layout-gap {:row-gap 0 :column-gap 0}
+            ;; Stretch would widen each line to half the board
+            :layout-align-content :start
+            :width 100 :height 100}
+    :children [[40 40] [40 40] [40 40]]
+    :expected [[0 0 40 40] [0 40 40 40] [40 0 40 40]]}
+
+   {:label "grid with a zero flex total"
+    :grid {:columns [{:type :flex :value 0} {:type :flex :value 0}]
+           :rows [{:type :fixed :value 50}]}
+    :children [[20 20] [20 20]]
+    :expected [[0 0 20 20] [20 0 20 20]]}
+
+   {:label "grid with an auto track"
+    :grid {:columns [{:type :auto}]
+           :rows [{:type :fixed :value 50}]}
+    :children [[30 20]]
+    :expected [[0 0 30 20]]}])
+
+(defn- case-board
+  "The board of a case. A grid starts with no tracks, and its tracks are added
+  one by one, so each one creates its cells."
+  [{:keys [board grid]}]
+  (if grid
+    (let [grid-board (apply make-grid-board
+                            (mapcat identity {:x 0 :y 0 :width 200 :height 200
+                                              :layout-grid-columns []
+                                              :layout-grid-rows []}))
+          grid-board (reduce ctl/add-grid-column grid-board (:columns grid))]
+      (reduce ctl/add-grid-row grid-board (:rows grid)))
+    (apply make-board (mapcat identity (merge {:x 0 :y 0 :width 200 :height 200} board)))))
+
+(defn- case-boxes
+  "Reflows one case of `small-layout-cases` and returns the box of each child."
+  [{:keys [grid children] :as case}]
+  (let [board (case-board case)
+        kids  (mapv (fn [[w h]] (make-child board w h)) children)
+        board (with-children board (if grid kids (reverse kids)))
+        board (if grid
+                (let [objects (into {(:id board) board} (map (juxt :id identity)) kids)]
+                  (ctl/assign-cells board objects))
+                board)
+        after (reflow board kids)]
+    (mapv (fn [kid]
+            (let [{:keys [x y width height]} (:selrect (get after (:id kid)))]
+              [x y width height]))
+          kids)))
+
+(t/deftest small-layouts-give-the-expected-child-boxes
+  (doseq [{:keys [label expected] :as case} small-layout-cases]
+    (let [boxes (case-boxes case)]
+      (t/is (= (count expected) (count boxes)) label)
+      (doseq [[box want] (map vector boxes expected)
+              [actual value] (map vector box want)]
+        (t/is (mth/close? actual value 0.01)
+              (str label ": " (pr-str box) " should be " (pr-str want)))))))

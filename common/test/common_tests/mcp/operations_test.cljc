@@ -6,22 +6,40 @@
 
 (ns common-tests.mcp.operations-test
   (:require
-   #?@(:clj [[app.common.files.changes :as cfc]
-             [app.common.files.changes-builder :as pcb]
-             [app.common.files.helpers :as cfh]
-             [app.common.logic.modifiers :as lm]
-             [app.common.logic.shapes :as cls]
-             [app.common.types.component :as ctk]
-             [app.common.types.pages-list :as ctpl]
-             [app.common.types.shape :as cts]
-             [app.common.types.shape-tree :as ctst]])
+   [app.common.files.changes :as cfc]
+   [app.common.files.changes-builder :as pcb]
+   [app.common.files.helpers :as cfh]
+   [app.common.geom.point :as gpt]
+   [app.common.geom.shapes :as gsh]
+   [app.common.logic.modifiers :as lm]
+   [app.common.logic.shapes :as cls]
+   [app.common.math :as mth]
    [app.common.mcp.operations :as mops]
+   [app.common.mcp.operations.arrange :as f-arrange]
+   [app.common.mcp.operations.components :as f-components]
+   [app.common.mcp.operations.layout :as f-layout]
+   [app.common.mcp.operations.library :as f-library]
+   [app.common.mcp.operations.prototype :as f-prototype]
+   [app.common.mcp.operations.schema]
+   [app.common.mcp.operations.shapes :as f-shapes]
+   [app.common.mcp.operations.state]
+   [app.common.mcp.operations.text :as f-text]
+   [app.common.mcp.operations.tokens :as f-tokens]
    [app.common.test-helpers.compositions :as tho]
    [app.common.test-helpers.files :as thf]
    [app.common.test-helpers.ids-map :as thi]
    [app.common.test-helpers.shapes :as ths]
    [app.common.test-helpers.tokens :as tht]
+   [app.common.test-helpers.variants :as thv]
+   [app.common.types.component :as ctk]
+   [app.common.types.container :as ctn]
    [app.common.types.file :as ctf]
+   [app.common.types.modifiers :as ctm]
+   [app.common.types.objects-map :as omap]
+   [app.common.types.pages-list :as ctpl]
+   [app.common.types.path :as path]
+   [app.common.types.shape :as cts]
+   [app.common.types.shape-tree :as ctst]
    [app.common.types.shape.layout :as ctl]
    [app.common.types.text :as txt]
    [app.common.types.tokens-lib :as ctob]
@@ -94,6 +112,22 @@
     (t/is (close? y (:y selrect)))
     (t/is (close? (+ x width) (:x2 selrect)))
     (t/is (close? (+ y height) (:y2 selrect))))
+  (let [points (:points shape)]
+    (t/is (= 4 (count points)))
+    (t/is (close? x (:x (nth points 0))))
+    (t/is (close? y (:y (nth points 0))))
+    (t/is (close? (+ x width) (:x (nth points 2))))
+    (t/is (close? (+ y height) (:y (nth points 2))))))
+
+(defn- assert-selrect-box
+  "Checks the selrect of `shape` and its points, which a path has in place of
+  a position and a size."
+  [shape x y width height]
+  (let [selrect (:selrect shape)]
+    (t/is (close? x (:x selrect)))
+    (t/is (close? y (:y selrect)))
+    (t/is (close? width (:width selrect)))
+    (t/is (close? height (:height selrect))))
   (let [points (:points shape)]
     (t/is (= 4 (count points)))
     (t/is (close? x (:x (nth points 0))))
@@ -383,7 +417,7 @@
         path   (shape-of file' (created result "$tmp:p"))]
     (t/is (= :path (:type path)))
     (t/is (seq (:content path)))
-    (assert-box path 0 0 100 50)))
+    (assert-selrect-box path 0 0 100 50)))
 
 (t/deftest create-path-with-d-and-position-moves-bounds
   (let [file   (thf/sample-file :file1)
@@ -394,7 +428,7 @@
         path   (shape-of file' (created result "$tmp:p"))]
     (t/is (close? 30 (:x (:selrect path))))
     (t/is (close? 40 (:y (:selrect path))))
-    (assert-box path 30 40 100 50)))
+    (assert-selrect-box path 30 40 100 50)))
 
 (t/deftest create-image-sets-media-fill
   (let [file     (thf/sample-file :file1)
@@ -666,290 +700,274 @@
     (t/is (= :validation (:type data)))
     (t/is (= :mcp-invalid-operation (:code data)))
     (t/is (seq (:hint data)))
-    (t/is (some? (re-find #"invalid shape" (str (:hint data)))))))
+    (t/is (some? (re-find #":content" (str (:hint data)))))))
 
 ;; ----- Nested containers and the modifier subset
 
-#?(:clj
-   (defn- nested-containers-file
-     "A page with nested containers. The board `:board` holds the group `:outer`
+(defn- nested-containers-file
+  "A page with nested containers. The board `:board` holds the group `:outer`
   over the bool `:bool`. The bool holds the group `:inner`, over the rects
   `:rect1` and `:rect2`, and the group `:other`, over the rects `:rect3` and
   `:rect4`. The board also holds the rect `:sibling`. The flex board `:flex`
   holds the group `:fgroup` over the rect `:frect`."
-     []
-     (doseq [label [:board :rect1 :rect2 :inner :rect3 :rect4 :other :bool :outer
-                    :sibling :flex :frect :fgroup]]
-       (thi/new-id! label))
-     (let [file (thf/sample-file :file1)
-           pid  (page-id-of file)
-           [file' _] (apply-ops file [{:op "create_board" :page-id pid :id (thi/id :board)
-                                       :x 0 :y 0 :width 400 :height 400}
-                                      {:op "create_rect" :page-id pid :id (thi/id :rect1)
-                                       :parent-id (thi/id :board)
-                                       :x 10 :y 10 :width 20 :height 20}
-                                      {:op "create_rect" :page-id pid :id (thi/id :rect2)
-                                       :parent-id (thi/id :board)
-                                       :x 40 :y 10 :width 20 :height 20}
-                                      {:op "create_group" :page-id pid :id (thi/id :inner)
-                                       :child-ids [(thi/id :rect1) (thi/id :rect2)]}
-                                      {:op "create_rect" :page-id pid :id (thi/id :rect3)
-                                       :parent-id (thi/id :board)
-                                       :x 80 :y 10 :width 20 :height 20}
-                                      {:op "create_rect" :page-id pid :id (thi/id :rect4)
-                                       :parent-id (thi/id :board)
-                                       :x 120 :y 10 :width 20 :height 20}
-                                      {:op "create_group" :page-id pid :id (thi/id :other)
-                                       :child-ids [(thi/id :rect3) (thi/id :rect4)]}
-                                      {:op "create_boolean" :page-id pid :id (thi/id :bool)
-                                       :bool-type "union"
-                                       :child-ids [(thi/id :inner) (thi/id :other)]}
-                                      {:op "create_group" :page-id pid :id (thi/id :outer)
-                                       :child-ids [(thi/id :bool)]}
-                                      {:op "create_rect" :page-id pid :id (thi/id :sibling)
-                                       :parent-id (thi/id :board)
-                                       :x 200 :y 200 :width 50 :height 50}
-                                      {:op "create_board" :page-id pid :id (thi/id :flex)
-                                       :x 500 :y 0 :width 200 :height 200}
-                                      {:op "set_flex_layout" :page-id pid :id (thi/id :flex)
-                                       :layout-flex-dir "row"}
-                                      {:op "create_rect" :page-id pid :id (thi/id :frect)
-                                       :parent-id (thi/id :flex)
-                                       :x 510 :y 10 :width 20 :height 20}
-                                      {:op "create_group" :page-id pid :id (thi/id :fgroup)
-                                       :child-ids [(thi/id :frect)]}])]
-       file')))
+  []
+  (doseq [label [:board :rect1 :rect2 :inner :rect3 :rect4 :other :bool :outer
+                 :sibling :flex :frect :fgroup]]
+    (thi/new-id! label))
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        [file' _] (apply-ops file [{:op "create_board" :page-id pid :id (thi/id :board)
+                                    :x 0 :y 0 :width 400 :height 400}
+                                   {:op "create_rect" :page-id pid :id (thi/id :rect1)
+                                    :parent-id (thi/id :board)
+                                    :x 10 :y 10 :width 20 :height 20}
+                                   {:op "create_rect" :page-id pid :id (thi/id :rect2)
+                                    :parent-id (thi/id :board)
+                                    :x 40 :y 10 :width 20 :height 20}
+                                   {:op "create_group" :page-id pid :id (thi/id :inner)
+                                    :child-ids [(thi/id :rect1) (thi/id :rect2)]}
+                                   {:op "create_rect" :page-id pid :id (thi/id :rect3)
+                                    :parent-id (thi/id :board)
+                                    :x 80 :y 10 :width 20 :height 20}
+                                   {:op "create_rect" :page-id pid :id (thi/id :rect4)
+                                    :parent-id (thi/id :board)
+                                    :x 120 :y 10 :width 20 :height 20}
+                                   {:op "create_group" :page-id pid :id (thi/id :other)
+                                    :child-ids [(thi/id :rect3) (thi/id :rect4)]}
+                                   {:op "create_boolean" :page-id pid :id (thi/id :bool)
+                                    :bool-type "union"
+                                    :child-ids [(thi/id :inner) (thi/id :other)]}
+                                   {:op "create_group" :page-id pid :id (thi/id :outer)
+                                    :child-ids [(thi/id :bool)]}
+                                   {:op "create_rect" :page-id pid :id (thi/id :sibling)
+                                    :parent-id (thi/id :board)
+                                    :x 200 :y 200 :width 50 :height 50}
+                                   {:op "create_board" :page-id pid :id (thi/id :flex)
+                                    :x 500 :y 0 :width 200 :height 200}
+                                   {:op "set_flex_layout" :page-id pid :id (thi/id :flex)
+                                    :layout-flex-dir "row"}
+                                   {:op "create_rect" :page-id pid :id (thi/id :frect)
+                                    :parent-id (thi/id :flex)
+                                    :x 510 :y 10 :width 20 :height 20}
+                                   {:op "create_group" :page-id pid :id (thi/id :fgroup)
+                                    :child-ids [(thi/id :frect)]}])]
+    file'))
 
-#?(:clj
-   (defn- full-objects-changes
-     "The changes that the modifiers of the geometry `props` give the shape
-     `id` when they run over all the objects of its page. These are the
-     changes that `update_shape` must emit for the same geometry."
-     [file page-id id props]
-     (let [fdata   (:data file)
-           objects (get-in fdata [:pages-index page-id :objects])
-           mods    (#'mops/geometry-modifiers (get objects id) props)]
-       (-> (pcb/empty-changes nil page-id)
-           (pcb/with-file-data fdata)
-           (pcb/with-library-data fdata)
-           (lm/generate-apply-modifiers objects {id {:modifiers mods}} {})
-           :redo-changes))))
+(defn- full-objects-changes
+  "The changes that the modifiers of the geometry `props` give the shape
+  `id` when they run over all the objects of its page. These are the
+  changes that `update_shape` must emit for the same geometry."
+  [file page-id id props]
+  (let [fdata   (:data file)
+        objects (get-in fdata [:pages-index page-id :objects])
+        mods    (mops/geometry-modifiers (get objects id) props)]
+    (-> (pcb/empty-changes nil page-id)
+        (pcb/with-file-data fdata)
+        (pcb/with-library-data fdata)
+        (lm/generate-apply-modifiers objects {id {:modifiers mods}} {})
+        :redo-changes)))
 
-#?(:clj
-   (t/deftest modifier-objects-subset-matches-full-objects
-     (let [file (nested-containers-file)
-           pid  (page-id-of file)]
-       (doseq [[label props] [[:rect1 {:x 15 :y 20 :width 30 :height 25}]
-                              [:rect2 {:x 50 :y 60}]
-                              [:rect3 {:width 5 :height 40}]
-                              [:rect4 {:x 130 :y 20}]
-                              [:sibling {:x 210 :y 190}]]]
-         (let [id       (thi/id label)
-               expected (full-objects-changes file pid id props)
-               result   (compile-ops file [{:op "update_shape" :page-id pid
-                                            :id id :props props}])]
-           (t/is (seq expected))
-           (t/is (= expected (:changes result))))))))
+(t/deftest modifier-objects-subset-matches-full-objects
+  (let [file (nested-containers-file)
+        pid  (page-id-of file)]
+    (doseq [[label props] [[:rect1 {:x 15 :y 20 :width 30 :height 25}]
+                           [:rect2 {:x 50 :y 60}]
+                           [:rect3 {:width 5 :height 40}]
+                           [:rect4 {:x 130 :y 20}]
+                           [:sibling {:x 210 :y 190}]]]
+      (let [id       (thi/id label)
+            expected (full-objects-changes file pid id props)
+            result   (compile-ops file [{:op "update_shape" :page-id pid
+                                         :id id :props props}])]
+        (t/is (seq expected))
+        (t/is (= expected (:changes result)))))))
 
-#?(:clj
-   (defn- op-changes
-     "The changes that the first op of `result` emitted, without the reflow."
-     [result]
-     (let [[start end] (first (:op-ranges result))]
-       (subvec (:changes result) start end))))
+(defn- op-changes
+  "The changes that the first op of `result` emitted, without the reflow."
+  [result]
+  (let [[start end] (first (:op-ranges result))]
+    (subvec (:changes result) start end)))
 
-#?(:clj
-   (defn- container-ops
-     "The ops that build the rect `$tmp:child` in the container `$tmp:container`
-     of `kind`: a flex or grid board, a group, a bool, a mask group, or a
-     component copy. The component copy is made later, by `container-file`."
-     [pid kind]
-     (let [board  {:op "create_board" :page-id pid :id "$tmp:container"
-                   :x 0 :y 0 :width 200 :height 200}
-           inside {:op "create_rect" :page-id pid :id "$tmp:child"
-                   :parent-id "$tmp:container" :x 10 :y 10 :width 40 :height 40}
-           root   {:op "create_rect" :page-id pid :id "$tmp:child"
-                   :x 10 :y 10 :width 40 :height 40}
-           other  {:op "create_rect" :page-id pid :id "$tmp:other"
-                   :x 60 :y 10 :width 40 :height 40}
-           sibling {:op "create_rect" :page-id pid :id "$tmp:sibling"
-                    :parent-id "$tmp:container" :x 60 :y 10 :width 40 :height 40}]
-       (case kind
-         :flex [board inside sibling
-                {:op "set_flex_layout" :page-id pid :id "$tmp:container"
-                 :layout-flex-dir "row"}]
+(defn- container-ops
+  "The ops that build the rect `$tmp:child` in the container `$tmp:container`
+  of `kind`: a flex or grid board, a group, a bool, a mask group, or a
+  component copy. The component copy is made later, by `container-file`."
+  [pid kind]
+  (let [board  {:op "create_board" :page-id pid :id "$tmp:container"
+                :x 0 :y 0 :width 200 :height 200}
+        inside {:op "create_rect" :page-id pid :id "$tmp:child"
+                :parent-id "$tmp:container" :x 10 :y 10 :width 40 :height 40}
+        root   {:op "create_rect" :page-id pid :id "$tmp:child"
+                :x 10 :y 10 :width 40 :height 40}
+        other  {:op "create_rect" :page-id pid :id "$tmp:other"
+                :x 60 :y 10 :width 40 :height 40}
+        sibling {:op "create_rect" :page-id pid :id "$tmp:sibling"
+                 :parent-id "$tmp:container" :x 60 :y 10 :width 40 :height 40}]
+    (case kind
+      :flex [board inside sibling
+             {:op "set_flex_layout" :page-id pid :id "$tmp:container"
+              :layout-flex-dir "row"}]
 
-         :grid [board inside sibling
-                {:op "set_grid_layout" :page-id pid :id "$tmp:container"
-                 :layout-grid-rows [{:type "flex" :value 1}]
-                 :layout-grid-columns [{:type "fixed" :value 100} {:type "flex" :value 1}]}
-                {:op "set_grid_cell" :page-id pid :grid-id "$tmp:container"
-                 :child-id "$tmp:child" :row 1 :column 1}
-                {:op "set_grid_cell" :page-id pid :grid-id "$tmp:container"
-                 :child-id "$tmp:sibling" :row 1 :column 2}]
+      :grid [board inside sibling
+             {:op "set_grid_layout" :page-id pid :id "$tmp:container"
+              :layout-grid-rows [{:type "flex" :value 1}]
+              :layout-grid-columns [{:type "fixed" :value 100} {:type "flex" :value 1}]}
+             {:op "set_grid_cell" :page-id pid :grid-id "$tmp:container"
+              :child-id "$tmp:child" :row 1 :column 1}
+             {:op "set_grid_cell" :page-id pid :grid-id "$tmp:container"
+              :child-id "$tmp:sibling" :row 1 :column 2}]
 
-         :group [root other
-                 {:op "create_group" :page-id pid :id "$tmp:container"
-                  :child-ids ["$tmp:child" "$tmp:other"]}]
+      :group [root other
+              {:op "create_group" :page-id pid :id "$tmp:container"
+               :child-ids ["$tmp:child" "$tmp:other"]}]
 
-         :bool [root other
-                {:op "create_boolean" :page-id pid :id "$tmp:container"
-                 :bool-type "union" :child-ids ["$tmp:child" "$tmp:other"]}]
+      :bool [root other
+             {:op "create_boolean" :page-id pid :id "$tmp:container"
+              :bool-type "union" :child-ids ["$tmp:child" "$tmp:other"]}]
 
-         :mask [root other
-                {:op "create_group" :page-id pid :id "$tmp:container"
-                 :child-ids ["$tmp:child" "$tmp:other"]}
-                {:op "make_mask" :page-id pid :group-id "$tmp:container"}]
+      :mask [root other
+             {:op "create_group" :page-id pid :id "$tmp:container"
+              :child-ids ["$tmp:child" "$tmp:other"]}
+             {:op "make_mask" :page-id pid :group-id "$tmp:container"}]
 
-         :component [board inside
-                     {:op "create_component" :page-id pid :id "$tmp:comp"
-                      :shape-ids ["$tmp:container"] :name "Button"}]))))
+      :component [board inside
+                  {:op "create_component" :page-id pid :id "$tmp:comp"
+                   :shape-ids ["$tmp:container"] :name "Button"}])))
 
-#?(:clj
-   (defn- container-file
-     "A file with the rect `:child` inside a container of `kind`, as made by
-     `container-ops`. Returns the file with the ids of the page, the container,
-     the child and the `:sibling` (none for a component copy)."
-     [kind]
-     (let [file (thf/sample-file :file1)
-           pid  (page-id-of file)
-           [file' result] (apply-ops file (container-ops pid kind))]
-       (if (= :component kind)
-         (let [[file'' result'] (apply-ops file' [{:op "instantiate_component" :page-id pid
-                                                   :component-id (created result "$tmp:comp")
-                                                   :x 300 :y 0 :id "$tmp:copy"}])
-               copy-id (created result' "$tmp:copy")]
-           {:file file'' :pid pid :container copy-id
-            :child (first (:shapes (shape-of file'' copy-id)))})
-         {:file file' :pid pid
-          :container (created result "$tmp:container")
-          :child (created result "$tmp:child")
-          :sibling (created result "$tmp:sibling")}))))
+(defn- container-file
+  "A file with the rect `:child` inside a container of `kind`, as made by
+  `container-ops`. Returns the file with the ids of the page, the container,
+  the child and the `:sibling` (none for a component copy)."
+  [kind]
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file (container-ops pid kind))]
+    (if (= :component kind)
+      (let [[file'' result'] (apply-ops file' [{:op "instantiate_component" :page-id pid
+                                                :component-id (created result "$tmp:comp")
+                                                :x 300 :y 0 :id "$tmp:copy"}])
+            copy-id (created result' "$tmp:copy")]
+        {:file file'' :pid pid :container copy-id
+         :child (first (:shapes (shape-of file'' copy-id)))})
+      {:file file' :pid pid
+       :container (created result "$tmp:container")
+       :child (created result "$tmp:child")
+       :sibling (created result "$tmp:sibling")})))
 
-#?(:clj
-   (defn- assert-selrect-covers
-     "Checks that the selrect of the container `container-id` is the box that
-     covers the selrects of the shapes `shape-ids` in `file`. The selrect is
-     the box that the renderer and hit testing read."
-     [file container-id shape-ids]
-     (let [boxes   (map #(:selrect (shape-of file %)) shape-ids)
-           selrect (:selrect (shape-of file container-id))]
-       (t/is (close? (apply min (map :x1 boxes)) (:x1 selrect)))
-       (t/is (close? (apply min (map :y1 boxes)) (:y1 selrect)))
-       (t/is (close? (apply max (map :x2 boxes)) (:x2 selrect)))
-       (t/is (close? (apply max (map :y2 boxes)) (:y2 selrect))))))
+(defn- assert-selrect-covers
+  "Checks that the selrect of the container `container-id` is the box that
+  covers the selrects of the shapes `shape-ids` in `file`. The selrect is
+  the box that the renderer and hit testing read."
+  [file container-id shape-ids]
+  (let [boxes   (map #(:selrect (shape-of file %)) shape-ids)
+        selrect (:selrect (shape-of file container-id))]
+    (t/is (close? (apply min (map :x1 boxes)) (:x1 selrect)))
+    (t/is (close? (apply min (map :y1 boxes)) (:y1 selrect)))
+    (t/is (close? (apply max (map :x2 boxes)) (:x2 selrect)))
+    (t/is (close? (apply max (map :y2 boxes)) (:y2 selrect)))))
 
-#?(:clj
-   (t/deftest update-shape-geometry-inside-group
-     (let [{:keys [file pid child container]} (container-file :group)
-           props  {:x 30 :y 40 :width 50 :height 30}
-           result (compile-ops file [{:op "update_shape" :page-id pid :id child :props props}])
-           file'  (thf/apply-changes file {:redo-changes (:changes result)})]
-       (assert-box (shape-of file' child) 30 40 50 30)
-       (assert-selrect-covers file' container (:shapes (shape-of file' container)))
-       (t/is (= (full-objects-changes file pid child props) (op-changes result))))))
+(t/deftest update-shape-geometry-inside-group
+  (let [{:keys [file pid child container]} (container-file :group)
+        props  {:x 30 :y 40 :width 50 :height 30}
+        result (compile-ops file [{:op "update_shape" :page-id pid :id child :props props}])
+        file'  (thf/apply-changes file {:redo-changes (:changes result)})]
+    (assert-box (shape-of file' child) 30 40 50 30)
+    (assert-selrect-covers file' container (:shapes (shape-of file' container)))
+    (t/is (= (full-objects-changes file pid child props) (op-changes result)))))
 
-#?(:clj
-   (t/deftest update-shape-geometry-inside-bool
-     ;; The top-level x, y, width and height of a bool are not refreshed by a
-     ;; resize, so the selrect carries the bounds here.
-     (let [{:keys [file pid child container]} (container-file :bool)
-           props  {:x 30 :y 40 :width 50 :height 30}
-           result (compile-ops file [{:op "update_shape" :page-id pid :id child :props props}])
-           file'  (thf/apply-changes file {:redo-changes (:changes result)})]
-       (assert-box (shape-of file' child) 30 40 50 30)
-       (assert-selrect-covers file' container (:shapes (shape-of file' container)))
-       (t/is (= (full-objects-changes file pid child props) (op-changes result))))))
+(t/deftest update-shape-geometry-inside-bool
+  ;; The top-level x, y, width and height of a bool are not refreshed by a
+  ;; resize, so the selrect carries the bounds here.
+  (let [{:keys [file pid child container]} (container-file :bool)
+        props  {:x 30 :y 40 :width 50 :height 30}
+        result (compile-ops file [{:op "update_shape" :page-id pid :id child :props props}])
+        file'  (thf/apply-changes file {:redo-changes (:changes result)})]
+    (assert-box (shape-of file' child) 30 40 50 30)
+    (assert-selrect-covers file' container (:shapes (shape-of file' container)))
+    (t/is (= (full-objects-changes file pid child props) (op-changes result)))))
 
-#?(:clj
-   (t/deftest update-shape-geometry-inside-mask-group
-     (let [{:keys [file pid child container]} (container-file :mask)
-           props  {:x 30 :y 40 :width 50 :height 30}
-           result (compile-ops file [{:op "update_shape" :page-id pid :id child :props props}])
-           file'  (thf/apply-changes file {:redo-changes (:changes result)})]
-       (assert-box (shape-of file' child) 30 40 50 30)
-       (t/is (true? (:masked-group (shape-of file' container))))
-       ;; The child is the mask, and the mask gives the box of the group.
-       (assert-selrect-covers file' container [child])
-       (t/is (= (full-objects-changes file pid child props) (op-changes result))))))
+(t/deftest update-shape-geometry-inside-mask-group
+  (let [{:keys [file pid child container]} (container-file :mask)
+        props  {:x 30 :y 40 :width 50 :height 30}
+        result (compile-ops file [{:op "update_shape" :page-id pid :id child :props props}])
+        file'  (thf/apply-changes file {:redo-changes (:changes result)})]
+    (assert-box (shape-of file' child) 30 40 50 30)
+    (t/is (true? (:masked-group (shape-of file' container))))
+    ;; The child is the mask, and the mask gives the box of the group.
+    (assert-selrect-covers file' container [child])
+    (t/is (= (full-objects-changes file pid child props) (op-changes result)))))
 
-#?(:clj
-   (t/deftest update-shape-geometry-inside-component-copy
-     (let [{:keys [file pid child container]} (container-file :component)
-           props  {:x 30 :y 40 :width 50 :height 30}
-           result (compile-ops file [{:op "update_shape" :page-id pid :id child :props props}])
-           file'  (thf/apply-changes file {:redo-changes (:changes result)})]
-       (assert-box (shape-of file' child) 30 40 50 30)
-       (t/is (ctk/in-component-copy? (shape-of file' container)))
-       (t/is (= (full-objects-changes file pid child props) (op-changes result))))))
+(t/deftest update-shape-geometry-inside-component-copy
+  (let [{:keys [file pid child container]} (container-file :component)
+        props  {:x 30 :y 40 :width 50 :height 30}
+        result (compile-ops file [{:op "update_shape" :page-id pid :id child :props props}])
+        file'  (thf/apply-changes file {:redo-changes (:changes result)})]
+    (assert-box (shape-of file' child) 30 40 50 30)
+    (t/is (ctk/in-component-copy? (shape-of file' container)))
+    (t/is (= (full-objects-changes file pid child props) (op-changes result)))))
 
-#?(:clj
-   (defn- assert-board-resize
-     "Checks the resize of `child` in the board of `kind`. The layout owns the
-     position of the child, so only its size is checked. The sibling moves by
-     `shift`, the width that the child gained in a flex row, or stays in place
-     in a fixed grid track. The modifiers reflow the children of the board in
-     the range of the op, so no change falls after it."
-     [kind shift]
-     (let [{:keys [file pid child sibling]} (container-file kind)
-           props  {:x 30 :y 40 :width 50 :height 30}
-           result (compile-ops file [{:op "update_shape" :page-id pid :id child :props props}])
-           file'  (thf/apply-changes file {:redo-changes (:changes result)})]
-       (t/is (close? 50 (:width (shape-of file' child))))
-       (t/is (close? 30 (:height (shape-of file' child))))
-       (t/is (= (full-objects-changes file pid child props) (op-changes result)))
-       (t/is (contains? (:touched-page-ids result) pid))
-       (t/is (close? (+ shift (:x (shape-of file sibling)))
-                     (:x (shape-of file' sibling)))))))
+(defn- assert-board-resize
+  "Checks the resize of `child` in the board of `kind`. The layout owns the
+  position of the child, so only its size is checked. The sibling moves by
+  `shift`, the width that the child gained in a flex row, or stays in place
+  in a fixed grid track. The modifiers reflow the children of the board in
+  the range of the op, so no change falls after it."
+  [kind shift]
+  (let [{:keys [file pid child sibling]} (container-file kind)
+        props  {:x 30 :y 40 :width 50 :height 30}
+        result (compile-ops file [{:op "update_shape" :page-id pid :id child :props props}])
+        file'  (thf/apply-changes file {:redo-changes (:changes result)})]
+    (t/is (close? 50 (:width (shape-of file' child))))
+    (t/is (close? 30 (:height (shape-of file' child))))
+    (t/is (= (full-objects-changes file pid child props) (op-changes result)))
+    (t/is (contains? (:touched-page-ids result) pid))
+    (t/is (close? (+ shift (:x (shape-of file sibling)))
+                  (:x (shape-of file' sibling))))))
 
-#?(:clj
-   (t/deftest update-shape-geometry-inside-flex-board
-     (assert-board-resize :flex 10)))
+(t/deftest update-shape-geometry-inside-flex-board
+  (assert-board-resize :flex 10))
 
-#?(:clj
-   (t/deftest update-shape-geometry-inside-grid-board
-     (assert-board-resize :grid 0)))
+(t/deftest update-shape-geometry-inside-grid-board
+  (assert-board-resize :grid 0))
 
-#?(:clj
-   (defn- two-step-changes
-     "The changes of a geometry-only `update_shape` of `id` when both of its
-     steps run over all the objects of the page: the modifiers, then the
-     merge of no attrs with the resize of the parents. The compiler skips the
-     second step when it can emit nothing, and must still emit these."
-     [file page-id id props]
-     (let [geometry (full-objects-changes file page-id id props)
-           fdata    (cfc/process-changes (:data file) geometry)
-           objects  (get-in fdata [:pages-index page-id :objects])
-           attrs    (-> (pcb/empty-changes nil page-id)
-                        (pcb/with-file-data fdata)
-                        (pcb/with-library-data fdata)
-                        (cls/generate-update-shapes [id] identity objects {})
-                        (pcb/resize-parents (cfh/get-parent-ids objects id))
-                        :redo-changes)]
-       (into geometry attrs))))
+(defn- two-step-changes
+  "The changes of a geometry-only `update_shape` of `id` when both of its
+  steps run over all the objects of the page: the modifiers, then the
+  merge of no attrs with the resize of the parents. The compiler skips the
+  second step when it can emit nothing, and must still emit these."
+  [file page-id id props]
+  (let [geometry (full-objects-changes file page-id id props)
+        fdata    (cfc/process-changes (:data file) geometry)
+        objects  (get-in fdata [:pages-index page-id :objects])
+        attrs    (-> (pcb/empty-changes nil page-id)
+                     (pcb/with-file-data fdata)
+                     (pcb/with-library-data fdata)
+                     (cls/generate-update-shapes [id] identity objects {})
+                     (pcb/resize-parents (cfh/get-parent-ids objects id))
+                     :redo-changes)]
+    (into geometry attrs)))
 
-#?(:clj
-   (t/deftest update-shape-geometry-matches-two-step-changes
-     (let [file    (thf/sample-file :file1)
-           pid     (page-id-of file)
-           [root-file root] (apply-ops file [{:op "create_rect" :page-id pid :id "$tmp:r"
-                                              :x 10 :y 10 :width 40 :height 40}])
-           grid    (container-file :grid)
-           props   {:x 25 :y 35}
-           cases   [[root-file pid (created root "$tmp:r")]
-                    (let [{:keys [file pid child]} (container-file :group)] [file pid child])
-                    (let [{:keys [file pid child]} (container-file :bool)] [file pid child])
-                    [(:file grid) (:pid grid) (:child grid)]
-                    [(:file grid) (:pid grid) (:container grid)]
-                    (let [{:keys [file pid container]} (container-file :flex)]
-                      [file pid container])]]
-       (doseq [[file pid id] cases]
-         (let [result (compile-ops file [{:op "update_shape" :page-id pid :id id
-                                          :props props}])]
-           (t/is (= (two-step-changes file pid id props) (op-changes result)))))
-       ;; Moving the grid board itself gives the second step changes to emit
-       (t/is (< (count (full-objects-changes (:file grid) (:pid grid) (:container grid) props))
-                (count (two-step-changes (:file grid) (:pid grid) (:container grid) props)))))))
+(t/deftest update-shape-geometry-matches-two-step-changes
+  (let [file    (thf/sample-file :file1)
+        pid     (page-id-of file)
+        [root-file root] (apply-ops file [{:op "create_rect" :page-id pid :id "$tmp:r"
+                                           :x 10 :y 10 :width 40 :height 40}])
+        grid    (container-file :grid)
+        props   {:x 25 :y 35}
+        cases   [[root-file pid (created root "$tmp:r")]
+                 (let [{:keys [file pid child]} (container-file :group)] [file pid child])
+                 (let [{:keys [file pid child]} (container-file :bool)] [file pid child])
+                 [(:file grid) (:pid grid) (:child grid)]
+                 [(:file grid) (:pid grid) (:container grid)]
+                 (let [{:keys [file pid container]} (container-file :flex)]
+                   [file pid container])]]
+    (doseq [[file pid id] cases]
+      (let [result (compile-ops file [{:op "update_shape" :page-id pid :id id
+                                       :props props}])]
+        (t/is (= (two-step-changes file pid id props) (op-changes result)))))
+    ;; Moving the grid board itself gives the second step changes to emit
+    (t/is (< (count (full-objects-changes (:file grid) (:pid grid) (:container grid) props))
+             (count (two-step-changes (:file grid) (:pid grid) (:container grid) props))))))
 
 ;; ----- Structure
 
@@ -1102,13 +1120,27 @@
 
 (t/deftest make-and-remove-mask
   (let [file (-> (thf/sample-file :file1)
-                 (tho/add-group :group1))
+                 (tho/add-group :group1)
+                 (ths/add-sample-shape :mask1 :parent-label :group1
+                                       :x 10 :y 20 :width 30 :height 40))
         pid  (page-id-of file)
         g1   (thi/id :group1)
         [file' _] (apply-ops file [{:op "make_mask" :page-id pid :group-id g1}])
         [file'' _] (apply-ops file' [{:op "remove_mask" :page-id pid :group-id g1}])]
     (t/is (true? (:masked-group (shape-of file' g1))))
     (t/is (not (:masked-group (shape-of file'' g1))))))
+
+(t/deftest make-mask-takes-the-box-of-the-mask-shape
+  (let [file (-> (thf/sample-file :file1)
+                 (tho/add-group :group1)
+                 (ths/add-sample-shape :mask1 :parent-label :group1
+                                       :x 10 :y 20 :width 30 :height 40))
+        pid  (page-id-of file)
+        g1   (thi/id :group1)
+        [file' _] (apply-ops file [{:op "make_mask" :page-id pid :group-id g1}])
+        group (shape-of file' g1)]
+    (t/is (true? (:masked-group group)))
+    (assert-box group 10 20 30 40)))
 
 ;; ----- Layout
 
@@ -2486,50 +2518,1059 @@
                                                :namespace "test.ns" :key "k" :value 5}]))]
     (t/is (= :mcp-invalid-operation (:code data)))))
 
-#?(:clj
-   (t/deftest bulk-create-300-rects-under-two-seconds
-     (let [file    (thf/sample-file :file1)
-           pid     (page-id-of file)
-           ops     (vec (for [i (range 300)]
-                          {:op "create_rect" :page-id pid :x (* i 10) :y 0
-                           :width 5 :height 5}))
-           start   (System/nanoTime)
-           result  (compile-ops file ops)
-           elapsed (/ (double (- (System/nanoTime) start)) 1e6)]
-       (t/is (< elapsed 2000))
-       (t/is (>= (count (:changes result)) 300)))))
+;; ----- Review fixes: names, structure, errors and sizing
+
+(t/deftest operation-names-are-the-sorted-op-names
+  (t/is (vector? mops/operation-names))
+  (t/is (= (sort mops/operation-names) mops/operation-names))
+  (t/is (= (count mops/operation-names) (count (set mops/operation-names))))
+  (t/is (contains? (set mops/operation-names) "apply_token")))
+
+(defn- group-chain-file
+  "A group `:group1` that holds only the board `:board-a`, which holds the rect
+  `:child-b`."
+  []
+  (-> (thf/sample-file :file1)
+      (tho/add-group :group1)
+      (tho/add-frame :board-a :parent-label :group1 :x 0 :y 0 :width 100 :height 100)
+      (ths/add-sample-shape :child-b :parent-label :board-a :x 10 :y 10 :width 10 :height 10)))
+
+(t/deftest move-a-shape-into-its-own-child-is-refused
+  (let [file (group-chain-file)
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "move_shapes" :page-id pid
+                                               :ids [(thi/id :board-a)]
+                                               :parent-id (thi/id :child-b)}]))]
+    (t/is (= :validation (:type data)))
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (re-find #"children" (:hint data)))
+    ;; The file is untouched, so the group the move would have removed is there
+    (t/is (some? (shape-of file (thi/id :group1))))))
+
+(t/deftest move-under-a-rect-is-refused
+  (let [file (two-rects-file)
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "move_shapes" :page-id pid
+                                               :ids [(thi/id :rect2)]
+                                               :parent-id (thi/id :rect1)}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (re-find #"cannot hold children" (:hint data)))))
+
+(t/deftest move-out-of-a-component-copy-is-refused
+  (let [{:keys [file pid child]} (container-file :component)
+        data (thrown-data #(compile-ops file [{:op "move_shapes" :page-id pid
+                                               :ids [child] :parent-id uuid/zero}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (re-find #"component copy" (:hint data)))))
 
 #?(:clj
-   (t/deftest bench-2000-update-shape-on-20000-shapes
-     (let [file0   (thf/sample-file :file1)
-           pid     (page-id-of file0)
-           ids     (vec (repeatedly 20000 uuid/next))
-           file    (update file0 :data
-                           (fn [fdata]
-                             (ctpl/update-page
-                              fdata pid
-                              (fn [page]
-                                (reduce (fn [page [i id]]
-                                          (ctst/add-shape
-                                           id
-                                           (cts/setup-shape
-                                            {:id id :type :rect :name (str "rect-" i)
-                                             :x (* (mod i 200) 10)
-                                             :y (* (quot i 200) 10)
-                                             :width 5 :height 5})
-                                           page nil nil nil true))
-                                        page
-                                        (map-indexed vector ids))))))
-           ops     (vec (for [i (range 2000)]
-                          {:op "update_shape" :page-id pid :id (nth ids i)
-                           :props {:x (+ 3000 (* (mod i 200) 10))
-                                   :y (+ 3000 (* (quot i 200) 10))}}))
-           start   (System/nanoTime)
-           result  (compile-ops file ops)
-           elapsed (/ (double (- (System/nanoTime) start)) 1e6)]
-       (println "bench-2000-update-shape-on-20000-shapes:" elapsed "ms")
-       ;; An idle run takes about 2 s. The limit is the 5 s target of the
-       ;; plan, which leaves room for a run that shares the CPU with other
-       ;; suites
-       (t/is (< elapsed 5000))
-       (t/is (>= (count (:changes result)) 2000)))))
+   (t/deftest internal-fault-in-an-op-is-not-a-client-error
+     (let [file (thf/sample-file :file1)
+           pid  (page-id-of file)
+           err  (with-redefs-fn {#'app.common.mcp.operations.schema/decode-op-values
+                                 (fn [_] (throw (NullPointerException. "boom")))}
+                  (fn []
+                    (try
+                      (compile-ops file [{:op "create_rect" :page-id pid
+                                          :x 0 :y 0 :width 10 :height 10}])
+                      nil
+                      (catch Exception e e))))
+           data (ex-data err)]
+       (t/is (= :internal (:type data)))
+       (t/is (= :mcp-compile-failed (:code data)))
+       (t/is (= 0 (:index data)))
+       (t/is (= "create_rect" (:op data)))
+       (t/is (instance? NullPointerException (.getCause err))))))
+
+(t/deftest set-flex-layout-drops-the-applied-gap-token
+  (let [file (file-with-token "gap8" "spacing" 8)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_board" :page-id pid :id "$tmp:b"
+                                         :x 0 :y 0 :width 200 :height 100}
+                                        {:op "set_flex_layout" :page-id pid :id "$tmp:b"
+                                         :layout-flex-dir "row"}])
+        board-id (created result "$tmp:b")
+        file''   (shape-with-token file' board-id "gap8" ["row-gap" "column-gap"] 8)
+        _        (t/is (= "gap8" (get-in (shape-of file'' board-id) [:applied-tokens :row-gap])))
+        [file3 _] (apply-ops file'' [{:op "set_flex_layout" :page-id pid :id board-id
+                                      :layout-gap {:row-gap 16 :column-gap 16}}])
+        board    (shape-of file3 board-id)]
+    (t/is (= 16 (get-in board [:layout-gap :row-gap])))
+    (t/is (not (contains? (:applied-tokens board) :row-gap)))
+    (t/is (not (contains? (:applied-tokens board) :column-gap)))))
+
+(t/deftest set-layout-child-fill-fixes-the-hug-parent
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_board" :page-id pid :id "$tmp:b"
+                                         :x 0 :y 0 :width 200 :height 200}
+                                        {:op "set_flex_layout" :page-id pid :id "$tmp:b"
+                                         :layout-flex-dir "column"
+                                         :layout-item-v-sizing "auto"}
+                                        {:op "create_rect" :page-id pid :id "$tmp:r"
+                                         :parent-id "$tmp:b"
+                                         :x 0 :y 0 :width 10 :height 10}])
+        board-id (created result "$tmp:b")
+        rect-id  (created result "$tmp:r")
+        [file'' _] (apply-ops file' [{:op "set_layout_child" :page-id pid :id rect-id
+                                      :layout-item-v-sizing "fill"}])]
+    (t/is (= :auto (:layout-item-v-sizing (shape-of file' board-id))))
+    (t/is (= :fix (:layout-item-v-sizing (shape-of file'' board-id))))))
+
+(t/deftest auto-height-text-wraps-its-paragraph
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        text (apply str (repeat 400 "a"))
+        [file' result] (apply-ops file [{:op "create_text" :page-id pid :id "$tmp:t"
+                                         :characters text :font-size 14 :width 200
+                                         :grow-type "auto-height" :x 0 :y 0}])
+        shape (shape-of file' (created result "$tmp:t"))]
+    ;; 400 characters of 0.6 em at 14 px in 200 px: 17 lines of 1.2 em
+    (t/is (close? (* 1.2 14 17) (:height shape)))
+    (t/is (close? 200 (:width shape)))))
+
+(t/deftest resize-path-twice-ends-at-the-second-size
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_path" :page-id pid :id "$tmp:p"
+                                         :d "M 0 0 L 100 0 L 100 50 Z"
+                                         :x 0 :y 0 :width 100 :height 50}])
+        path-id (created result "$tmp:p")
+        [file'' _] (apply-ops file' [{:op "update_shape" :page-id pid :id path-id
+                                      :props {:width 200}}])
+        [file3 _] (apply-ops file'' [{:op "update_shape" :page-id pid :id path-id
+                                      :props {:width 100}}])]
+    (t/is (close? 200 (get-in (shape-of file'' path-id) [:selrect :width])))
+    (t/is (close? 100 (get-in (shape-of file3 path-id) [:selrect :width])))))
+
+(t/deftest rotate-twice-ends-at-the-second-angle
+  (let [file (two-rects-file)
+        pid  (page-id-of file)
+        rect (thi/id :rect1)
+        [file' _] (apply-ops file [{:op "update_shape" :page-id pid :id rect
+                                    :props {:rotation 30}}])
+        [file'' _] (apply-ops file' [{:op "update_shape" :page-id pid :id rect
+                                      :props {:rotation 60}}])]
+    (t/is (close? 30 (:rotation (shape-of file' rect))))
+    (t/is (close? 60 (:rotation (shape-of file'' rect))))))
+
+(defn- file-with-brand-rect
+  "The file with the colour token `brand`, `#ff0000`, in `Core`, and a rect
+  `:rect1` to take it."
+  []
+  (-> (file-with-token "brand" "color" "#ff0000")
+      (ths/add-sample-shape :rect1 :x 0 :y 0 :width 10 :height 10)))
+
+(t/deftest apply-color-token-in-hsl-warns-and-keeps-the-fill
+  (let [file (file-with-brand-rect)
+        pid  (page-id-of file)
+        rect (thi/id :rect1)
+        before (get-in (shape-of file rect) [:fills 0 :fill-color])
+        [file' result] (apply-ops file [{:op "apply_token" :page-id pid :shape-ids [rect]
+                                         :token-name "brand" :attributes ["fill"]
+                                         :resolved-value "hsl(210 50% 40%)"}])
+        shape (shape-of file' rect)]
+    (t/is (= [{:code :token-not-applied :token "brand" :attributes ["fill"]}]
+             (:warnings result)))
+    (t/is (= before (get-in shape [:fills 0 :fill-color])))
+    (t/is (not (contains? (:applied-tokens shape) :fill)))))
+
+(t/deftest apply-color-token-with-a-colour-name-sets-the-fill
+  (let [file (file-with-brand-rect)
+        pid  (page-id-of file)
+        rect (thi/id :rect1)
+        [file' result] (apply-ops file [{:op "apply_token" :page-id pid :shape-ids [rect]
+                                         :token-name "brand" :attributes ["fill"]
+                                         :resolved-value "red"}])
+        shape (shape-of file' rect)]
+    (t/is (empty? (:warnings result)))
+    (t/is (= "#ff0000" (get-in shape [:fills 0 :fill-color])))
+    (t/is (= "brand" (get-in shape [:applied-tokens :fill])))))
+
+(t/deftest update-shape-refuses-a-key-that-has-its-own-op
+  (let [file (two-rects-file)
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "update_shape" :page-id pid
+                                               :id (thi/id :rect1)
+                                               :props {:masked-group true}}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (re-find #"make_mask" (:hint data)))))
+
+(t/deftest create-rect-refuses-a-layout-attr-of-a-board
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "create_rect" :page-id pid
+                                               :x 0 :y 0 :width 10 :height 10
+                                               :props {:layout-gap {:row-gap 4 :column-gap 4}}}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    ;; The layout gap has its own op, so `props` refuses it on every type
+    (t/is (re-find #"set_flex_layout" (:hint data)))))
+
+(t/deftest props-keys-per-shape-type
+  (let [keys-of mops/props-keys-of-type]
+    ;; The keys that have an op of their own are in no type
+    (doseq [type [:frame :rect :circle :group :bool :text :path :image :svg-raw]]
+      (t/is (not (contains? (keys-of type) :layout-gap)) (str type))
+      (t/is (not (contains? (keys-of type) :layout-padding)) (str type))
+      (t/is (not (contains? (keys-of type) :layout-item-h-sizing)) (str type))
+      ;; The structural keys are in no type
+      (t/is (not (contains? (keys-of type) :layout)) (str type))
+      (t/is (not (contains? (keys-of type) :masked-group)) (str type))
+      (t/is (not (contains? (keys-of type) :variant-id)) (str type)))
+    ;; A plain attr is in the type
+    (t/is (contains? (keys-of :rect) :hide-in-viewer))))
+
+(t/deftest create-rect-without-x-names-the-missing-field
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "create_rect" :page-id pid
+                                               :y 0 :width 1 :height 1}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (= 0 (:index data)))
+    (t/is (re-find #":x" (:hint data)))
+    (t/is (some? (:details data)))))
+
+(t/deftest group-refuses-a-repeated-child
+  (let [file (two-rects-file)
+        pid  (page-id-of file)
+        rect (thi/id :rect1)
+        data (thrown-data #(compile-ops file [{:op "create_group" :page-id pid
+                                               :child-ids [rect rect]}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (re-find #"more than once" (:hint data)))))
+
+;; ----- Lookup counts on a large page
+;;
+;; Wall time is not a gate: it depends on the machine. These tests count the
+;; lookups that the compiler makes on the objects of a page, which is what a
+;; scan of the page costs.
+
+(defn- counted-seq
+  "The entries of `s`, each counted as one lookup, since a scan of the page
+  reads every entry. The seq of an empty map is nil."
+  [counter s]
+  (when (some? s)
+    (map (fn [entry] (swap! counter inc) entry) s)))
+
+#?(:clj
+   (deftype CountingMap [m counter]
+     clojure.lang.ILookup
+     (valAt [_ k] (swap! counter inc) (get m k))
+     (valAt [_ k not-found] (swap! counter inc) (get m k not-found))
+
+     clojure.lang.Associative
+     (containsKey [_ k] (contains? m k))
+     (entryAt [_ k] (swap! counter inc) (find m k))
+     (assoc [_ k v] (CountingMap. (assoc m k v) counter))
+
+     clojure.lang.IPersistentMap
+     (assocEx [_ k v] (CountingMap. (.assocEx ^clojure.lang.IPersistentMap m k v) counter))
+     (without [_ k] (CountingMap. (dissoc m k) counter))
+
+     clojure.lang.IPersistentCollection
+     (count [_] (count m))
+     (cons [_ o] (CountingMap. (conj m o) counter))
+     (empty [_] (CountingMap. (empty m) counter))
+     (equiv [_ o] (= m (if (instance? CountingMap o) (.-m ^CountingMap o) o)))
+
+     clojure.lang.Seqable
+     (seq [_] (counted-seq counter (seq m)))
+
+     clojure.lang.IFn
+     (invoke [_ k] (swap! counter inc) (get m k))
+     (invoke [_ k not-found] (swap! counter inc) (get m k not-found))
+
+     java.lang.Iterable
+     (iterator [this] (.iterator ^Iterable (or (seq this) ())))))
+
+#?(:cljs
+   (deftype CountingMap [m counter]
+     ILookup
+     (-lookup [_ k] (swap! counter inc) (get m k))
+     (-lookup [_ k not-found] (swap! counter inc) (get m k not-found))
+
+     IAssociative
+     (-contains-key? [_ k] (contains? m k))
+     (-assoc [_ k v] (CountingMap. (assoc m k v) counter))
+
+     IFind
+     (-find [_ k] (swap! counter inc) (find m k))
+
+     IMap
+     (-dissoc [_ k] (CountingMap. (dissoc m k) counter))
+
+     ICounted
+     (-count [_] (count m))
+
+     ISeqable
+     (-seq [_] (counted-seq counter (seq m)))
+
+     IKVReduce
+     (-kv-reduce [_ f init]
+       (reduce-kv (fn [acc k v] (swap! counter inc) (f acc k v)) init m))
+
+     IFn
+     (-invoke [_ k] (swap! counter inc) (get m k))
+     (-invoke [_ k not-found] (swap! counter inc) (get m k not-found))))
+
+(defn- counting-file
+  "The file `file` with the objects of its page wrapped in a counting map.
+  Returns the file and the counter atom."
+  [file]
+  (let [counter (atom 0)
+        pid     (page-id-of file)
+        objects (get-in file [:data :pages-index pid :objects])]
+    [(assoc-in file [:data :pages-index pid :objects] (CountingMap. objects counter))
+     counter]))
+
+(defn- lookups-of
+  "The number of lookups in the page objects that the compile of `operations`
+  makes on `file`."
+  [file operations]
+  (let [[file' counter] (counting-file file)]
+    (compile-ops file' operations)
+    @counter))
+
+(defn- big-page-file
+  "The file `base` with `n` rects at the root of its page. Returns the file and
+  the ids of the rects, in order."
+  [base n]
+  (let [pid (page-id-of base)
+        ids (vec (repeatedly n uuid/next))]
+    [(update base :data
+             (fn [fdata]
+               (ctpl/update-page
+                fdata pid
+                (fn [page]
+                  (reduce (fn [page [i id]]
+                            (ctst/add-shape
+                             id
+                             (cts/setup-shape {:id id :type :rect :name (str "rect-" i)
+                                               :x (* (mod i 200) 10)
+                                               :y (* (quot i 200) 10)
+                                               :width 5 :height 5})
+                             page nil nil nil true))
+                          page
+                          (map-indexed vector ids))))))
+     ids]))
+
+(defn- now-ms
+  []
+  #?(:clj (/ (double (System/nanoTime)) 1e6)
+     :cljs (js/Date.now)))
+
+(defn- counter-id-fn
+  "A new-id function that gives the same ids in every compile."
+  []
+  (let [n (atom 0)]
+    (fn [] (uuid/custom 0 (swap! n inc)))))
+
+(defn- compile-with
+  "Compiles `operations` against `file` with `opts`, and returns the result."
+  [file operations opts]
+  (mops/compile-operations (:data file) operations opts))
+
+(defn- modifier-input-sizes
+  "The number of objects that each call of the modifiers gets while the
+  `operations` compile on `file`."
+  [file operations]
+  (let [sizes (atom [])
+        orig  lm/generate-apply-modifiers]
+    (with-redefs [lm/generate-apply-modifiers
+                  (fn [builder objects tree opts]
+                    (swap! sizes conj (count objects))
+                    (orig builder objects tree opts))]
+      (compile-ops file operations))
+    @sizes))
+
+(defn- reflow-ids-of
+  "The ids that the layout reflow is asked to run from, when the
+  `operations` compile on `file`."
+  [file operations]
+  (let [seen (atom [])
+        orig lm/generate-reflow]
+    (with-redefs [lm/generate-reflow
+                  (fn [changes objects ids opts]
+                    (swap! seen into ids)
+                    (orig changes objects ids opts))]
+      (compile-ops file operations))
+    @seen))
+
+(defn- lookups-of-ops
+  "The lookups per op that `operations` make on the large page of `file`."
+  [file operations]
+  (/ (lookups-of file operations) (count operations)))
+
+;; ----- Counts on a large page: the gates
+
+(def ^:private lookup-bound
+  "The most lookups of the page objects that one op may make on a page of
+  20,000 shapes. Before the scan of the names was removed, an unnamed create
+  made about 20,000 of them."
+  200)
+
+(t/deftest lookups-per-op-stay-bounded-on-a-large-page
+  (let [[file ids]  (big-page-file (thf/sample-file :file1) 20000)
+        pid         (page-id-of file)
+        [text-file text-result]
+        (apply-ops file [{:op "create_text" :page-id pid :id "$tmp:t"
+                          :characters "Hello" :font-size 20 :grow-type "fixed"
+                          :x 0 :y 0 :width 200 :height 40}])
+        text-id     (created text-result "$tmp:t")
+        [token-file token-ids] (big-page-file (file-with-token "w50" "sizing" 50) 20000)
+        tpid        (page-id-of token-file)
+        n           50
+        update-ops  (vec (for [i (range n)]
+                           {:op "update_shape" :page-id pid :id (nth ids i)
+                            :props {:x (+ 3000 i) :y 3000}}))
+        create-ops  (vec (for [i (range n)]
+                           {:op "create_rect" :page-id pid :x (* i 10) :y 5000
+                            :width 5 :height 5}))
+        text-ops    (vec (for [i (range n)]
+                           {:op "set_text" :page-id pid :id text-id
+                            :characters (str "Bye " i)}))
+        token-ops   (vec (for [id (take n token-ids)]
+                           {:op "apply_token" :page-id tpid :shape-ids [id]
+                            :token-name "w50" :attributes ["width"]
+                            :resolved-value 50}))]
+    (doseq [[label f ops] [["update_shape" file update-ops]
+                           ["create_rect unnamed" file create-ops]
+                           ["set_text" text-file text-ops]
+                           ["apply_token" token-file token-ops]]]
+      (let [per-op (lookups-of-ops f ops)]
+        (println "lookups per op," label ":" (double per-op))
+        (t/is (<= per-op lookup-bound) (str label " makes " (double per-op) " lookups per op"))))))
+
+;; ----- Shapes given to the modifiers: the three families of CMP-04
+
+(t/deftest modifier-inputs-are-a-part-of-the-page
+  (let [[file ids] (big-page-file (thf/sample-file :file1) 20000)
+        pid        (page-id-of file)
+        [text-file text-result]
+        (apply-ops file [{:op "create_text" :page-id pid :id "$tmp:t"
+                          :characters "Hi" :font-size 20 :grow-type "auto-width"
+                          :x 0 :y 0}])
+        text-id    (created text-result "$tmp:t")
+        [token-file token-ids] (big-page-file (file-with-token "w50" "sizing" 50) 20000)
+        tpid       (page-id-of token-file)
+        align-sizes (modifier-input-sizes
+                     file [{:op "align" :page-id pid
+                            :ids [(nth ids 0) (nth ids 1)] :axis "hleft"}])
+        text-sizes  (modifier-input-sizes
+                     text-file [{:op "set_text" :page-id pid :id text-id
+                                 :characters "Bye there"}])
+        token-sizes (modifier-input-sizes
+                     token-file [{:op "apply_token" :page-id tpid
+                                  :shape-ids [(first token-ids)] :token-name "w50"
+                                  :attributes ["width"] :resolved-value 50}])]
+    (doseq [[label sizes] [["align" align-sizes]
+                           ["set_text" text-sizes]
+                           ["apply_token" token-sizes]]]
+      (println "modifier inputs," label ":" sizes)
+      (t/is (seq sizes) label)
+      (t/is (every? #(< % 50) sizes) (str label " gives the modifiers " sizes)))))
+
+#?(:clj
+   (t/deftest modifier-input-for-the-three-families-matches-the-full-page
+     ;; With the part of the page replaced by the whole page, the changes of
+     ;; each family must not change.
+     (let [base    (nested-containers-file)
+           pid     (page-id-of base)
+           [file result] (apply-ops base [{:op "create_text" :page-id pid
+                                           :id "$tmp:t" :characters "Hi" :font-size 20
+                                           :grow-type "auto-width" :x 0 :y 0}])
+           tid     (created result "$tmp:t")
+           full    (fn [f ops]
+                     (with-redefs-fn {#'app.common.mcp.operations.state/modifier-objects-of (fn [objects _] objects)
+                                      #'app.common.mcp.operations.state/modifier-objects (fn [objects _] objects)}
+                       (fn [] (:changes (compile-ops f ops)))))
+           subset  (fn [f ops] (:changes (compile-ops f ops)))
+           cases   [[:align file [{:op "align" :page-id pid
+                                   :ids [(thi/id :rect1) (thi/id :rect3)] :axis "hleft"}]]
+                    [:set-text file [{:op "set_text" :page-id pid :id tid
+                                      :characters "Bye there"}]]]]
+       (doseq [[label f ops] cases]
+         (let [changes (subset f ops)]
+           (t/is (seq changes) (str label " changes nothing"))
+           (t/is (= (full f ops) changes) (str label " differs with the full page")))))))
+
+;; ----- The reflow
+
+(t/deftest reflow-skips-a-shape-in-no-layout
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_board" :page-id pid :id "$tmp:b"
+                                         :x 0 :y 0 :width 200 :height 200}])
+        board (created result "$tmp:b")
+        plain (reflow-ids-of file' [{:op "create_rect" :page-id pid :parent-id board
+                                     :x 10 :y 10 :width 20 :height 20}])
+        [flex-file flex-result] (apply-ops file [{:op "create_board" :page-id pid :id "$tmp:f"
+                                                  :x 0 :y 0 :width 200 :height 200}
+                                                 {:op "set_flex_layout" :page-id pid :id "$tmp:f"
+                                                  :layout-flex-dir "row"}])
+        flex  (created flex-result "$tmp:f")
+        inside (reflow-ids-of flex-file [{:op "create_rect" :page-id pid :parent-id flex
+                                          :x 10 :y 10 :width 20 :height 20}])]
+    (t/is (empty? plain) "a rect in a plain board is not reflowed")
+    (t/is (seq inside) "a rect in a flex board is reflowed")))
+
+(t/deftest reflow-error-is-an-internal-error
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        ops  [{:op "create_board" :page-id pid :id "$tmp:f"
+               :x 0 :y 0 :width 200 :height 200}
+              {:op "set_flex_layout" :page-id pid :id "$tmp:f" :layout-flex-dir "row"}
+              {:op "create_rect" :page-id pid :parent-id "$tmp:f"
+               :x 10 :y 10 :width 20 :height 20}]
+        data (with-redefs [lm/generate-reflow
+                           (fn [& _] (throw (ex-info "boom" {})))]
+               (thrown-data #(compile-ops file ops)))]
+    (t/is (= :internal (:type data)))
+    (t/is (= :mcp-compile-failed (:code data)))
+    (t/is (nil? (:index data)))
+    (t/is (= "reflow" (:op data)))))
+
+;; ----- Names and structure
+
+(t/deftest default-names-are-plain
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_rect" :page-id pid :id "$tmp:r1"
+                                         :x 0 :y 0 :width 10 :height 10}
+                                        {:op "create_rect" :page-id pid :id "$tmp:r2"
+                                         :x 20 :y 0 :width 10 :height 10}
+                                        {:op "create_board" :page-id pid :id "$tmp:b"
+                                         :x 0 :y 0 :width 100 :height 100}
+                                        {:op "create_group" :page-id pid :id "$tmp:g"
+                                         :child-ids ["$tmp:r1" "$tmp:r2"]}])]
+    ;; Two rects get the same plain name, with no suffix
+    (t/is (= "Rectangle" (:name (shape-of file' (created result "$tmp:r1")))))
+    (t/is (= "Rectangle" (:name (shape-of file' (created result "$tmp:r2")))))
+    (t/is (= "Board" (:name (shape-of file' (created result "$tmp:b")))))
+    (t/is (= "Group" (:name (shape-of file' (created result "$tmp:g")))))))
+
+(t/deftest boolean-takes-the-parent-of-its-head
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_board" :page-id pid :id "$tmp:b"
+                                         :x 0 :y 0 :width 200 :height 200}
+                                        {:op "create_rect" :page-id pid :id "$tmp:in"
+                                         :parent-id "$tmp:b" :x 10 :y 10 :width 20 :height 20}
+                                        {:op "create_rect" :page-id pid :id "$tmp:out"
+                                         :x 100 :y 100 :width 20 :height 20}])
+        in-id    (created result "$tmp:in")
+        out-id   (created result "$tmp:out")
+        objects  (get-in (:data file') [:pages-index pid :objects])
+        ordered  (cfh/order-by-indexed-shapes objects [in-id out-id])
+        front    (first ordered)
+        bottom   (last ordered)]
+    ;; The children sit in two parents, and the boolean takes the parent of
+    ;; its head: the front child for a union, the bottom child for a difference.
+    (t/is (not= (:parent-id (get objects in-id)) (:parent-id (get objects out-id))))
+    (doseq [[bool-type head] [["union" front] ["difference" bottom]]]
+      (let [[file'' res] (apply-ops file' [{:op "create_boolean" :page-id pid
+                                            :id "$tmp:bool" :bool-type bool-type
+                                            :child-ids [in-id out-id]}])
+            bool (shape-of file'' (created res "$tmp:bool"))]
+        (t/is (= (:parent-id (get objects head)) (:parent-id bool))
+              (str bool-type " takes the parent of its head"))))))
+
+(t/deftest props-refuse-the-keys-that-have-an-op
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)]
+    (doseq [[k hint] [[:layout-item-h-sizing "set_layout_child"]
+                      [:layout-item-margin "set_layout_child"]
+                      [:layout-gap "set_flex_layout"]
+                      [:layout-padding "set_flex_layout or set_grid_layout"]]]
+      (let [data (thrown-data #(compile-ops file [{:op "create_rect" :page-id pid
+                                                   :x 0 :y 0 :width 10 :height 10
+                                                   :props {k 1}}]))]
+        (t/is (= :mcp-invalid-operation (:code data)) (str k))
+        (t/is (re-find (re-pattern hint) (str (:hint data)))
+              (str k " names " hint))))))
+
+;; ----- Reproducible ids, and the input page
+
+(t/deftest the-same-ops-give-equal-changes-with-a-counting-id-fn
+  (let [file (nested-containers-file)
+        pid  (page-id-of file)
+        ops  [{:op "create_rect" :page-id pid :id "$tmp:a" :parent-id (thi/id :board)
+               :x 300 :y 300 :width 10 :height 10}
+              {:op "create_rect" :page-id pid :id "$tmp:b" :parent-id (thi/id :board)
+               :x 320 :y 300 :width 10 :height 10}
+              {:op "create_group" :page-id pid :id "$tmp:g" :child-ids ["$tmp:a" "$tmp:b"]}
+              {:op "update_shape" :page-id pid :id (thi/id :rect1) :props {:x 15 :y 25}}
+              {:op "align" :page-id pid :ids [(thi/id :rect1) (thi/id :rect3)] :axis "vcenter"}]
+        once (compile-with file ops {:new-id-fn (counter-id-fn)})
+        twice (compile-with file ops {:new-id-fn (counter-id-fn)})]
+    (t/is (seq (:changes once)))
+    (t/is (= (:changes once) (:changes twice)))
+    (t/is (= (:created-ids once) (:created-ids twice)))))
+
+(t/deftest a-lazy-objects-page-compiles-as-a-plain-page
+  (let [file (nested-containers-file)
+        pid  (page-id-of file)
+        lazy (update-in file [:data :pages-index pid :objects] omap/wrap)
+        ops  [{:op "update_shape" :page-id pid :id (thi/id :rect1) :props {:x 15 :y 25}}
+              {:op "create_rect" :page-id pid :id "$tmp:a" :parent-id (thi/id :board)
+               :x 300 :y 300 :width 10 :height 10}
+              {:op "align" :page-id pid :ids [(thi/id :rect1) (thi/id :rect3)] :axis "hleft"}]
+        plain-result (compile-with file ops {:new-id-fn (counter-id-fn)})
+        lazy-result  (compile-with lazy ops {:new-id-fn (counter-id-fn)})]
+    (t/is (seq (:changes plain-result)))
+    (t/is (= (:changes plain-result) (:changes lazy-result)))))
+
+;; ----- Libraries: the `:libraries` input
+
+(t/deftest instantiate-component-from-a-library
+  (let [[lib comp-id] (button-component-file)
+        lib-id        (:id (:data lib))
+        target        (thf/sample-file :file2)
+        tpid          (page-id-of target)
+        result        (compile-with target
+                                    [{:op "instantiate_component" :page-id tpid
+                                      :component-id comp-id :library-id lib-id
+                                      :x 300 :y 0 :id "$tmp:copy"}]
+                                    {:new-id-fn uuid/next
+                                     :libraries {lib-id (:data lib)}})
+        target'       (thf/apply-changes target {:redo-changes (:changes result)})
+        copy          (shape-of target' (created result "$tmp:copy"))]
+    (t/is (= comp-id (:component-id copy)))
+    (t/is (close? 300 (:x copy)))))
+
+(t/deftest apply-typography-from-a-library
+  (let [[lib lib-result] (apply-ops (thf/sample-file :file1)
+                                    [{:op "create_typography"
+                                      :typography {:id "$tmp:t" :name "Body"
+                                                   :font-family "sourcesanspro"
+                                                   :font-size "18"}}])
+        lib-id   (:id (:data lib))
+        typo-id  (created lib-result "$tmp:t")
+        target   (thf/sample-file :file2)
+        tpid     (page-id-of target)
+        result   (compile-with target
+                               [{:op "create_text" :page-id tpid :id "$tmp:x"
+                                 :characters "Hello" :font-size 10 :font-family "other"
+                                 :grow-type "fixed" :x 0 :y 0 :width 200 :height 40}
+                                {:op "apply_typography" :page-id tpid :id "$tmp:x"
+                                 :typography-id typo-id :library-id lib-id}]
+                               {:new-id-fn uuid/next
+                                :libraries {lib-id (:data lib)}})
+        target'  (thf/apply-changes target {:redo-changes (:changes result)})
+        nodes    (txt/node-seq txt/is-text-node?
+                               (:content (shape-of target' (created result "$tmp:x"))))]
+    (t/is (seq nodes))
+    (t/is (every? #(= "sourcesanspro" (:font-family %)) nodes))
+    (t/is (every? #(= typo-id (:typography-ref-id %)) nodes))
+    (t/is (every? #(= lib-id (:typography-ref-file %)) nodes))))
+
+(t/deftest set-tokens-source-to-a-library
+  (let [lib      (tokens-file)
+        lib-id   (:id (:data lib))
+        target   (thf/sample-file :file2)
+        result   (compile-with target
+                               [{:op "set_tokens_source" :library-id lib-id}]
+                               {:new-id-fn uuid/next
+                                :libraries {lib-id (:data lib)}})
+        target'  (thf/apply-changes target {:redo-changes (:changes result)})]
+    (t/is (= lib-id (tht/get-tokens-source target')))))
+
+;; ----- Benchmarks: printed, not gated
+
+(t/deftest bulk-create-300-rects-counts-the-changes
+  (let [file    (thf/sample-file :file1)
+        pid     (page-id-of file)
+        ops     (vec (for [i (range 300)]
+                       {:op "create_rect" :page-id pid :x (* i 10) :y 0
+                        :width 5 :height 5}))
+        start   (now-ms)
+        result  (compile-ops file ops)
+        elapsed (- (now-ms) start)]
+    (println "bulk-create-300-rects:" elapsed "ms (not a gate)")
+    (t/is (>= (count (:changes result)) 300))))
+
+(t/deftest bench-2000-update-shape-on-20000-shapes-counts-the-changes
+  (let [[file ids] (big-page-file (thf/sample-file :file1) 20000)
+        pid     (page-id-of file)
+        ops     (vec (for [i (range 2000)]
+                       {:op "update_shape" :page-id pid :id (nth ids i)
+                        :props {:x (+ 3000 (* (mod i 200) 10))
+                                :y (+ 3000 (* (quot i 200) 10))}}))
+        start   (now-ms)
+        result  (compile-ops file ops)
+        elapsed (- (now-ms) start)]
+    (println "bench-2000-update-shape-on-20000-shapes:" elapsed "ms (not a gate)")
+    (t/is (>= (count (:changes result)) 2000))))
+
+(t/deftest schema-op-names-are-the-registry-names
+  ;; Each op of the schema is in the registry, and each registry name is in the schema
+  (t/is (= (set mops/operation-names) mops/schema-op-names)))
+
+;; ----- Review round: nesting loops, rotation, path content, gaps, copies, faults
+
+(t/deftest move-copy-into-its-own-main-is-refused
+  (let [[file comp-id] (button-component-file)
+        pid      (page-id-of file)
+        main-id  (get-in (:data file) [:components comp-id :main-instance-id])
+        [file' result] (apply-ops file [{:op "instantiate_component" :page-id pid
+                                         :component-id comp-id :x 300 :y 0 :id "$tmp:copy"}
+                                        {:op "create_group" :page-id pid :id "$tmp:g"
+                                         :child-ids ["$tmp:copy"]}])
+        copy-id  (created result "$tmp:copy")
+        group-id (created result "$tmp:g")
+        data     (thrown-data #(compile-ops file' [{:op "move_shapes" :page-id pid
+                                                    :ids [copy-id] :parent-id main-id}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (re-find #"nest" (str (:hint data))))
+    ;; Nothing is deleted: the group and its copy are still there
+    (t/is (some? (shape-of file' group-id)))
+    (t/is (some? (shape-of file' copy-id)))))
+
+(t/deftest update-shape-rotation-of-a-flipped-rect-keeps-the-flip
+  (let [file    (thf/sample-file :file1)
+        pid     (page-id-of file)
+        id      (uuid/next)
+        base    (cts/setup-shape {:type :rect :x 0 :y 0 :width 40 :height 20})
+        flipped (-> (gsh/transform-shape base (-> (ctm/empty)
+                                                  (ctm/resize (gpt/point -1.0 1.0)
+                                                              (gsh/shape->center base))))
+                    (assoc :id id :parent-id uuid/zero :frame-id uuid/zero))
+        file'   (update file :data
+                        (fn [fdata]
+                          (ctpl/update-page fdata pid
+                                            #(ctst/add-shape id flipped % nil nil nil true))))
+        [file'' _] (apply-ops file' [{:op "update_shape" :page-id pid :id id
+                                      :props {:rotation 0}}])
+        after   (shape-of file'' id)]
+    (t/is (true? (:flip-x after)))
+    (doseq [[a b] (map vector (:points after) (:points flipped))]
+      (t/is (close? (:x a) (:x b)))
+      (t/is (close? (:y a) (:y b))))))
+
+(t/deftest set-path-content-refits-the-box-to-the-content
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_path" :page-id pid :id "$tmp:p"
+                                         :d "M 0 0 L 100 0 L 100 50 Z" :x 30 :y 40}])
+        path-id (created result "$tmp:p")
+        [file'' _] (apply-ops file' [{:op "set_path_content" :page-id pid :id path-id
+                                      :content (path/from-string "M 0 0 L 200 0 L 200 80 Z")}])
+        shape   (shape-of file'' path-id)]
+    (t/is (= :path (:type shape)))
+    (assert-selrect-box shape 30 40 200 80)))
+
+(t/deftest set-path-content-refuses-a-shape-that-is-not-a-path
+  (let [file (two-rects-file)
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "set_path_content" :page-id pid
+                                               :id (thi/id :rect1)
+                                               :content (path/from-string "M 0 0 L 10 0 L 10 10 Z")}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (re-find #"path shape" (str (:hint data))))))
+
+(t/deftest create-rect-props-accept-hide-in-viewer
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_rect" :page-id pid :id "$tmp:r"
+                                         :x 0 :y 0 :width 10 :height 10
+                                         :props {:hide-in-viewer true}}])]
+    (t/is (true? (:hide-in-viewer (shape-of file' (created result "$tmp:r")))))))
+
+(t/deftest apply-sizing-token-records-the-width-in-applied-tokens
+  (let [file (file-with-token "wide" "sizing" 50)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_rect" :page-id pid :id "$tmp:r"
+                                         :x 0 :y 0 :width 10 :height 10}])
+        rect-id (created result "$tmp:r")
+        [file'' _] (apply-ops file' [{:op "apply_token" :page-id pid :shape-ids [rect-id]
+                                      :token-name "wide" :attributes ["width"]
+                                      :resolved-value 50}])
+        rect    (shape-of file'' rect-id)]
+    (t/is (close? 50 (:width rect)))
+    (t/is (= "wide" (get-in rect [:applied-tokens :width])))))
+
+(defn- gap-token-board
+  "The file with the board `$tmp:b` in a row flex layout, whose row and column
+  gaps carry the token `gap8`. Returns the file and the id of the board."
+  []
+  (let [file (file-with-token "gap8" "spacing" 8)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_board" :page-id pid :id "$tmp:b"
+                                         :x 0 :y 0 :width 200 :height 100}
+                                        {:op "set_flex_layout" :page-id pid :id "$tmp:b"
+                                         :layout-flex-dir "row"}])
+        board-id (created result "$tmp:b")]
+    [(shape-with-token file' board-id "gap8" ["row-gap" "column-gap"] 8) board-id]))
+
+(t/deftest set-flex-layout-without-a-gap-keeps-the-gap-and-its-tokens
+  (let [[file board-id] (gap-token-board)
+        pid     (page-id-of file)
+        [file' _] (apply-ops file [{:op "set_flex_layout" :page-id pid :id board-id
+                                    :layout-flex-dir "column"}])
+        board   (shape-of file' board-id)]
+    (t/is (= 8 (get-in board [:layout-gap :row-gap])))
+    (t/is (= 8 (get-in board [:layout-gap :column-gap])))
+    (t/is (= "gap8" (get-in board [:applied-tokens :row-gap])))
+    (t/is (= "gap8" (get-in board [:applied-tokens :column-gap])))))
+
+(t/deftest set-flex-layout-unapplies-only-the-gap-side-that-changes
+  (let [[file board-id] (gap-token-board)
+        pid     (page-id-of file)
+        [file' _] (apply-ops file [{:op "set_flex_layout" :page-id pid :id board-id
+                                    :layout-gap {:row-gap 16 :column-gap 8}}])
+        board   (shape-of file' board-id)]
+    (t/is (= 16 (get-in board [:layout-gap :row-gap])))
+    (t/is (= 8 (get-in board [:layout-gap :column-gap])))
+    (t/is (not (contains? (:applied-tokens board) :row-gap)))
+    (t/is (= "gap8" (get-in board [:applied-tokens :column-gap])))))
+
+(t/deftest create-into-a-component-copy-is-refused
+  (let [file (-> (thf/sample-file :file1)
+                 (tho/add-simple-component-with-copy :c1 :main :main-child :copy))
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "create_rect" :page-id pid
+                                               :parent-id (thi/id :copy)
+                                               :x 0 :y 0 :width 5 :height 5}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (re-find #"component copy" (str (:hint data))))))
+
+(t/deftest instantiate-into-a-component-copy-is-refused
+  (let [file (-> (thf/sample-file :file1)
+                 (tho/add-simple-component-with-copy :c1 :main :main-child :copy))
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "instantiate_component" :page-id pid
+                                               :component-id (thi/id :c1)
+                                               :parent-id (thi/id :copy)
+                                               :x 0 :y 0}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))))
+
+(t/deftest clone-of-a-shape-inside-a-copy-is-refused
+  (let [file  (-> (thf/sample-file :file1)
+                  (tho/add-simple-component-with-copy :c1 :main :main-child :copy))
+        pid   (page-id-of file)
+        inner (first (:shapes (shape-of file (thi/id :copy))))
+        data  (thrown-data #(compile-ops file [{:op "clone_shape" :page-id pid :id inner}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))))
+
+(t/deftest set-layout-child-margin-keeps-the-other-sides
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_board" :page-id pid :id "$tmp:b"
+                                         :x 0 :y 0 :width 200 :height 200}
+                                        {:op "set_flex_layout" :page-id pid :id "$tmp:b"
+                                         :layout-flex-dir "row"}
+                                        {:op "create_rect" :page-id pid :id "$tmp:r"
+                                         :parent-id "$tmp:b" :x 0 :y 0 :width 10 :height 10}])
+        rect-id (created result "$tmp:r")
+        [file'' _] (apply-ops file' [{:op "set_layout_child" :page-id pid :id rect-id
+                                      :layout-item-margin {:m1 1 :m2 2 :m3 3 :m4 4}}
+                                     {:op "set_layout_child" :page-id pid :id rect-id
+                                      :layout-item-margin {:m1 9}}])]
+    (t/is (= {:m1 9 :m2 2 :m3 3 :m4 4}
+             (:layout-item-margin (shape-of file'' rect-id))))))
+
+#?(:clj
+   (t/deftest assertion-error-in-an-op-is-a-compile-failure
+     (let [file (thf/sample-file :file1)
+           pid  (page-id-of file)
+           data (with-redefs-fn {#'app.common.mcp.operations.schema/decode-op-values
+                                 (fn [_] (throw (AssertionError. "boom")))}
+                  (fn []
+                    (thrown-data #(compile-ops file [{:op "create_rect" :page-id pid
+                                                      :x 0 :y 0 :width 10 :height 10}]))))]
+       (t/is (= :mcp-compile-failed (:code data)))
+       (t/is (= 0 (:index data)))
+       (t/is (= "create_rect" (:op data))))))
+
+;; ----- Padding: merged with the current padding, and only the changed sides lose their token
+
+(defn- padding-token-board
+  "The file with the board `$tmp:b` in a row flex layout, whose four paddings
+  carry the token `pad` of 12. Returns the file and the id of the board."
+  []
+  (let [file (file-with-token "pad" "spacing" 12)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_board" :page-id pid :id "$tmp:b"
+                                         :x 0 :y 0 :width 200 :height 100}
+                                        {:op "set_flex_layout" :page-id pid :id "$tmp:b"
+                                         :layout-flex-dir "row"}])
+        board-id (created result "$tmp:b")]
+    [(shape-with-token file' board-id "pad" ["p1" "p2" "p3" "p4"] 12) board-id]))
+
+(t/deftest set-flex-layout-without-a-padding-keeps-the-padding-and-its-tokens
+  (let [[file board-id] (padding-token-board)
+        pid   (page-id-of file)
+        [file' _] (apply-ops file [{:op "set_flex_layout" :page-id pid :id board-id
+                                    :layout-flex-dir "column"}])
+        board (shape-of file' board-id)]
+    (doseq [side [:p1 :p2 :p3 :p4]]
+      (t/is (= 12 (get-in board [:layout-padding side])) (str side))
+      (t/is (= "pad" (get-in board [:applied-tokens side])) (str side)))))
+
+(t/deftest set-flex-layout-padding-on-one-side-unapplies-only-that-side
+  (let [[file board-id] (padding-token-board)
+        pid   (page-id-of file)
+        [file' _] (apply-ops file [{:op "set_flex_layout" :page-id pid :id board-id
+                                    :layout-padding {:p1 4}}])
+        board (shape-of file' board-id)]
+    (t/is (= 4 (get-in board [:layout-padding :p1])))
+    (doseq [side [:p2 :p3 :p4]]
+      (t/is (= 12 (get-in board [:layout-padding side])) (str side))
+      (t/is (= "pad" (get-in board [:applied-tokens side])) (str side)))
+    (t/is (not (contains? (:applied-tokens board) :p1)))))
+
+(t/deftest set-grid-layout-without-a-padding-keeps-the-padding-and-its-tokens
+  (let [[file board-id] (padding-token-board)
+        pid   (page-id-of file)
+        [file' _] (apply-ops file [{:op "set_grid_layout" :page-id pid :id board-id
+                                    :layout-grid-rows [{:type "fixed" :value 50}]
+                                    :layout-grid-columns [{:type "fixed" :value 50}]}])
+        board (shape-of file' board-id)]
+    (doseq [side [:p1 :p2 :p3 :p4]]
+      (t/is (= 12 (get-in board [:layout-padding side])) (str side))
+      (t/is (= "pad" (get-in board [:applied-tokens side])) (str side)))))
+
+;; ----- The families: each op is declared once, with a schema that names it
+
+(def ^:private family-maps
+  [f-shapes/ops f-layout/ops f-text/ops f-components/ops f-library/ops
+   f-tokens/ops f-prototype/ops f-arrange/ops])
+
+(t/deftest family-keys-are-the-op-names-of-their-schemas
+  (doseq [family family-maps
+          [op-name entry] family]
+    (t/is (= op-name (get-in entry [:schema 1 :title])) op-name)
+    (t/is (fn? (:compile entry)) op-name)))
+
+(t/deftest the-merged-op-table-has-no-duplicate-keys
+  ;; The merge of the families keeps one entry per key, so the number of
+  ;; names is the sum of the families only when no op is declared twice
+  (t/is (= (reduce + (map count family-maps))
+           (count mops/operation-names))))
+
+;; ----- Review round 2: paths, variants, nesting, the schema, the parser
+
+(defn- path-file
+  "The file with a path `$tmp:p` made from a `d` string at 30, 40 (100 x 50)."
+  []
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_path" :page-id pid :id "$tmp:p"
+                                         :d "M 0 0 L 100 0 L 100 50 Z" :x 30 :y 40}])]
+    [file' pid (created result "$tmp:p")]))
+
+(t/deftest create-path-keeps-no-position-of-its-own
+  (let [[file _ path-id] (path-file)
+        path (shape-of file path-id)]
+    (t/is (nil? (:x path)))
+    (t/is (nil? (:width path)))
+    (assert-selrect-box path 30 40 100 50)))
+
+(t/deftest set-path-content-keeps-the-position-after-a-move
+  (let [[file pid path-id] (path-file)
+        [file' _] (apply-ops file [{:op "update_shape" :page-id pid :id path-id
+                                    :props {:x 300 :y 400}}])
+        [file'' _] (apply-ops file' [{:op "set_path_content" :page-id pid :id path-id
+                                      :content (path/from-string "M 0 0 L 200 0 L 200 80 Z")}])]
+    (assert-selrect-box (shape-of file'' path-id) 300 400 200 80)))
+
+(t/deftest set-path-content-reads-the-origin-of-a-path-with-no-x
+  ;; A path drawn in the editor, or migrated, can have `:x` nil
+  (let [[file pid path-id] (path-file)
+        file' (update-in file [:data :pages-index pid :objects path-id]
+                         #(assoc % :x nil :y nil))
+        [file'' _] (apply-ops file' [{:op "set_path_content" :page-id pid :id path-id
+                                      :content (path/from-string "M 0 0 L 200 0 L 200 80 Z")}])]
+    (assert-selrect-box (shape-of file'' path-id) 30 40 200 80)))
+
+(t/deftest set-path-content-on-a-rotated-path-keeps-its-transform
+  (let [[file pid path-id] (path-file)
+        [file' _] (apply-ops file [{:op "update_shape" :page-id pid :id path-id
+                                    :props {:rotation 30}}])
+        [file'' _] (apply-ops file' [{:op "set_path_content" :page-id pid :id path-id
+                                      :content (path/from-string "M 0 0 L 200 0 L 200 80 Z")}])
+        [file3 _] (apply-ops file'' [{:op "update_shape" :page-id pid :id path-id
+                                      :props {:width 200}}])
+        path   (shape-of file3 path-id)
+        [p0 p1 p2] (:points path)
+        side   (fn [a b] (let [dx (- (:x a) (:x b))
+                               dy (- (:y a) (:y b))]
+                           (mth/sqrt (+ (* dx dx) (* dy dy)))))]
+    ;; The points stay on the rotated box: the first side is the width, the
+    ;; second the height of the selrect, and the two sides are perpendicular
+    (t/is (close? 200 (side p0 p1)))
+    (t/is (close? (:height (:selrect path)) (side p1 p2)))
+    (t/is (close? 0 (+ (* (- (:x p1) (:x p0)) (- (:x p2) (:x p1)))
+                       (* (- (:y p1) (:y p0)) (- (:y p2) (:y p1))))))))
+
+(t/deftest create-rect-into-a-variant-container-is-refused
+  (let [file (thv/add-variant (thf/sample-file :file1) :variant :c1 :root1 :c2 :root2)
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "create_rect" :page-id pid
+                                               :parent-id (thi/id :variant)
+                                               :x 0 :y 0 :width 5 :height 5}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (re-find #"variant container" (str (:hint data))))))
+
+(t/deftest instantiate-into-its-own-main-is-refused
+  (let [[file comp-id] (button-component-file)
+        pid     (page-id-of file)
+        main-id (get-in (:data file) [:components comp-id :main-instance-id])
+        data    (thrown-data #(compile-ops file [{:op "instantiate_component" :page-id pid
+                                                  :component-id comp-id :parent-id main-id
+                                                  :x 0 :y 0}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (re-find #"own component" (str (:hint data))))))
+
+(t/deftest clone-of-a-copy-child-without-a-parent-is-refused
+  ;; Without a parent the clone goes where the source is, inside the copy
+  (let [file  (-> (thf/sample-file :file1)
+                  (tho/add-simple-component-with-copy :c1 :main :main-child :copy))
+        pid   (page-id-of file)
+        inner (first (:shapes (shape-of file (thi/id :copy))))
+        data  (thrown-data #(compile-ops file [{:op "clone_shape" :page-id pid :id inner}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (re-find #"component copy" (str (:hint data))))))
+
+(t/deftest schema-branches-are-sorted-by-op-name
+  (let [names (take-nth 2 (drop 2 mops/schema:operation))]
+    (t/is (seq names))
+    (t/is (= (sort names) names))))
+
+#?(:clj
+   (t/deftest a-parser-fault-is-a-compile-failure
+     ;; A NullPointerException from the tokens parser is a fault, not a bad document
+     (let [file (thf/sample-file :file1)
+           data (with-redefs-fn {#'ctob/read-multi-set-dtcg
+                                 (fn [_] (throw (NullPointerException. "boom")))}
+                  (fn []
+                    (thrown-data #(compile-ops file [{:op "import_tokens_dtcg"
+                                                      :json "{}" :mode "merge"}]))))]
+       (t/is (= :mcp-compile-failed (:code data)))
+       (t/is (= "import_tokens_dtcg" (:op data))))))
+
+(t/deftest clone-of-a-copy-child-to-an-outside-parent-is-detached
+  (let [file  (-> (thf/sample-file :file1)
+                  (tho/add-simple-component-with-copy :c1 :main :main-child :copy)
+                  (tho/add-frame :outside :x 500 :y 0 :width 100 :height 100))
+        pid   (page-id-of file)
+        inner (first (:shapes (shape-of file (thi/id :copy))))
+        result (compile-ops file [{:op "clone_shape" :page-id pid :id inner
+                                   :parent-id (thi/id :outside) :new-id "$tmp:clone"}])
+        file'  (thf/apply-changes file {:redo-changes (:changes result)})
+        clone  (shape-of file' (created result "$tmp:clone"))]
+    (t/is (= (thi/id :outside) (:parent-id clone)))
+    ;; Detached: the clone keeps no link to its component or its main shape
+    (t/is (nil? (:shape-ref clone)))
+    (t/is (nil? (:component-id clone)))
+    (t/is (not (ctk/in-component-copy? clone)))))
+
+(t/deftest nesting-level-delta-accepts-a-non-empty-list-of-heads
+  ;; A shape in a copy has heads to compare with the new parent's heads: the
+  ;; comparison of the two lists must not call its predicate with one argument
+  (let [file  (-> (thf/sample-file :file1)
+                  (tho/add-simple-component-with-copy :c1 :main :main-child :copy)
+                  (tho/add-frame :outside :x 500 :y 0 :width 100 :height 100))
+        objects (get-in (:data file) [:pages-index (page-id-of file) :objects])
+        inner   (shape-of file (first (:shapes (shape-of file (thi/id :copy)))))]
+    (t/is (integer? (ctn/get-nesting-level-delta objects inner (get objects (thi/id :outside)))))))

@@ -25,7 +25,8 @@
 (def ^:private xf:without-uuid-zero
   (remove #(= % uuid/zero)))
 
-(def ^:private transform-attrs
+(def transform-attrs
+  "The attributes that a transform changes. The frontend and the MCP compiler give them to the changes of the modifiers."
   #{:selrect
     :points
     :x
@@ -65,7 +66,7 @@
     :fills
     :fill-image})
 
-(defn- check-delta
+(defn check-delta
   "Tells whether a transform of a component copy shape is a free change that must not mark it as touched."
   [shape root transformed-shape transformed-root]
   (let [is-root?     (and (some? root)
@@ -110,7 +111,7 @@
          (mth/close? (:height selrect) (:height transformed-selrect))
          orientation-unchanged?)))
 
-(defn- calculate-ignore-tree
+(defn calculate-ignore-tree
   "Returns a map from shape id to the flag that ignores its geometry."
   [modif-tree objects]
 

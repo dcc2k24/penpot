@@ -697,3 +697,29 @@
   (if (true? (:hide-in-viewer shape))
     shape
     (dissoc shape :hide-in-viewer)))
+
+(defn check-structure-move
+  "Checks the move of the shapes `ids` into `parent-id` of `objects`. Returns
+  `{:ids ids}`, the ids to move, or `{:problem message}` when the editor would
+  refuse the move. An id whose ancestor is also moved is dropped, since the
+  ancestor takes it along. A nil `parent-id` skips the checks on the target,
+  for a new shape. A parent that is a moved shape, or lies under one, would
+  make a loop. A move into or out of a component copy is refused, since the
+  change would delete or copy the shape without a sign. A move that would nest
+  a component inside its own main is refused too, as the editor refuses it."
+  [objects ids parent-id]
+  (let [ids (vec (cfh/clean-loops objects ids))]
+    (if (and (some? parent-id)
+             (some #(cfh/is-parent? objects parent-id %) ids))
+      {:problem "a shape cannot move into itself or into one of its children"}
+      (if-let [id (first (filter (fn [id]
+                                   (or (ctk/in-component-copy?
+                                        (get objects (:parent-id (get objects id))))
+                                       (and (some? parent-id)
+                                            (ctk/in-component-copy? (get objects parent-id)))))
+                                 ids))]
+        {:problem (str "shape " id " cannot move into or out of a component copy")}
+        (if-let [id (and (some? parent-id)
+                         (first (filter #(cfh/components-nesting-loop? objects % parent-id) ids)))]
+          {:problem (str "shape " id " would nest a component inside its own main")}
+          {:ids ids})))))

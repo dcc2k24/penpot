@@ -396,7 +396,7 @@
       min-fr
       (let [{:keys [size type value]} (first tracks)
             ;; A flex track with a zero value cannot give a minimum fr: skip it
-            min-fr (if (and (= type :flex) (pos? value)) (max min-fr (/ size value)) min-fr)]
+            min-fr (if (and (= type :flex) (number? value) (pos? value)) (max min-fr (/ size value)) min-fr)]
         (recur (rest tracks) (double min-fr))))))
 
 (defn calc-layout-data
