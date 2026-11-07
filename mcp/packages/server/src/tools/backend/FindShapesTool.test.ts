@@ -25,8 +25,7 @@ function sessionServer(): PenpotMcpServer {
 
 /** A fake backend that accepts every token. */
 function acceptingBackend(): FakePenpotBackend {
-    return new FakePenpotBackend().respond("mcp-whoami", {
-        profileId: "profile-1",
+    return new FakePenpotBackend().respond("mcp-whoami", { contractVersion: 1, profileId: "profile-1",
         scopes: ["mcp:read", "mcp:write", "mcp:manage", "mcp:delete"],
     });
 }
@@ -95,13 +94,33 @@ test("get_shapes sends camelCase fields in kebab-case", async () => {
     assert.deepEqual(onlyParams(backend, "get-mcp-shapes").fields, ["parent-id", "x", "shape-ref"]);
 });
 
-test("get_shapes sends no fields when none are given", async () => {
+test("get_shapes sends a short default set of fields when none are given", async () => {
     const backend = acceptingBackend().respond("get-mcp-shapes", { shapes: [], missing: [] });
     const tool = new GetShapesTool(sessionServer(), servicesFor(backend));
 
     await tool.execute({ fileId: FILE, pageId: PAGE, ids: [SHAPE] });
 
-    assert.equal("fields" in onlyParams(backend, "get-mcp-shapes"), false);
+    assert.deepEqual(onlyParams(backend, "get-mcp-shapes").fields, [
+        "id",
+        "name",
+        "type",
+        "parent-id",
+        "x",
+        "y",
+        "width",
+        "height",
+        "hidden",
+        "shapes",
+    ]);
+});
+
+test("get_shapes with fields sends them as the caller named them, in kebab-case", async () => {
+    const backend = acceptingBackend().respond("get-mcp-shapes", { shapes: [], missing: [] });
+    const tool = new GetShapesTool(sessionServer(), servicesFor(backend));
+
+    await tool.execute({ fileId: FILE, pageId: PAGE, ids: [SHAPE], fields: ["fills", "layoutGap"] });
+
+    assert.deepEqual(onlyParams(backend, "get-mcp-shapes").fields, ["fills", "layout-gap"]);
 });
 
 test("get_shapes shows a backend circle as an ellipse and leaves other types alone", async () => {

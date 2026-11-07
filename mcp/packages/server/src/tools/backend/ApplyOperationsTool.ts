@@ -2,9 +2,12 @@ import { z } from "zod";
 import type { PenpotMcpServer } from "../../PenpotMcpServer";
 import type { ToolResponse } from "../../ToolResponse";
 import type { BackendServices } from "../../backend/BackendServices";
+import { TokenDigest } from "../../backend/TokenDigest";
 import { BackendTool } from "./BackendTool";
 import { BackendIds } from "./BackendIds";
+import { TokenCatalogueCache } from "./TokenCatalogueCache";
 import { WriteOptions } from "./WriteOptions";
+import { OPERATION_NAMES } from "./operations/OperationSchemas";
 import { OperationValidator } from "./operations/OperationValidator";
 import { ApplyTokenValues, TokenCatalogue, type TokenValueWarning } from "../../sandbox/ApplyTokenValues";
 
@@ -29,8 +32,8 @@ export class ApplyOperationsArgs {
             .boolean()
             .optional()
             .describe(
-                "When true, commit large batches in several transactions of up to 300 creations. " +
-                    "On failure the response names lastCommittedRevn and failedOperationIndex. Default false."
+                "Kept for older clients. Batches are cut by size on the backend and all commit in one " +
+                    "transaction; a failed call changes nothing. Default false."
             ),
         ...WriteOptions.schema,
     };
@@ -55,11 +58,14 @@ export class ApplyOperationsArgs {
 /**
  * Applies a list of typed design operations to a file in one write.
  *
- * Before the write, every `apply_token` operation without `resolvedValue` gets the token's value from the file's
- * token catalogue, read once per call and only when the call holds an `apply_token` operation. A supplied value is
- * kept, with a warning in the result when it is not the token's value.
+ * Inside the write queue, every `apply_token` operation without `resolvedValue` gets the token's value from the
+ * file's token catalogue, and then the batch is validated. Running both there means a token write queued before
+ * this call is seen. A supplied value is kept, with a warning in the result when it is not the token's value.
  */
 export class ApplyOperationsTool extends BackendTool<ApplyOperationsArgs> {
+    /** How long a token catalogue is kept, in milliseconds, while the file does not change. */
+    private static readonly CATALOGUE_TTL_MS = 30_000;
+
     private readonly validator = new OperationValidator();
 
     private readonly tokenValues = new ApplyTokenValues(
@@ -67,8 +73,18 @@ export class ApplyOperationsTool extends BackendTool<ApplyOperationsArgs> {
         " Fix the token, or pass resolvedValue to set the value yourself."
     );
 
-    constructor(mcpServer: PenpotMcpServer, services: BackendServices) {
+    private readonly catalogues: TokenCatalogueCache;
+
+    /**
+     * Creates the tool.
+     *
+     * @param mcpServer - The MCP server instance
+     * @param services - backend, validator, rate limiter and write queue shared by all backend tools
+     * @param now - clock in milliseconds for the token catalogue cache, injectable for tests
+     */
+    constructor(mcpServer: PenpotMcpServer, services: BackendServices, now: () => number = Date.now) {
         super(mcpServer, ApplyOperationsArgs.schema, services);
+        this.catalogues = new TokenCatalogueCache(ApplyOperationsTool.CATALOGUE_TTL_MS, now);
     }
 
     public getToolName(): string {
@@ -82,27 +98,44 @@ export class ApplyOperationsTool extends BackendTool<ApplyOperationsArgs> {
             "Use $tmp:name handles to refer to shapes created earlier in the same call; the response maps them to UUIDs. " +
             "Set dryRun true to validate without saving. Pass baseRevn from get_file_outline to detect concurrent edits. " +
             "Shape params are camelCase: pageId, parentId, x, y, width, height, props (fills, strokes, radius, ...). " +
-            "Ops: create_page, update_page, delete_page, move_page, create_board, create_rect, create_ellipse, " +
-            "create_text (characters), create_path, create_image (mediaId, mediaWidth, mediaHeight), create_svg_raw, " +
-            "create_group (childIds), create_boolean (boolType, childIds), update_shape (id, props), move_shapes " +
-            "(ids, parentId), reorder, delete_shapes, clone_shape, ungroup, flatten, make_mask, remove_mask, " +
-            "set_flex_layout, set_grid_layout, remove_layout, set_layout_child, set_grid_cell, set_text, " +
-            "set_text_style, apply_typography, create_component, instantiate_component, detach, swap_component, " +
-            "reset_overrides, update_main, rename_component, delete_component, restore_component, sync_components, " +
-            "create_color, update_color, delete_color, create_typography, update_typography, delete_typography, " +
-            "create_token_set, update_token_set, delete_token_set, move_token_set, create_token, update_token, " +
-            "delete_token, create_theme, update_theme, delete_theme, activate_theme, deactivate_theme, toggle_set, " +
-            "set_tokens_status, set_tokens_source, import_tokens_dtcg, set_base_font_size, apply_token " +
-            "(resolvedValue is optional and defaults to the token's value in the active sets), " +
-            "unapply_token, add_interaction, remove_interaction, create_flow, remove_flow, add_ruler_guide, " +
-            "remove_ruler_guide, set_board_grid_guides, set_plugin_data, align, distribute. " +
+            `Ops: ${OPERATION_NAMES.join(", ")}. ` +
             'Example: {op: create_rect, pageId, id: "$tmp:bg", x: 0, y: 0, width: 100, height: 40, props: {fills: [{fillColor: "#ff0000", fillOpacity: 1}]}}. ' +
-            "Read the schema of an op from the error message if a parameter is rejected."
+            "Call describe_operations with op names to read their parameters when one is rejected."
         );
     }
 
     protected async executeBackend(args: ApplyOperationsArgs, userToken: string): Promise<ToolResponse> {
-        const catalogue = new TokenCatalogue(this.services.backend, userToken, args.fileId);
+        const { result, tokenWarnings } = await this.queueWrite(
+            userToken,
+            args.fileId,
+            () => this.applyInQueue(args, userToken),
+            args.dryRun !== true
+        );
+        return this.jsonResponse(
+            WriteOptions.withAlreadyApplied(ApplyOperationsTool.withWarnings(result, tokenWarnings))
+        );
+    }
+
+    /**
+     * Fills the token values and validates the batch, then sends it to the backend.
+     *
+     * Runs in the write queue of the file, so the catalogue read sees the writes queued before this call.
+     *
+     * @param args - the validated tool arguments
+     * @param userToken - the MCP token of the request
+     * @returns the backend result and the token warnings of the batch
+     * @throws Error when a token cannot be resolved or an operation is invalid, before anything is sent
+     */
+    private async applyInQueue(
+        args: ApplyOperationsArgs,
+        userToken: string
+    ): Promise<{ result: unknown; tokenWarnings: TokenValueWarning[] }> {
+        const key = `${TokenDigest.sha256Hex(userToken)}:${args.fileId}`;
+        const catalogue = this.catalogues.get(
+            key,
+            this.writeCount(userToken, args.fileId),
+            () => new TokenCatalogue(this.services.backend, userToken, args.fileId)
+        );
         const tokenWarnings = await this.tokenValues.fill(args.operations, catalogue);
         const operations = this.validator.validate(args.operations);
         const params = {
@@ -111,8 +144,8 @@ export class ApplyOperationsTool extends BackendTool<ApplyOperationsArgs> {
             ...(args.allowSplit !== undefined ? { allowSplit: args.allowSplit } : {}),
             ...WriteOptions.toParams(args),
         };
-        const result = await this.callWrite(userToken, args.fileId, "mcp-apply-operations", params);
-        return this.jsonResponse(ApplyOperationsTool.withWarnings(result, tokenWarnings));
+        const result = await this.callCommand(userToken, "mcp-apply-operations", params);
+        return { result, tokenWarnings };
     }
 
     /**

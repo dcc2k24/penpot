@@ -21,8 +21,7 @@ function sessionServer(): PenpotMcpServer {
 
 /** A fake backend that accepts every token. */
 function acceptingBackend(): FakePenpotBackend {
-    return new FakePenpotBackend().respond("mcp-whoami", {
-        profileId: "profile-1",
+    return new FakePenpotBackend().respond("mcp-whoami", { contractVersion: 1, profileId: "profile-1",
         scopes: ["mcp:read", "mcp:write", "mcp:manage", "mcp:delete"],
     });
 }

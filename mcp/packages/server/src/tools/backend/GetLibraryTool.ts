@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { PenpotMcpServer } from "../../PenpotMcpServer";
+import type { ToolAnnotations } from "../../Tool";
 import type { ToolResponse } from "../../ToolResponse";
 import type { BackendServices } from "../../backend/BackendServices";
 import { BackendTool } from "./BackendTool";
@@ -36,6 +37,10 @@ export class GetLibraryArgs {
 export class GetLibraryTool extends BackendTool<GetLibraryArgs> {
     constructor(mcpServer: PenpotMcpServer, services: BackendServices) {
         super(mcpServer, GetLibraryArgs.schema, services);
+    }
+
+    public annotations(): ToolAnnotations {
+        return { readOnlyHint: true, destructiveHint: false };
     }
 
     public getToolName(): string {

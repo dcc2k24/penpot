@@ -85,3 +85,18 @@ test("calling a release function twice frees one slot only", async () => {
     releaseThird();
     assert.equal(slots.running, 0);
 });
+
+test("a call past the queue limit is refused at once, without waiting", async () => {
+    const turn = new CallSlots(1, 1000, 2);
+    const running = await turn.acquire();
+    const queuedOne = turn.acquire();
+    const queuedTwo = turn.acquire();
+    await assert.rejects(turn.acquire(), {
+        message: "execute_code is busy: 1 running and 2 queued; retry in a moment.",
+    });
+    assert.equal(turn.queued, 2);
+    running();
+    (await queuedOne)();
+    (await queuedTwo)();
+    assert.equal(turn.running, 0);
+});

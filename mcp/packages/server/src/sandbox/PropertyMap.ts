@@ -13,9 +13,10 @@ export interface PropertyEntry {
     /**
      * How the sandbox writes the value: `attr` is a plain `update_shape` prop, `geometry` goes through the
      * geometry path, `derived` is computed from other attributes, `content` lives inside the text content
-     * tree, and `unsupported` has no direct mapping.
+     * tree, `layout-child` goes through `set_layout_child`, `path-content` goes through `set_path_content`, and
+     * `unsupported` has no direct mapping.
      */
-    kind: "attr" | "geometry" | "derived" | "content" | "unsupported";
+    kind: "attr" | "geometry" | "derived" | "content" | "layout-child" | "path-content" | "unsupported";
 }
 
 /**
@@ -98,24 +99,24 @@ export class PropertyMap {
         grid: { attr: "layout", access: "read", kind: "derived" },
 
         // layout child properties, stored as shape attributes on the child.
-        absolute: { attr: "layoutItemAbsolute", access: "read-write", kind: "attr" },
-        zIndex: { attr: "layoutItemZIndex", access: "read-write", kind: "attr" },
-        horizontalSizing: { attr: "layoutItemHSizing", access: "read-write", kind: "attr" },
-        verticalSizing: { attr: "layoutItemVSizing", access: "read-write", kind: "attr" },
-        alignSelf: { attr: "layoutItemAlignSelf", access: "read-write", kind: "attr" },
+        absolute: { attr: "layoutItemAbsolute", access: "read-write", kind: "layout-child" },
+        zIndex: { attr: "layoutItemZIndex", access: "read-write", kind: "layout-child" },
+        horizontalSizing: { attr: "layoutItemHSizing", access: "read-write", kind: "layout-child" },
+        verticalSizing: { attr: "layoutItemVSizing", access: "read-write", kind: "layout-child" },
+        alignSelf: { attr: "layoutItemAlignSelf", access: "read-write", kind: "layout-child" },
         // the layout child object, shape.layoutChild, sets the vertical and horizontal margins as pairs of sides.
         layoutChild: { attr: "layoutItemAbsolute", access: "read", kind: "derived" },
         verticalMargin: { attr: "layoutItemMargin.m1", access: "read", kind: "unsupported" },
         horizontalMargin: { attr: "layoutItemMargin.m2", access: "read", kind: "unsupported" },
-        topMargin: { attr: "layoutItemMargin.m1", access: "read-write", kind: "attr" },
-        rightMargin: { attr: "layoutItemMargin.m2", access: "read-write", kind: "attr" },
-        bottomMargin: { attr: "layoutItemMargin.m3", access: "read-write", kind: "attr" },
-        leftMargin: { attr: "layoutItemMargin.m4", access: "read-write", kind: "attr" },
-        marginType: { attr: "layoutItemMarginType", access: "read-write", kind: "attr" },
-        maxWidth: { attr: "layoutItemMaxW", access: "read-write", kind: "attr" },
-        minWidth: { attr: "layoutItemMinW", access: "read-write", kind: "attr" },
-        maxHeight: { attr: "layoutItemMaxH", access: "read-write", kind: "attr" },
-        minHeight: { attr: "layoutItemMinH", access: "read-write", kind: "attr" },
+        topMargin: { attr: "layoutItemMargin.m1", access: "read-write", kind: "layout-child" },
+        rightMargin: { attr: "layoutItemMargin.m2", access: "read-write", kind: "layout-child" },
+        bottomMargin: { attr: "layoutItemMargin.m3", access: "read-write", kind: "layout-child" },
+        leftMargin: { attr: "layoutItemMargin.m4", access: "read-write", kind: "layout-child" },
+        marginType: { attr: "layoutItemMarginType", access: "read-write", kind: "layout-child" },
+        maxWidth: { attr: "layoutItemMaxW", access: "read-write", kind: "layout-child" },
+        minWidth: { attr: "layoutItemMinW", access: "read-write", kind: "layout-child" },
+        maxHeight: { attr: "layoutItemMaxH", access: "read-write", kind: "layout-child" },
+        minHeight: { attr: "layoutItemMinH", access: "read-write", kind: "layout-child" },
 
         // layout cell properties. The cell lives in the parent grid's layout-grid-cells map, which shape.layoutCell reads.
         layoutCell: { attr: "layoutGridCells", access: "read", kind: "derived" },
@@ -127,7 +128,7 @@ export class PropertyMap {
         position: { attr: "layoutGridCells", access: "read-write", kind: "unsupported" },
 
         // path and boolean properties.
-        content: { attr: "content", access: "read-write", kind: "attr" },
+        content: { attr: "content", access: "read-write", kind: "path-content" },
         d: { attr: "content", access: "read", kind: "derived" },
         commands: { attr: "content", access: "read", kind: "derived" },
 

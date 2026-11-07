@@ -16,10 +16,12 @@ export class CallSlots {
      *
      * @param maxConcurrent - most calls that may hold a slot at once
      * @param waitMs - longest time a queued call waits for a slot, in milliseconds
+     * @param maxQueued - most calls that may wait in the queue; a call past it is refused at once
      */
     constructor(
         private readonly maxConcurrent: number,
-        private readonly waitMs: number
+        private readonly waitMs: number,
+        private readonly maxQueued: number = Number.POSITIVE_INFINITY
     ) {}
 
     /** Number of slots held by running calls. */
@@ -36,12 +38,19 @@ export class CallSlots {
      * Takes a slot, waiting in the queue when every slot is held.
      *
      * @returns a promise of the release function, which the caller must call once the call ends
-     * @throws Error when no slot frees up within the wait limit
+     * @throws Error when the queue is full, or when no slot frees up within the wait limit
      */
     public acquire(): Promise<() => void> {
         if (this.held < this.maxConcurrent) {
             this.held += 1;
             return Promise.resolve(this.createRelease());
+        }
+        if (this.waiters.length >= this.maxQueued) {
+            return Promise.reject(
+                new Error(
+                    `execute_code is busy: ${this.maxConcurrent} running and ${this.maxQueued} queued; retry in a moment.`
+                )
+            );
         }
         return new Promise<() => void>((resolve, reject) => {
             const waiter: Waiter = { resolve, timer: undefined };

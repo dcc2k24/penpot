@@ -164,32 +164,101 @@ test("loadPage fails when the file changed between two tree pages", async () => 
     });
 });
 
-test("the 21st page load in one call throws", async () => {
+test("the 21st distinct page load in one call throws", async () => {
     const backend = new FakePenpotBackend()
         .respond("get-mcp-page-tree", treePage(1, { id: "root", type: "frame", childCount: 0 }))
         .respond("get-mcp-shapes", shapesFor(1));
     const host = harness(backend);
 
     for (let load = 0; load < 20; load += 1) {
-        await host.loadPage(FILE, PAGE);
+        await host.loadPage(FILE, `${PAGE}-${load}`);
     }
-    await assert.rejects(host.loadPage(FILE, PAGE), {
+    await assert.rejects(host.loadPage(FILE, `${PAGE}-20`), {
         message: "execute_code loads at most 20 pages per script",
     });
     assert.equal(backend.callsTo("get-mcp-page-tree").length, 20);
 });
 
-test("loadPage fails when the page data of one call exceeds 50 MB", async () => {
-    const big = "x".repeat(26 * 1024 * 1024);
+test("loading a page again does not count twice against the page cap", async () => {
+    const backend = new FakePenpotBackend()
+        .respond("get-mcp-page-tree", treePage(1, { id: "root", type: "frame", childCount: 0 }))
+        .respond("get-mcp-shapes", shapesFor(1));
+    const host = harness(backend);
+
+    for (let load = 0; load < 30; load += 1) {
+        await host.loadPage(FILE, PAGE);
+    }
+    assert.equal(backend.callsTo("get-mcp-page-tree").length, 30);
+});
+
+test("loadPage fails when the pages held by one call exceed 16 MB", async () => {
+    const big = "x".repeat(9 * 1024 * 1024);
     const backend = new FakePenpotBackend()
         .respond("get-mcp-page-tree", treePage(1, { id: "root", type: "frame", childCount: 0 }))
         .respond("get-mcp-shapes", { revn: 1, shapes: [{ id: "root", name: big }], missing: [] });
     const host = harness(backend);
 
-    await host.loadPage(FILE, PAGE);
-    await assert.rejects(host.loadPage(FILE, PAGE), {
-        message: "execute_code working copy exceeds 50 MB; narrow the script to fewer pages",
+    await host.loadPage(FILE, `${PAGE}-a`);
+    await assert.rejects(host.loadPage(FILE, `${PAGE}-b`), {
+        message: /holds at most 16 MB of page data per script/,
     });
+});
+
+test("a page that is loaded again replaces its copy in the byte count", async () => {
+    const big = "x".repeat(9 * 1024 * 1024);
+    const backend = new FakePenpotBackend()
+        .respond("get-mcp-page-tree", treePage(1, { id: "root", type: "frame", childCount: 0 }))
+        .respond("get-mcp-shapes", { revn: 1, shapes: [{ id: "root", name: big }], missing: [] });
+    const host = harness(backend);
+
+    for (let load = 0; load < 3; load += 1) {
+        await host.loadPage(FILE, PAGE);
+    }
+    assert.equal(backend.callsTo("get-mcp-page-tree").length, 3);
+});
+
+test("a page load reports the ids that the backend leaves out as a warning", async () => {
+    const backend = new FakePenpotBackend()
+        .respond(
+            "get-mcp-page-tree",
+            treePage(3, {
+                id: "root",
+                type: "frame",
+                childCount: 1,
+                children: [{ id: "gone", type: "rect", childCount: 0 }],
+            })
+        )
+        .respond("get-mcp-shapes", shapesFor(3, ["gone"]));
+    const host = harness(backend);
+
+    const page = JSON.parse(await host.loadPage(FILE, PAGE));
+
+    assert.deepEqual(
+        page.shapes.map((shape: { id: string }) => shape.id),
+        ["root"]
+    );
+    const warnings = host.summary().warnings as Array<{ code: string; count: number }>;
+    assert.deepEqual(
+        warnings.map((warning) => [warning.code, warning.count]),
+        [["shapes-missing", 1]]
+    );
+});
+
+test("a page with shapes below the depth limit reports a warning", async () => {
+    // a chain of 21 nodes: the node at depth 20 has a child that the model cannot hold.
+    let node: Record<string, unknown> = { id: "leaf", type: "rect", childCount: 0 };
+    for (let depth = 19; depth >= 0; depth -= 1) {
+        node = { id: `n${depth}`, type: "group", childCount: 1, children: [node] };
+    }
+    const backend = new FakePenpotBackend()
+        .respond("get-mcp-page-tree", treePage(4, node))
+        .respond("get-mcp-shapes", shapesFor(4));
+    const host = harness(backend);
+
+    await host.loadPage(FILE, PAGE);
+
+    const warnings = host.summary().warnings as Array<{ code: string }>;
+    assert.ok(warnings.some((warning) => warning.code === "shapes-below-depth-limit"));
 });
 
 test("flush sends one mcp-apply-operations call with the operations and a request id", async () => {
@@ -543,9 +612,9 @@ test("a call whose wall-clock deadline has passed is refused before the backend 
     assert.equal(JSON.parse(await host.loadFileOutline(FILE)).id, FILE);
 });
 
-test("loadPage stops at the first shape batch that takes the call over 50 MB", async () => {
+test("loadPage stops at the first shape batch that takes the call over 16 MB", async () => {
     const children = Array.from({ length: 201 }, (_, index) => ({ id: `c${index}`, type: "rect", childCount: 0 }));
-    const big = "x".repeat(51 * 1024 * 1024);
+    const big = "x".repeat(17 * 1024 * 1024);
     const backend = new FakePenpotBackend()
         .respond("get-mcp-page-tree", treePage(1, { id: "root", type: "frame", childCount: 201, children }))
         .respond("get-mcp-shapes", (params: object) => ({
@@ -556,7 +625,7 @@ test("loadPage stops at the first shape batch that takes the call over 50 MB", a
     const host = harness(backend);
 
     await assert.rejects(host.loadPage(FILE, PAGE), {
-        message: "execute_code working copy exceeds 50 MB; narrow the script to fewer pages",
+        message: /^page .* has 202 shapes \(about [0-9.]+ MB\)/,
     });
     assert.equal(backend.callsTo("get-mcp-shapes").length, 1);
 });
@@ -634,10 +703,10 @@ test("a flush holds the write queue of the file across all of its calls", async 
     });
     const host = new SandboxHost(services, TOKEN);
 
-    await host.flush(FILE, JSON.stringify(deleteOps(1600)), false);
+    await host.flush(FILE, JSON.stringify(deleteOps(2100)), false);
     await otherWrite;
 
-    assert.deepEqual(order, ["call of 1500", "call of 100", "other write"]);
+    assert.deepEqual(order, ["call of 1500", "call of 600", "other write"]);
 });
 
 test("a failed later call names its chunk and the committed operations, and the summary keeps the earlier call", async () => {
@@ -651,11 +720,15 @@ test("a failed later call names its chunk and the committed operations, and the 
     });
     const host = harness(backend);
 
-    await assert.rejects(host.flush(FILE, JSON.stringify(deleteOps(1600)), false), {
+    // a later call that fails comes back as data: the guest adopts the ids and throws the message.
+    const failure = JSON.parse(await host.flush(FILE, JSON.stringify(deleteOps(2100)), false)).failure;
+    assert.deepEqual(failure, {
         message:
-            "execute_code: chunk 2 of 2 of a flush failed. 1500 of 1600 operations of this flush were committed by " +
+            "execute_code: chunk 2 of 2 of a flush failed. 1500 of 2100 operations of this flush were committed by " +
             "the earlier chunks, and those chunks stay applied. Chunk 2 and the later chunks were not applied. " +
             "Backend error validation: second call refused",
+        committed: 1500,
+        createdIds: {},
     });
     assert.deepEqual(host.summary(), {
         opsApplied: 1500,
@@ -686,7 +759,7 @@ test("the write options go to every call, and a later call takes the revn of the
         allowSplit: true,
     });
 
-    await host.flush(FILE, JSON.stringify(deleteOps(1600)), false);
+    await host.flush(FILE, JSON.stringify(deleteOps(2100)), false);
     await host.flush(FILE, JSON.stringify(deleteOps(1)), true);
     await host.flush(FILE, JSON.stringify(deleteOps(1)), false);
 
@@ -697,22 +770,139 @@ test("the write options go to every call, and a later call takes the revn of the
         [4, 7, 8, 8]
     );
     for (const params of calls) {
-        assert.equal(params.snapshot, false);
         assert.equal(params.failOnConflict, true);
         assert.equal(params.allowSplit, true);
+    }
+    // the script's options say no snapshot, so no call takes one.
+    for (const params of calls.filter((params) => params.dryRun !== true)) {
+        assert.equal(params.snapshot, false);
     }
     assert.equal(calls[2].dryRun, true);
 });
 
-test("a call without write options sends none of them", async () => {
+test("an unset snapshot leaves the choice to the backend, on every call of the script", async () => {
+    const backend = new FakePenpotBackend().respond("mcp-apply-operations", countingWrites(2));
+    const host = harness(backend);
+    host.beginCall(Number.POSITIVE_INFINITY, {});
+
+    await host.flush(FILE, JSON.stringify(deleteOps(2100)), false);
+    await host.flush(FILE, JSON.stringify(deleteOps(10)), false);
+
+    for (const call of backend.callsTo("mcp-apply-operations")) {
+        assert.equal("snapshot" in (call.params as object), false);
+    }
+});
+
+test("an explicit snapshot false sends false on every call", async () => {
+    const backend = new FakePenpotBackend().respond("mcp-apply-operations", countingWrites(2));
+    const host = harness(backend);
+    host.beginCall(Number.POSITIVE_INFINITY, { snapshot: false });
+
+    await host.flush(FILE, JSON.stringify(deleteOps(2100)), false);
+
+    assert.deepEqual(
+        backend.callsTo("mcp-apply-operations").map((call) => (call.params as { snapshot: boolean }).snapshot),
+        [false, false]
+    );
+});
+
+test("a call without write options sends no conflict or split options", async () => {
     const backend = new FakePenpotBackend().respond("mcp-apply-operations", countingWrites(2));
     const host = harness(backend);
 
-    await host.flush(FILE, JSON.stringify(deleteOps(1600)), false);
+    await host.flush(FILE, JSON.stringify(deleteOps(2100)), false);
 
     for (const call of backend.callsTo("mcp-apply-operations")) {
         assert.deepEqual(Object.keys(call.params as object).sort(), ["fileId", "operations", "requestId"]);
     }
+});
+
+test("a flush of up to 2000 operations is one call, and 2001 operations are split", async () => {
+    const backend = new FakePenpotBackend().respond("mcp-apply-operations", countingWrites(2));
+    const host = harness(backend);
+
+    await host.flush(FILE, JSON.stringify(deleteOps(2000)), false);
+    assert.deepEqual(
+        backend.callsTo("mcp-apply-operations").map((call) => operationsOf(call).length),
+        [2000]
+    );
+
+    await host.flush(FILE, JSON.stringify(deleteOps(2001)), false);
+    assert.deepEqual(
+        backend
+            .callsTo("mcp-apply-operations")
+            .slice(1)
+            .map((call) => operationsOf(call).length),
+        [1500, 501]
+    );
+});
+
+test("the first write of a script takes the snapshot, and the request ids of one script are derived from one id", async () => {
+    const backend = new FakePenpotBackend().respond("mcp-apply-operations", countingWrites(2));
+    const host = harness(backend);
+    host.beginCall(Number.POSITIVE_INFINITY, { snapshot: true });
+
+    await host.flush(FILE, JSON.stringify(deleteOps(2100)), false);
+    await host.flush(FILE, JSON.stringify(deleteOps(10)), false);
+
+    const calls = backend.callsTo("mcp-apply-operations").map((call) => call.params as Record<string, unknown>);
+    assert.deepEqual(
+        calls.map((params) => params.snapshot),
+        [true, false, false]
+    );
+    const ids = calls.map((params) => params.requestId as string);
+    assert.equal(new Set(ids).size, 3, "every call has its own request id");
+    for (const id of ids) {
+        assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    }
+
+    // a second script gets other ids.
+    host.beginCall(Number.POSITIVE_INFINITY, { snapshot: true });
+    await host.flush(FILE, JSON.stringify(deleteOps(10)), false);
+    const again = backend.callsTo("mcp-apply-operations").at(-1)?.params as Record<string, unknown>;
+    assert.equal(again.snapshot, true);
+    assert.equal(ids.includes(again.requestId as string), false);
+});
+
+test("a flush waits for rate-limit tokens for all its calls, and the wait ends at the deadline", async () => {
+    const backend = new FakePenpotBackend().respond("mcp-apply-operations", countingWrites(2));
+    const services = new BackendServices(backend, new BackendSettings(10, 1000), new FakeExporterClient());
+    let refusals = 3;
+    (services as unknown as { rateLimiter: { acquire(token: string): void } }).rateLimiter = {
+        acquire() {
+            if (refusals > 0) {
+                refusals -= 1;
+                throw new Error("rate limited, retry after 1 s");
+            }
+        },
+    };
+    const host = new SandboxHost(services, TOKEN);
+    host.beginCall(Date.now() + 5_000, {});
+
+    await host.flush(FILE, JSON.stringify(deleteOps(2100)), false);
+    assert.equal(backend.callsTo("mcp-apply-operations").length, 2, "both calls went through after the waits");
+
+    refusals = Number.POSITIVE_INFINITY;
+    host.beginCall(Date.now() + 250, {});
+    await assert.rejects(host.flush(FILE, JSON.stringify(deleteOps(10)), false), {
+        message: "The script exceeded the wall-clock time limit",
+    });
+    assert.equal(backend.callsTo("mcp-apply-operations").length, 2, "no call is sent without a token");
+});
+
+test("a write in flight at the deadline finishes, and its answer is in the summary", async () => {
+    const backend = new FakePenpotBackend().respond(
+        "mcp-apply-operations",
+        () => new Promise((resolve) => setTimeout(() => resolve(writeResult(6)), 200))
+    );
+    const host = harness(backend);
+    host.beginCall(Date.now() + 50, {});
+
+    const answer = JSON.parse(await host.flush(FILE, JSON.stringify(deleteOps(3)), false));
+
+    assert.equal(answer.revn, 6);
+    assert.equal(host.summary().opsApplied, 3);
+    assert.equal(host.summary().chunks, 1);
 });
 
 test("a dry run of up to 2000 operations goes in one call", async () => {
@@ -765,4 +955,197 @@ test("an apply_token without a value gets it from the catalogue, read once per f
     const values = backend.callsTo("mcp-apply-operations").map((call) => operationsOf(call)[0].resolvedValue);
     assert.deepEqual(values, [8, 16]);
     assert.equal(backend.callsTo("get-mcp-tokens").length, 1);
+});
+
+test("a failed later call returns the ids of the saved calls, and only those", async () => {
+    let calls = 0;
+    const backend = new FakePenpotBackend().respond("mcp-apply-operations", () => {
+        calls += 1;
+        if (calls === 2) {
+            throw new Error("Backend error validation: second call refused");
+        }
+        return { revn: 5, createdIds: { "$tmp:first": "id-first" }, warnings: [], dryRun: false };
+    });
+    const host = harness(backend);
+    const operations = [...deleteOps(2099), { op: "delete_shapes", id: "$tmp:first", pageId: PAGE, ids: [SHAPE] }];
+
+    const failure = JSON.parse(await host.flush(FILE, JSON.stringify(operations), false)).failure;
+
+    assert.equal(failure.committed, 1500);
+    assert.deepEqual(failure.createdIds, { "$tmp:first": "id-first" });
+    assert.equal(host.summary().chunks, 1);
+});
+
+test("a single call that fails still throws, and a dry run that fails still throws", async () => {
+    const backend = new FakePenpotBackend().fail("mcp-apply-operations", new Error("Backend error validation: bad"));
+    const host = harness(backend);
+
+    await assert.rejects(host.flush(FILE, JSON.stringify(deleteOps(10)), false), {
+        message: "Backend error validation: bad",
+    });
+    await assert.rejects(host.flush(FILE, JSON.stringify(deleteOps(10)), true), {
+        message: "Backend error validation: bad",
+    });
+});
+
+test("a later call replaces only the handles in id fields, not the same text elsewhere", async () => {
+    const backend = new FakePenpotBackend().respond("mcp-apply-operations", countingWrites(2));
+    const host = harness(backend);
+    const operations = [
+        { op: "create_rect", id: "$tmp:a", pageId: PAGE, x: 0, y: 0, width: 1, height: 1, name: "$tmp:a" },
+        ...deleteOps(2099),
+        { op: "update_shape", pageId: PAGE, id: "$tmp:a", props: { name: "$tmp:a" } },
+    ];
+
+    await host.flush(FILE, JSON.stringify(operations), false);
+
+    const second = operationsOf(backend.callsTo("mcp-apply-operations")[1]);
+    assert.equal(second[second.length - 1].id, "id-a");
+    assert.equal((second[second.length - 1].props as { name: string }).name, "$tmp:a");
+});
+
+test("without failOnConflict the base revision stays the caller's for every call", async () => {
+    const backend = new FakePenpotBackend().respond("mcp-apply-operations", countingWrites(7));
+    const host = harness(backend);
+    host.beginCall(Number.POSITIVE_INFINITY, { baseRevn: 4 });
+
+    await host.flush(FILE, JSON.stringify(deleteOps(2100)), false);
+    await host.flush(FILE, JSON.stringify(deleteOps(1)), false);
+
+    assert.deepEqual(
+        backend.callsTo("mcp-apply-operations").map((call) => (call.params as { baseRevn?: number }).baseRevn),
+        [4, 4, 4]
+    );
+});
+
+test("a flush reports progress after each of its chunks", async () => {
+    const backend = new FakePenpotBackend().respond("mcp-apply-operations", countingWrites(2));
+    const host = harness(backend);
+    const lines: string[] = [];
+    host.setProgress((_done, _total, line) => lines.push(line));
+
+    await host.flush(FILE, JSON.stringify(deleteOps(2100)), false);
+
+    assert.deepEqual(lines, [
+        "1500 of 2100 operations of the flush are applied",
+        "2100 of 2100 operations of the flush are applied",
+    ]);
+});
+
+/** Backend whose first `mcp-apply-operations` call waits until the test releases it, so a flush is in flight. */
+class GatedBackend extends FakePenpotBackend {
+    private releaseGate: () => void = () => undefined;
+    private readonly gate = new Promise<void>((resolve) => {
+        this.releaseGate = resolve;
+    });
+
+    /** Number of `mcp-apply-operations` calls started, including the gated one. */
+    public started = 0;
+
+    /** Lets the gated call go on. */
+    public release(): void {
+        this.releaseGate();
+    }
+
+    public override async callCommand<T = unknown>(userToken: string, name: string, params: object): Promise<T> {
+        if (name === "mcp-apply-operations") {
+            this.started += 1;
+        }
+        if (name === "mcp-apply-operations" && this.started === 1) {
+            await this.gate;
+        }
+        return super.callCommand<T>(userToken, name, params);
+    }
+}
+
+/**
+ * Waits until a condition holds, checking after each event-loop turn.
+ *
+ * @param condition - the condition to wait for
+ */
+async function waitUntil(condition: () => boolean): Promise<void> {
+    for (let turn = 0; turn < 1000 && !condition(); turn += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.ok(condition(), "the condition did not hold");
+}
+
+test("an abandoned flush sends no call after the one in flight, and reports what the earlier calls applied", async () => {
+    const backend = new GatedBackend().respond("mcp-apply-operations", writeResult(1));
+    const host = harness(backend);
+    const flushing = host.flush(FILE, JSON.stringify(deleteOps(4000)), false);
+    await waitUntil(() => backend.started === 1);
+    host.abandon();
+    backend.release();
+    const answer = JSON.parse(await flushing) as { failure?: { committed: number } };
+    assert.equal(backend.callsTo("mcp-apply-operations").length, 1, "the chunks after the first were not sent");
+    assert.equal(answer.failure?.committed, 1500);
+});
+
+test("settled waits for the call in flight, so the totals of an abandoned script are final", async () => {
+    const backend = new GatedBackend().respond("mcp-apply-operations", writeResult(1));
+    const host = harness(backend);
+    const flushing = host.flush(FILE, JSON.stringify(deleteOps(4000)), false);
+    await waitUntil(() => backend.started === 1);
+    host.abandon();
+    const settling = host.settled(5000);
+    backend.release();
+    await settling;
+    await flushing;
+    assert.equal(host.summary().chunks, 1);
+    assert.equal(host.summary().opsApplied, 1500);
+});
+
+test("settled gives up after its time when the call in flight never answers", async () => {
+    const backend = new GatedBackend().respond("mcp-apply-operations", writeResult(1));
+    const host = harness(backend);
+    const flushing = host.flush(FILE, JSON.stringify(deleteOps(4000)), false);
+    await waitUntil(() => backend.started === 1);
+    const started = Date.now();
+    await host.settled(100);
+    assert.ok(Date.now() - started < 2000, "settled returned after its own limit");
+    backend.release();
+    await flushing;
+});
+
+test("a page above the setting fails with its id, shape count and size, and the way out", async () => {
+    const big = "x".repeat(4096);
+    const children = Array.from({ length: 300 }, (_, index) => ({ id: `s${index}`, type: "rect", childCount: 0 }));
+    const backend = new FakePenpotBackend()
+        .respond("get-mcp-page-tree", treePage(3, { id: "root", type: "frame", childCount: 300, children }))
+        .respond("get-mcp-shapes", (params: object) => ({
+            revn: 3,
+            shapes: (params as { ids: string[] }).ids.map((id) => ({ id, name: big })),
+            missing: [],
+        }));
+    const services = new BackendServices(backend, new BackendSettings(10, 1000), new FakeExporterClient());
+    const host = new SandboxHost(services, TOKEN, undefined, 512 * 1024);
+
+    await assert.rejects(host.loadPage(FILE, PAGE), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, new RegExp(`^page ${PAGE} has 301 shapes \\(about [0-9.]+ MB\\); `));
+        assert.match(
+            error.message,
+            /execute_code loads a whole page; use apply_operations and get_shapes\/find_shapes/
+        );
+        assert.match(error.message, /or raise PENPOT_MCP_SANDBOX_PAGE_MB$/);
+        return true;
+    });
+});
+
+test("a page far above the setting stops after its first batch, before the rest is fetched or serialised", async () => {
+    const big = "x".repeat(5000);
+    const children = Array.from({ length: 2000 }, (_, index) => ({ id: `c${index}`, type: "rect", childCount: 0 }));
+    const backend = new FakePenpotBackend()
+        .respond("get-mcp-page-tree", treePage(4, { id: "root", type: "frame", childCount: 2000, children }))
+        .respond("get-mcp-shapes", (params: object) => ({
+            revn: 4,
+            shapes: (params as { ids: string[] }).ids.map((id) => ({ id, name: big })),
+            missing: [],
+        }));
+    const services = new BackendServices(backend, new BackendSettings(10, 1000), new FakeExporterClient());
+    const host = new SandboxHost(services, TOKEN, undefined, 1024 * 1024);
+
+    await assert.rejects(host.loadPage(FILE, PAGE), { message: /^page .* has 2001 shapes \(about [0-9.]+ MB\)/ });
+    assert.equal(backend.callsTo("get-mcp-shapes").length, 1);
 });

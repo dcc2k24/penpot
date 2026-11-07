@@ -247,3 +247,55 @@ test("dispose releases every runtime and leaves no live runtime", async () => {
     assert.equal(SandboxRuntime.liveCount(), 0);
     await assert.rejects(sessions.acquire("c"), /disposed/);
 });
+
+test("one token runs one script at a time, with two more queued; the next is refused as busy", async () => {
+    const sessions = new SandboxSessions(new SandboxSettings(), () => SandboxRuntime.create(""));
+    try {
+        const running = await sessions.acquireTurn("alice");
+        const waitingOne = sessions.acquireTurn("alice");
+        const waitingTwo = sessions.acquireTurn("alice");
+        await assert.rejects(sessions.acquireTurn("alice"), { message: /is busy/ });
+        // another token has its own turn and is not held up.
+        const other = await sessions.acquireTurn("bob");
+        other();
+        running();
+        (await waitingOne)();
+        (await waitingTwo)();
+    } finally {
+        sessions.dispose();
+    }
+});
+
+test("stats count runtimes created, disposed, recycled and calls by outcome", async () => {
+    const sessions = new SandboxSessions(new SandboxSettings(), () => SandboxRuntime.create(""));
+    try {
+        await sessions.acquire("alice");
+        sessions.recordOutcome("ok");
+        sessions.recordOutcome("interrupted");
+        const stats = sessions.stats();
+        assert.equal(stats.live, 1);
+        assert.equal(stats.created, 1);
+        assert.equal(stats.interrupted, 1);
+        assert.equal(stats.calls.ok, 1);
+        assert.equal(stats.calls.interrupted, 1);
+        sessions.discard("alice");
+        assert.equal(sessions.stats().disposed, 1);
+        assert.equal(sessions.stats().live, 0);
+    } finally {
+        sessions.dispose();
+    }
+});
+
+test("stop disposes every runtime, and a later acquisition creates a fresh one", async () => {
+    const sessions = new SandboxSessions(new SandboxSettings(), () => SandboxRuntime.create(""));
+    try {
+        const first = await sessions.acquire("alice");
+        sessions.stop();
+        assert.equal(first.disposed, true);
+        assert.equal(sessions.size, 0);
+        const second = await sessions.acquire("alice");
+        assert.notEqual(second, first);
+    } finally {
+        sessions.dispose();
+    }
+});

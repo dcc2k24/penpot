@@ -3,11 +3,11 @@ import { createServer as createHttpServer, type Server as HttpServer } from "nod
 import { type AddressInfo, createServer as createNetServer } from "node:net";
 import { test } from "node:test";
 import express from "express";
-import { type BackendTokenValidator, TokenRejectedError } from "./backend/BackendTokenValidator";
-import { InitializeTokenCheck, McpAuthentication } from "./McpAuthentication";
+import { type BackendTokenValidator, BackendTooOldError, TokenRejectedError } from "./backend/BackendTokenValidator";
+import { McpAuthentication, RequestTokenCheck } from "./McpAuthentication";
 import { PenpotMcpServer, partitionToolNames } from "./PenpotMcpServer";
 
-const whoami = { profileId: "profile-1", scopes: ["mcp:read"] };
+const whoami = { profileId: "profile-1", scopes: ["mcp:read"], contractVersion: 1 };
 
 /** A validator stub that records the tokens it sees and throws the error chosen for each token. */
 class StubValidator implements Pick<BackendTokenValidator, "validate"> {
@@ -90,9 +90,14 @@ function postMcp(url: string, token: string, body: string, headers: Record<strin
  *
  * @param validator the validator the gate uses
  */
+/**
+ * Serves the token gate on `/mcp` the way the server does: authenticate, then check the token against the backend.
+ *
+ * @param validator the validator the gate uses
+ */
 function gateApp(validator: StubValidator): express.Express {
     const authentication = new McpAuthentication("https://penpot.example/api/mcp/oauth", true);
-    const check = new InitializeTokenCheck(authentication, validator);
+    const check = new RequestTokenCheck(authentication, validator);
     const app = express();
     app.use(express.json());
     app.all("/mcp", async (req, res) => {
@@ -100,7 +105,7 @@ function gateApp(validator: StubValidator): express.Express {
         if (result.isRejected) {
             return;
         }
-        if (await check.rejectsRequest(req, res, result.userToken ?? "")) {
+        if (result.userToken !== undefined && (await check.check(res, result.userToken)) === "rejected") {
             return;
         }
         res.json({ ok: true });
@@ -132,22 +137,36 @@ test("a token that the backend accepts passes initialize", async () => {
     });
 });
 
-test("a request that is not initialize is not pre-validated", async () => {
+test("a tool call with a rejected token gets 401, so the client sees the challenge and not a tool error", async () => {
     const validator = new StubValidator(() => new TokenRejectedError());
     const toolCall = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "whoami" } });
     await withApp(gateApp(validator), async (url) => {
         const response = await postMcp(url, "bad-token", toolCall);
-        assert.equal(response.status, 200);
-        assert.deepEqual(validator.tokens, []);
+        assert.equal(response.status, 401);
+        assert.match(response.headers.get("www-authenticate") ?? "", /error="invalid_token"/);
+        assert.deepEqual(validator.tokens, ["bad-token"]);
     });
 });
 
-test("an initialize with an existing session header is not pre-validated", async () => {
+test("a token that the backend starts to reject gets 401 on a later request", async () => {
+    let rejecting = false;
+    const validator = new StubValidator(() => (rejecting ? new TokenRejectedError() : undefined));
+    const toolCall = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "whoami" } });
+    await withApp(gateApp(validator), async (url) => {
+        assert.equal((await postMcp(url, "alice-token", toolCall)).status, 200);
+        rejecting = true;
+        const response = await postMcp(url, "alice-token", toolCall);
+        assert.equal(response.status, 401);
+        assert.match(response.headers.get("www-authenticate") ?? "", /error="invalid_token"/);
+    });
+});
+
+test("a request with an existing session header is validated too", async () => {
     const validator = new StubValidator(() => new TokenRejectedError());
     await withApp(gateApp(validator), async (url) => {
         const response = await postMcp(url, "bad-token", initializeBody(), { "mcp-session-id": "session-1" });
-        assert.equal(response.status, 200);
-        assert.deepEqual(validator.tokens, []);
+        assert.equal(response.status, 401);
+        assert.deepEqual(validator.tokens, ["bad-token"]);
     });
 });
 
@@ -157,6 +176,16 @@ test("a backend failure other than a rejection lets initialize through", async (
         const response = await postMcp(url, "good-token", initializeBody());
         assert.equal(response.status, 200);
         assert.deepEqual(validator.tokens, ["good-token"]);
+    });
+});
+
+test("a backend that is too old lets the request through, so the tool call reports the reason", async () => {
+    const validator = new StubValidator(
+        () => new BackendTooOldError("backend too old for backend mode: it reports contract version none.")
+    );
+    await withApp(gateApp(validator), async (url) => {
+        const response = await postMcp(url, "good-token", initializeBody());
+        assert.equal(response.status, 200);
     });
 });
 
@@ -313,10 +342,11 @@ test("partitionToolNames sorts the plain names and the bridge names separately",
 
 test("both mode gives the plugin tools their own names and leaves the plain names to the backend", async () => {
     await withEnvironment(
-        { ...serverEnvironment(0, "http://127.0.0.1:9/"), PENPOT_MCP_AUTH_URI: undefined },
+        { ...serverEnvironment(0, "http://127.0.0.1:9/"), PENPOT_MCP_AUTH_URI: undefined, PENPOT_MCP_MODE: "both" },
         async () => {
             const server = new PenpotMcpServer(false);
             try {
+                await server.whenReady();
                 const names = server.getToolNames();
                 assert.equal(server.getMode(), "both");
                 assert.deepEqual(server.getBridgeToolNames(), [
@@ -348,6 +378,7 @@ test("bridge mode keeps the plain plugin tool names", async () => {
         async () => {
             const server = new PenpotMcpServer(false);
             try {
+                await server.whenReady();
                 assert.equal(server.getMode(), "bridge");
                 assert.deepEqual(server.getBridgeToolNames(), []);
                 assert.ok(server.getToolNames().includes("execute_code"));
@@ -356,4 +387,66 @@ test("bridge mode keeps the plain plugin tool names", async () => {
             }
         }
     );
+});
+
+test("with a backend, readyz answers 503 while the backend readiness endpoint does not answer ready", async () => {
+    const backend = await startFakeBackend(200);
+    try {
+        const port = await freePort();
+        await withEnvironment({ ...serverEnvironment(port, backend.url), PENPOT_MCP_MODE: "both" }, async () => {
+            const server = new PenpotMcpServer(true);
+            await server.start();
+            try {
+                const response = await fetch(`http://127.0.0.1:${port}/readyz`);
+                assert.equal(response.status, 503);
+            } finally {
+                await server.stop();
+            }
+        });
+    } finally {
+        await backend.close();
+    }
+});
+
+test("with a backend and OAuth, a token the backend validated gets the large body limit", async () => {
+    const backend = await startFakeBackend(200);
+    try {
+        const port = await freePort();
+        await withEnvironment(serverEnvironment(port, backend.url), async () => {
+            const server = new PenpotMcpServer(true);
+            await server.start();
+            try {
+                const body = JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "tools/list",
+                    params: { pad: "x".repeat(5 * 1024 * 1024) },
+                });
+                const response = await postMcp(`http://127.0.0.1:${port}/mcp`, "good-token", body);
+                assert.notEqual(response.status, 413);
+            } finally {
+                await server.stop();
+            }
+        });
+    } finally {
+        await backend.close();
+    }
+});
+
+test("bridge mode answers readyz 200 without probing a configured backend", async () => {
+    const backend = await startFakeBackend(200);
+    try {
+        const port = await freePort();
+        await withEnvironment({ ...serverEnvironment(port, backend.url), PENPOT_MCP_MODE: "bridge" }, async () => {
+            const server = new PenpotMcpServer(true);
+            await server.start();
+            try {
+                assert.equal((await fetch(`http://127.0.0.1:${port}/readyz`)).status, 200);
+            } finally {
+                await server.stop();
+            }
+        });
+    } finally {
+        await backend.close();
+    }
 });

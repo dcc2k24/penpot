@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { BackendServices } from "../backend/BackendServices";
 import { ExportConcurrency } from "../utils/ExportConcurrency";
 import { ExporterError, type ExportFormat, type RenderedFile } from "../backend/ExporterClient";
@@ -6,6 +6,7 @@ import { TokenDigest } from "../backend/TokenDigest";
 import { OperationValidator } from "../tools/backend/operations/OperationValidator";
 import { ApplyTokenValues, TokenCatalogue } from "./ApplyTokenValues";
 import type { SandboxHostCalls } from "./SandboxRuntime";
+import { SandboxSettings } from "./SandboxSettings";
 
 /** A node of the page tree returned by `get-mcp-page-tree`. */
 interface TreeNode {
@@ -37,9 +38,15 @@ interface WriteResult {
     validation?: { ok?: boolean; errors?: unknown[] };
 }
 
+/** A token catalogue with the time it was read. */
+interface CatalogueEntry {
+    readonly catalogue: TokenCatalogue;
+    readonly readAt: number;
+}
+
 /** Write options of one execute_code call, sent with every `mcp-apply-operations` call that its flushes make. */
 export interface SandboxWriteOptions {
-    /** Whether the backend takes a version snapshot before each call commits; unset for the backend default. */
+    /** Whether the backend takes a version snapshot before the script's first write; unset for the backend default. */
     snapshot?: boolean;
     /** Revision the caller read the file at. Later calls of the script use the revn of its own last write. */
     baseRevn?: number;
@@ -49,17 +56,41 @@ export interface SandboxWriteOptions {
     allowSplit?: boolean;
 }
 
+/** Receives the progress of a flush: operations done, operations in the flush, and a line of text. */
+export type ProgressSink = (done: number, total: number, text: string) => void;
+
+/**
+ * Thrown when a later call of a flush fails. The earlier calls stayed applied; the error carries what they created.
+ */
+class ChunkFailure extends Error {
+    /**
+     * Creates the failure.
+     *
+     * @param message - text that names the failed call
+     * @param committed - operations of the earlier calls, which stay applied
+     * @param createdIds - ids that the earlier calls created, by handle
+     */
+    constructor(
+        message: string,
+        public readonly committed: number,
+        public readonly createdIds: Record<string, string>
+    ) {
+        super(message);
+        this.name = "ChunkFailure";
+    }
+}
+
 /** Summary of the writes and reads of one execute_code call. */
 export interface SandboxSummary {
     /** Operations applied by successful, non-dry-run `mcp-apply-operations` calls. */
     opsApplied: number;
     /** Successful, non-dry-run flushes and SVG imports. A flush counts once all of its calls succeeded. */
     flushes: number;
-    /** Successful, non-dry-run `mcp-apply-operations` calls; a flush of more than 1500 operations makes several. */
+    /** Successful, non-dry-run `mcp-apply-operations` calls; a flush of more than 2000 operations makes several. */
     chunks: number;
     /** Revn reported by the latest page load or applied write, or `null` when there was none. */
     revn: number | null;
-    /** Warnings collected from the applied writes. */
+    /** Warnings collected from the applied writes and from the page loads. */
     warnings: unknown[];
     /** Temporary ids of all applied writes mapped to the created ids. */
     createdIds: Record<string, string>;
@@ -70,22 +101,24 @@ export interface SandboxSummary {
  *
  * The sandbox calls the methods of this class through {@link SandboxHostCalls}. Every method runs under the
  * token the host was built with, and every write goes through the per-file write queue. Counters are kept per
- * call and reset by {@link beginCall}. Token validation and rate limiting happen before the script runs, in the
- * tool that owns the call.
+ * call and reset by {@link beginCall}. Token validation happens before the script runs, in the tool that owns
+ * the call.
  *
- * A flush arrives already folded by the guest (see `CoreSource`), and goes to the backend in calls of at most
- * {@link CHUNK_SIZE} operations, all under one hold of the write queue of the file.
+ * A flush arrives already folded by the guest (see `CoreSource`). It goes to the backend in one call when it
+ * has at most {@link MAX_CALL_OPERATIONS} operations, which the backend commits as one transaction. A larger
+ * flush goes in calls of {@link CHUNK_SIZE} operations, all under one hold of the write queue of the file.
+ *
+ * Every call of a script carries an id derived from one script id, so the writes of a script can be found
+ * together. The first write of the script takes a snapshot, so one restore undoes the whole script.
  */
 export class SandboxHost implements SandboxHostCalls {
-    /** Most page loads one call may make. */
+    /** Most distinct pages one call may load. A page loaded again does not count twice. */
     private static readonly MAX_PAGE_LOADS = 20;
-    /** Most bytes of page data one call may load, counted over all page loads. */
-    private static readonly MAX_LOAD_BYTES = 50 * 1024 * 1024;
     /** Most operations one call may send, counted over all flushes, dry runs included. */
     private static readonly MAX_OPERATIONS = 5000;
     /**
-     * Most operations one `mcp-apply-operations` call carries. The backend refuses a call above
-     * {@link MAX_CALL_OPERATIONS}, so a larger flush goes in several calls of this size.
+     * Most operations one `mcp-apply-operations` call carries when a flush is split. The backend takes up to
+     * {@link MAX_CALL_OPERATIONS} in one call.
      */
     private static readonly CHUNK_SIZE = 1500;
     /** Most operations the backend takes in one `mcp-apply-operations` call (`max-operations`). */
@@ -102,11 +135,28 @@ export class SandboxHost implements SandboxHostCalls {
     private static readonly MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
     /** Most exports and media uploads one call may make, counted together. */
     private static readonly MAX_EXPORTS_PER_CALL = 20;
-    /** Message of the error that a page load raises when the call would exceed 50 MB of page data. */
-    private static readonly LOAD_LIMIT_MESSAGE =
-        "execute_code working copy exceeds 50 MB; narrow the script to fewer pages";
+    /** How long a token catalogue is kept, in milliseconds, before the next `apply_token` reads it again. */
+    private static readonly TOKEN_CATALOGUE_MAX_AGE_MS = 10_000;
+    /** Time between two tries to take a rate-limit token, in milliseconds. */
+    private static readonly RATE_RETRY_MS = 100;
     /** Message of the error that a primitive raises once the wall-clock limit of the call has passed. */
     private static readonly WALL_CLOCK_MESSAGE = "The script exceeded the wall-clock time limit";
+    /**
+     * Time the watchdog allows for each backend call of a flush: the backend request timeout (55 s by default),
+     * rounded up. A call that is still running within its allowance is committing, not stuck.
+     */
+    private static readonly CALL_ALLOWANCE_MS = 60_000;
+    /** Operation fields that name shapes, where a handle of an earlier call can stand. */
+    private static readonly ID_FIELDS: readonly string[] = [
+        "id",
+        "ids",
+        "parentId",
+        "frameId",
+        "shapeId",
+        "shapeIds",
+        "shapes",
+        "componentId",
+    ];
     /** Formats that the exporter renders. */
     private static readonly EXPORT_FORMATS: ReadonlySet<string> = new Set(["png", "svg", "jpeg", "webp", "pdf"]);
 
@@ -138,14 +188,23 @@ export class SandboxHost implements SandboxHostCalls {
 
     private readonly tokenDigest: string;
 
+    /** Id of the script, which the request ids and the snapshot label of its writes are derived from. */
+    private scriptId: string = randomUUID();
+    /** Receives a line after each chunk of a flush; set by the tool. */
+    private progress: ProgressSink | undefined = undefined;
+    /** Calls of the flush in flight or still to start; the watchdog allows time for them. */
+    private chunksLeft = 0;
     private opsApplied = 0;
     private flushes = 0;
     private chunks = 0;
     private warnings: unknown[] = [];
-    private loadedPages = 0;
-    private loadedBytes = 0;
-    private pageLoadAttempts = 0;
+    /** Bytes of the pages held in this call, by page key. A page loaded again replaces its entry. */
+    private pageBytes = new Map<string, number>();
     private operationsSent = 0;
+    /** Flushes started by the current call, dry runs included. */
+    private flushCount = 0;
+    /** Whether the script has taken its snapshot, which the first write of the script does. */
+    private snapshotTaken = false;
     /** Primitive calls made by the current call, counted before any check. */
     private hostCalls = 0;
     /** Exports and media uploads made by the current call. */
@@ -155,9 +214,13 @@ export class SandboxHost implements SandboxHostCalls {
     private lastRevn: number | null = null;
     private createdIds: Record<string, string> = {};
     /** Token catalogues of the files this call resolved token values in, by file id. */
-    private tokenCatalogues = new Map<string, TokenCatalogue>();
+    private tokenCatalogues = new Map<string, CatalogueEntry>();
     /** Write options of the current call. */
     private writeOptions: SandboxWriteOptions = {};
+    /** Whether the watchdog gave up on the script: the calls of its flushes that are not sent yet are not sent. */
+    private abandoned = false;
+    /** Settles when the flush in flight, if any, has finished. */
+    private inFlight: Promise<void> | undefined = undefined;
     /**
      * Base revision sent with the next write: the caller's `baseRevn` until the script commits, then the revn of
      * its last commit, so that a later write does not report the script's own earlier writes as conflicts.
@@ -176,35 +239,91 @@ export class SandboxHost implements SandboxHostCalls {
     constructor(
         private readonly services: BackendServices,
         private readonly userToken: string,
-        private readonly maxHostCalls: number = 1000
+        private readonly maxHostCalls: number = 1000,
+        private readonly maxPageBytes: number = SandboxSettings.DEFAULT_MAX_PAGE_MB * 1024 * 1024
     ) {
         this.tokenDigest = TokenDigest.sha256Hex(userToken);
     }
 
     /**
-     * Resets the per-call counters before a new execute_code script runs.
+     * Resets the per-call state before a new execute_code script runs, and gives the script its id.
      *
      * @param deadlineAt - absolute instant in epoch milliseconds after which the primitives throw, or infinity
      *   for no wall-clock limit
      * @param writeOptions - write options of the call, sent with every `mcp-apply-operations` call
      */
-    public beginCall(deadlineAt: number = Number.POSITIVE_INFINITY, writeOptions: SandboxWriteOptions = {}): void {
+    public beginCall(
+        deadlineAt: number = Number.POSITIVE_INFINITY,
+        writeOptions: SandboxWriteOptions = {},
+        scriptId: string = randomUUID()
+    ): void {
+        this.scriptId = scriptId;
+        this.chunksLeft = 0;
         this.opsApplied = 0;
         this.flushes = 0;
         this.chunks = 0;
         this.writeOptions = { ...writeOptions };
         this.conflictBaseRevn = writeOptions.baseRevn;
         this.warnings = [];
-        this.loadedPages = 0;
-        this.loadedBytes = 0;
-        this.pageLoadAttempts = 0;
+        this.pageBytes = new Map();
         this.operationsSent = 0;
+        this.flushCount = 0;
+        this.snapshotTaken = false;
         this.hostCalls = 0;
         this.exportCalls = 0;
         this.deadlineAt = deadlineAt;
         this.lastRevn = null;
         this.createdIds = {};
         this.tokenCatalogues = new Map();
+    }
+
+    /**
+     * Sets the function that receives a progress line after each chunk of a flush.
+     *
+     * @param progress - receives the text of the line
+     */
+    public setProgress(progress: ProgressSink | undefined): void {
+        this.progress = progress;
+    }
+
+    /**
+     * Milliseconds that the watchdog allows the writes in flight: one call allowance for each call of the flush
+     * that is still to run, the one in flight included.
+     *
+     * @returns the extra time, in milliseconds
+     */
+    public writeAllowanceMs(): number {
+        return this.chunksLeft * SandboxHost.CALL_ALLOWANCE_MS;
+    }
+
+    /**
+     * Stops the script's flushes: a call that is not sent yet is not sent. A call already in flight still lands, so
+     * use {@link settled} to wait for it.
+     */
+    public abandon(): void {
+        this.abandoned = true;
+    }
+
+    /**
+     * Waits for the flush in flight, if any, for at most the given time. Used after an abandoned call, so that the
+     * totals are final before the next script of the token runs.
+     *
+     * @param maxMs - longest time to wait, in milliseconds
+     */
+    public async settled(maxMs: number): Promise<void> {
+        const pending = this.inFlight;
+        if (pending === undefined) {
+            return;
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined = undefined;
+        const timeout = new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, maxMs);
+        });
+        try {
+            await Promise.race([pending, timeout]);
+        } finally {
+            clearTimeout(timer);
+        }
     }
 
     /**
@@ -229,7 +348,7 @@ export class SandboxHost implements SandboxHostCalls {
      */
     public async loadFileOutline(fileId: string): Promise<string> {
         this.countPrimitive(false);
-        this.admitPrimitive();
+        await this.admitPrimitive();
         const outline = await this.services.backend.callCommand(this.userToken, "get-mcp-file-outline", { fileId });
         return JSON.stringify(outline);
     }
@@ -237,24 +356,30 @@ export class SandboxHost implements SandboxHostCalls {
     /**
      * Reads every shape of one page and returns them as JSON text.
      *
-     * Walks the page tree up to 20 levels, so shapes nested deeper than 20 levels are not returned. Pages the tree in cursor order, then fetches the shapes in batches of 200 ids and keeps
-     * the order of the tree. Every page of the tree and every batch must report the same revn.
+     * Walks the page tree up to 20 levels, then fetches the shapes in batches of 200 ids and keeps the order of the
+     * tree. Every page of the tree and every batch must report the same revn. A page that is loaded again in the
+     * same call replaces its earlier copy and does not count twice against the page cap.
+     *
+     * The result carries warnings for shapes that the model cannot hold: those below the depth limit, and ids that
+     * the backend reports as missing.
      *
      * @param fileId - file that holds the page
      * @param pageId - page to read
      * @returns JSON text of `{ revn, pageId, fileId, shapes }`
-     * @throws Error when the call already loaded 20 pages, the file changed while it was read, or the call
-     *   would exceed 50 MB of page data
+     * @throws Error when the call already loaded 20 distinct pages, the file changed while it was read, or the
+     *   pages would exceed 16 MB of page data
      */
     public async loadPage(fileId: string, pageId: string): Promise<string> {
         this.countPrimitive(false);
-        if (this.pageLoadAttempts >= SandboxHost.MAX_PAGE_LOADS) {
+        const key = `${fileId}\n${pageId}`;
+        const isNew = !this.pageBytes.has(key);
+        if (isNew && this.pageBytes.size >= SandboxHost.MAX_PAGE_LOADS) {
             throw new Error("execute_code loads at most 20 pages per script");
         }
-        this.pageLoadAttempts += 1;
-        this.admitPrimitive();
+        await this.admitPrimitive();
 
         const ids = new Set<string>();
+        const deepest = { dropped: false };
         let revn: number | undefined;
         let cursor: string | undefined;
         do {
@@ -273,16 +398,18 @@ export class SandboxHost implements SandboxHostCalls {
                 params
             );
             revn = this.checkRevn(revn, page.revn);
-            this.collectIds(page.root, ids);
+            this.collectIds(page.root, ids, 1, deepest);
             if (page.truncated && page.nextCursor === undefined) {
                 throw new Error("get-mcp-page-tree reported a truncated page without a cursor");
             }
             cursor = page.truncated ? page.nextCursor : undefined;
         } while (cursor !== undefined);
 
+        // each shape is serialised once; the page text is then joined from those pieces.
         const allIds = [...ids];
-        const shapesById = new Map<string, { id: string } & Record<string, unknown>>();
-        let batchBytes = 0;
+        const shapeJson = new Map<string, string>();
+        const others = this.loadedBytes() - (this.pageBytes.get(key) ?? 0);
+        let shapeBytes = 0;
         for (let start = 0; start < allIds.length; start += SandboxHost.SHAPE_BATCH_SIZE) {
             const batch = allIds.slice(start, start + SandboxHost.SHAPE_BATCH_SIZE);
             const result = await this.services.backend.callCommand<ShapesResult>(this.userToken, "get-mcp-shapes", {
@@ -292,32 +419,49 @@ export class SandboxHost implements SandboxHostCalls {
                 includeChildren: false,
             });
             revn = this.checkRevn(revn, result.revn);
-            // the batch counts against the call before the next batch is requested.
-            batchBytes += Buffer.byteLength(JSON.stringify(result.shapes), "utf8");
-            if (this.loadedBytes + batchBytes > SandboxHost.MAX_LOAD_BYTES) {
-                throw new Error(SandboxHost.LOAD_LIMIT_MESSAGE);
-            }
             for (const shape of result.shapes) {
-                shapesById.set(shape.id, shape);
+                const text = JSON.stringify(shape);
+                shapeJson.set(shape.id, text);
+                shapeBytes += Buffer.byteLength(text, "utf8");
+            }
+            // The shapes read so far give the size of the page. A page that is clearly too large stops here, before
+            // its other shapes are fetched and serialised.
+            const read = Math.min(start + SandboxHost.SHAPE_BATCH_SIZE, allIds.length);
+            const estimate = Math.round((shapeBytes / read) * allIds.length);
+            if (read < allIds.length && estimate > this.maxPageBytes) {
+                throw this.pageTooLarge(pageId, allIds.length, estimate, true);
             }
         }
 
-        // keep the tree order; ids reported as missing, or absent from the response, are skipped.
-        const shapes: Array<{ id: string } & Record<string, unknown>> = [];
+        // keep the tree order; ids that the backend did not return are skipped and reported.
+        const pieces: string[] = [];
         for (const id of allIds) {
-            const shape = shapesById.get(id);
-            if (shape !== undefined) {
-                shapes.push(shape);
+            const text = shapeJson.get(id);
+            if (text !== undefined) {
+                pieces.push(text);
             }
         }
-
-        const text = JSON.stringify({ revn, pageId, fileId, shapes });
+        const text =
+            '{"revn":' +
+            String(revn ?? null) +
+            ',"pageId":' +
+            JSON.stringify(pageId) +
+            ',"fileId":' +
+            JSON.stringify(fileId) +
+            ',"shapes":[' +
+            pieces.join(",") +
+            "]}";
         const bytes = Buffer.byteLength(text, "utf8");
-        if (this.loadedBytes + bytes > SandboxHost.MAX_LOAD_BYTES) {
-            throw new Error(SandboxHost.LOAD_LIMIT_MESSAGE);
+        if (bytes > this.maxPageBytes) {
+            throw this.pageTooLarge(pageId, allIds.length, bytes, false);
         }
-        this.loadedBytes += bytes;
-        this.loadedPages += 1;
+        if (others + bytes > this.maxPageBytes) {
+            throw new Error(this.pagesTooLarge());
+        }
+        this.pageBytes.set(key, bytes);
+        if (isNew) {
+            this.noteDroppedShapes(fileId, pageId, deepest.dropped, allIds.length - pieces.length);
+        }
         this.lastRevn = revn ?? null;
         return text;
     }
@@ -326,10 +470,11 @@ export class SandboxHost implements SandboxHostCalls {
      * Applies a batch of operations to a file through `mcp-apply-operations`.
      *
      * Every `apply_token` operation without a value gets one from the token catalogue, and every operation is
-     * checked, before anything is sent. A flush of more than {@link CHUNK_SIZE} operations then goes in several
-     * calls, in order, and each later call names the shapes that an earlier call created by their ids. The flush
-     * holds the write queue of the file from its first call to its last, so no other write of this adapter to the
-     * file lands between two of its calls. Each call carries the write options of the script.
+     * checked, before anything is sent. The calls of the flush are admitted together, before the first one, so a
+     * rate limit or the wall-clock limit never stops a flush half way. A flush of up to 2000 operations is one call;
+     * a larger one goes in several calls, in order, and each later call names the shapes that an earlier call
+     * created by their ids. The flush holds the write queue of the file from its first call to its last. Each call
+     * carries the write options of the script and a request id that is derived from the script id.
      *
      * A dry run goes in one call, so that every operation is checked against the same file; it takes at most
      * {@link MAX_CALL_OPERATIONS} operations. Only successful, non-dry-run calls count towards the totals of the
@@ -360,15 +505,38 @@ export class SandboxHost implements SandboxHostCalls {
                     "Dry run a smaller part of the script."
             );
         }
-        this.admitPrimitive();
         this.operationsSent += operations.length;
+        const chunks = dryRun ? [operations] : SandboxHost.splitChunks(operations);
+        await this.admitCalls(chunks.length);
         const tokenWarnings = await this.tokenValues.fill(operations, this.tokenCatalogue(fileId));
         SandboxHost.validateOperations(operations);
 
-        const chunks = dryRun ? [operations] : SandboxHost.splitChunks(operations);
-        const answers = await this.services.writeQueue.run(this.tokenDigest, fileId, () =>
-            this.sendChunks(fileId, chunks, operations.length, dryRun)
-        );
+        this.flushCount += 1;
+        const flushNumber = this.flushCount;
+        let answers: WriteResult[];
+        // the watchdog allows time for every call of the flush, including one that waits in the write queue.
+        this.chunksLeft = chunks.length;
+        try {
+            const sending = this.services.writeQueue.run(this.tokenDigest, fileId, () =>
+                this.sendChunks(fileId, chunks, operations.length, dryRun, flushNumber)
+            );
+            this.inFlight = sending.then(
+                () => undefined,
+                () => undefined
+            );
+            answers = await sending;
+        } catch (error) {
+            // a later call failed: the earlier calls stay applied, so the guest gets their ids and the failure as data.
+            if (error instanceof ChunkFailure) {
+                this.chunksLeft = 0;
+                return JSON.stringify({
+                    failure: { message: error.message, committed: error.committed, createdIds: error.createdIds },
+                });
+            }
+            throw error;
+        } finally {
+            this.chunksLeft = 0;
+        }
         if (!dryRun) {
             this.flushes += 1;
             this.warnings.push(...tokenWarnings);
@@ -384,13 +552,14 @@ export class SandboxHost implements SandboxHostCalls {
     /**
      * Sends the calls of one flush in order. The caller holds the write queue of the file.
      *
-     * Each call after the first is admitted like a primitive: it is refused once the wall-clock limit has passed,
-     * and it charges the rate limit of the token.
+     * The calls were admitted before the flush started, so none is refused here. A call that fails stops the
+     * flush, and the error names the operations that the earlier calls committed.
      *
      * @param fileId - file the operations change
      * @param chunks - the operations of each call, in order
      * @param total - operations of the whole flush
      * @param dryRun - whether the calls only validate
+     * @param flushNumber - position of the flush in the script, from 1
      * @returns the answer of each call, in order
      * @throws Error with the cause of the failed call; for a flush of several calls, the error names the failed
      *   call and the operations that the earlier calls committed
@@ -399,35 +568,58 @@ export class SandboxHost implements SandboxHostCalls {
         fileId: string,
         chunks: unknown[][],
         total: number,
-        dryRun: boolean
+        dryRun: boolean,
+        flushNumber: number
     ): Promise<WriteResult[]> {
         const created = new Map<string, string>();
         const answers: WriteResult[] = [];
         let committed = 0;
         for (let index = 0; index < chunks.length; index += 1) {
+            if (this.abandoned) {
+                // the watchdog gave up on the script: the earlier calls stay applied, and no later call is sent.
+                throw new ChunkFailure(
+                    "The script was stopped, so the remaining calls of this flush were not sent.",
+                    committed,
+                    Object.fromEntries(created)
+                );
+            }
+            this.chunksLeft = chunks.length - index;
             const chunk =
-                index === 0 ? chunks[0] : chunks[index].map((operation) => SandboxHost.withIds(operation, created));
+                index === 0
+                    ? chunks[0]
+                    : chunks[index].map((operation) => SandboxHost.rewriteHandles(operation, created));
+            const requestId =
+                flushNumber === 1 && index === 0
+                    ? this.scriptId
+                    : SandboxHost.deriveRequestId(this.scriptId, `${flushNumber}/${index + 1}`);
+            const snapshot = dryRun ? undefined : this.snapshotFor(index);
             let answer: WriteResult;
             try {
-                if (index > 0) {
-                    this.admitPrimitive();
-                }
                 answer = await this.services.backend.callCommand<WriteResult>(
                     this.userToken,
                     "mcp-apply-operations",
-                    this.writeParams(fileId, chunk, dryRun)
+                    this.writeParams(fileId, chunk, dryRun, requestId, snapshot)
                 );
             } catch (error) {
                 if (chunks.length === 1) {
                     throw error;
                 }
-                throw SandboxHost.chunkFailure(index + 1, chunks.length, committed, total, error);
+                const failure = SandboxHost.chunkFailure(index + 1, chunks.length, committed, total, error);
+                if (index === 0) {
+                    throw failure;
+                }
+                // the saved chunks keep their ids; the flush returns them with the failure, see flush().
+                throw new ChunkFailure(failure.message, committed, Object.fromEntries(created));
             }
             answer = SandboxHost.isRecord(answer) ? answer : {};
             if (!dryRun) {
+                if (snapshot === true) {
+                    this.snapshotTaken = true;
+                }
                 committed += chunk.length;
                 this.chunks += 1;
                 this.recordAnswer(chunk.length, answer);
+                this.progress?.(committed, total, `${committed} of ${total} operations of the flush are applied`);
                 if (chunk.some((operation) => ApplyTokenValues.changesTokens(operation))) {
                     this.tokenCatalogues.delete(fileId);
                 }
@@ -441,25 +633,54 @@ export class SandboxHost implements SandboxHostCalls {
     }
 
     /**
+     * Tells whether the call that is about to be sent takes the snapshot of the script.
+     *
+     * Only the first write of the script takes one, so a restore undoes the whole script. A script that sets
+     * `snapshot: false` takes none.
+     *
+     * @param index - position of the call in its flush
+     * @returns true for the snapshot call, false for the others
+     */
+    private snapshotFor(index: number): boolean | undefined {
+        const requested = this.writeOptions.snapshot;
+        if (requested === undefined) {
+            // the backend's own rule: it snapshots deletes, more than 100 operations, or when asked.
+            return undefined;
+        }
+        if (requested === false) {
+            return false;
+        }
+        return index === 0 && !this.snapshotTaken;
+    }
+
+    /**
      * Builds the parameters of one `mcp-apply-operations` call, with the write options of the script.
      *
      * @param fileId - file the operations change
      * @param operations - the operations of the call
      * @param dryRun - whether the call only validates
+     * @param requestId - request id of the call, which the backend uses for its snapshot label
+     * @param snapshot - whether the call takes the snapshot, or undefined to leave the choice to the backend
      * @returns the command parameters
      */
-    private writeParams(fileId: string, operations: unknown[], dryRun: boolean): Record<string, unknown> {
-        const params: Record<string, unknown> = { fileId, operations, requestId: randomUUID() };
+    private writeParams(
+        fileId: string,
+        operations: unknown[],
+        dryRun: boolean,
+        requestId: string,
+        snapshot: boolean | undefined
+    ): Record<string, unknown> {
+        const params: Record<string, unknown> = { fileId, operations, requestId };
         if (dryRun) {
             params.dryRun = true;
         }
-        const options = this.writeOptions;
-        if (options.snapshot !== undefined) {
-            params.snapshot = options.snapshot;
+        if (snapshot !== undefined) {
+            params.snapshot = snapshot;
         }
         if (this.conflictBaseRevn !== undefined) {
             params.baseRevn = this.conflictBaseRevn;
         }
+        const options = this.writeOptions;
         if (options.failOnConflict !== undefined) {
             params.failOnConflict = options.failOnConflict;
         }
@@ -484,12 +705,12 @@ export class SandboxHost implements SandboxHostCalls {
         this.countPrimitive(true);
         const params = SandboxHost.parseObject(paramsJson, "export parameters");
         const fileId = SandboxHost.requiredString(params, "fileId");
-        this.admitPrimitive();
+        await this.admitPrimitive();
         const renderToken = await this.services.renderSessions.tokenFor(this.userToken, fileId);
         let file;
         if (typeof params.mediaId === "string" && params.mediaId.length > 0) {
             const mediaId = params.mediaId;
-            file = await ExportConcurrency.withPermit(() =>
+            file = await ExportConcurrency.withBackendPermit(this.tokenDigest, () =>
                 this.recoverRenderSession(fileId, () => this.services.exporter.downloadAsset(renderToken, mediaId))
             );
         } else {
@@ -529,7 +750,7 @@ export class SandboxHost implements SandboxHostCalls {
             throw new Error("the export scale must be above 0 and up to 10");
         }
         const { profileId } = await this.services.validator.validate(this.userToken);
-        return ExportConcurrency.withPermit(() =>
+        return ExportConcurrency.withBackendPermit(this.tokenDigest, () =>
             this.recoverRenderSession(fileId, () =>
                 this.services.exporter.exportShape(renderToken, {
                     fileId,
@@ -547,7 +768,8 @@ export class SandboxHost implements SandboxHostCalls {
     /**
      * Stores an image from an http or https address in the media library of a file.
      *
-     * The backend downloads the image, so the call completes before the script goes on.
+     * The backend downloads the image, so the call completes before the script goes on. The write options of the
+     * script do not reach this call; see the tool description.
      *
      * @param paramsJson - JSON object with `fileId`, `url` and an optional `name`
      * @returns the media object as JSON text
@@ -561,7 +783,7 @@ export class SandboxHost implements SandboxHostCalls {
         if (!/^https?:\/\//i.test(url)) {
             throw new Error("The url must start with http:// or https://.");
         }
-        this.admitPrimitive();
+        await this.admitPrimitive();
         const commandParams: Record<string, unknown> = { fileId, isLocal: true, url };
         if (typeof params.name === "string") {
             commandParams.name = params.name;
@@ -589,7 +811,7 @@ export class SandboxHost implements SandboxHostCalls {
         if (content.byteLength === 0 || content.byteLength > SandboxHost.MAX_UPLOAD_BYTES) {
             throw new Error("the image must be between 1 byte and 50 MB");
         }
-        this.admitPrimitive();
+        await this.admitPrimitive();
         const media = await this.services.writeQueue.run(this.tokenDigest, fileId, () =>
             this.services.backend.callMultipart(
                 this.userToken,
@@ -604,6 +826,8 @@ export class SandboxHost implements SandboxHostCalls {
     /**
      * Imports an SVG document into a page through `mcp-import-svg`.
      *
+     * The write options of the script do not reach this call; see the tool description.
+     *
      * @param paramsJson - JSON object with the command parameters, including `fileId`
      * @returns the backend result as JSON text
      * @throws Error when the text is not a JSON object or the backend rejects the import
@@ -612,7 +836,7 @@ export class SandboxHost implements SandboxHostCalls {
         this.countPrimitive(false);
         const params = SandboxHost.parseObject(paramsJson, "import_svg parameters");
         const fileId = SandboxHost.fileIdOf(params);
-        this.admitPrimitive();
+        await this.admitPrimitive();
         const result = await this.services.writeQueue.run(this.tokenDigest, fileId, () =>
             this.services.backend.callCommand<WriteResult>(this.userToken, "mcp-import-svg", params)
         );
@@ -628,7 +852,7 @@ export class SandboxHost implements SandboxHostCalls {
      * Calls an allow-listed backend command for the sandbox.
      *
      * Reads run directly. Writes run through the per-file write queue, keyed by the `fileId` parameter, or by
-     * the empty string when the command has none.
+     * the empty string when the command has none. The write options of the script do not reach these calls.
      *
      * @param name - backend command name
      * @param paramsJson - JSON object with the command parameters
@@ -644,7 +868,7 @@ export class SandboxHost implements SandboxHostCalls {
             throw new Error(`rpc: ${name} is not available in execute_code`);
         }
         const params = SandboxHost.parseObject(paramsJson, "rpc parameters");
-        this.admitPrimitive();
+        await this.admitPrimitive();
 
         let result: unknown;
         if (isRead) {
@@ -684,30 +908,62 @@ export class SandboxHost implements SandboxHostCalls {
     /**
      * Admits a primitive that reaches the backend or the exporter, after its cap checks.
      *
-     * Refuses the call once the wall-clock limit has passed, and charges one request to the rate limit of the token.
-     *
-     * @throws Error when the wall-clock limit has passed or the rate limit refuses the request
+     * @throws Error when the wall-clock limit passes before a rate-limit token is free
      */
-    private admitPrimitive(): void {
-        if (Date.now() >= this.deadlineAt) {
-            throw new Error(SandboxHost.WALL_CLOCK_MESSAGE);
-        }
-        this.services.rateLimiter.acquire(this.userToken);
+    private async admitPrimitive(): Promise<void> {
+        await this.admitCalls(1);
     }
 
     /**
-     * Returns the token catalogue of a file for this call. It is read at most once per file and call, and dropped
-     * after a write that changes tokens.
+     * Admits a number of backend calls before they start: checks the wall-clock limit once, then takes one
+     * rate-limit token per call. A call waits for its token; the wait ends at the deadline.
+     *
+     * @param count - number of backend calls to admit
+     * @throws Error when the wall-clock limit has passed, or the deadline comes before a token is free
+     */
+    private async admitCalls(count: number): Promise<void> {
+        if (Date.now() >= this.deadlineAt) {
+            throw new Error(SandboxHost.WALL_CLOCK_MESSAGE);
+        }
+        for (let taken = 0; taken < count; taken += 1) {
+            await this.takeRateToken();
+        }
+    }
+
+    /**
+     * Waits until the rate limit of the token gives one request, bounded by the deadline.
+     *
+     * @throws Error when the deadline passes before a token is free
+     */
+    private async takeRateToken(): Promise<void> {
+        for (;;) {
+            try {
+                this.services.rateLimiter.acquire(this.userToken);
+                return;
+            } catch {
+                if (Date.now() + SandboxHost.RATE_RETRY_MS >= this.deadlineAt) {
+                    throw new Error(SandboxHost.WALL_CLOCK_MESSAGE);
+                }
+                await new Promise<void>((resolve) => setTimeout(resolve, SandboxHost.RATE_RETRY_MS));
+            }
+        }
+    }
+
+    /**
+     * Returns the token catalogue of a file for this call. It is read at most once per file and call, is read
+     * again after 10 s, and is dropped after a write that changes tokens.
      *
      * @param fileId - file that holds the tokens
      * @returns the catalogue
      */
     private tokenCatalogue(fileId: string): TokenCatalogue {
-        let catalogue = this.tokenCatalogues.get(fileId);
-        if (catalogue === undefined) {
-            catalogue = new TokenCatalogue(this.services.backend, this.userToken, fileId);
-            this.tokenCatalogues.set(fileId, catalogue);
+        const now = Date.now();
+        const held = this.tokenCatalogues.get(fileId);
+        if (held !== undefined && now - held.readAt < SandboxHost.TOKEN_CATALOGUE_MAX_AGE_MS) {
+            return held.catalogue;
         }
+        const catalogue = new TokenCatalogue(this.services.backend, this.userToken, fileId);
+        this.tokenCatalogues.set(fileId, { catalogue, readAt: now });
         return catalogue;
     }
 
@@ -748,46 +1004,85 @@ export class SandboxHost implements SandboxHostCalls {
         }
         if (typeof result.revn === "number") {
             this.lastRevn = result.revn;
-            if (this.conflictBaseRevn !== undefined) {
+            // The base moves only with failOnConflict. Without it the base is a hint, and moving it would hide
+            // changes that others made between the caller's read and the script's first write from later checks.
+            if (this.conflictBaseRevn !== undefined && this.writeOptions.failOnConflict === true) {
                 this.conflictBaseRevn = result.revn;
             }
         }
     }
 
     /**
-     * Splits the operations of a flush into calls of at most {@link CHUNK_SIZE} operations each.
+     * Splits the operations of a flush into calls. A flush of up to {@link MAX_CALL_OPERATIONS} operations is one
+     * call, so the backend commits it as one transaction; a larger one is cut into calls of {@link CHUNK_SIZE}.
      *
      * @param operations - the operations of the flush, in order
      * @returns the calls, in order; an empty flush gives one empty call
      */
     private static splitChunks(operations: unknown[]): unknown[][] {
+        if (operations.length <= SandboxHost.MAX_CALL_OPERATIONS) {
+            return [operations];
+        }
         const chunks: unknown[][] = [];
         for (let start = 0; start < operations.length; start += SandboxHost.CHUNK_SIZE) {
             chunks.push(operations.slice(start, start + SandboxHost.CHUNK_SIZE));
         }
-        return chunks.length > 0 ? chunks : [[]];
+        return chunks;
     }
 
     /**
-     * Copies a value of an operation with every handle that an earlier call of the flush created replaced by its id.
+     * Derives a request id from the script id and a label, in the form of a UUID.
      *
-     * @param value - a value of an operation
+     * The backend takes request ids as UUIDs, so the label is hashed into one. The same script id and label always
+     * give the same id.
+     *
+     * @param scriptId - id of the script
+     * @param label - position of the call, such as `1/2` for the second call of the first flush
+     * @returns a UUID text
+     */
+    private static deriveRequestId(scriptId: string, label: string): string {
+        const hex = createHash("sha256").update(`${scriptId}/${label}`).digest("hex").slice(0, 32).split("");
+        hex[12] = "5";
+        hex[16] = ((Number.parseInt(hex[16], 16) & 0x3) | 0x8).toString(16);
+        const text = hex.join("");
+        return `${text.slice(0, 8)}-${text.slice(8, 12)}-${text.slice(12, 16)}-${text.slice(16, 20)}-${text.slice(20)}`;
+    }
+
+    /**
+     * Copies an operation with every handle that an earlier call created replaced by its id.
+     *
+     * Only the fields that name shapes are read, so a text that happens to equal a handle is left alone.
+     *
+     * @param operation - one operation of a later call
      * @param created - ids by handle, from the earlier calls of the flush
      * @returns the copy
      */
-    private static withIds(value: unknown, created: ReadonlyMap<string, string>): unknown {
+    private static rewriteHandles(operation: unknown, created: ReadonlyMap<string, string>): unknown {
+        if (!SandboxHost.isRecord(operation)) {
+            return operation;
+        }
+        const copy: Record<string, unknown> = { ...operation };
+        for (const field of SandboxHost.ID_FIELDS) {
+            if (field in copy) {
+                copy[field] = SandboxHost.replaceHandles(copy[field], created);
+            }
+        }
+        return copy;
+    }
+
+    /**
+     * Replaces handles inside an id field, which is a text or a list of texts.
+     *
+     * @param value - the field value
+     * @param created - ids by handle
+     * @returns the value with each handle replaced
+     */
+    private static replaceHandles(value: unknown, created: ReadonlyMap<string, string>): unknown {
         if (typeof value === "string") {
             return created.get(value) ?? value;
         }
         if (Array.isArray(value)) {
-            return value.map((item) => SandboxHost.withIds(item, created));
-        }
-        if (SandboxHost.isRecord(value)) {
-            const copy: Record<string, unknown> = {};
-            for (const [key, item] of Object.entries(value)) {
-                copy[key] = SandboxHost.withIds(item, created);
-            }
-            return copy;
+            return value.map((item) => SandboxHost.replaceHandles(item, created));
         }
         return value;
     }
@@ -857,14 +1152,94 @@ export class SandboxHost implements SandboxHostCalls {
     /**
      * Adds the id of a tree node and of every node below it, in document order, without repeats.
      *
+     * The root is at depth 1. A node below the depth limit that still has children marks the page as cut short.
+     *
      * @param node - the node to walk
      * @param ids - ids collected so far, in document order
+     * @param depth - depth of the node, from 1
+     * @param state - receives `dropped` when a node below the depth limit has children
      */
-    private collectIds(node: TreeNode, ids: Set<string>): void {
+    private collectIds(node: TreeNode, ids: Set<string>, depth: number, state: { dropped: boolean }): void {
         ids.add(node.id);
-        for (const child of node.children ?? []) {
-            this.collectIds(child, ids);
+        const children = node.children ?? [];
+        if (depth >= SandboxHost.TREE_DEPTH && children.length > 0) {
+            state.dropped = true;
         }
+        for (const child of children) {
+            this.collectIds(child, ids, depth + 1, state);
+        }
+    }
+
+    /**
+     * Records a warning when a page load left out shapes, so the script can tell the model is incomplete.
+     *
+     * @param fileId - file of the page
+     * @param pageId - page that was loaded
+     * @param depthCut - whether shapes below the depth limit were left out
+     * @param missing - number of ids in the tree that the backend did not return
+     */
+    private noteDroppedShapes(fileId: string, pageId: string, depthCut: boolean, missing: number): void {
+        if (depthCut) {
+            this.warnings.push({
+                code: "shapes-below-depth-limit",
+                fileId,
+                pageId,
+                message: `Shapes nested deeper than ${SandboxHost.TREE_DEPTH} levels are not in the model of page ${pageId}.`,
+            });
+        }
+        if (missing > 0) {
+            this.warnings.push({
+                code: "shapes-missing",
+                fileId,
+                pageId,
+                count: missing,
+                message: `${missing} shape(s) of page ${pageId} were reported missing and are not in the model.`,
+            });
+        }
+    }
+
+    /**
+     * Words the error of one page that is above the cap.
+     *
+     * @param pageId - the page
+     * @param shapes - shapes in the page
+     * @param bytes - size of the page as JSON, or the estimate of it
+     * @param estimated - whether the size is an estimate from the shapes read so far
+     * @returns the error, which names the page, its size and shape count, and the way out
+     */
+    private pageTooLarge(pageId: string, shapes: number, bytes: number, estimated: boolean): Error {
+        const megabytes = (bytes / (1024 * 1024)).toFixed(1);
+        return new Error(
+            `page ${pageId} has ${shapes} shapes (${estimated ? "about " : ""}${megabytes} MB); ` +
+                "execute_code loads a whole page; use apply_operations and get_shapes/find_shapes for a page this " +
+                "large, or raise PENPOT_MCP_SANDBOX_PAGE_MB"
+        );
+    }
+
+    /**
+     * Words the error of the pages of one call that together are above the cap.
+     *
+     * @returns the error text
+     */
+    private pagesTooLarge(): string {
+        const megabytes = (this.maxPageBytes / (1024 * 1024)).toFixed(0);
+        return (
+            `execute_code holds at most ${megabytes} MB of page data per script, and the pages it loads reach more; ` +
+            "narrow the script to fewer pages, or raise PENPOT_MCP_SANDBOX_PAGE_MB"
+        );
+    }
+
+    /**
+     * Returns the bytes of all page copies that the call holds.
+     *
+     * @returns the total of the page byte counts
+     */
+    private loadedBytes(): number {
+        let total = 0;
+        for (const bytes of this.pageBytes.values()) {
+            total += bytes;
+        }
+        return total;
     }
 
     /**

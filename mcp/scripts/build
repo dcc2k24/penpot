@@ -21,7 +21,7 @@ set +e
 set -e
 popd
 
-pnpm -r --filter "!mcp-plugin" install;
+pnpm -r --filter "!mcp-plugin" --filter '!mcp-loadtest' --filter '!mcp-design-parity' --filter '!design-parity-app' install;
 pnpm -r --filter "mcp-server" run build;
 
 rsync -avr packages/server/dist/ ./dist/;

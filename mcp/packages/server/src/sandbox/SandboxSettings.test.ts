@@ -7,8 +7,12 @@ test("defaults apply when the variables are unset or blank", () => {
         PENPOT_MCP_SANDBOX_TIMEOUT_S: undefined,
         PENPOT_MCP_SANDBOX_IDLE_MIN: "   ",
     });
-    assert.equal(settings.cpuBudgetMs, 10_000);
+    assert.equal(settings.cpuBudgetMs, 3_000);
     assert.equal(settings.idleEvictMs, 30 * 60 * 1000);
+});
+
+test("the default CPU budget is 3 s, so one script cannot hold the event loop for 10 s", () => {
+    assert.equal(SandboxSettings.DEFAULT_CPU_BUDGET_MS, 3_000);
 });
 
 test("custom values are read in seconds and minutes", () => {
@@ -41,7 +45,7 @@ test("the new limits default to their documented values", () => {
     const settings = new SandboxSettings();
     assert.equal(settings.wallMs, 120_000);
     assert.equal(settings.maxHostCalls, 1000);
-    assert.equal(settings.maxSessions, 50);
+    assert.equal(settings.maxSessions, 20);
     assert.equal(settings.maxConcurrentCalls, 4);
     assert.equal(settings.slotWaitMs, 60_000);
 });
@@ -50,7 +54,7 @@ test("the defaults of the new limits apply when the environment is empty", () =>
     const settings = SandboxSettings.fromEnvironment({});
     assert.equal(settings.wallMs, 120_000);
     assert.equal(settings.maxHostCalls, 1000);
-    assert.equal(settings.maxSessions, 50);
+    assert.equal(settings.maxSessions, 20);
     assert.equal(settings.maxConcurrentCalls, 4);
     assert.equal(settings.slotWaitMs, 60_000);
 });
@@ -90,4 +94,36 @@ test("malformed integer values throw an error that names the variable", () => {
             (error: unknown) => error instanceof Error && error.message.includes(name)
         );
     }
+});
+
+test("workers are on by default, and a false value switches them off", () => {
+    assert.equal(SandboxSettings.fromEnvironment({}).workers, true);
+    assert.equal(SandboxSettings.fromEnvironment({ PENPOT_MCP_SANDBOX_WORKERS: "false" }).workers, false);
+    assert.equal(SandboxSettings.fromEnvironment({ PENPOT_MCP_SANDBOX_WORKERS: "0" }).workers, false);
+    assert.equal(SandboxSettings.fromEnvironment({ PENPOT_MCP_SANDBOX_WORKERS: " TRUE " }).workers, true);
+    assert.equal(SandboxSettings.workersEnabled({}), true);
+});
+
+test("a malformed workers value throws an error that names the variable", () => {
+    assert.throws(
+        () => SandboxSettings.fromEnvironment({ PENPOT_MCP_SANDBOX_WORKERS: "maybe" }),
+        /PENPOT_MCP_SANDBOX_WORKERS must be true or false/
+    );
+});
+
+test("the page cap is 16 MB by default, and PENPOT_MCP_SANDBOX_PAGE_MB sets it in MB", () => {
+    assert.equal(SandboxSettings.fromEnvironment({}).maxPageBytes, 16 * 1024 * 1024);
+    assert.equal(SandboxSettings.fromEnvironment({ PENPOT_MCP_SANDBOX_PAGE_MB: "32" }).maxPageBytes, 32 * 1024 * 1024);
+    assert.equal(SandboxSettings.fromEnvironment({ PENPOT_MCP_SANDBOX_PAGE_MB: "0.5" }).maxPageBytes, 512 * 1024);
+});
+
+test("a malformed page cap throws an error that names its variable", () => {
+    assert.throws(
+        () => SandboxSettings.fromEnvironment({ PENPOT_MCP_SANDBOX_PAGE_MB: "lots" }),
+        /PENPOT_MCP_SANDBOX_PAGE_MB/
+    );
+    assert.throws(
+        () => SandboxSettings.fromEnvironment({ PENPOT_MCP_SANDBOX_PAGE_MB: "0" }),
+        /PENPOT_MCP_SANDBOX_PAGE_MB/
+    );
 });

@@ -83,6 +83,6 @@ export class BatchCreateShapesTool extends BackendTool<BatchCreateShapesArgs> {
             ...WriteOptions.toParams(args),
         };
         const result = await this.callWrite(userToken, args.fileId, "mcp-apply-operations", params);
-        return this.jsonResponse({ nodes: expanded.nodes, result });
+        return this.jsonResponse({ nodes: expanded.nodes, result: WriteOptions.withAlreadyApplied(result) });
     }
 }

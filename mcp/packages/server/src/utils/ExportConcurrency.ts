@@ -37,6 +37,12 @@ export class ExportConcurrency {
     /** Default number of concurrent backend exports. */
     private static readonly DEFAULT_BACKEND_MAXIMUM = 4;
 
+    /** Renders a token may hold at once. One token cannot take every backend export slot. */
+    public static readonly RENDERS_PER_TOKEN = 1;
+
+    /** Time a backend render may run before its caller gets an error and its permits are freed, in milliseconds. */
+    public static readonly RENDER_TIMEOUT_MS = 60_000;
+
     /**
      * Bound of the backend export gate. Backend mode defaults to 4 concurrent exports; the variable
      * PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS overrides it, and zero means no limit.
@@ -49,17 +55,33 @@ export class ExportConcurrency {
             ? new Semaphore("ExportShapeBackendTool", ExportConcurrency.backendMaximum)
             : undefined;
 
+    /** Per-token gates that hold at least one render, keyed by token digest. Dropped again when idle. */
+    private static readonly tokenGates = new Map<string, { gate: Semaphore; holders: number }>();
+
     /**
-     * Runs a backend export task through the backend gate, which defaults to four concurrent exports.
+     * Runs a backend render under the permits of its token and of the process.
      *
-     * @param task - the export to run
+     * A token gets {@link RENDERS_PER_TOKEN} render at a time, and the process runs at most the backend maximum
+     * at once. The task is held to the render timeout. At the deadline its signal is aborted, so that the render
+     * stops and does not keep loading the exporter, and the caller gets an error.
+     *
+     * @param tokenDigest - digest of the MCP token of the request, never the raw token
+     * @param task - the render to run; it receives the signal that fires at the deadline and should pass it on
+     * @param timeoutMs - the time the task may run, in milliseconds; defaults to {@link RENDER_TIMEOUT_MS}
      * @returns the value that the task resolves to
+     * @throws Error when the task runs longer than the timeout, or fails
      */
-    public static withBackendPermit<T>(task: () => Promise<T>): Promise<T> {
-        if (ExportConcurrency.backendSemaphore === undefined) {
-            return task();
+    public static async withBackendPermit<T>(
+        tokenDigest: string,
+        task: (signal: AbortSignal) => Promise<T>,
+        timeoutMs: number = ExportConcurrency.RENDER_TIMEOUT_MS
+    ): Promise<T> {
+        const entry = ExportConcurrency.holdTokenGate(tokenDigest);
+        try {
+            return await entry.gate.withPermit(() => ExportConcurrency.runWithProcessPermit(task, timeoutMs));
+        } finally {
+            ExportConcurrency.releaseTokenGate(tokenDigest, entry);
         }
-        return ExportConcurrency.backendSemaphore.withPermit(task);
     }
 
     /**
@@ -88,5 +110,72 @@ export class ExportConcurrency {
             return task();
         }
         return ExportConcurrency.semaphore.withPermit(task);
+    }
+
+    /**
+     * Returns the gate of a token, creating it when the token has none, and counts the caller as a holder.
+     *
+     * @param tokenDigest - digest of the MCP token
+     */
+    private static holdTokenGate(tokenDigest: string): { gate: Semaphore; holders: number } {
+        let entry = ExportConcurrency.tokenGates.get(tokenDigest);
+        if (entry === undefined) {
+            entry = {
+                gate: new Semaphore(`ExportToken:${tokenDigest.slice(0, 12)}`, ExportConcurrency.RENDERS_PER_TOKEN),
+                holders: 0,
+            };
+            ExportConcurrency.tokenGates.set(tokenDigest, entry);
+        }
+        entry.holders += 1;
+        return entry;
+    }
+
+    /**
+     * Stops counting a holder of a token gate, and drops the gate when no holder is left.
+     *
+     * @param tokenDigest - digest of the MCP token
+     * @param entry - the gate the holder was given
+     */
+    private static releaseTokenGate(tokenDigest: string, entry: { holders: number }): void {
+        entry.holders -= 1;
+        if (entry.holders === 0 && ExportConcurrency.tokenGates.get(tokenDigest) === entry) {
+            ExportConcurrency.tokenGates.delete(tokenDigest);
+        }
+    }
+
+    /**
+     * Runs a task under the process-wide backend permit, when there is a bound, with the render timeout.
+     *
+     * @param task - the render to run
+     * @param timeoutMs - the time the task may run, in milliseconds
+     */
+    private static runWithProcessPermit<T>(task: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
+        const timed = () => ExportConcurrency.withDeadline(task, timeoutMs);
+        if (ExportConcurrency.backendSemaphore === undefined) {
+            return timed();
+        }
+        return ExportConcurrency.backendSemaphore.withPermit(timed);
+    }
+
+    /**
+     * Runs a task and rejects when it does not settle within the time. At the deadline the signal that the task
+     * receives is aborted, so the work it started can stop.
+     *
+     * @param task - the work to run; it receives the signal that fires at the deadline
+     * @param timeoutMs - the time allowed, in milliseconds
+     */
+    private static withDeadline<T>(task: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
+        const controller = new AbortController();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const deadline = new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => {
+                const error = new Error(`The export did not finish within ${timeoutMs / 1000} seconds.`);
+                controller.abort(error);
+                reject(error);
+            }, timeoutMs);
+        });
+        return Promise.race([task(controller.signal), deadline]).finally(() => {
+            clearTimeout(timer);
+        });
     }
 }

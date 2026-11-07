@@ -7,6 +7,7 @@ import type { BackendServices } from "../../backend/BackendServices";
 import { FileUtils } from "../../utils/FileUtils";
 import { BackendTool } from "./BackendTool";
 import { BackendIds } from "./BackendIds";
+import { ImportDirectory } from "./ImportDirectory";
 import { WriteOptions } from "./WriteOptions";
 
 /** Arguments of {@link ImportImageBackendTool}. */
@@ -40,7 +41,10 @@ export class ImportImageBackendArgs {
             .string()
             .min(1)
             .optional()
-            .describe("Absolute path of an image file on this machine. Give exactly one of base64, url or filePath."),
+            .describe(
+                "Absolute path of an image file inside the import directory (PENPOT_MCP_IMPORT_DIR, penpot-imports " +
+                    "in the home directory by default). Give exactly one of base64, url or filePath."
+            ),
         mimeType: z
             .enum(ImportImageBackendArgs.MIME_TYPES)
             .optional()
@@ -145,6 +149,8 @@ interface ApplyAnswer {
     revn: number;
     /** Ids of the created shapes, keyed by their `$tmp:` handle. */
     createdIds: Record<string, string>;
+    /** True when an earlier call with the same requestId already applied this write. */
+    alreadyApplied?: boolean;
 }
 
 /** Stores a raster image in a file and places it as an image shape. */
@@ -188,8 +194,8 @@ export class ImportImageBackendTool extends BackendTool<ImportImageBackendArgs> 
     public getToolDescription(): string {
         return (
             "Adds a raster image to a file as a media object, and by default as an image shape. " +
-            "Supported formats: PNG, JPEG, GIF, WEBP. Up to 50 MB. " +
-            "Give exactly one of base64, url or filePath. " +
+            "Supported formats: PNG, JPEG, GIF, WEBP. Up to 50 MB from a url or filePath; inline base64 is limited " +
+            "to 24 MB of base64 text, about 18 MB of image. Give exactly one of base64, url or filePath. " +
             "The shape goes on the first page unless pageId is given. Give parentId to place it in a board or group. " +
             "If only width or only height is given, the other size keeps the aspect ratio. " +
             "Without width or height, the image keeps its own size. " +
@@ -214,7 +220,7 @@ export class ImportImageBackendTool extends BackendTool<ImportImageBackendArgs> 
         const media =
             args.url !== undefined
                 ? await this.createMediaFromUrl(userToken, args.fileId, args.url, args.name)
-                : await this.uploadImage(userToken, args, this.loadImage(args));
+                : await this.uploadImage(userToken, args, await this.loadImage(args));
 
         if (args.createShape === false) {
             return this.jsonResponse(ImportImageBackendTool.mediaSummary(media));
@@ -226,20 +232,23 @@ export class ImportImageBackendTool extends BackendTool<ImportImageBackendArgs> 
             operations: [ImportImageBackendTool.createImageOperation(args, media, pageId)],
             ...WriteOptions.toParams(args),
         });
-        return this.jsonResponse({
-            ...ImportImageBackendTool.mediaSummary(media),
-            shapeId: answer.createdIds["$tmp:image"],
-            revn: answer.revn,
-        });
+        return this.jsonResponse(
+            WriteOptions.withAlreadyApplied({
+                ...ImportImageBackendTool.mediaSummary(media),
+                shapeId: answer.createdIds["$tmp:image"],
+                revn: answer.revn,
+                alreadyApplied: answer.alreadyApplied,
+            })
+        );
     }
 
     /**
      * Reads the image bytes from the base64 text or the local file that the arguments name.
      *
      * @param args - the validated tool arguments, with exactly one source set
-     * @throws Error when the file is missing, relative, empty or too large
+     * @throws Error when the file is outside the import directory, missing, relative, empty or too large
      */
-    private loadImage(args: ImportImageBackendArgs): LoadedImage {
+    private async loadImage(args: ImportImageBackendArgs): Promise<LoadedImage> {
         if (args.base64 !== undefined) {
             // a data: URL prefix is optional, so the decoder strips it when present
             const bytes = Buffer.from(args.base64.replace(/^data:[^,]*;base64,/, ""), "base64");
@@ -248,12 +257,12 @@ export class ImportImageBackendTool extends BackendTool<ImportImageBackendArgs> 
         }
         if (args.filePath !== undefined) {
             FileUtils.checkPathIsAbsolute(args.filePath);
-            if (!fs.existsSync(args.filePath)) {
-                throw new Error(`File not found: ${args.filePath}`);
-            }
+            // the root check comes first, so that a path outside the root never shows whether it exists
+            ImportDirectory.assertReadable(args.filePath, process.env);
+            const size = await ImportImageBackendTool.sizeOf(args.filePath);
             // check the size before reading, so that a large file is never loaded
-            ImportImageBackendTool.checkSize(fs.statSync(args.filePath).size);
-            const bytes = fs.readFileSync(args.filePath);
+            ImportImageBackendTool.checkSize(size);
+            const bytes = await fs.promises.readFile(args.filePath);
             // a file that is not a supported image is refused before any upload
             if (ImportImageBackendTool.detectMimeType(bytes) === undefined) {
                 throw new Error("The file is not a PNG, JPEG, GIF or WEBP image.");
@@ -411,6 +420,25 @@ export class ImportImageBackendTool extends BackendTool<ImportImageBackendArgs> 
             return "image/webp";
         }
         return undefined;
+    }
+
+    /**
+     * Returns the size of a file, or fails with the file-not-found text when it is missing.
+     *
+     * @param filePath - the absolute path, already checked to lie in the import directory
+     * @throws Error when the file is missing or is not a file
+     */
+    private static async sizeOf(filePath: string): Promise<number> {
+        let stat: fs.Stats;
+        try {
+            stat = await fs.promises.stat(filePath);
+        } catch {
+            throw new Error(`File not found: ${filePath}`);
+        }
+        if (!stat.isFile()) {
+            throw new Error(`File not found: ${filePath}`);
+        }
+        return stat.size;
     }
 
     /**

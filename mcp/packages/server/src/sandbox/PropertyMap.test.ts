@@ -38,7 +38,15 @@ test("unknown plugin type throws an error that names it", () => {
 
 test("every property entry has a valid attr, access and kind", () => {
     const accessValues = new Set(["read", "write", "read-write"]);
-    const kindValues = new Set(["attr", "geometry", "derived", "content", "unsupported"]);
+    const kindValues = new Set([
+        "attr",
+        "geometry",
+        "derived",
+        "content",
+        "layout-child",
+        "path-content",
+        "unsupported",
+    ]);
 
     for (const [name, entry] of Object.entries(PropertyMap.PROPERTIES)) {
         assert.ok(entry.attr.length > 0, `${name} has an empty attr`);

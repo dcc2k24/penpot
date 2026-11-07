@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { PenpotMcpServer } from "../../PenpotMcpServer";
+import type { ToolAnnotations } from "../../Tool";
 import type { ToolResponse } from "../../ToolResponse";
 import type { BackendServices } from "../../backend/BackendServices";
 import { BackendTool } from "./BackendTool";
@@ -21,7 +22,10 @@ export class GetPageTreeArgs {
             .min(1)
             .max(20)
             .optional()
-            .describe("How many levels of children to include below the start shape (1 to 20, default 3)."),
+            .describe(
+                "How many levels to include, counting the start shape as level 1 (1 to 20, default 3). " +
+                    "depth 1 returns the start shape alone; depth 2 adds its direct children."
+            ),
         fields: z
             .array(z.string().min(1))
             .optional()
@@ -36,7 +40,10 @@ export class GetPageTreeArgs {
             .min(1)
             .max(5000)
             .optional()
-            .describe("Maximum number of nodes in this response (1 to 5000, default 500)."),
+            .describe(
+                "Maximum number of nodes in this response (1 to 5000, default 100). A response cut for size " +
+                    "has no nextCursor; repeat the call with a smaller limit instead."
+            ),
         cursor: z
             .string()
             .optional()
@@ -60,10 +67,17 @@ export class GetPageTreeArgs {
 
 /** Returns the shape hierarchy of one page, or of a subtree, one slice at a time. */
 export class GetPageTreeTool extends BackendTool<GetPageTreeArgs> {
+    /** Nodes returned when the caller sets no limit; a page of this size fits the response cap. */
+    private static readonly DEFAULT_LIMIT = 100;
+
     private readonly fieldNames = new BackendFieldNames();
 
     constructor(mcpServer: PenpotMcpServer, services: BackendServices) {
         super(mcpServer, GetPageTreeArgs.schema, services);
+    }
+
+    public annotations(): ToolAnnotations {
+        return { readOnlyHint: true, destructiveHint: false };
     }
 
     public getToolName(): string {
@@ -87,7 +101,7 @@ export class GetPageTreeTool extends BackendTool<GetPageTreeArgs> {
             ...(args.rootId !== undefined ? { rootId: args.rootId } : {}),
             ...(args.depth !== undefined ? { depth: args.depth } : {}),
             ...(args.fields !== undefined ? { fields: this.fieldNames.toBackendFields(args.fields) } : {}),
-            ...(args.limit !== undefined ? { limit: args.limit } : {}),
+            limit: args.limit ?? GetPageTreeTool.DEFAULT_LIMIT,
             ...(args.cursor !== undefined ? { cursor: args.cursor } : {}),
         };
         const response = await this.callCommand<{ root?: unknown } | undefined>(userToken, "get-mcp-page-tree", params);

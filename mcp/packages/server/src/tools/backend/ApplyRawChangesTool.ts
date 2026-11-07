@@ -61,6 +61,7 @@ export class ApplyRawChangesTool extends BackendTool<ApplyRawChangesArgs> {
             changes: args.changes,
             ...WriteOptions.toParams(args),
         };
-        return this.jsonResponse(await this.callWrite(userToken, args.fileId, "mcp-apply-changes", params));
+        const result = await this.callWrite(userToken, args.fileId, "mcp-apply-changes", params);
+        return this.jsonResponse(WriteOptions.withAlreadyApplied(result));
     }
 }

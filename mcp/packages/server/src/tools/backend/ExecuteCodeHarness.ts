@@ -109,7 +109,7 @@ export function pageRecords(shapes: FakeShape[]): Map<string, Record<string, unk
  * @param shapes - shapes of the page
  * @returns the root node
  */
-function pageTree(shapes: FakeShape[]): { id: string; children: unknown[] } {
+export function pageTree(shapes: FakeShape[]): { id: string; children: unknown[] } {
     const build = (id: string): { id: string; children: unknown[] } => ({
         id,
         children: shapes.filter((shape) => (shape.parentId ?? ROOT) === id).map((shape) => build(shape.id)),
@@ -136,6 +136,48 @@ export function applyResult(params: object, revn: number): unknown {
     return { revn, createdIds, warnings: [], changeCount: operations.length };
 }
 
+/** The shape type that each create operation makes in the fake page. */
+const CREATED_TYPES: Record<string, string> = {
+    create_board: "frame",
+    create_rect: "rect",
+    create_ellipse: "circle",
+};
+
+/**
+ * Stores the effect of one write on the shapes of the fake page: a create adds a shape under its parent, and an
+ * update merges its props. Handles map to the ids the write gave them.
+ *
+ * @param shapes - shapes of the fake page, changed in place
+ * @param operations - the operations of the write
+ * @param createdIds - ids of the handles that the write created
+ */
+export function applyToShapes(shapes: FakeShape[], operations: Op[], createdIds: Record<string, string>): void {
+    const resolve = (value: unknown): unknown =>
+        typeof value === "string" && createdIds[value] !== undefined ? createdIds[value] : value;
+    for (const operation of operations) {
+        const type = CREATED_TYPES[operation.op as string];
+        if (type !== undefined) {
+            const shape: FakeShape = {
+                id: resolve(operation.id) as string,
+                type,
+                name: typeof operation.name === "string" ? operation.name : type,
+                parentId: (resolve(operation.parentId) as string | undefined) ?? ROOT,
+            };
+            for (const key of ["x", "y", "width", "height"]) {
+                if (typeof operation[key] === "number") {
+                    shape[key] = operation[key];
+                }
+            }
+            shapes.push(shape);
+        } else if (operation.op === "update_shape") {
+            const shape = shapes.find((candidate) => candidate.id === resolve(operation.id));
+            if (shape !== undefined && typeof operation.props === "object" && operation.props !== null) {
+                Object.assign(shape, operation.props);
+            }
+        }
+    }
+}
+
 /**
  * Builds the fake backend and the tool. The backend accepts every token and echoes the created ids of each write.
  *
@@ -143,12 +185,13 @@ export function applyResult(params: object, revn: number): unknown {
  * @returns the fakes and the tool
  */
 export function harness(options: HarnessOptions = {}): Harness {
-    const shapes = options.shapes ?? [];
+    // the shapes of the fake page; a write adds to them, so a later page read sees what the write created.
+    const shapes: FakeShape[] = [...(options.shapes ?? [])];
     // the revn of the fake file, advanced by every write so that page reads report the latest one.
     let revn = 1;
-    const records = pageRecords(shapes);
     const backend = new FakePenpotBackend()
         .respond("mcp-whoami", {
+            contractVersion: 1,
             profileId: "profile-1",
             scopes: ["mcp:read", "mcp:write", "mcp:manage", "mcp:delete"],
         })
@@ -170,6 +213,7 @@ export function harness(options: HarnessOptions = {}): Harness {
         }))
         .respond("get-mcp-shapes", (params: object) => {
             const ids = (params as { ids: string[] }).ids;
+            const records = pageRecords(shapes);
             return {
                 revn,
                 shapes: ids.filter((id) => records.has(id)).map((id) => records.get(id)),
@@ -198,7 +242,9 @@ export function harness(options: HarnessOptions = {}): Harness {
         })
         .respond("mcp-apply-operations", (params: object) => {
             revn += 1;
-            return applyResult(params, revn);
+            const result = applyResult(params, revn) as { createdIds: Record<string, string> };
+            applyToShapes(shapes, (params as { operations: Op[] }).operations, result.createdIds);
+            return result;
         });
     for (const [name, response] of Object.entries(options.responses ?? {})) {
         backend.respond(name, response);

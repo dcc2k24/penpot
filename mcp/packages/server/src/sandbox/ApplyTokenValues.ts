@@ -62,6 +62,17 @@ export class TokenCatalogue {
 }
 
 /**
+ * The token write rule, shared by the host and the guest. The prelude copies it into the guest, so both sides name
+ * the same operations. `pattern` matches the names of the ops that change tokens, sets, themes or the base font
+ * size; `shapeOps` are the ops that apply or remove a token on shapes, which the pattern also matches and which do
+ * not change the catalogue.
+ */
+export const TOKEN_WRITE_RULE: { readonly pattern: string; readonly shapeOps: readonly string[] } = {
+    pattern: "token|theme|toggle_set|base_font_size",
+    shapeOps: ["apply_token", "unapply_token"],
+};
+
+/**
  * Fills the values of the `apply_token` operations of one batch from the token catalogue of the file.
  *
  * Both write paths use it: `apply_operations` and the flushes of `execute_code`. An operation without
@@ -75,10 +86,10 @@ export class TokenCatalogue {
  */
 export class ApplyTokenValues {
     /** Operation names that apply or remove a token on shapes, and so do not change the catalogue. */
-    private static readonly SHAPE_TOKEN_OPS: ReadonlySet<string> = new Set(["apply_token", "unapply_token"]);
+    private static readonly SHAPE_TOKEN_OPS: ReadonlySet<string> = new Set(TOKEN_WRITE_RULE.shapeOps);
 
     /** Pattern of the operation names that change tokens, sets, themes or the base font size. */
-    private static readonly TOKEN_WRITE = /token|theme|toggle_set|base_font_size/;
+    private static readonly TOKEN_WRITE = new RegExp(TOKEN_WRITE_RULE.pattern);
 
     /**
      * Creates a filler for one write path.

@@ -1,12 +1,19 @@
 /**
  * Size limit of HTTP request bodies, read from `PENPOT_MCP_MAX_BODY_MB`.
  *
- * The same limit sizes the JSON parser of the HTTP endpoint and the base64 fields of the backend tools that
- * carry file contents inline, so that a tool never accepts an argument the endpoint would refuse.
+ * The limit for authenticated requests sizes the JSON parser of the HTTP endpoint and the base64 fields of
+ * the backend tools that carry file contents inline. A request without a token gets the small
+ * {@link BodyLimit.UNAUTHENTICATED_BYTES} limit, so that a stranger cannot make the server buffer large bodies.
  */
 export class BodyLimit {
     /** Default request body limit, in megabytes. */
     public static readonly DEFAULT_MEGABYTES = 32;
+
+    /**
+     * Body limit of a request that the backend has not validated, in bytes. Plugin-bridge exports and
+     * imports carry images inline, so this floor is 4 MB rather than the 2 MB of the JSON parser default.
+     */
+    public static readonly UNAUTHENTICATED_BYTES = 4 * 1024 * 1024;
 
     /** Bytes in one megabyte. */
     private static readonly BYTES_PER_MEGABYTE = 1024 * 1024;

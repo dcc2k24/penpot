@@ -16,6 +16,26 @@ import { ImportArchiveBackendTool } from "./ImportArchiveBackendTool";
 import { ImportImageBackendTool } from "./ImportImageBackendTool";
 import { ImportSvgBackendTool } from "./ImportSvgBackendTool";
 
+/**
+ * Runs a test body with PENPOT_MCP_IMPORT_DIR set to a directory, restoring the previous value afterwards.
+ *
+ * @param dir - the import directory for the duration of the body
+ * @param body - the test body
+ */
+async function withImportDir(dir: string, body: () => Promise<void>): Promise<void> {
+    const previous = process.env.PENPOT_MCP_IMPORT_DIR;
+    process.env.PENPOT_MCP_IMPORT_DIR = dir;
+    try {
+        await body();
+    } finally {
+        if (previous === undefined) {
+            delete process.env.PENPOT_MCP_IMPORT_DIR;
+        } else {
+            process.env.PENPOT_MCP_IMPORT_DIR = previous;
+        }
+    }
+}
+
 const TOKEN = "alice-token";
 const PROJECT = "1b2c3d4e-0000-4000-8000-000000000002";
 const FILE = "1b2c3d4e-0000-4000-8000-000000000003";
@@ -44,6 +64,7 @@ function serverStub(fileSystemAccess: boolean): PenpotMcpServer {
 function harness(fileSystemAccess = true) {
     const backend = new FakePenpotBackend()
         .respond("mcp-whoami", {
+            contractVersion: 1,
             profileId: "profile-1",
             scopes: ["mcp:read", "mcp:write", "mcp:manage", "mcp:delete"],
         })
@@ -277,18 +298,43 @@ test("import_image refuses a request with no source", async () => {
 
 // ── import_image: local file paths ──
 
-test("import_image reads a file path and names the upload after the file", async () => {
+test("import_image reads a file path inside the import directory and names the upload after the file", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "import-image-"));
     try {
-        const filePath = path.join(dir, "photo.png");
-        fs.writeFileSync(filePath, PNG);
-        const { backend, services, server } = harness(true);
-        await new ImportImageBackendTool(server, services).execute({ fileId: FILE, pageId: PAGE, filePath });
-        const upload = lastCall(backend, "upload-file-media-object");
-        assert.deepEqual(upload.fields, { "file-id": FILE, "is-local": "true", name: "photo.png" });
-        assert.equal(filePartOf(upload).fileName, "photo.png");
+        await withImportDir(dir, async () => {
+            const filePath = path.join(dir, "photo.png");
+            fs.writeFileSync(filePath, PNG);
+            const { backend, services, server } = harness(true);
+            await new ImportImageBackendTool(server, services).execute({ fileId: FILE, pageId: PAGE, filePath });
+            const upload = lastCall(backend, "upload-file-media-object");
+            assert.deepEqual(upload.fields, { "file-id": FILE, "is-local": "true", name: "photo.png" });
+            assert.equal(filePartOf(upload).fileName, "photo.png");
+        });
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("import_image refuses a file path outside the import directory before anything is read", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "import-root-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "import-outside-"));
+    try {
+        await withImportDir(root, async () => {
+            const filePath = path.join(outside, "photo.png");
+            fs.writeFileSync(filePath, PNG);
+            const { backend, services, server } = harness(true);
+            const response = await new ImportImageBackendTool(server, services).execute({
+                fileId: FILE,
+                pageId: PAGE,
+                filePath,
+            });
+            assert.equal(response.isError, true);
+            assert.match(textOf(response), /inside the import directory/);
+            assert.equal(backend.callsTo("upload-file-media-object").length, 0);
+        });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(outside, { recursive: true, force: true });
     }
 });
 
@@ -303,16 +349,18 @@ test("import_image refuses a relative file path", async () => {
     assert.equal(backend.callsTo("upload-file-media-object").length, 0);
 });
 
-test("import_image reports a missing file", async () => {
+test("import_image reports a missing file inside the import directory", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "import-image-"));
     try {
-        const { services, server } = harness(true);
-        const missing = path.join(dir, "missing.png");
-        const response = await new ImportImageBackendTool(server, services).execute({
-            fileId: FILE,
-            filePath: missing,
+        await withImportDir(dir, async () => {
+            const { services, server } = harness(true);
+            const missing = path.join(dir, "missing.png");
+            const response = await new ImportImageBackendTool(server, services).execute({
+                fileId: FILE,
+                filePath: missing,
+            });
+            assert.match(textOf(response), /File not found/);
         });
-        assert.match(textOf(response), /File not found/);
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -338,17 +386,16 @@ test("import_svg sends only the set fields and returns the backend answer", asyn
         x: 10,
         name: "icon",
     });
-    assert.deepEqual(lastCall(backend, "mcp-import-svg").params, {
+    const { requestId, ...sent } = lastCall(backend, "mcp-import-svg").params as Record<string, unknown>;
+    assert.match(String(requestId), /^[0-9a-f-]{36}$/);
+    assert.deepEqual(sent, {
         fileId: FILE,
         pageId: PAGE,
         svg,
         x: 10,
         name: "icon",
     });
-    assert.equal(
-        textOf(response),
-        JSON.stringify({ revn: 4, rootId: SHAPE, shapeIds: [SHAPE], changeCount: 3 }, null, 2)
-    );
+    assert.equal(textOf(response), JSON.stringify({ revn: 4, rootId: SHAPE, shapeIds: [SHAPE], changeCount: 3 }));
 });
 
 // ── import_archive ──
@@ -465,11 +512,16 @@ test("import_image refuses a file that is not an image before any upload", async
     const { backend, services, server } = harness();
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "import-image-"));
     try {
-        const file = path.join(dir, "notes.txt");
-        fs.writeFileSync(file, "plain text, not an image");
-        const response = await new ImportImageBackendTool(server, services).execute({ fileId: FILE, filePath: file });
-        assert.match(textOf(response), /not a PNG, JPEG, GIF or WEBP image/);
-        assert.equal(backend.callsTo("upload-file-media-object").length, 0);
+        await withImportDir(dir, async () => {
+            const file = path.join(dir, "notes.txt");
+            fs.writeFileSync(file, "plain text, not an image");
+            const response = await new ImportImageBackendTool(server, services).execute({
+                fileId: FILE,
+                filePath: file,
+            });
+            assert.match(textOf(response), /not a PNG, JPEG, GIF or WEBP image/);
+            assert.equal(backend.callsTo("upload-file-media-object").length, 0);
+        });
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }

@@ -8,6 +8,14 @@ interface Bucket {
     updatedAt: number;
 }
 
+/** Error raised when a token has used its bucket; the caller should retry later. */
+export class RateLimitError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "RateLimitError";
+    }
+}
+
 /**
  * Limits the request rate of each MCP token with a token bucket.
  *
@@ -63,7 +71,7 @@ export class TokenRateLimiter {
 
         if (bucket.available < 1) {
             const retryAfter = Math.ceil((1 - bucket.available) / this.ratePerSecond);
-            throw new Error(`rate limited, retry after ${retryAfter} s`);
+            throw new RateLimitError(`rate limited, retry after ${retryAfter} s`);
         }
         bucket.available -= 1;
     }

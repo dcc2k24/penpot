@@ -1,6 +1,7 @@
 import { EmptyToolArgs } from "../../Tool";
 import type { ToolResponse } from "../../ToolResponse";
 import type { PenpotMcpServer } from "../../PenpotMcpServer";
+import type { ToolAnnotations } from "../../Tool";
 import type { BackendServices } from "../../backend/BackendServices";
 import { BackendTool } from "./BackendTool";
 
@@ -8,6 +9,10 @@ import { BackendTool } from "./BackendTool";
 export class ListTeamsTool extends BackendTool<EmptyToolArgs> {
     constructor(mcpServer: PenpotMcpServer, services: BackendServices) {
         super(mcpServer, EmptyToolArgs.schema, services);
+    }
+
+    public annotations(): ToolAnnotations {
+        return { readOnlyHint: true, destructiveHint: false };
     }
 
     public getToolName(): string {

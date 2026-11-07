@@ -4,7 +4,7 @@ import { BackendSettings } from "./BackendSettings";
 
 test("defaults match the documented values", () => {
     const settings = BackendSettings.fromEnvironment({});
-    assert.equal(settings.timeoutSeconds, 120);
+    assert.equal(settings.timeoutSeconds, 55);
     assert.equal(settings.rateLimitPerSecond, 10);
     assert.equal(settings.rateLimitBurst, 20);
     assert.equal(settings.allowQueryToken, true);
@@ -47,9 +47,9 @@ test("PENPOT_MCP_ALLOW_QUERY_TOKEN accepts only true or false", () => {
     assert.equal(BackendSettings.fromEnvironment({ PENPOT_MCP_ALLOW_QUERY_TOKEN: "TRUE" }).allowQueryToken, true);
 });
 
-test("the backend response cap defaults to 64 MB", () => {
-    assert.equal(BackendSettings.fromEnvironment({}).maxResponseMb, 64);
-    assert.equal(BackendSettings.readMaxResponseMb({}), 64);
+test("the backend response cap defaults to 8 MB", () => {
+    assert.equal(BackendSettings.fromEnvironment({}).maxResponseMb, 8);
+    assert.equal(BackendSettings.readMaxResponseMb({}), 8);
 });
 
 test("PENPOT_MCP_BACKEND_MAX_RESPONSE_MB sets the backend response cap", () => {
@@ -58,12 +58,39 @@ test("PENPOT_MCP_BACKEND_MAX_RESPONSE_MB sets the backend response cap", () => {
     assert.equal(BackendSettings.fromEnvironment({ PENPOT_MCP_BACKEND_MAX_RESPONSE_MB: "16" }).maxResponseMb, 16);
 });
 
-for (const value of ["", "   ", "abc", "0", "-3", "Infinity", "NaN"]) {
-    test(`PENPOT_MCP_BACKEND_MAX_RESPONSE_MB=${JSON.stringify(value)} falls back to 64 without throwing`, () => {
-        assert.equal(BackendSettings.readMaxResponseMb({ PENPOT_MCP_BACKEND_MAX_RESPONSE_MB: value }), 64);
-        assert.equal(BackendSettings.fromEnvironment({ PENPOT_MCP_BACKEND_MAX_RESPONSE_MB: value }).maxResponseMb, 64);
+for (const value of ["abc", "0", "-3", "Infinity", "NaN"]) {
+    test(`PENPOT_MCP_BACKEND_MAX_RESPONSE_MB=${JSON.stringify(value)} is a startup error that names the variable`, () => {
+        assert.throws(
+            () => BackendSettings.readMaxResponseMb({ PENPOT_MCP_BACKEND_MAX_RESPONSE_MB: value }),
+            /PENPOT_MCP_BACKEND_MAX_RESPONSE_MB/
+        );
+        assert.throws(
+            () => BackendSettings.fromEnvironment({ PENPOT_MCP_BACKEND_MAX_RESPONSE_MB: value }),
+            /PENPOT_MCP_BACKEND_MAX_RESPONSE_MB/
+        );
     });
 }
+
+test("a blank response cap falls back to 8 MB", () => {
+    assert.equal(BackendSettings.readMaxResponseMb({ PENPOT_MCP_BACKEND_MAX_RESPONSE_MB: "   " }), 8);
+});
+
+test("the query-parameter token is accepted by default in bridge mode only", () => {
+    assert.equal(BackendSettings.fromEnvironment({}, "bridge").allowQueryToken, true);
+    assert.equal(BackendSettings.fromEnvironment({}, "backend").allowQueryToken, false);
+    assert.equal(BackendSettings.fromEnvironment({}, "both").allowQueryToken, false);
+});
+
+test("an explicit PENPOT_MCP_ALLOW_QUERY_TOKEN wins over the mode default", () => {
+    assert.equal(
+        BackendSettings.fromEnvironment({ PENPOT_MCP_ALLOW_QUERY_TOKEN: "true" }, "both").allowQueryToken,
+        true
+    );
+    assert.equal(
+        BackendSettings.fromEnvironment({ PENPOT_MCP_ALLOW_QUERY_TOKEN: "false" }, "bridge").allowQueryToken,
+        false
+    );
+});
 
 test("the exporter URI defaults to the local exporter", () => {
     assert.equal(BackendSettings.fromEnvironment({}).exporterUri, "http://localhost:6061/");

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { PenpotMcpServer } from "../../PenpotMcpServer";
+import type { ToolAnnotations } from "../../Tool";
 import type { ToolResponse } from "../../ToolResponse";
 import type { BackendServices } from "../../backend/BackendServices";
 import { BackendTool } from "./BackendTool";
@@ -213,6 +214,10 @@ export class ManageFilesTool extends BackendTool<ManageFilesArgs> {
         super(mcpServer, ManageFilesArgs.schema, services);
     }
 
+    public annotations(): ToolAnnotations {
+        return { readOnlyHint: false, destructiveHint: true };
+    }
+
     public getToolName(): string {
         return "manage_files";
     }
@@ -233,9 +238,10 @@ export class ManageFilesTool extends BackendTool<ManageFilesArgs> {
             throw new Error(`manage_files action "${args.action}" needs ${missing.join(", ")}.`);
         }
         const params = spec.params(args);
+        // every action without a file id changes teams or projects and is not queued, so once sent it must finish
         const result = spec.fileScoped
             ? await this.callWrite(userToken, args.fileId!, spec.command, params)
-            : await this.callCommand(userToken, spec.command, params);
+            : await this.withoutAbort(() => this.callCommand(userToken, spec.command, params));
         return this.jsonResponse(result ?? { status: "ok" });
     }
 }

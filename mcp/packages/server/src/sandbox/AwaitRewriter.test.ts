@@ -114,3 +114,13 @@ test("an await inside a non-async function is a syntax error and is returned unc
     const code = "function run() { return await penpot.x(); }";
     assert.equal(AwaitRewriter.rewrite(code), code);
 });
+
+test("promise callbacks are refused, since their writes would run after the last flush", () => {
+    assert.throws(() => AwaitRewriter.rewrite("penpot.createBoard().then(() => 1)"), /promises and their callbacks/);
+    assert.throws(() => AwaitRewriter.rewrite("Promise.resolve().catch(() => 1)"), /promises and their callbacks/);
+    assert.throws(
+        () => AwaitRewriter.rewrite("Promise.prototype.then = function () {};"),
+        /promises and their callbacks/
+    );
+    assert.throws(() => AwaitRewriter.rewrite("p.finally(() => 1)"), /promises and their callbacks/);
+});

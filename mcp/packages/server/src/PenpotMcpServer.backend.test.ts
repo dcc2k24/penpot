@@ -17,6 +17,7 @@ const WHOAMI = {
     fullname: "Alice",
     scopes: ["mcp:read"],
     version: { full: "2.17", base: "2.17" },
+    contractVersion: 1,
 };
 
 let stub: Server;
@@ -69,14 +70,15 @@ afterEach(async () => {
     process.env = previousEnv;
 });
 
-/** Starts the server with the current environment and connects a client that carries a query token. */
+/** Starts the server with the current environment and connects a client that carries a bearer token. */
 async function connect(multiUser = false): Promise<Client> {
     server = new PenpotMcpServer(multiUser);
     await server.start();
     client = new Client({ name: "backend-mode-test", version: "1" });
     const url = new URL(`http://127.0.0.1:${server.port}/mcp`);
-    url.searchParams.set("userToken", "alice");
-    await client.connect(new StreamableHTTPClientTransport(url));
+    await client.connect(
+        new StreamableHTTPClientTransport(url, { requestInit: { headers: { Authorization: "Bearer alice" } } })
+    );
     return client;
 }
 
@@ -94,8 +96,8 @@ function textOf(result: { content: unknown }): string {
 
 const MODE_CASES: [string, Record<string, string | undefined>, string | RegExp][] = [
     ["unset without a backend URI is bridge", {}, "bridge"],
-    ["unset with a backend URI is both", { PENPOT_MCP_BACKEND_URI: "http://localhost:9001/" }, "both"],
-    ["blank mode counts as unset", { PENPOT_MCP_MODE: "  ", PENPOT_MCP_BACKEND_URI: "http://x/" }, "both"],
+    ["unset with a backend URI stays bridge", { PENPOT_MCP_BACKEND_URI: "http://localhost:9001/" }, "bridge"],
+    ["blank mode counts as unset", { PENPOT_MCP_MODE: "  ", PENPOT_MCP_BACKEND_URI: "http://x/" }, "bridge"],
     ["bridge ignores a backend URI", { PENPOT_MCP_MODE: "bridge", PENPOT_MCP_BACKEND_URI: "http://x/" }, "bridge"],
     ["backend with a URI", { PENPOT_MCP_MODE: "backend", PENPOT_MCP_BACKEND_URI: "http://x/" }, "backend"],
     ["mode names are case-insensitive", { PENPOT_MCP_MODE: "BOTH", PENPOT_MCP_BACKEND_URI: "http://x/" }, "both"],
@@ -149,7 +151,7 @@ test("backend mode answers whoami with the backend identity, sending the token a
     process.env.PENPOT_MCP_BACKEND_URI = backendUri;
     const connected = await connect();
     const result = await connected.callTool({ name: "whoami", arguments: {} });
-    assert.match(textOf(result), /"profileId": "profile-1"/);
+    assert.match(textOf(result), /"profileId": ?"profile-1"/);
     const whoamiCalls = received.filter((request) => request.url.endsWith("/api/main/methods/mcp-whoami"));
     assert.ok(whoamiCalls.length >= 1);
     assert.equal(whoamiCalls[0].authorization, "Token alice");

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { PenpotMcpServer } from "../../PenpotMcpServer";
+import type { ToolAnnotations } from "../../Tool";
 import type { ToolResponse } from "../../ToolResponse";
 import type { BackendServices } from "../../backend/BackendServices";
 import { BackendTool } from "./BackendTool";
@@ -8,13 +9,28 @@ import { BackendShapeTypes } from "./BackendShapeTypes";
 
 /** Arguments of {@link FindShapesTool}. */
 export class FindShapesArgs {
+    /** Shape types a search may match, with the aliases that the adapter maps to backend names. */
+    static readonly TYPES = [
+        "frame",
+        "board",
+        "rect",
+        "ellipse",
+        "circle",
+        "text",
+        "path",
+        "group",
+        "bool",
+        "image",
+        "svg-raw",
+    ] as const;
+
     static schema = {
         fileId: BackendIds.uuid().describe("Id of the file to search, from list_files."),
         pageId: BackendIds.uuid()
             .optional()
             .describe("Id of the one page to search. Leave it out to search every page, one page at a time."),
         type: z
-            .string()
+            .enum(FindShapesArgs.TYPES)
             .optional()
             .describe(
                 "Shape type to match: frame, rect, ellipse, text, path, bool, group, image or svg-raw. " +
@@ -73,6 +89,10 @@ export class FindShapesArgs {
 export class FindShapesTool extends BackendTool<FindShapesArgs> {
     constructor(mcpServer: PenpotMcpServer, services: BackendServices) {
         super(mcpServer, FindShapesArgs.schema, services);
+    }
+
+    public annotations(): ToolAnnotations {
+        return { readOnlyHint: true, destructiveHint: false };
     }
 
     public getToolName(): string {

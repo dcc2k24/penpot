@@ -1,9 +1,11 @@
 import { z } from "zod";
 import type { PenpotMcpServer } from "../../PenpotMcpServer";
+import type { ToolAnnotations } from "../../Tool";
 import type { ToolResponse } from "../../ToolResponse";
 import type { BackendServices } from "../../backend/BackendServices";
 import { BackendTool } from "./BackendTool";
 import { BackendIds } from "./BackendIds";
+import { ListWindow } from "./ListWindow";
 
 /** Arguments of {@link ListFilesTool}. */
 export class ListFilesArgs {
@@ -26,10 +28,12 @@ export class ListFilesArgs {
             .number()
             .int()
             .min(1)
+            .max(1000)
             .optional()
             .describe(
-                "Maximum number of search matches to return (1 or more). Needs query. The search is not paginated, " +
-                    "so the limit cuts the matches after the backend answers."
+                "Maximum number of files to return (1 to 1000, default 100). Applies to every listing. The backend " +
+                    "answers in full, so the limit cuts the list after it answers; the output says how many files " +
+                    "were shown and how many exist."
             ),
         deleted: z
             .boolean()
@@ -54,6 +58,10 @@ export class ListFilesTool extends BackendTool<ListFilesArgs> {
         super(mcpServer, ListFilesArgs.schema, services);
     }
 
+    public annotations(): ToolAnnotations {
+        return { readOnlyHint: true, destructiveHint: false };
+    }
+
     public getToolName(): string {
         return "list_files";
     }
@@ -62,7 +70,7 @@ export class ListFilesTool extends BackendTool<ListFilesArgs> {
         return (
             "Lists files. Give a projectId to list one project's files, or a teamId alone to list the team's " +
             "recent files, or a teamId with query to search the team by name, or a teamId with deleted true to " +
-            "list the team's trash. The search is not paginated; limit cuts its matches client-side and the " +
+            "list the team's trash. Every listing keeps the first 100 files unless limit says otherwise; the " +
             "output says how many were shown. " +
             "File ids returned here are the fileId for every later call. " +
             "Next: get_file_outline with a fileId."
@@ -72,50 +80,62 @@ export class ListFilesTool extends BackendTool<ListFilesArgs> {
     protected async executeBackend(args: ListFilesArgs, userToken: string): Promise<ToolResponse> {
         if (args.deleted) {
             this.requireTeam(args);
-            return this.jsonResponse(
-                await this.callCommand(userToken, "get-team-deleted-files", { teamId: args.teamId })
+            return this.listed(
+                await this.callCommand(userToken, "get-team-deleted-files", { teamId: args.teamId }),
+                args
             );
         }
         if (args.projectId) {
-            return this.jsonResponse(
-                await this.callCommand(userToken, "get-project-files", { projectId: args.projectId })
+            return this.listed(
+                await this.callCommand(userToken, "get-project-files", { projectId: args.projectId }),
+                args
             );
         }
         if (args.teamId) {
             if (args.query === undefined) {
-                return this.jsonResponse(
-                    await this.callCommand(userToken, "get-team-recent-files", { teamId: args.teamId })
+                return this.listed(
+                    await this.callCommand(userToken, "get-team-recent-files", { teamId: args.teamId }),
+                    args
                 );
             }
-            return this.searchFiles(userToken, args.teamId, args.query, args.limit);
+            return this.searchFiles(userToken, args.teamId, args.query, args);
         }
         throw new Error("list_files needs a projectId, or a teamId (alone, with query, or with deleted set to true).");
     }
 
     /**
-     * Searches the file names of a team and cuts the matches to the limit, when one is given.
+     * Wraps the files of a listing with their counts, cut to the limit.
+     *
+     * @param answer - the files the backend returned; a non-list answer is returned unchanged
+     * @param args - the tool arguments, which carry the limit
+     */
+    private listed(answer: unknown, args: ListFilesArgs): ToolResponse {
+        if (!Array.isArray(answer)) {
+            return this.jsonResponse(answer);
+        }
+        const kept = ListWindow.cut(answer, args.limit, "files");
+        return this.jsonResponse({ files: kept.items, shown: kept.shown, total: kept.total, note: kept.note });
+    }
+
+    /**
+     * Searches the file names of a team and cuts the matches to the limit.
      *
      * @param userToken - the MCP token of the request
      * @param teamId - team to search
      * @param query - text to find in the file names
-     * @param limit - largest number of matches to return; `undefined` returns every match
+     * @param args - the tool arguments, which carry the limit
      */
     private async searchFiles(
         userToken: string,
         teamId: string,
         query: string,
-        limit: number | undefined
+        args: ListFilesArgs
     ): Promise<ToolResponse> {
         const matches = await this.callCommand<unknown[]>(userToken, "search-files", {
             teamId,
             searchTerm: query,
         });
-        const shown = limit === undefined ? matches : matches.slice(0, limit);
-        const note =
-            shown.length < matches.length
-                ? `Showing ${shown.length} of ${matches.length} matches. Narrow the query to see the rest.`
-                : "";
-        return this.jsonResponse({ files: shown, shown: shown.length, total: matches.length, note });
+        return this.listed(matches, args);
     }
 
     /**

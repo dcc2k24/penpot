@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { PenpotMcpServer } from "../../PenpotMcpServer";
+import type { ToolAnnotations } from "../../Tool";
 import type { ToolResponse } from "../../ToolResponse";
 import type { BackendServices } from "../../backend/BackendServices";
 import { BackendTool } from "./BackendTool";
@@ -22,7 +23,8 @@ export class GetShapesArgs {
             .optional()
             .describe(
                 "Attributes to return per shape, such as width, parent-id or parentId. " +
-                    "camelCase and kebab-case names both work. Default: all attributes."
+                    "camelCase and kebab-case names both work. Default: id, name, type, parentId, x, y, width, height, " +
+                    "hidden and shapes (the ids of the children). Name more, such as fills or content, to get them."
             ),
         includeChildren: z
             .boolean()
@@ -43,10 +45,28 @@ export class GetShapesArgs {
 
 /** Returns the full attributes of specific shapes. */
 export class GetShapesTool extends BackendTool<GetShapesArgs> {
+    /** Attributes returned when the caller names no fields; the heavy ones are left out. */
+    private static readonly DEFAULT_FIELDS = [
+        "id",
+        "name",
+        "type",
+        "parentId",
+        "x",
+        "y",
+        "width",
+        "height",
+        "hidden",
+        "shapes",
+    ];
+
     private readonly fieldNames = new BackendFieldNames();
 
     constructor(mcpServer: PenpotMcpServer, services: BackendServices) {
         super(mcpServer, GetShapesArgs.schema, services);
+    }
+
+    public annotations(): ToolAnnotations {
+        return { readOnlyHint: true, destructiveHint: false };
     }
 
     public getToolName(): string {
@@ -58,7 +78,7 @@ export class GetShapesTool extends BackendTool<GetShapesArgs> {
             "Returns the full attributes of up to 200 shapes by id, plus the ids that do not exist in missing. " +
             "Text shapes include their characters and textLayoutState. " +
             "Attribute names in the response are camelCase. " +
-            "Use fields to keep the answer small. " +
+            "Only a short set of attributes comes back unless fields names more. " +
             "Next: apply_operations to change them, using the ids here."
         );
     }
@@ -68,7 +88,7 @@ export class GetShapesTool extends BackendTool<GetShapesArgs> {
             fileId: args.fileId,
             pageId: args.pageId,
             ids: args.ids,
-            ...(args.fields !== undefined ? { fields: this.fieldNames.toBackendFields(args.fields) } : {}),
+            fields: this.fieldNames.toBackendFields(args.fields ?? GetShapesTool.DEFAULT_FIELDS),
             ...(args.includeChildren !== undefined ? { includeChildren: args.includeChildren } : {}),
         };
         const response = await this.callCommand<{ shapes?: unknown } | undefined>(userToken, "get-mcp-shapes", params);

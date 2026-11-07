@@ -302,18 +302,37 @@ The Penpot MCP server can be configured using environment variables.
 | `PENPOT_MCP_AUTH_URI` | Public base URL of the MCP authorization service, e.g. `https://penpot.example/api/mcp/oauth`. Set to enable OAuth; requires `--multi-user`. Use HTTPS (HTTP is allowed on loopback for development), without credentials, query parameters, or a fragment. | (unset; OAuth disabled) |
 | `PENPOT_MCP_REDIS_URI`                           | Redis connection URI (e.g. `redis://host:6379`) enabling multi-instance horizontal scaling via Redis pub/sub task routing (multi-user mode only). When unset, the server runs in single-instance mode, requiring the plugin and MCP client to connect to the same instance. | (unset)        |
 | `PENPOT_MCP_BACKEND_URI` | Penpot instance base URI. Setting a nonblank value enables the backend tools (`submit_feedback` and, in backend or both mode, the tools in [Backend mode](#backend-mode)). The MCP server appends suffixes such as `api/main/methods/send-mcp-feedback`. Backend interactions require MCP user tokens to be provided.  | (unset) |
-| `PENPOT_MCP_MODE` | Which tools the server offers: `bridge` (plugin tools only), `backend` (backend tools only, no plugin bridge and no WebSocket server) or `both`. `backend` and `both` require `PENPOT_MCP_BACKEND_URI`. In `both` mode the plugin tools are named `execute_code_in_tab`, `export_shape_from_tab` and `import_image_in_tab`. When unset, the mode is `both` if `PENPOT_MCP_BACKEND_URI` is set and `bridge` otherwise. | (`both` with a backend URI, else `bridge`) |
-| `PENPOT_MCP_ALLOW_QUERY_TOKEN` | Accept the MCP token as the `userToken` query parameter. Set to `false` to accept only the `Authorization` header; a request with the query parameter then gets a 401. A warning is logged once per token when the parameter is used. | `true` |
+| `PENPOT_MCP_MODE` | Which tools the server offers: `bridge` (plugin tools only), `backend` (backend tools only, no plugin bridge and no WebSocket server) or `both`. `backend` and `both` require `PENPOT_MCP_BACKEND_URI`. In `both` mode the plugin tools are named `execute_code_in_tab`, `export_shape_from_tab` and `import_image_in_tab`. Setting `PENPOT_MCP_BACKEND_URI` alone does not change the mode. | `bridge` |
+| `PENPOT_MCP_ALLOW_QUERY_TOKEN` | Accept the MCP token as the `userToken` query parameter. Set to `false` to accept only the `Authorization` header; a request with the query parameter then gets a 401. A warning is logged once per token when the parameter is used. | `true` in bridge mode, `false` in backend and both mode |
 | `PENPOT_MCP_RATE_LIMIT_RPS` | Sustained requests per second allowed for each MCP token in backend mode | `10` |
 | `PENPOT_MCP_RATE_LIMIT_BURST` | Requests each MCP token may send at once in backend mode | `20` |
-| `PENPOT_MCP_BACKEND_TIMEOUT_S` | Timeout, in seconds, for each call to the Penpot backend | `120` |
+| `PENPOT_MCP_BACKEND_TIMEOUT_S` | Timeout, in seconds, for each call to the Penpot backend | `55` |
 | `PENPOT_MCP_EXPORTER_URI` | Base URI of the Penpot exporter service. The `export_shape` backend tool posts export requests to its root path. | `http://localhost:6061/` |
 | `PENPOT_MCP_ASSETS_URI` | Base URI that serves `/assets/by-id/` for downloads of export results and of `mode: fill` media. Set it when the backend answers asset requests with HTTP 204 and an `x-accel-redirect` header, which nginx turns into the file. Unset, the server downloads from the origin of the URI that the exporter answers with, which is the public URI. A fill download has no exporter answer, so it uses `PENPOT_MCP_BACKEND_URI` when this is unset. | (unset) |
-| `PENPOT_MCP_BACKEND_MAX_RESPONSE_MB` | Cap, in megabytes, on the body of one backend or exporter response. A larger response fails with an error that names this variable. | `64` |
+| `PENPOT_MCP_BACKEND_MAX_RESPONSE_MB` | Cap, in megabytes, on the body of one backend or exporter response. A larger response fails with an error that names this variable. | `8` |
 | `PENPOT_MCP_MAX_BODY_MB` | Largest HTTP request body the server accepts, in megabytes. The same limit caps the base64 text that `import_archive` and `import_image` accept inline, so an archive above it must be given as `filePath` or `url`. | `32` |
-| `PENPOT_MCP_SANDBOX_TIMEOUT_S` | Time limit, in seconds, of one `execute_code` call in backend mode. | `10` |
+| `PENPOT_MCP_SANDBOX_TIMEOUT_S` | CPU time, in seconds, that one `execute_code` call may use in backend mode. | `3` |
 | `PENPOT_MCP_SANDBOX_IDLE_MIN` | Minutes without a call after which the sandbox state of an MCP token (its runtime and its `storage`) is dropped. | `30` |
-| `PENPOT_MCP_EXPORT_DIR` | Absolute directory that the `filePath` argument of the export tools may write to. Paths outside it, including through symbolic links, are refused. | the home directory of the user who runs the server |
+| `PENPOT_MCP_EXPORT_DIR` | Absolute directory that the `filePath` argument of the export tools may write to. Paths outside it, including through symbolic links, are refused. | `penpot-exports` in the home directory of the user who runs the server |
+| `PENPOT_MCP_IMPORT_DIR` | Absolute directory that the `filePath` argument of the import tools may read from. Paths outside it, including through symbolic links, are refused. | `penpot-imports` in the home directory of the user who runs the server |
+| `PENPOT_MCP_SANDBOX_WALL_S` | Wall-clock limit, in seconds, of one `execute_code` call in backend mode. | `120` |
+| `PENPOT_MCP_SANDBOX_MAX_HOST_CALLS` | Most host calls that one `execute_code` script may make in backend mode. | `1000` |
+| `PENPOT_MCP_SANDBOX_MAX_SESSIONS` | Most live sandbox runtimes in backend mode, and most saved `storage` copies. Each runtime holds a worker thread, so keep this low. | `20` |
+| `PENPOT_MCP_SANDBOX_MAX_CONCURRENT` | Most `execute_code` calls that run at once in backend mode. | `4` |
+| `PENPOT_MCP_SANDBOX_PAGE_MB` | Most page data, in MB of JSON, that one `execute_code` call may hold in backend mode. The guest parses each page as JSON inside a 256 MB WebAssembly memory, and a parsed page takes several times its JSON size, so the default leaves room for the script's own data. A page above the cap fails with its id, shape count and size; use `apply_operations` and `get_shapes`/`find_shapes` for such a page, or raise the setting. | `16` |
+| `PENPOT_MCP_MAX_TOOL_RESPONSE_KB` | Largest JSON answer of one backend tool, in kilobytes (1 to 10000). Longer answers are cut. | `100` |
+
+`PENPOT_MCP_SANDBOX_WORKERS` sets where a sandbox script runs in backend mode. The default, `true`, runs each token's sandbox in a worker thread, so a script that spins for its CPU budget no longer stalls other requests. The server stops a worker that runs past its wall-clock limit, and the next call of that token starts a new worker with the `storage` saved from the last call. Set the variable to `false` to run every script on the main thread, as before. The saved `storage` is JSON: a value that JSON cannot hold, such as a `Map`, a function or a cyclic object, is lost when its worker is stopped, and a `storage` above 8 MB of JSON is not saved; the call then says so and the previous copy is kept. Memory: each worker's JavaScript heap is capped at 512 MB, and its WebAssembly memory can grow to 256 MB. Lower `PENPOT_MCP_SANDBOX_MAX_SESSIONS` on a small server. Workers need the worker entry in the build; see `packages/server/src/sandbox/WORKER_THREADS.md`.
+
+### Health and metrics endpoints
+
+The MCP server serves these endpoints without a token:
+
+- `/healthz` returns `ok` while the process is up. It does not check the backend.
+- `/readyz` returns `ready` (HTTP 200) when the backend is ready, or `not ready` (HTTP 503) when it is not. Without `PENPOT_MCP_BACKEND_URI`, it returns `ready` while the process is up.
+- `/metrics` returns metrics in the Prometheus text format.
+
+For more detail, see the MCP section of the [configuration guide](../docs/technical-guide/configuration.md#mcp).
 
 ### Backend Configuration
 
@@ -384,7 +403,7 @@ The `high_level_overview` tool returns the backend instructions in this mode; th
 `packages/server/data/backend_instructions.md`.
 
 Each MCP token is validated against the backend (`mcp-whoami`, cached for 60 seconds) and limited to
-`PENPOT_MCP_RATE_LIMIT_RPS` requests per second. Writes to one file run one after another.
+`PENPOT_MCP_RATE_LIMIT_RPS` requests per second. Writes by one token to one file run one after another in each server process.
 Request bodies are capped at `PENPOT_MCP_MAX_BODY_MB`, and backend responses at `PENPOT_MCP_BACKEND_MAX_RESPONSE_MB`.
 Exports wait for a slot: at most `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` run at once (4 by default in backend mode).
 A failed tool call returns `isError: true` with the failure text.
@@ -397,8 +416,8 @@ In `both` mode the plain tool names belong to the backend tools, such as `whoami
 `export_shape_from_tab` and `import_image_in_tab`. Clients that call the plugin tools by their old names must
 switch to the new names. To keep the old names and drop the backend tools, set `PENPOT_MCP_MODE=bridge`.
 
-When `PENPOT_MCP_MODE` is unset and `PENPOT_MCP_BACKEND_URI` is set, the server runs in `both` mode and logs a
-warning at startup. Set `PENPOT_MCP_MODE` to `backend` or `bridge` to choose one.
+When `PENPOT_MCP_MODE` is unset, the server runs in `bridge` mode even if `PENPOT_MCP_BACKEND_URI` is set, and logs a
+warning that the backend tools are off. Set `PENPOT_MCP_MODE` to `backend` or `both` to serve them.
 
 The `import_archive` tool takes a `url` only in local mode. The server downloads it, follows at most five
 redirects and refuses loopback, private, link-local, unique-local, CGNAT and unspecified addresses.

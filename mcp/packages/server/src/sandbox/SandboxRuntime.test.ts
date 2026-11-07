@@ -63,8 +63,9 @@ test("start-up time and per-call overhead", async () => {
         runtime.dispose();
     }
     const startUpMedian = median(startUps);
+    // a worker starts in about half a second, and test files run in parallel, so the bound only catches a hang.
     for (const elapsed of startUps) {
-        assert.ok(elapsed < 1000, `start-up took ${elapsed} ms`);
+        assert.ok(elapsed < 10_000, `start-up took ${elapsed} ms`);
     }
     console.log("sandbox start-up ms", startUpMedian.toFixed(2));
 
@@ -260,11 +261,12 @@ test("non-string results are rejected", async () => {
     }
 });
 
-test("a promise that never settles is reported", async () => {
+test("a promise returned by the guest is not read as a result", async () => {
     const runtime = await SandboxRuntime.create("function run() { return new Promise(() => {}) }");
     try {
         await assert.rejects(runtime.invoke("run", [], new TestHost(), 1000), (error: unknown) => {
             assert.ok(error instanceof SandboxRuntimeError);
+            assert.equal(error.message, "The script must return a string.");
             return true;
         });
     } finally {
@@ -272,13 +274,12 @@ test("a promise that never settles is reported", async () => {
     }
 });
 
-test("a promise that rejects in the guest is reported as an error", async () => {
+test("an async function's rejection is not read as a result", async () => {
     const runtime = await SandboxRuntime.create('async function run() { throw new TypeError("async failure") }');
     try {
         await assert.rejects(runtime.invoke("run", [], new TestHost(), 1000), (error: unknown) => {
             assert.ok(error instanceof SandboxRuntimeError);
-            assert.equal(error.guestName, "TypeError");
-            assert.equal(error.message, "async failure");
+            assert.equal(error.message, "The script must return a string.");
             return true;
         });
     } finally {
@@ -286,20 +287,133 @@ test("a promise that rejects in the guest is reported as an error", async () => 
     }
 });
 
-test("a host primitive called after an await is refused without corrupting the runtime", async () => {
+test("a script that replaces Promise.prototype.then cannot hang a call", async () => {
     const runtime = await SandboxRuntime.create(
-        'async function run() { await null; return __host.rpc("x", "{}") }\n' +
-            'async function plain() { await null; return "p" }'
+        'function run() { Promise.prototype.then = function () {}; return "done" }\n' +
+            'function plain() { return "p" }'
     );
     try {
+        assert.equal(await runtime.invoke("run", [], new TestHost(), 1000, { wallMs: 5000 }), "done");
+        assert.equal(await runtime.invoke("plain", [], new TestHost(), 1000, { wallMs: 5000 }), "p");
+    } finally {
+        runtime.dispose();
+    }
+});
+
+test("the arguments of a call are literals, so a setter on __arg0 cannot hang the next call", async () => {
+    const runtime = await SandboxRuntime.create(
+        "function define() {\n" +
+            '  Object.defineProperty(globalThis, "__arg0", { configurable: true, get() { return "" }, set() { for (;;) {} } });\n' +
+            '  return "defined";\n' +
+            "}\n" +
+            "function echo(text) { return text }"
+    );
+    try {
+        assert.equal(await runtime.invoke("define", [], new TestHost(), 1000, { wallMs: 5000 }), "defined");
+        assert.equal(
+            await runtime.invoke("echo", ["quote \"'` ${x}"], new TestHost(), 1000, { wallMs: 5000 }),
+            "quote \"'` ${x}"
+        );
+    } finally {
+        runtime.dispose();
+    }
+});
+
+test("the interrupt handler stops guest code that runs outside a call", async () => {
+    // reads a private method of the in-process runtime, so the runtime is created on this thread.
+    const runtime = await SandboxRuntime.createInProcess("");
+    try {
+        const internals = runtime as unknown as { shouldInterrupt(): boolean };
+        assert.equal(internals.shouldInterrupt(), true);
+    } finally {
+        runtime.dispose();
+    }
+});
+
+test("a write that never answers is ended by the watchdog, and the runtime is marked dead", async () => {
+    class HangingWriteHost extends TestHost {
+        override flush(): Promise<string> {
+            return new Promise<string>(() => {});
+        }
+    }
+    const runtime = await SandboxRuntime.create('function run() { __host.flush("f", "[]", false); return "x" }');
+    try {
+        await assert.rejects(
+            runtime.invoke("run", [], new HangingWriteHost(), 1000, { wallMs: 100, writeGraceMs: 200 }),
+            (error: unknown) => {
+                assert.ok(error instanceof SandboxRuntimeError);
+                assert.equal(error.fatal, true);
+                assert.equal(error.limit, "wall");
+                return true;
+            }
+        );
+        assert.equal(runtime.poisoned, true);
         await assert.rejects(runtime.invoke("run", [], new TestHost(), 1000), (error: unknown) => {
             assert.ok(error instanceof SandboxRuntimeError);
-            assert.equal(error.message, "host primitives cannot be called after an await");
-            assert.equal(error.fatal, false);
+            assert.equal(error.message, "runtime was discarded");
             return true;
         });
-        assert.equal(runtime.poisoned, false);
-        assert.equal(await runtime.invoke("plain", [], new TestHost(), 1000), "p");
+    } finally {
+        runtime.dispose();
+    }
+});
+
+test("a write in flight at the deadline is waited for, and the script stops after it", async () => {
+    class SlowWriteHost extends TestHost {
+        public flushes = 0;
+        override async flush(): Promise<string> {
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            this.flushes += 1;
+            return '{"revn":5}';
+        }
+    }
+    const host = new SlowWriteHost();
+    const runtime = await SandboxRuntime.create(
+        'function run() { var answer = __host.flush("f", "[]", false); return "after:" + answer }'
+    );
+    try {
+        await assert.rejects(runtime.invoke("run", [], host, 1000, { wallMs: 100 }), (error: unknown) => {
+            assert.ok(error instanceof SandboxRuntimeError);
+            assert.equal(error.limit, "wall");
+            return true;
+        });
+        assert.equal(host.flushes, 1);
+    } finally {
+        runtime.dispose();
+    }
+});
+
+test("the wall clock of a call starts when the call starts, not when it is queued", async () => {
+    const runtime = await SandboxRuntime.create(
+        'function slow() { var t = Date.now(); while (Date.now() - t < 300) {} return "s" }\n' +
+            'function run() { return "r" }'
+    );
+    try {
+        const first = runtime.invoke("slow", [], new TestHost(), 1000, { wallMs: 5000 });
+        let remaining = -1;
+        const second = runtime.invoke("run", [], new TestHost(), 1000, {
+            wallMs: 1000,
+            onStart: (deadlineAt) => {
+                remaining = deadlineAt - Date.now();
+            },
+        });
+        assert.equal(await first, "s");
+        assert.equal(await second, "r");
+        assert.ok(remaining >= 900, `the clock had ${remaining} ms left when the call started`);
+    } finally {
+        runtime.dispose();
+    }
+});
+
+test("a global that a script replaces is read-only for the next call", async () => {
+    const runtime = await SandboxRuntime.create(
+        'var __runScript = function () { return "original" };\n' +
+            'function tamper() { __runScript = function () { return "changed" }; return "tampered" }\n' +
+            "function call() { return __runScript() }"
+    );
+    try {
+        assert.equal(await runtime.invoke("tamper", [], new TestHost(), 1000, { wallMs: 5000 }), "tampered");
+        assert.equal(await runtime.invoke("call", [], new TestHost(), 1000, { wallMs: 5000 }), "original");
     } finally {
         runtime.dispose();
     }
@@ -370,7 +484,7 @@ test("a busy loop stops at the wall-clock deadline and poisons the runtime", asy
     const runtime = await SandboxRuntime.create("function run() { while (true) {} }");
     const started = Date.now();
     try {
-        await assert.rejects(runtime.invoke("run", [], new TestHost(), 60_000, Date.now() + 100), (error: unknown) => {
+        await assert.rejects(runtime.invoke("run", [], new TestHost(), 60_000, { wallMs: 100 }), (error: unknown) => {
             assert.ok(error instanceof SandboxRuntimeError);
             assert.equal(error.fatal, true);
             assert.ok(error.message.includes("wall-clock"), error.message);
@@ -392,15 +506,12 @@ test("a host call that never settles stops at the wall-clock deadline", async ()
     const runtime = await SandboxRuntime.create('function run() { return __host.loadPage("f", "p") }');
     const started = Date.now();
     try {
-        await assert.rejects(
-            runtime.invoke("run", [], new HangingHost(), 60_000, Date.now() + 50),
-            (error: unknown) => {
-                assert.ok(error instanceof SandboxRuntimeError);
-                assert.equal(error.fatal, true);
-                assert.ok(error.message.includes("wall-clock"), error.message);
-                return true;
-            }
-        );
+        await assert.rejects(runtime.invoke("run", [], new HangingHost(), 60_000, { wallMs: 50 }), (error: unknown) => {
+            assert.ok(error instanceof SandboxRuntimeError);
+            assert.equal(error.fatal, true);
+            assert.ok(error.message.includes("wall-clock"), error.message);
+            return true;
+        });
         assert.ok(Date.now() - started < 5000);
         assert.equal(runtime.poisoned, true);
     } finally {
@@ -413,15 +524,12 @@ test("a guest that catches the wall-clock error is still stopped", async () => {
         'function run() { try { __host.loadPage("f", "p") } catch (e) { return "caught" } }'
     );
     try {
-        await assert.rejects(
-            runtime.invoke("run", [], new HangingHost(), 60_000, Date.now() + 50),
-            (error: unknown) => {
-                assert.ok(error instanceof SandboxRuntimeError);
-                assert.equal(error.fatal, true);
-                assert.ok(error.message.includes("wall-clock"), error.message);
-                return true;
-            }
-        );
+        await assert.rejects(runtime.invoke("run", [], new HangingHost(), 60_000, { wallMs: 50 }), (error: unknown) => {
+            assert.ok(error instanceof SandboxRuntimeError);
+            assert.equal(error.fatal, true);
+            assert.ok(error.message.includes("wall-clock"), error.message);
+            return true;
+        });
         assert.equal(runtime.poisoned, true);
     } finally {
         runtime.dispose();
@@ -434,8 +542,77 @@ test("without a deadline a slow host call completes, and a far deadline does not
     const runtime = await SandboxRuntime.create('function run() { return __host.loadPage("f", "p") }');
     try {
         assert.equal(await runtime.invoke("run", [], host, 1000), "page:f:p");
-        assert.equal(await runtime.invoke("run", [], host, 1000, Date.now() + 60_000), "page:f:p");
+        assert.equal(await runtime.invoke("run", [], host, 1000, { wallMs: 60_000 }), "page:f:p");
         assert.equal(runtime.poisoned, false);
+    } finally {
+        runtime.dispose();
+    }
+});
+
+test("a write that outlives the grace is waited for while its write allowance lasts", async () => {
+    class SlowFlush extends TestHost {
+        public flushes = 0;
+        override async flush(): Promise<string> {
+            await new Promise((resolve) => setTimeout(resolve, 400));
+            this.flushes += 1;
+            return '{"revn":5}';
+        }
+    }
+    const host = new SlowFlush();
+    const runtime = await SandboxRuntime.create('function run() { __host.flush("f", "[]", false); return "x" }');
+    try {
+        await assert.rejects(
+            runtime.invoke("run", [], host, 1000, { wallMs: 100, writeGraceMs: 50, writeAllowanceMs: () => 5000 }),
+            (error: unknown) => {
+                assert.ok(error instanceof SandboxRuntimeError);
+                assert.equal(error.limit, "wall");
+                return true;
+            }
+        );
+        assert.equal(host.flushes, 1, "the write finished before the call was reported");
+    } finally {
+        runtime.dispose();
+    }
+});
+
+test("a stuck runtime frees its context once the host call it waited for settles", async () => {
+    class LateFlush extends TestHost {
+        override async flush(): Promise<string> {
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            return '{"revn":5}';
+        }
+    }
+    // reads a private flag of the in-process runtime, so the runtime is created on this thread.
+    const runtime = await SandboxRuntime.createInProcess(
+        'function run() { __host.flush("f", "[]", false); return "x" }'
+    );
+    const internals = runtime as unknown as { contextReleased: boolean };
+    try {
+        await assert.rejects(
+            runtime.invoke("run", [], new LateFlush(), 1000, { wallMs: 50, graceMs: 30, writeGraceMs: 30 }),
+            SandboxRuntimeError
+        );
+        assert.equal(runtime.poisoned, true);
+        assert.equal(internals.contextReleased, false, "the context is kept while the host call is pending");
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        assert.equal(internals.contextReleased, true, "the context is freed once the host call settled");
+    } finally {
+        runtime.dispose();
+    }
+});
+
+test("a promise callback that runs after the script fails the call instead of dropping its work", async () => {
+    const runtime = await SandboxRuntime.create(
+        'function run() { var p = Promise.resolve(1); p["then"](function () { return 2 }); return "x" }\n' +
+            'function plain() { return "p" }'
+    );
+    try {
+        await assert.rejects(runtime.invoke("run", [], new TestHost(), 1000, { wallMs: 5000 }), (error: unknown) => {
+            assert.ok(error instanceof SandboxRuntimeError);
+            assert.match(error.message, /promise callback ran after the script/);
+            return true;
+        });
+        assert.equal(await runtime.invoke("plain", [], new TestHost(), 1000, { wallMs: 5000 }), "p");
     } finally {
         runtime.dispose();
     }

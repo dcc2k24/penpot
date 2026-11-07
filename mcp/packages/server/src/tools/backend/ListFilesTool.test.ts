@@ -21,8 +21,7 @@ function sessionServer(): PenpotMcpServer {
 
 /** A fake backend that accepts every token. */
 function acceptingBackend(): FakePenpotBackend {
-    return new FakePenpotBackend().respond("mcp-whoami", {
-        profileId: "profile-1",
+    return new FakePenpotBackend().respond("mcp-whoami", { contractVersion: 1, profileId: "profile-1",
         scopes: ["mcp:read", "mcp:write", "mcp:manage", "mcp:delete"],
     });
 }
@@ -85,8 +84,28 @@ test("list_files with a limit cuts the search matches and reports files, shown, 
         files: matches(5).slice(0, 2),
         shown: 2,
         total: 5,
-        note: "Showing 2 of 5 matches. Narrow the query to see the rest.",
+        note: "Showing 2 of 5 files. Repeat the call with a larger limit, or narrow the request, to see the rest.",
     });
+});
+
+test("list_files without a limit keeps the first 100 files of a project listing and says how many exist", async () => {
+    const backend = acceptingBackend().respond("get-project-files", matches(150));
+
+    const parsed = JSON.parse(textOf(await toolFor(backend).execute({ projectId: TEAM })));
+
+    assert.equal(parsed.files.length, 100);
+    assert.equal(parsed.shown, 100);
+    assert.equal(parsed.total, 150);
+    assert.match(parsed.note, /Showing 100 of 150 files/);
+});
+
+test("list_files with a limit on a recent-files listing cuts it and says so", async () => {
+    const backend = acceptingBackend().respond("get-team-recent-files", matches(3));
+
+    const parsed = JSON.parse(textOf(await toolFor(backend).execute({ teamId: TEAM, limit: 1 })));
+
+    assert.deepEqual(parsed.files, matches(1));
+    assert.equal(parsed.total, 3);
 });
 
 test("list_files with a limit at or above the match count returns every match with an empty note", async () => {

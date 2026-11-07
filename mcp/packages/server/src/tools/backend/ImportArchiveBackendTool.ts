@@ -1,15 +1,17 @@
 import { z } from "zod";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { Agent, Response as FetchResponse } from "undici";
 import type { PenpotMcpServer } from "../../PenpotMcpServer";
 import type { ToolResponse } from "../../ToolResponse";
 import type { BackendServices } from "../../backend/BackendServices";
 import { FileUtils } from "../../utils/FileUtils";
 import { BodyLimit } from "../../utils/BodyLimit";
 import { PublicAddressPolicy } from "../../utils/PublicAddressPolicy";
-import { Semaphore } from "../../utils/Semaphore";
 import { BackendTool } from "./BackendTool";
 import { BackendIds } from "./BackendIds";
+import { ImportDirectory } from "./ImportDirectory";
+import { ImportGate } from "./ImportGate";
 
 /** Describes the base64 argument; the body cap is noted here because the cap is set by the environment. */
 const BASE64_DESCRIPTION =
@@ -36,7 +38,8 @@ export class ImportArchiveBackendArgs {
             .min(1)
             .optional()
             .describe(
-                "Absolute path of a .penpot archive on this machine. Give exactly one of base64, url or filePath."
+                "Absolute path of a .penpot archive inside the import directory (PENPOT_MCP_IMPORT_DIR, " +
+                    "penpot-imports in the home directory by default). Give exactly one of base64, url or filePath."
             ),
         name: z
             .string()
@@ -79,8 +82,11 @@ export class ImportArchiveBackendTool extends BackendTool<ImportArchiveBackendAr
     /** Most redirects that one download may follow. */
     private static readonly MAX_REDIRECTS = 5;
 
-    /** Number of archive imports that may run at once, across all sessions of the process. */
-    private static readonly imports = new Semaphore("import_archive", 2);
+    /**
+     * Gate of the archive imports of the process: two run at once, eight may wait, and a wait ends after a minute.
+     * The gate is taken before the archive is read, so a waiting import holds no archive bytes.
+     */
+    private static readonly imports = new ImportGate(2, 8, 60_000);
 
     /**
      * Creates the archive import tool. The filePath argument is offered only in local mode, and the url
@@ -113,6 +119,7 @@ export class ImportArchiveBackendTool extends BackendTool<ImportArchiveBackendAr
             "Imports a .penpot archive into a project as a new file. " +
             "Give exactly one of base64, url or filePath. Up to 200 MB. " +
             "url is downloaded by the MCP server (local mode only). " +
+            "filePath must lie inside the import directory (PENPOT_MCP_IMPORT_DIR). " +
             "Inline base64 is limited by the request body cap (PENPOT_MCP_MAX_BODY_MB, 32 MB by default); " +
             "archives above that cap must use filePath or url. " +
             "Returns the ids of the new files. " +
@@ -121,38 +128,44 @@ export class ImportArchiveBackendTool extends BackendTool<ImportArchiveBackendAr
     }
 
     /**
-     * Loads the archive from the one source that the arguments name, then uploads it to the backend.
+     * Takes a slot in the import gate, loads the archive from the one source that the arguments name, then
+     * uploads it to the backend.
      *
      * @param args - the validated tool arguments
      * @param userToken - the MCP token of the request
-     * @throws Error when no source or more than one source is given, or the archive is invalid
+     * @throws Error when no source or more than one source is given, the archive is invalid, or the server is busy
      */
     protected async executeBackend(args: ImportArchiveBackendArgs, userToken: string): Promise<ToolResponse> {
         const sourceCount = [args.base64, args.url, args.filePath].filter((value) => value !== undefined).length;
         if (sourceCount !== 1) {
             throw new Error("Give exactly one of base64, url or filePath.");
         }
-        const archive = await this.loadArchive(args);
-        const name = args.name ?? archive.baseName ?? "Imported file";
-        if (name.length < 1 || name.length > 250) {
-            throw new Error("The file name must be 1 to 250 characters. Pass name.");
-        }
-        const answer = await ImportArchiveBackendTool.imports.withPermit(() =>
-            this.callMultipart<unknown>(
-                userToken,
-                "import-binfile",
-                { name, "project-id": args.projectId, version: "3" },
-                [
-                    {
-                        fieldName: "file",
-                        fileName: "archive.penpot",
-                        mimeType: "application/octet-stream",
-                        content: archive.bytes,
-                    },
-                ],
-                { timeoutMs: ImportArchiveBackendTool.IMPORT_TIMEOUT_MS }
-            )
-        );
+        const answer = await ImportArchiveBackendTool.imports.withPermit(async () => {
+            const archive = await this.loadArchive(args);
+            const name = args.name ?? archive.baseName ?? "Imported file";
+            if (name.length < 1 || name.length > 250) {
+                throw new Error("The file name must be 1 to 250 characters. Pass name.");
+            }
+            this.reportProgress(1, 2, "The archive is read; uploading it to the backend.");
+            // the import creates files and is not tied to one file, so it is not queued: once sent it must finish
+            return this.withoutAbort(() =>
+                this.callMultipart<unknown>(
+                    userToken,
+                    "import-binfile",
+                    { name, "project-id": args.projectId, version: "3" },
+                    [
+                        {
+                            fieldName: "file",
+                            fileName: "archive.penpot",
+                            mimeType: "application/octet-stream",
+                            content: archive.bytes,
+                        },
+                    ],
+                    { timeoutMs: ImportArchiveBackendTool.IMPORT_TIMEOUT_MS }
+                )
+            );
+        });
+        this.reportProgress(2, 2, "The backend has imported the archive.");
         const fileIds = ImportArchiveBackendTool.fileIdsOf(answer);
         return this.jsonResponse({ fileIds, ...(fileIds.length === 0 ? { result: answer } : {}) });
     }
@@ -181,12 +194,12 @@ export class ImportArchiveBackendTool extends BackendTool<ImportArchiveBackendAr
         }
         if (args.filePath !== undefined) {
             FileUtils.checkPathIsAbsolute(args.filePath);
-            if (!fs.existsSync(args.filePath)) {
-                throw new Error(`File not found: ${args.filePath}`);
-            }
+            // the root check comes first, so that a path outside the root never shows whether it exists
+            ImportDirectory.assertReadable(args.filePath, process.env);
+            const size = await ImportArchiveBackendTool.sizeOf(args.filePath);
             // check the size before reading, so that a large archive is never loaded
-            ImportArchiveBackendTool.checkSize(fs.statSync(args.filePath).size);
-            const bytes = fs.readFileSync(args.filePath);
+            ImportArchiveBackendTool.checkSize(size);
+            const bytes = await fs.promises.readFile(args.filePath);
             ImportArchiveBackendTool.checkZip(bytes);
             return {
                 bytes,
@@ -197,74 +210,102 @@ export class ImportArchiveBackendTool extends BackendTool<ImportArchiveBackendAr
     }
 
     /**
+     * Returns the size of a file, or fails with the file-not-found text when it is missing.
+     *
+     * @param filePath - the absolute path of an existing or missing file, already checked to lie in the root
+     * @throws Error when the file is missing or is not a file
+     */
+    private static async sizeOf(filePath: string): Promise<number> {
+        let stat: fs.Stats;
+        try {
+            stat = await fs.promises.stat(filePath);
+        } catch {
+            throw new Error(`File not found: ${filePath}`);
+        }
+        if (!stat.isFile()) {
+            throw new Error(`File not found: ${filePath}`);
+        }
+        return stat.size;
+    }
+
+    /**
      * Downloads the archive from an http or https address. Each hop of a redirect is checked against the
-     * address policy, and at most {@link MAX_REDIRECTS} redirects are followed.
+     * address policy and connects to the checked address, and at most {@link MAX_REDIRECTS} redirects are followed.
      *
      * @param url - the address of the archive
-     * @throws Error when the address is not http or https, points to a refused address, the status is not OK,
-     *   there are too many redirects, or the archive is too large
+     * @throws Error when the address is not http or https, points to a refused address, the server refuses the
+     *   download, there are too many redirects, or the archive is too large
      */
     private async download(url: string): Promise<Uint8Array> {
         if (!/^https?:\/\//i.test(url)) {
             throw new Error("The url must start with http:// or https://.");
         }
-        const response = await this.followRedirects(new URL(url));
-        if (!response.ok) {
-            throw new Error(`The download failed with HTTP status ${response.status}.`);
-        }
-        // refuse early when the server declares a size above the limit
-        if (Number(response.headers.get("content-length") ?? 0) > ImportArchiveBackendTool.MAX_ARCHIVE_BYTES) {
-            throw new Error("The archive is larger than 200 MB.");
-        }
-        const body = response.body;
-        if (body === null) {
-            const bytes = new Uint8Array(await response.arrayBuffer());
-            ImportArchiveBackendTool.checkSize(bytes.length);
-            return bytes;
-        }
-        // the declared size can be wrong or missing, so the bytes are counted while they arrive
-        const reader = body.getReader();
-        const chunks: Uint8Array[] = [];
-        let total = 0;
-        for (;;) {
-            const { done, value } = await reader.read();
-            if (done) {
-                break;
+        const { response, agent } = await this.followRedirects(new URL(url));
+        try {
+            if (!response.ok) {
+                throw new Error("The download was refused by the server, so no archive was read.");
             }
-            total += value.byteLength;
-            if (total > ImportArchiveBackendTool.MAX_ARCHIVE_BYTES) {
-                await reader.cancel();
+            // refuse early when the server declares a size above the limit
+            if (Number(response.headers.get("content-length") ?? 0) > ImportArchiveBackendTool.MAX_ARCHIVE_BYTES) {
                 throw new Error("The archive is larger than 200 MB.");
             }
-            chunks.push(value);
+            const body = response.body;
+            if (body === null) {
+                const bytes = new Uint8Array(await response.arrayBuffer());
+                ImportArchiveBackendTool.checkSize(bytes.length);
+                return bytes;
+            }
+            // the declared size can be wrong or missing, so the bytes are counted while they arrive
+            const reader = body.getReader();
+            const chunks: Uint8Array[] = [];
+            let total = 0;
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    break;
+                }
+                total += value.byteLength;
+                if (total > ImportArchiveBackendTool.MAX_ARCHIVE_BYTES) {
+                    await reader.cancel();
+                    throw new Error("The archive is larger than 200 MB.");
+                }
+                chunks.push(value);
+            }
+            ImportArchiveBackendTool.checkSize(total);
+            return Buffer.concat(chunks);
+        } finally {
+            await agent.close();
         }
-        ImportArchiveBackendTool.checkSize(total);
-        return Buffer.concat(chunks);
     }
 
     /**
-     * Fetches an address by hand, checking every hop before it is requested.
+     * Fetches an address by hand, checking every hop before it is requested and connecting to the checked address.
      *
      * @param start - the first address to fetch
-     * @returns the response of the final hop, with its body unread
+     * @returns the response of the final hop, with its body unread, and the pool that must be closed after it
      * @throws Error when a hop points to a refused address or a non-http scheme, or when there are too many redirects
      */
-    private async followRedirects(start: URL): Promise<Response> {
+    private async followRedirects(start: URL): Promise<{ response: FetchResponse; agent: Agent }> {
         let current = start;
         for (let hop = 0; ; hop++) {
             if (!["http:", "https:"].includes(current.protocol)) {
                 throw new Error("The url must start with http:// or https://.");
             }
-            await PublicAddressPolicy.assertPublicHost(current);
-            const response = await fetch(current, {
+            const checked = await PublicAddressPolicy.checkedAddressOf(current);
+            // fetchPinned closes the pool itself when the request fails
+            const { response, agent } = await PublicAddressPolicy.fetchPinned(checked, current, {
                 redirect: "manual",
                 signal: AbortSignal.timeout(ImportArchiveBackendTool.DOWNLOAD_TIMEOUT_MS),
             });
             const location = response.headers.get("location");
             if (response.status < 300 || response.status > 399 || location === null) {
-                return response;
+                return { response, agent };
             }
-            await response.body?.cancel();
+            try {
+                await response.body?.cancel();
+            } finally {
+                await agent.close();
+            }
             if (hop >= ImportArchiveBackendTool.MAX_REDIRECTS) {
                 throw new Error(`The download followed more than ${ImportArchiveBackendTool.MAX_REDIRECTS} redirects.`);
             }

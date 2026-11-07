@@ -3,7 +3,8 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import { once } from "node:events";
 import { afterEach, beforeEach, test } from "node:test";
 import { BackendRpcError } from "./backend/BackendRpcError";
-import { PenpotBackendClient } from "./PenpotBackendClient";
+import { PenpotBackendClient, isWriteCommand } from "./PenpotBackendClient";
+import { CallContext } from "./backend/CallContext";
 
 /** One request received by the local backend stub. */
 interface Received {
@@ -303,5 +304,81 @@ test("callCommand refuses redirects instead of following them", async () => {
 test("rejects a base URI with credentials, a query or a fragment", () => {
     for (const uri of ["https://user:secret@example.com/", "https://example.com/?token=1", "file:///tmp/x"]) {
         assert.throws(() => new PenpotBackendClient(uri), /PENPOT_MCP_BACKEND_URI/);
+    }
+});
+
+test("callCommand gives up when the caller signal fires, before the timeout", async () => {
+    reply.delayMs = 500;
+    const controller = new AbortController();
+    const call = client().callCommand("alice", "get-teams", {}, { signal: controller.signal, timeoutMs: 5_000 });
+    setTimeout(() => controller.abort(), 20);
+    await assert.rejects(call, /got no response \(AbortError\)/);
+});
+
+test("callCommand takes the signal of the current call when none is given", async () => {
+    reply.delayMs = 500;
+    const controller = new AbortController();
+    const call = CallContext.run({ signal: controller.signal }, () => client().callCommand("alice", "get-teams", {}));
+    setTimeout(() => controller.abort(), 20);
+    await assert.rejects(call, /got no response/);
+});
+
+test("callCommand sends the request id of the current call as X-Request-Id", async () => {
+    await CallContext.run({ requestId: "req-42" }, () => client().callCommand("alice", "get-teams", {}));
+    assert.equal(received[0].headers["x-request-id"], "req-42");
+});
+
+test("callCommand sends no X-Request-Id outside a tool call", async () => {
+    await client().callCommand("alice", "get-teams", {});
+    assert.equal(received[0].headers["x-request-id"], undefined);
+});
+
+test("callCommand passes the connection pool to fetch", async (t) => {
+    const pool = { pool: true };
+    const seen: RequestInit[] = [];
+    t.mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
+        seen.push(init ?? {});
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+    await new PenpotBackendClient(baseUri, 120, 8, pool as never).callCommand("alice", "get-teams", {});
+    assert.equal((seen[0] as { dispatcher?: unknown }).dispatcher, pool);
+});
+
+test("a body over the cap is refused when the client was built with the cap from settings", async () => {
+    reply.chunked = true;
+    reply.body = JSON.stringify({ data: "x".repeat(2 * 1024 * 1024) });
+    await assert.rejects(
+        new PenpotBackendClient(baseUri, 120, 1).callCommand("alice", "get-teams", {}),
+        /exceeds 1 MB/
+    );
+});
+
+test("a write command is not aborted by the caller's signal, even while it is in flight", async () => {
+    reply.delayMs = 200;
+    const controller = new AbortController();
+    const call = client().callCommand("alice", "delete-project", {}, { signal: controller.signal, timeoutMs: 5_000 });
+    setTimeout(() => controller.abort(), 20);
+    assert.deepEqual(await call, {});
+});
+
+test("a call marked abortable false is not aborted, even when it is a read", async () => {
+    reply.delayMs = 200;
+    const controller = new AbortController();
+    const call = client().callCommand(
+        "alice",
+        "get-teams",
+        {},
+        { signal: controller.signal, abortable: false, timeoutMs: 5_000 }
+    );
+    setTimeout(() => controller.abort(), 20);
+    assert.deepEqual(await call, {});
+});
+
+test("isWriteCommand names the commands that change state and no read", () => {
+    for (const name of ["create-file", "delete-project", "move-files", "import-binfile", "mcp-apply-operations"]) {
+        assert.equal(isWriteCommand(name), true, name);
+    }
+    for (const name of ["get-teams", "mcp-whoami", "get-mcp-shapes"]) {
+        assert.equal(isWriteCommand(name), false, name);
     }
 });

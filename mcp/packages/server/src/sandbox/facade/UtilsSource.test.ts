@@ -381,11 +381,17 @@ test("addFlexLayout adds the layout with the direction and moves the children in
     const { host, context } = setup();
     const envelope = runScript(context, 'penpotUtils.addFlexLayout(penpot.currentPage.getShapeById("B1"), "row");');
     assert.equal(envelope.ok, true);
-    assert.deepEqual(lastOperations(host), [
-        { op: "set_flex_layout", pageId: "P1", id: "B1", layoutFlexDir: "row" },
-        { op: "move_shapes", pageId: "P1", ids: ["R1"], parentId: "B1", index: 0 },
-        { op: "move_shapes", pageId: "P1", ids: ["G1"], parentId: "B1", index: 0 },
-    ]);
+    // the children are moved once the layout is in the page, so the moves go in a flush of their own
+    assert.deepEqual(
+        host.calls.flush.map((call) => call.operations),
+        [
+            [{ op: "set_flex_layout", pageId: "P1", id: "B1", layoutFlexDir: "row" }],
+            [
+                { op: "move_shapes", pageId: "P1", ids: ["R1"], parentId: "B1", index: 0 },
+                { op: "move_shapes", pageId: "P1", ids: ["G1"], parentId: "B1", index: 0 },
+            ],
+        ]
+    );
 });
 
 test("analyzeDescendants keeps the non-null results of the descendants, and a depth of 1 stops at the children", () => {

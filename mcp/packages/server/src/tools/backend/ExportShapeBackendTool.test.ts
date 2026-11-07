@@ -40,7 +40,7 @@ interface ContentItem {
  */
 function harness(fsEnabled = false) {
     const backend = new FakePenpotBackend()
-        .respond("mcp-whoami", { profileId: "profile-1", scopes: ["mcp:read"] })
+        .respond("mcp-whoami", { contractVersion: 1, profileId: "profile-1", scopes: ["mcp:read"] })
         .respond("create-mcp-render-session", {
             token: "rs-1",
             expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
@@ -150,7 +150,7 @@ test("a page exports each root shape in page order and returns one image per sha
         pageId: PAGE,
         depth: 2,
         limit: 5000,
-        fields: ["name"],
+        fields: ["name", "width", "height"],
     });
     assert.equal(backend.callsTo("get-mcp-shapes").length, 0);
     assert.deepEqual(
@@ -363,7 +363,7 @@ test("a render session the exporter refuses is dropped and the call is retried o
 
 test("a 401 that a fresh render session cures returns the image", async () => {
     const backend = new FakePenpotBackend()
-        .respond("mcp-whoami", { profileId: "profile-1", scopes: ["mcp:read"] })
+        .respond("mcp-whoami", { contractVersion: 1, profileId: "profile-1", scopes: ["mcp:read"] })
         .respond("create-mcp-render-session", {
             token: "rs-1",
             expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
@@ -460,7 +460,7 @@ test("a shape that is not on the page is refused before the exporter is called",
         fileId: FILE,
         pageId: PAGE,
         ids: [SHAPE],
-        fields: ["id"],
+        fields: ["id", "width", "height"],
     });
     assert.equal(exporter.exports.length, 0);
 });
@@ -472,4 +472,138 @@ test("another backend error from the shape read passes through unchanged", async
     assert.equal(response.isError, true);
     assert.equal(textOf(response), "Tool execution failed: Error: file not found");
     assert.equal(exporter.exports.length, 0);
+});
+
+test("an svg above 256 kB is refused inline and asks for filePath", async () => {
+    const { exporter, tool } = harness();
+    exporter.respondExport({ bytes: new Uint8Array(300_000), mimeType: "image/svg+xml" });
+    const response = await tool.execute({ ...shapeArgs, format: "svg" });
+    assert.equal(response.isError, true);
+    assert.match(textOf(response), /above the 256 kB limit for inline svg output.*filePath/);
+});
+
+test("a pdf above 256 kB is refused inline, and a file of that size is saved when filePath is given", async () => {
+    const { exporter, tool } = harness(true);
+    exporter.respondExport({ bytes: new Uint8Array(300_000), mimeType: "application/pdf" });
+    const inline = await tool.execute({ ...shapeArgs, format: "pdf" });
+    assert.equal(inline.isError, true);
+    assert.match(textOf(inline), /above the 256 kB limit for inline pdf output/);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "export-big-pdf-"));
+    try {
+        await withExportDir(dir, async () => {
+            const file = path.join(dir, "big.pdf");
+            const saved = await tool.execute({ ...shapeArgs, format: "pdf", filePath: file });
+            assert.equal(saved.isError, undefined);
+            assert.equal(fs.statSync(file).size, 300_000);
+        });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("a raster whose box times the scale has more than 16 million pixels is refused before the render", async () => {
+    const { backend, exporter, tool } = harness();
+    backend.respond("get-mcp-shapes", { shapes: [{ id: SHAPE, type: "rect", width: 2000, height: 2000 }] });
+    const response = await tool.execute({ ...shapeArgs, scale: 5 });
+    assert.equal(response.isError, true);
+    assert.match(textOf(response), /above the 16 million limit for png output/);
+    assert.equal(exporter.exports.length, 0);
+});
+
+test("a raster within 16 million pixels is rendered", async () => {
+    const { backend, exporter, tool } = harness();
+    backend.respond("get-mcp-shapes", { shapes: [{ id: SHAPE, type: "rect", width: 2000, height: 2000 }] });
+    await tool.execute({ ...shapeArgs, scale: 2 });
+    assert.equal(exporter.exports.length, 1);
+});
+
+test("a filePath with the wrong extension is refused before the export", async () => {
+    const { exporter, tool } = harness(true);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "export-ext-"));
+    try {
+        await withExportDir(dir, async () => {
+            const response = await tool.execute({ ...shapeArgs, format: "png", filePath: path.join(dir, "out.jpg") });
+            assert.equal(response.isError, true);
+            assert.match(textOf(response), /must end in \.png for this format/);
+            assert.equal(exporter.exports.length, 0);
+        });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("an existing file is refused unless overwrite is true, and then it is replaced", async () => {
+    const { exporter, tool } = harness(true);
+    exporter.respondExport({ bytes: PNG, mimeType: "image/png" });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "export-overwrite-"));
+    try {
+        await withExportDir(dir, async () => {
+            const file = path.join(dir, "out.png");
+            fs.writeFileSync(file, "keep me");
+            const refused = await tool.execute({ ...shapeArgs, filePath: file });
+            assert.equal(refused.isError, true);
+            assert.match(textOf(refused), /already exists\. Pass overwrite true/);
+            assert.equal(exporter.exports.length, 0);
+            assert.equal(fs.readFileSync(file, "utf8"), "keep me");
+            await tool.execute({ ...shapeArgs, filePath: file, overwrite: true });
+            assert.deepEqual(fs.readFileSync(file), Buffer.from(PNG));
+        });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("a filePath through a symbolic link below the export directory is refused before the export", async () => {
+    const { exporter, tool } = harness(true);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "export-link-"));
+    try {
+        await withExportDir(dir, async () => {
+            const elsewhere = path.join(dir, "elsewhere");
+            fs.mkdirSync(elsewhere);
+            // a junction to a folder needs no special rights on Windows, unlike a file symlink
+            fs.symlinkSync(elsewhere, path.join(dir, "link"), "junction");
+            const response = await tool.execute({ ...shapeArgs, filePath: path.join(dir, "link", "out.png") });
+            assert.equal(response.isError, true);
+            assert.match(textOf(response), /must not pass through a symbolic link/);
+            assert.equal(exporter.exports.length, 0);
+        });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("a page keeps the shapes rendered before one that fails, and the response is an error", async () => {
+    const { backend, exporter, tool } = harness();
+    backend.respond(
+        "get-mcp-page-tree",
+        pageTree([
+            { id: rootId(1), name: "Board A" },
+            { id: rootId(2), name: "Board B" },
+            { id: rootId(3), name: "Board C" },
+        ])
+    );
+    exporter.respondExport((request) => {
+        if (request.objectId === rootId(2)) {
+            throw new ExporterError(500, "render crashed");
+        }
+        return { bytes: PNG, mimeType: "image/png" };
+    });
+    const response = await tool.execute(pageArgs);
+    assert.equal(response.isError, true);
+    assert.deepEqual(
+        response.content.map((item) => item.type),
+        ["text", "text", "image"]
+    );
+    assert.match(textOf(response), /exported 1 of 3 root shapes/);
+    assert.match(textOf(response), new RegExp(`Shape ${rootId(2)} could not be exported`));
+    assert.match(textOf(response), /shapes after it were not exported/);
+});
+
+test("a page whose first root shape fails is an error with no partial result", async () => {
+    const { backend, exporter, tool } = harness();
+    backend.respond("get-mcp-page-tree", pageTree([{ id: rootId(1), name: "Board A" }]));
+    exporter.failExport(new ExporterError(500, "render crashed"));
+    const response = await tool.execute(pageArgs);
+    assert.equal(response.isError, true);
+    assert.match(textOf(response), new RegExp(`Shape ${rootId(1)} could not be exported`));
 });

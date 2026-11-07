@@ -234,20 +234,20 @@ test("penpotMgmt.listTeams returns the teams of the rpc", async () => {
     assert.equal(backend.callsTo("get-teams").length, 1);
 });
 
-/** A script that creates one board and 1600 rectangles inside it, which makes 1601 operations after folding. */
+/** A script that creates one board and 2100 rectangles inside it, which makes 2101 operations after folding. */
 const LARGE_FLUSH = `const board = penpot.createBoard();
-                 for (let i = 0; i < 1600; i++) {
+                 for (let i = 0; i < 2100; i++) {
                      board.appendChild(penpot.createRectangle());
                  }
                  return "ok";`;
 
-test("a flush over 1500 operations goes in several calls, and later calls get the ids of earlier ones", async () => {
+test("a flush over 2000 operations goes in several calls, and later calls get the ids of earlier ones", async () => {
     const { backend, tool } = harness();
     const body = JSON.parse(textOf(await run(tool, LARGE_FLUSH)));
     const writes = backend.callsTo("mcp-apply-operations");
-    assert.equal(writes.length, 2, "1601 operations go in two calls");
+    assert.equal(writes.length, 2, "2101 operations go in two calls");
     assert.equal(opsOf(writes[0]).length, 1500);
-    assert.equal(opsOf(writes[1]).length, 101);
+    assert.equal(opsOf(writes[1]).length, 601);
     const boardHandle = opsOf(writes[0])[0].id as string;
     assert.match(boardHandle, /^\$tmp:/);
     assert.equal(
@@ -255,7 +255,7 @@ test("a flush over 1500 operations goes in several calls, and later calls get th
         "uuid-" + boardHandle.slice("$tmp:".length),
         "the second call names the board by the id that the first call returned"
     );
-    assert.equal(body.opsApplied, 1601);
+    assert.equal(body.opsApplied, 2101);
     assert.equal(body.flushes, 1);
     assert.equal(body.chunks, 2);
     assert.equal(body.result, "ok");
@@ -280,7 +280,7 @@ test("a failing later call names its chunk and the operations committed before i
     const text = textOf(await run(tool, LARGE_FLUSH));
     assert.match(
         text,
-        /execute_code: chunk 2 of 2 of a flush failed\. 1500 of 1601 operations of this flush were committed by the earlier chunks, and those chunks stay applied\./
+        /execute_code: chunk 2 of 2 of a flush failed\. 1500 of 2101 operations of this flush were committed by the earlier chunks, and those chunks stay applied\./
     );
     assert.match(text, /Backend error validation: second call refused/);
     assert.match(text, /Applied before the failure: opsApplied=1500, flushes=0, chunks=1, revn=2, createdIds=/);
@@ -323,7 +323,8 @@ test("the write options of the call reach every mcp-apply-operations call of the
         [1, 2]
     );
     for (const params of writes) {
-        assert.equal(params.snapshot, true);
+        // the first call takes the snapshot, so one restore undoes the whole script.
+        assert.equal(params.snapshot, writes.indexOf(params) === 0);
         assert.equal(params.failOnConflict, true);
         assert.equal(params.allowSplit, true);
     }

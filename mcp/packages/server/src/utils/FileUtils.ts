@@ -25,10 +25,11 @@ export class FileUtils {
      *
      * @param filePath - The absolute path to the file where data should be written
      * @param bytes - The binary data to write to the file
+     * @param options - whether an existing file may be replaced; replaced by default
      */
-    public static writeBinaryFile(filePath: string, bytes: Uint8Array): void {
+    public static writeBinaryFile(filePath: string, bytes: Uint8Array, options: FileWriteOptions = {}): void {
         this.createParentDirectories(filePath);
-        fs.writeFileSync(filePath, Buffer.from(bytes));
+        fs.writeFileSync(filePath, Buffer.from(bytes), { flag: FileUtils.flagOf(options) });
     }
 
     /**
@@ -36,9 +37,25 @@ export class FileUtils {
      *
      * @param filePath - The absolute path to the file where data should be written
      * @param text - The text data to write to the file
+     * @param options - whether an existing file may be replaced; replaced by default
      */
-    public static writeTextFile(filePath: string, text: string): void {
+    public static writeTextFile(filePath: string, text: string, options: FileWriteOptions = {}): void {
         this.createParentDirectories(filePath);
-        fs.writeFileSync(filePath, text, { encoding: "utf-8" });
+        fs.writeFileSync(filePath, text, { encoding: "utf-8", flag: FileUtils.flagOf(options) });
     }
+
+    /**
+     * Returns the open flag of a write: `w` replaces a file, `wx` fails when one exists.
+     *
+     * @param options - the write options
+     */
+    private static flagOf(options: FileWriteOptions): "w" | "wx" {
+        return options.overwrite === false ? "wx" : "w";
+    }
+}
+
+/** How a file write treats a file that already exists. */
+export interface FileWriteOptions {
+    /** False refuses to replace an existing file, with the exclusive open flag. Defaults to true. */
+    overwrite?: boolean;
 }

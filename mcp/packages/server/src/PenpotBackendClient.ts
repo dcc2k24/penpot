@@ -1,6 +1,9 @@
+import type { Dispatcher } from "undici";
 import { createLogger } from "./logger";
 import { BackendRpcError } from "./backend/BackendRpcError";
 import { BackendSettings } from "./backend/BackendSettings";
+import { CallContext } from "./backend/CallContext";
+import { withDispatcher } from "./backend/ConnectionPools";
 import { ServerSentEvents } from "./backend/ServerSentEvents";
 import { Transit } from "./backend/Transit";
 
@@ -26,6 +29,44 @@ export interface BackendUpload {
 export interface RpcCallOptions {
     /** Overrides the configured timeout for this call, in milliseconds. */
     timeoutMs?: number;
+    /**
+     * Fires when the caller gives up. Defaults to the signal of the current tool call.
+     *
+     * A command that changes state is never aborted by this signal, even when it has not been sent yet:
+     * the backend may already have applied it, and the caller then cannot tell what happened. The rule is
+     * applied by name (see {@link isWriteCommand}), so writes that skip the file queue are covered too.
+     */
+    signal?: AbortSignal;
+    /**
+     * Set to `false` to stop the signal of the call from aborting this command, even a read. Use it for a
+     * call that must finish, such as a cleanup after the client has gone.
+     */
+    abortable?: boolean;
+}
+
+/** Name prefixes of backend commands that change state. */
+const WRITE_COMMAND_PREFIXES = [
+    "create-",
+    "delete-",
+    "duplicate-",
+    "move-",
+    "rename-",
+    "restore-",
+    "update-",
+    "lock-",
+    "unlock-",
+    "import-",
+    "mcp-apply-",
+    "mcp-import-",
+];
+
+/**
+ * Reports whether a backend command changes state, judged by its name.
+ *
+ * @param name - the backend command name, for example `delete-project`
+ */
+export function isWriteCommand(name: string): boolean {
+    return WRITE_COMMAND_PREFIXES.some((prefix) => name.startsWith(prefix));
 }
 
 /** Backend operations available to MCP tools. */
@@ -73,13 +114,14 @@ export class PenpotBackendClient implements PenpotBackend {
      *
      * @param baseUri - absolute HTTP(S) URI of the instance, without credentials, query or fragment
      * @param timeoutSeconds - default timeout of backend commands, in seconds
-     * @param maxResponseMb - cap on the body of one backend response, in megabytes; defaults to the
-     *   `PENPOT_MCP_BACKEND_MAX_RESPONSE_MB` environment value
+     * @param maxResponseMb - cap on the body of one backend response, in megabytes
+     * @param dispatcher - connection pool passed to `fetch` for every call, or undefined for the global pool
      */
     constructor(
         baseUri: string,
-        private readonly timeoutSeconds: number = 120,
-        maxResponseMb: number = BackendSettings.readMaxResponseMb(process.env)
+        private readonly timeoutSeconds: number = BackendSettings.DEFAULT_TIMEOUT_SECONDS,
+        maxResponseMb: number = BackendSettings.DEFAULT_MAX_RESPONSE_MB,
+        private readonly dispatcher?: Dispatcher
     ) {
         try {
             this.baseUri = new URL(baseUri);
@@ -122,7 +164,8 @@ export class PenpotBackendClient implements PenpotBackend {
                 headers: this.headers(userToken, { "Content-Type": "application/json" }),
                 body: JSON.stringify(params),
             },
-            options.timeoutMs ?? this.timeoutSeconds * 1000
+            options.timeoutMs ?? this.timeoutSeconds * 1000,
+            PenpotBackendClient.abortSignalFor(name, options)
         );
         return (await this.readResult(name, response)) as T;
     }
@@ -149,17 +192,36 @@ export class PenpotBackendClient implements PenpotBackend {
         const response = await this.send(
             name,
             { method: "POST", headers: this.headers(userToken), body: form },
-            options.timeoutMs ?? this.timeoutSeconds * 1000
+            options.timeoutMs ?? this.timeoutSeconds * 1000,
+            PenpotBackendClient.abortSignalFor(name, options)
         );
         return (await this.readResult(name, response)) as T;
     }
 
-    /** Builds the headers shared by every backend call. */
+    /**
+     * Picks the signal that may abort a command. Writes and calls marked `abortable: false` get none.
+     *
+     * @param name - the command name
+     * @param options - the options of the call
+     */
+    private static abortSignalFor(name: string, options: RpcCallOptions): AbortSignal | undefined {
+        if (options.abortable === false || isWriteCommand(name)) {
+            return undefined;
+        }
+        return options.signal ?? CallContext.current()?.signal;
+    }
+
+    /**
+     * Builds the headers shared by every backend call. The request id of the tool call, when there is one,
+     * goes in `X-Request-Id`, so the backend log line names the same call as the adapter.
+     */
     private headers(userToken: string, extra: Record<string, string> = {}): Record<string, string> {
+        const requestId = CallContext.current()?.requestId;
         return {
             Authorization: `Token ${userToken}`,
             "X-Client": "penpot-mcp",
             Accept: "application/json",
+            ...(requestId !== undefined ? { "X-Request-Id": requestId } : {}),
             ...extra,
         };
     }
@@ -167,18 +229,28 @@ export class PenpotBackendClient implements PenpotBackend {
     /**
      * Sends one request to a backend command and returns the response with its body still unread.
      *
+     * The request stops at the timeout or when the caller's signal fires, whichever comes first.
+     *
      * @param name - command name, for error messages
      * @param init - request method, headers and body
      * @param timeoutMs - time limit for the whole call, in milliseconds
+     * @param signal - fires when the caller gives up, or undefined
      * @throws Error when the request fails before a response arrives
      */
-    private async send(name: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+    private async send(name: string, init: RequestInit, timeoutMs: number, signal?: AbortSignal): Promise<Response> {
+        const timeout = AbortSignal.timeout(timeoutMs);
         try {
-            return await fetch(this.commandUrl(name), {
-                ...init,
-                redirect: "manual",
-                signal: AbortSignal.timeout(timeoutMs),
-            });
+            return await fetch(
+                this.commandUrl(name),
+                withDispatcher(
+                    {
+                        ...init,
+                        redirect: "manual",
+                        signal: signal === undefined ? timeout : AbortSignal.any([timeout, signal]),
+                    },
+                    this.dispatcher
+                )
+            );
         } catch (error) {
             this.logger.error(error, "Penpot RPC request failed: %s", name);
             const reason = error instanceof Error ? error.name : "unknown";
@@ -287,7 +359,8 @@ export class PenpotBackendClient implements PenpotBackend {
      * Reads a response body as text, refusing bodies over the configured cap.
      *
      * A declared Content-Length over the cap is refused before any byte is read. Otherwise the bytes are
-     * counted while they stream in, and the read stops as soon as the count passes the cap.
+     * counted while they stream in, and the read stops as soon as the count passes the cap. Each chunk is
+     * decoded as it arrives, so only the text is held, never the raw chunks next to a joined copy.
      *
      * @param response - response whose body is still unread
      * @returns the body decoded as UTF-8
@@ -303,25 +376,18 @@ export class PenpotBackendClient implements PenpotBackend {
             return "";
         }
         const reader = response.body.getReader();
-        const chunks: Uint8Array[] = [];
+        const decoder = new TextDecoder();
+        let text = "";
         let total = 0;
-        let result = await reader.read();
-        while (!result.done) {
+        for (let result = await reader.read(); !result.done; result = await reader.read()) {
             total += result.value.byteLength;
             if (total > this.maxResponseBytes) {
                 await reader.cancel();
                 throw this.oversizeError();
             }
-            chunks.push(result.value);
-            result = await reader.read();
+            text += decoder.decode(result.value, { stream: true });
         }
-        const bytes = new Uint8Array(total);
-        let offset = 0;
-        for (const chunk of chunks) {
-            bytes.set(chunk, offset);
-            offset += chunk.byteLength;
-        }
-        return new TextDecoder().decode(bytes);
+        return text + decoder.decode();
     }
 
     /** Builds the error for a response body over the cap. */
@@ -343,13 +409,19 @@ export class PenpotBackendClient implements PenpotBackend {
     private async postFeedback(methodName: string, userToken: string, params: object): Promise<void> {
         let response: Response;
         try {
-            response = await fetch(this.commandUrl(methodName), {
-                method: "POST",
-                headers: this.headers(userToken, { "Content-Type": "application/json" }),
-                body: JSON.stringify(params),
-                redirect: "manual",
-                signal: AbortSignal.timeout(PenpotBackendClient.FEEDBACK_TIMEOUT_MS),
-            });
+            response = await fetch(
+                this.commandUrl(methodName),
+                withDispatcher(
+                    {
+                        method: "POST",
+                        headers: this.headers(userToken, { "Content-Type": "application/json" }),
+                        body: JSON.stringify(params),
+                        redirect: "manual",
+                        signal: AbortSignal.timeout(PenpotBackendClient.FEEDBACK_TIMEOUT_MS),
+                    },
+                    this.dispatcher
+                )
+            );
             // discard backend diagnostics, which may contain private data
             await response.body?.cancel();
         } catch (error) {

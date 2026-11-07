@@ -298,9 +298,14 @@ test("layoutChild writes set_layout_child, and reads null when the parent has no
         )
     );
     assert.deepEqual(body.result, [false, null]);
+    // the second write reads the page first. set_layout_child also resizes the parent and the children in the
+    // backend, which the local model does not repeat, so the page is read again and the first write is sent before it.
     const writes = backend.callsTo("mcp-apply-operations");
+    assert.equal(writes.length, 2);
     assert.deepEqual(opsOf(writes[0]), [
         { op: "set_layout_child", pageId: PAGE, id: CHILD_A, layoutItemHSizing: "fill" },
+    ]);
+    assert.deepEqual(opsOf(writes[1]), [
         {
             op: "set_layout_child",
             pageId: PAGE,

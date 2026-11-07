@@ -282,6 +282,11 @@ export const OPERATION_SCHEMAS = {
         content: z.unknown().optional(),
         d: z.string().optional(),
     }),
+    set_path_content: operation("set_path_content", {
+        pageId: ref.describe("Id of the page that holds the path shape."),
+        id: ref.describe("Id of the path shape, or a $tmp: handle of a path created earlier in the call."),
+        content: z.unknown().describe("Path content, in the same form that create_path takes for its content."),
+    }),
     create_image: shapeOperation("create_image", {
         mediaId: uuid,
         mediaWidth: positiveNumber,
@@ -532,3 +537,16 @@ export const OPERATION_UNION = z.discriminatedUnion(
 
 /** Names of every valid operation, in table order. */
 export const OPERATION_NAMES: readonly string[] = Object.keys(OPERATION_SCHEMAS);
+
+/** Rules that span several operations, keyed by the topic they cover. */
+export const OPERATION_RULES: Readonly<Record<string, string>> = {
+    fontVariantId: fontVariantIdDoc,
+    fontWeight: fontWeightDoc,
+    fontStyle: fontStyleDoc,
+    tokenType: tokenTypeDoc,
+    overrides: overridesDoc,
+    childIndex: childIndexDoc,
+};
+
+/** Parameter schemas of every operation, keyed by op name, for reading them by name. */
+export const OPERATION_SCHEMA_BY_NAME: Readonly<Record<string, z.ZodType>> = OPERATION_SCHEMAS;

@@ -20,7 +20,10 @@ export const CORE_SOURCE: string = String.raw`
     "execute_code allows at most 5000 operations per script; split the work into several calls";
   const PAGE_LIMIT_MESSAGE = "execute_code loads at most 20 pages per script";
   const AWAIT_PATTERN = /\bawait\b/;
-  const TOKEN_WRITE_PATTERN = /token|theme|toggle_set/;
+  // the token write rule is defined once on the host (ApplyTokenValues.ts) and reaches the guest through the prelude,
+  // so both copies name the same ops.
+  const TOKEN_WRITE = new RegExp(TOKEN_WRITE_RULE.pattern);
+  const TOKEN_SHAPE_OPS = TOKEN_WRITE_RULE.shapeOps;
   const AWAIT_HINT =
     "execute_code runs synchronously in backend mode: penpot calls return values directly; remove await";
 
@@ -59,12 +62,18 @@ export const CORE_SOURCE: string = String.raw`
       pageId: pageId,
       pending: [],
       folds: new FoldIndex(),
+      // working copies by page key; a page is missing from the map when it must be read again
       pages: new Map(),
+      // page keys whose queued ops the local model cannot show; the next read of such a page flushes first
+      dirty: new Set(),
+      // page keys read in this call, counted once each against the page cap
+      loaded: new Set(),
+      // true once a flush of this call has been saved
+      savedWrites: false,
       files: new Map(),
       aliases: new Map(),
       handleCount: 0,
       opCount: 0,
-      pageLoads: 0,
       revn: null,
       warnings: []
     };
@@ -179,12 +188,16 @@ export const CORE_SOURCE: string = String.raw`
     return out;
   };
 
-  // reads one page from the host and replaces the records of the model with it.
+  // reads one page from the host and replaces the records of the model with it. A page read again after a flush
+  // counts once, so the cap is on distinct pages.
   function loadRecords(model) {
-    if (state.pageLoads >= MAX_PAGE_LOADS) {
-      throw new Error(PAGE_LIMIT_MESSAGE);
+    const key = pageKey(model.fileId, model.pageId);
+    if (!state.loaded.has(key)) {
+      if (state.loaded.size >= MAX_PAGE_LOADS) {
+        throw new Error(PAGE_LIMIT_MESSAGE);
+      }
+      state.loaded.add(key);
     }
-    state.pageLoads += 1;
     const data = JSON.parse(__host.loadPage(model.fileId, model.pageId));
     model.revn = data.revn;
     model.records = new Map();
@@ -194,17 +207,41 @@ export const CORE_SOURCE: string = String.raw`
     state.revn = data.revn;
   }
 
-  // returns the page model, loading it on first access; queued ops of the page are applied to a new load.
+  // a page read that fails after a saved flush says so, so the script does not run the write again.
+  function loadPageRecords(model) {
+    try {
+      loadRecords(model);
+    } catch (err) {
+      if (!state.savedWrites) {
+        throw err;
+      }
+      throw new Error(
+        "execute_code: the writes that ran before this read are saved; the read of the page failed. " +
+          errorMessage(err)
+      );
+    }
+  }
+
+  // returns the page model, loading it on first access. A page with queued ops that the local model cannot show is
+  // flushed first, so the read sees the backend's result. Queued ops of the page are applied to a new load.
   function page(fileId, pageId) {
     const file = fileId === undefined ? state.fileId : resolveId(fileId);
     const pid = resolveId(pageId);
     const key = pageKey(file, pid);
+    if (state.dirty.has(key)) {
+      flush(false);
+    }
     if (state.pages.has(key)) {
       return state.pages.get(key);
     }
     const model = new PageModel(file, pid);
-    loadRecords(model);
+    loadPageRecords(model);
     replayPending(model);
+    if (state.dirty.has(key)) {
+      // a queued op of the page that the replay could not show: send the queue, then read the page again
+      flush(false);
+      loadPageRecords(model);
+    }
     state.pages.set(key, model);
     return model;
   }
@@ -214,23 +251,12 @@ export const CORE_SOURCE: string = String.raw`
     if (model.fileId !== state.fileId) {
       return;
     }
+    const key = pageKey(model.fileId, model.pageId);
     for (const op of state.pending) {
-      if (op.pageId === model.pageId) {
-        applyLocal(model, op);
+      if (op.pageId === model.pageId && !applyLocal(model, op)) {
+        state.dirty.add(key);
       }
     }
-  }
-
-  // reloads a page into its cached model, or into a new model when the page is not cached.
-  function reloadPage(fileId, pageId) {
-    const key = pageKey(fileId, pageId);
-    if (state.pageLoads >= MAX_PAGE_LOADS) {
-      state.pages.delete(key);
-      return;
-    }
-    const model = state.pages.get(key) || new PageModel(fileId, pageId);
-    loadRecords(model);
-    state.pages.set(key, model);
   }
 
   // local effects of queued ops (best effort, for read-after-write within one call)
@@ -286,6 +312,9 @@ export const CORE_SOURCE: string = String.raw`
     }
   }
 
+  // The local effects below return true when the model shows the backend's result exactly. A false answer marks the
+  // page dirty, so the next read sends the queue and reads the page again.
+
   function createLocal(model, op, type) {
     const parentId = op.parentId === undefined ? ROOT_ID : op.parentId;
     const parent = model.get(parentId);
@@ -311,24 +340,42 @@ export const CORE_SOURCE: string = String.raw`
     if (parent) {
       insertChild(parent, record.id, op.index);
     }
-    return record;
+    return parent !== undefined;
   }
+
+  // the geometry props of a shape
+  const GEOMETRY_KEYS = ["x", "y", "width", "height"];
 
   function updateLocal(model, op) {
     const record = model.get(op.id);
     if (!record || !op.props || typeof op.props !== "object") {
-      return;
+      return false;
     }
-    // merging the props also updates x, y, width, height and rotation.
-    Object.assign(record, op.props);
+    const props = op.props;
+    const geometry = GEOMETRY_KEYS.some((key) => props[key] !== undefined);
+    const parent = model.get(record.parentId);
+    const hasChildren = Array.isArray(record.shapes) && record.shapes.length > 0;
+    // a move of a shape with children, or of a child of a layout, can change other shapes in the backend
+    const exact = !(geometry && (hasChildren || (parent && parent.layout)));
+    // merging the props also updates x, y, width, height and rotation; the bounds come from selrect, so it follows.
+    Object.assign(record, props);
+    if (record.selrect && typeof record.selrect === "object") {
+      for (const key of GEOMETRY_KEYS) {
+        if (props[key] !== undefined) {
+          record.selrect[key] = props[key];
+        }
+      }
+    }
+    return exact;
   }
 
   function moveLocal(model, op) {
     const target = model.get(op.parentId);
     if (!target) {
-      return;
+      return false;
     }
     const moved = [];
+    let reparented = false;
     for (const id of op.ids) {
       const record = model.get(id);
       if (!record || record.id === target.id || isWithin(model, record.id, target.id)) {
@@ -336,6 +383,10 @@ export const CORE_SOURCE: string = String.raw`
       }
       if (moved.indexOf(record) >= 0) {
         continue;
+      }
+      if (record.parentId !== target.id) {
+        // the backend may change the position of a shape that changes parent, so the model does not guess it
+        reparented = true;
       }
       detachChild(model, record);
       moved.push(record);
@@ -356,12 +407,13 @@ export const CORE_SOURCE: string = String.raw`
     for (const record of moved) {
       reframe(model, record, frameId, seen);
     }
+    return !reparented;
   }
 
   function reorderLocal(model, op) {
     const parent = model.get(op.parentId);
     if (!parent) {
-      return;
+      return false;
     }
     const shapes = [];
     for (const id of op.ids) {
@@ -371,6 +423,7 @@ export const CORE_SOURCE: string = String.raw`
       }
     }
     parent.shapes = shapes;
+    return true;
   }
 
   function removeTree(model, record, seen) {
@@ -397,6 +450,7 @@ export const CORE_SOURCE: string = String.raw`
       detachChild(model, record);
       removeTree(model, record, seen);
     }
+    return true;
   }
 
   // builds a group or a boolean around the children, which take the place of the first child.
@@ -409,12 +463,12 @@ export const CORE_SOURCE: string = String.raw`
       }
     }
     if (children.length === 0) {
-      return;
+      return false;
     }
     const first = children[0];
     const parent = model.get(first.parentId);
     if (!parent) {
-      return;
+      return false;
     }
     if (!Array.isArray(parent.shapes)) {
       parent.shapes = [];
@@ -454,6 +508,7 @@ export const CORE_SOURCE: string = String.raw`
       record.parentId = group.id;
       reframe(model, record, frameId, seen);
     }
+    return true;
   }
 
   // bounding box of records, with missing numbers counted as zero.
@@ -474,50 +529,188 @@ export const CORE_SOURCE: string = String.raw`
     return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
   }
 
-  // applies one queued op to a page model. Ops without a local effect are skipped; the next flush reloads.
+  // the attributes that set_flex_layout and set_grid_layout reset to the compiler defaults when the op leaves them
+  // out (initial-flex-layout and initial-grid-layout in common).
+  const FLEX_LAYOUT_DEFAULTS = {
+    layoutFlexDir: "row",
+    layoutGap: { rowGap: 0, columnGap: 0 },
+    layoutAlignItems: "start",
+    layoutJustifyContent: "start",
+    layoutAlignContent: "stretch",
+    layoutWrapType: "nowrap",
+    layoutPadding: { p1: 0, p2: 0, p3: 0, p4: 0 }
+  };
+  const GRID_LAYOUT_DEFAULTS = {
+    layoutGridDir: "row",
+    layoutGap: { rowGap: 0, columnGap: 0 },
+    layoutAlignItems: "start",
+    layoutJustifyItems: "start",
+    layoutAlignContent: "stretch",
+    layoutJustifyContent: "stretch",
+    layoutPadding: { p1: 0, p2: 0, p3: 0, p4: 0 },
+    layoutGridRows: [],
+    layoutGridColumns: [],
+    layoutGridCells: {}
+  };
+
+  // a copy of a value made of JSON data
+  function copyJson(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  // the nodes of a content tree with the given type, in document order
+  function collectNodes(node, type, out) {
+    if (!isPlainObject(node)) {
+      return out;
+    }
+    if (node.type === type) {
+      out.push(node);
+    }
+    for (const child of Array.isArray(node.children) ? node.children : []) {
+      collectNodes(child, type, out);
+    }
+    return out;
+  }
+
+  // a text with one paragraph and one run takes the new characters and keeps the style of the run.
+  function setTextLocal(model, op) {
+    const record = model.get(op.id);
+    if (!record || record.type !== "text" || typeof op.characters !== "string" || op.characters.indexOf("\n") >= 0) {
+      return false;
+    }
+    const paragraphs = collectNodes(record.content, "paragraph", []);
+    if (paragraphs.length !== 1 || !Array.isArray(paragraphs[0].children) || paragraphs[0].children.length !== 1) {
+      return false;
+    }
+    const run = paragraphs[0].children[0];
+    if (typeof run.text !== "string") {
+      return false;
+    }
+    paragraphs[0].children = [Object.assign({}, run, { text: op.characters })];
+    return true;
+  }
+
+  // set_layout_child sets the layout attributes of the shape. The backend also resizes the children and the parent of a
+  // sized shape, so the model is exact only for a shape without children, under a parent without a layout.
+  function setChildLocal(model, op) {
+    const record = model.get(op.id);
+    if (!record) {
+      return false;
+    }
+    for (const key of Object.keys(op)) {
+      if (key.indexOf("layout") === 0) {
+        record[key] = copyJson(op[key]);
+      }
+    }
+    const parent = model.get(record.parentId);
+    const hasChildren = Array.isArray(record.shapes) && record.shapes.length > 0;
+    return !hasChildren && !(parent && parent.layout);
+  }
+
+  function setPluginDataLocal(model, op) {
+    const record = model.get(op.id);
+    if (!record || op.target !== "shape" || typeof op.namespace !== "string" || typeof op.key !== "string") {
+      return false;
+    }
+    if (!isPlainObject(record.pluginData)) {
+      record.pluginData = {};
+    }
+    const bucket = isPlainObject(record.pluginData[op.namespace]) ? record.pluginData[op.namespace] : {};
+    bucket[op.key] = op.value;
+    record.pluginData[op.namespace] = bucket;
+    return true;
+  }
+
+  // set_flex_layout and set_grid_layout: the layout is replaced by the op, with the defaults for what it leaves out.
+  function setLayoutLocal(model, op, kind) {
+    const record = model.get(op.id);
+    if (!record) {
+      return false;
+    }
+    // a track without a value gets a default size in the backend, which the model does not know
+    for (const key of ["layoutGridRows", "layoutGridColumns"]) {
+      if (Array.isArray(op[key]) && op[key].some((track) => !isPlainObject(track) || track.value == null)) {
+        return false;
+      }
+    }
+    const defaults = kind === "grid" ? GRID_LAYOUT_DEFAULTS : FLEX_LAYOUT_DEFAULTS;
+    for (const key of Object.keys(record)) {
+      if (kind === "flex" && key.indexOf("layoutGrid") === 0) {
+        delete record[key];
+      }
+    }
+    record.layout = kind;
+    for (const key of Object.keys(defaults)) {
+      record[key] = copyJson(op[key] !== undefined ? op[key] : defaults[key]);
+    }
+    for (const key of Object.keys(op)) {
+      if (key.indexOf("layout") === 0) {
+        record[key] = copyJson(op[key]);
+      }
+    }
+    // the backend moves the children into the new layout, which the model does not repeat
+    return !(Array.isArray(record.shapes) && record.shapes.length > 0);
+  }
+
+  function addInteractionLocal(model, op) {
+    const record = model.get(op.id);
+    if (!record || !isPlainObject(op.interaction)) {
+      return false;
+    }
+    const list = Array.isArray(record.interactions) ? record.interactions : [];
+    record.interactions = list.concat([copyJson(op.interaction)]);
+    return true;
+  }
+
+  function removeInteractionLocal(model, op) {
+    const record = model.get(op.id);
+    const list = record && Array.isArray(record.interactions) ? record.interactions : [];
+    if (typeof op.index !== "number" || op.index < 0 || op.index >= list.length) {
+      return false;
+    }
+    record.interactions = list.slice(0, op.index).concat(list.slice(op.index + 1));
+    return true;
+  }
+
+  // applies one queued op to a page model. Returns false when the model does not show the backend's result for it,
+  // so the page is read again at the next read. Text, path and image creates, clones, instances and the other ops
+  // have no local effect yet.
   function applyLocal(model, op) {
     switch (op.op) {
       case "create_board":
-        createLocal(model, op, "frame");
-        break;
+        return createLocal(model, op, "frame");
       case "create_rect":
-        createLocal(model, op, "rect");
-        break;
+        return createLocal(model, op, "rect");
       case "create_ellipse":
-        createLocal(model, op, "circle");
-        break;
-      case "create_text":
-        createLocal(model, op, "text");
-        break;
-      case "create_path":
-        createLocal(model, op, "path");
-        break;
-      case "create_image":
-        createLocal(model, op, "image");
-        break;
-      case "create_svg_raw":
-        createLocal(model, op, "svg-raw");
-        break;
+        return createLocal(model, op, "circle");
       case "create_group":
-        groupLocal(model, op, "group");
-        break;
+        return groupLocal(model, op, "group");
       case "create_boolean":
-        groupLocal(model, op, "bool");
-        break;
+        return groupLocal(model, op, "bool");
       case "update_shape":
-        updateLocal(model, op);
-        break;
+        return updateLocal(model, op);
       case "move_shapes":
-        moveLocal(model, op);
-        break;
+        return moveLocal(model, op);
       case "reorder":
-        reorderLocal(model, op);
-        break;
+        return reorderLocal(model, op);
       case "delete_shapes":
-        deleteLocal(model, op);
-        break;
+        return deleteLocal(model, op);
+      case "set_text":
+        return setTextLocal(model, op);
+      case "set_plugin_data":
+        return setPluginDataLocal(model, op);
+      case "set_layout_child":
+        return setChildLocal(model, op);
+      case "set_flex_layout":
+        return setLayoutLocal(model, op, "flex");
+      case "set_grid_layout":
+        return setLayoutLocal(model, op, "grid");
+      case "add_interaction":
+        return addInteractionLocal(model, op);
+      case "remove_interaction":
+        return removeInteractionLocal(model, op);
       default:
-        break;
+        return false;
     }
   }
 
@@ -526,8 +719,8 @@ export const CORE_SOURCE: string = String.raw`
   // create names the shape, or the new parent, before it:
   // - an update_shape with only foldable props goes onto the create of its shape, until a move folded into it;
   // - a move_shapes of one shape, without an index, gives the create its parent, when the create has no parent
-  //   yet and the parent is an existing id or a handle created before the create. The children of a parent
-  //   then keep the order of their moves.
+  //   yet and the parent is an existing id or a handle created before the create, and only when every op after the
+  //   create is a create too. Any other op may touch the parent or its ancestors, and a fold would jump over it.
   // Only board, rectangle and ellipse creates take folds: text, path and image creates derive their attributes
   // from the create, so an update of them stays a separate op. A key whose value is undefined counts as absent,
   // as it does in the JSON that the host receives.
@@ -596,6 +789,8 @@ export const CORE_SOURCE: string = String.raw`
     this.lastNamed = new Map();
     // shapes whose create took a parent by a folded move; no later update folds into them
     this.sealed = new Set();
+    // index in the batch of the last set_layout_child op of each shape id
+    this.childOps = new Map();
   }
 
   FoldIndex.prototype.namedAt = function (id) {
@@ -623,11 +818,35 @@ export const CORE_SOURCE: string = String.raw`
     if (FOLDABLE_CREATE_OPS.has(op.op) && typeof op.id === "string") {
       this.creates.set(op.id, index);
     }
+    if (op.op === "set_layout_child" && typeof op.id === "string") {
+      this.childOps.set(op.id, index);
+    }
   };
 
   // folds an op into an earlier create of the batch; returns false when the op stays.
   FoldIndex.prototype.fold = function (batch, op) {
-    return this.foldUpdate(batch, op) || this.foldMove(batch, op);
+    return this.foldUpdate(batch, op) || this.foldMove(batch, op) || this.foldLayoutChild(batch, op);
+  };
+
+  // several layout setters of one shape merge into one set_layout_child, when the op before them on that shape is the
+  // last op of the batch. Then no other op lies between them, so the merged op has the order of the setters.
+  FoldIndex.prototype.foldLayoutChild = function (batch, op) {
+    if (op.op !== "set_layout_child" || typeof op.id !== "string") {
+      return false;
+    }
+    const keys = definedKeys(op).filter((key) => key !== "op" && key !== "pageId" && key !== "id");
+    if (keys.length === 0 || !keys.every((key) => key.indexOf("layout") === 0)) {
+      return false;
+    }
+    const at = this.childOps.get(op.id);
+    if (at === undefined || at !== batch.length - 1 || batch[at].pageId !== op.pageId) {
+      return false;
+    }
+    for (const key of keys) {
+      batch[at][key] = copyJson(op[key]);
+    }
+    this.noteNames(op, at);
+    return true;
   };
 
   FoldIndex.prototype.foldUpdate = function (batch, op) {
@@ -668,6 +887,13 @@ export const CORE_SOURCE: string = String.raw`
     if (this.namedAt(child) !== at || !this.parentReadyAt(parent, at) || this.namedAt(parent) >= at) {
       return false;
     }
+    // an op after the create that is not a create may change the parent or its ancestors (a move, an update or a
+    // delete of an ancestor), and then the fold would move the shape past it. Such a move stays in order.
+    for (let index = at + 1; index < batch.length; index += 1) {
+      if (!ID_CREATE_OPS.has(batch[index].op)) {
+        return false;
+      }
+    }
     create.parentId = parent;
     this.noteNames(parent, at);
     this.sealed.add(child);
@@ -689,6 +915,7 @@ export const CORE_SOURCE: string = String.raw`
   function clearPending() {
     state.pending = [];
     state.folds = new FoldIndex();
+    state.dirty = new Set();
   }
 
   function enqueue(op) {
@@ -709,9 +936,10 @@ export const CORE_SOURCE: string = String.raw`
       state.pending.push(queued);
     }
     if (queued.pageId !== undefined) {
-      const model = state.pages.get(pageKey(state.fileId, queued.pageId));
-      if (model) {
-        applyLocal(model, queued);
+      const key = pageKey(state.fileId, queued.pageId);
+      const model = state.pages.get(key);
+      if (model && !applyLocal(model, queued)) {
+        state.dirty.add(key);
       }
     }
     return createsShape ? queued.id : undefined;
@@ -727,27 +955,19 @@ export const CORE_SOURCE: string = String.raw`
     return ids;
   }
 
-  // after a flush, reloads each touched page, except the pages the batch deleted.
-  function reloadTouched(fileId, ops) {
-    const deleted = new Set();
-    for (const op of ops) {
-      if (op.op === "delete_page") {
-        deleted.add(resolveId(op.id));
-      }
-    }
+  // drops the cached copies of the pages that the ops touched. Each one is read again at its next read, so a flush
+  // does not read the pages back, and a read that fails later does not undo a write that was saved.
+  function forgetTouched(fileId, ops) {
     for (const raw of touchedPageIds(ops)) {
       const pageId = resolveId(raw);
-      if (isHandle(pageId)) {
-        continue;
-      }
-      if (deleted.has(pageId)) {
+      if (!isHandle(pageId)) {
         state.pages.delete(pageKey(fileId, pageId));
-      } else {
-        reloadPage(fileId, pageId);
       }
     }
   }
 
+  // sends the queued ops to the host. A dry run keeps them queued; a write clears them. The host may answer a failed
+  // write with a failure that lists the ids of the chunks it saved, so the script can still use those shapes.
   function flush(dryRun) {
     if (state.pending.length === 0) {
       return { skipped: true };
@@ -758,33 +978,48 @@ export const CORE_SOURCE: string = String.raw`
     try {
       result = JSON.parse(__host.flush(fileId, JSON.stringify(ops), !!dryRun));
     } catch (err) {
-      // a dry run changes nothing, so its ops stay pending; a failed write drops them and rereads the touched pages.
+      // a dry run changes nothing, so its ops stay pending; a failed write drops them.
       if (!dryRun) {
         clearPending();
-        for (const raw of touchedPageIds(ops)) {
-          state.pages.delete(pageKey(fileId, raw));
-        }
+        forgetTouched(fileId, ops);
       }
       throw err;
     }
     if (dryRun) {
       return result;
     }
-    clearPending();
-    const created = result && result.createdIds ? result.createdIds : {};
-    for (const key of Object.keys(created)) {
-      state.aliases.set(key, created[key]);
+    if (result && result.failure) {
+      const failure = result.failure;
+      clearPending();
+      forgetTouched(fileId, ops);
+      adoptCreatedIds(failure.createdIds);
+      if (failure.committed > 0) {
+        state.savedWrites = true;
+      }
+      throw new Error(String(failure.message));
     }
+    clearPending();
+    adoptCreatedIds(result && result.createdIds);
     if (result && typeof result.revn === "number") {
       state.revn = result.revn;
     }
     if (result && Array.isArray(result.warnings)) {
       state.warnings.push(...result.warnings);
     }
-    reloadTouched(fileId, ops);
+    state.savedWrites = true;
+    forgetTouched(fileId, ops);
     return result;
   }
 
+  // maps the handles that a flush created to their ids, so that later ops and reads resolve them.
+  function adoptCreatedIds(created) {
+    const ids = created || {};
+    for (const key of Object.keys(ids)) {
+      state.aliases.set(key, ids[key]);
+    }
+  }
+
+  // the final flush of a script. Nothing is read after it, so the touched pages are only marked for a later read.
   function end() {
     flush(false);
   }
@@ -815,17 +1050,22 @@ export const CORE_SOURCE: string = String.raw`
     if (result && typeof result.revn === "number") {
       state.revn = result.revn;
     }
-    // the import changes the page, so a cached copy of it is read again.
+    state.savedWrites = true;
+    // the import changes the page, so a cached copy of it is read again at the next read.
     const fileId = request.fileId === undefined ? state.fileId : request.fileId;
-    if (state.pages.has(pageKey(fileId, request.pageId))) {
-      reloadPage(fileId, request.pageId);
-    }
+    state.pages.delete(pageKey(fileId, request.pageId));
     return result;
+  }
+
+  // true when a queued op changes tokens, sets, themes or the base font size, so a token read sees it.
+  function changesTokens(op) {
+    const name = String(op.op);
+    return TOKEN_SHAPE_OPS.indexOf(name) < 0 && TOKEN_WRITE.test(name);
   }
 
   // flushes the queued writes when one of them changes tokens, so that a token read or apply sees them.
   function flushTokens() {
-    if (state.pending.some((op) => TOKEN_WRITE_PATTERN.test(String(op.op)))) {
+    if (state.pending.some(changesTokens)) {
       flush(false);
     }
   }

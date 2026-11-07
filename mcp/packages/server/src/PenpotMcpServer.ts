@@ -1,7 +1,22 @@
-import { createMcpHandler, McpServer, type McpHttpHandler } from "@modelcontextprotocol/server";
+import type { ServerContext } from "@modelcontextprotocol/server";
+import {
+    createMcpHandler,
+    hostHeaderValidationResponse,
+    localhostAllowedHostnames,
+    localhostAllowedOrigins,
+    McpServer,
+    type McpHttpHandler,
+    originValidationResponse,
+} from "@modelcontextprotocol/server";
 import { toNodeHandler } from "@modelcontextprotocol/node";
-import type { Server as HttpServer } from "node:http";
-import type { Express } from "express";
+import type { IncomingMessage, Server as HttpServer } from "node:http";
+import type {
+    Express,
+    NextFunction,
+    Request as ExpressRequest,
+    RequestHandler,
+    Response as ExpressResponse,
+} from "express";
 import { z } from "zod";
 import { AsyncLocalStorage } from "async_hooks";
 import { ExecuteCodeTool } from "./tools/ExecuteCodeTool";
@@ -24,15 +39,19 @@ import { ReadTaigaIssueTool } from "./tools/dev/ReadTaigaIssueTool";
 import { NreplClient } from "./NreplClient";
 import { ReplServer } from "./ReplServer";
 import { ApiDocs } from "./ApiDocs";
-import { InitializeTokenCheck, McpAuthentication } from "./McpAuthentication";
+import { McpAuthentication, type McpAuthenticationResult, RequestTokenCheck } from "./McpAuthentication";
 import { BackendSettings } from "./backend/BackendSettings";
 import { BackendTokenValidator } from "./backend/BackendTokenValidator";
-import { BackendServices } from "./backend/BackendServices";
-import { HttpExporterClient } from "./backend/ExporterClient";
-import { BackendToolSet } from "./tools/backend/BackendToolSet";
+import { AdapterMetrics } from "./backend/AdapterMetrics";
+import { BackendReadiness } from "./backend/BackendReadiness";
+import { withDispatcher } from "./backend/ConnectionPools";
 import { TokenDigest } from "./backend/TokenDigest";
 import { BodyLimit } from "./utils/BodyLimit";
-import type { ToolCallRecord } from "./Tool";
+import { ExportDirectory } from "./utils/ExportDirectory";
+import type { BackendServices } from "./backend/BackendServices";
+import type { ToolCallRecord, ToolAnnotations } from "./Tool";
+import type { ProgressReporter } from "./backend/CallContext";
+import type { Dispatcher } from "undici";
 
 /**
  * Session context for request-scoped data.
@@ -49,6 +68,43 @@ const MCP_MODES = ["bridge", "backend", "both"] as const;
  */
 export type McpMode = (typeof MCP_MODES)[number];
 
+/** Host names that count as loopback, for the DNS rebinding checks. */
+const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "::1", "[::1]"];
+
+/** Time the HTTP server waits for open requests before it closes their connections, in milliseconds. */
+const HTTP_CLOSE_DEADLINE_MS = 10_000;
+
+/** Time the readiness probe waits for the backend, in milliseconds. */
+const READINESS_PROBE_TIMEOUT_MS = 2_000;
+
+/**
+ * Reports whether a socket address is a loopback address: an IPv4 address in 127.0.0.0/8, IPv6 `::1`, or the
+ * IPv4 form of either.
+ *
+ * @param address - the remote address of a socket, or undefined when it is not known
+ */
+export function isLoopbackAddress(address: string | undefined): boolean {
+    if (address === undefined) {
+        return false;
+    }
+    const plain = address.startsWith("::ffff:") ? address.slice("::ffff:".length) : address;
+    return plain === "::1" || /^127./.test(plain);
+}
+
+/** Headers that a reverse proxy adds to the requests it forwards. */
+const FORWARDING_HEADERS = ["x-forwarded-for", "x-forwarded-host", "x-real-ip", "forwarded"];
+
+/**
+ * Reports whether a request comes from this machine itself and was not forwarded by a proxy. A proxy on this
+ * machine connects from loopback too, so the forwarding headers count against the request.
+ *
+ * @param req - the incoming request
+ */
+function isLoopbackClient(req: ExpressRequest): boolean {
+    const forwarded = FORWARDING_HEADERS.some((name) => req.headers[name] !== undefined);
+    return !forwarded && isLoopbackAddress(req.socket.remoteAddress);
+}
+
 /**
  * Indicates whether a value names a known server mode.
  *
@@ -56,6 +112,26 @@ export type McpMode = (typeof MCP_MODES)[number];
  */
 function isMcpMode(value: string): value is McpMode {
     return (MCP_MODES as readonly string[]).includes(value);
+}
+
+/**
+ * Reads a TCP port from an environment variable.
+ *
+ * @param env - the environment to read
+ * @param name - the variable name, named in the error
+ * @param fallback - the port used when the variable is unset or blank
+ * @throws Error naming the variable when the value is not a whole number from 0 to 65535
+ */
+export function readPortVariable(env: Record<string, string | undefined>, name: string, fallback: number): number {
+    const raw = env[name]?.trim();
+    if (raw === undefined || raw === "") {
+        return fallback;
+    }
+    const value = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+    if (!Number.isInteger(value) || value > 65535) {
+        throw new Error(`${name} must be a port number from 0 to 65535 (got "${raw}").`);
+    }
+    return value;
 }
 
 /**
@@ -68,6 +144,17 @@ class ToolInfo {
         public readonly config: { description: string; inputSchema: z.ZodObject<z.ZodRawShape> }
     ) {}
 }
+
+/** What the gate in front of `/mcp` learned about a request. */
+interface RequestAuth {
+    /** The MCP token of the request, when one was sent. */
+    userToken: string | undefined;
+    /** True when the request may use the large body limit: its token was accepted. */
+    authenticated: boolean;
+}
+
+/** The authentication of each request, keyed by its response. */
+const requestAuthOf = new WeakMap<ExpressResponse, RequestAuth>();
 
 /**
  * Indicates whether developer tools may be registered for the current server mode.
@@ -104,6 +191,27 @@ export function partitionToolNames(
     };
 }
 
+/**
+ * Builds a web `Request` from a Node request, so that the SDK's Host and Origin checks can read it.
+ *
+ * @param req - the incoming request
+ * @returns the web request, or undefined when a header cannot be represented
+ */
+function webRequestOf(req: IncomingMessage): Request | undefined {
+    try {
+        const headers = new Headers();
+        for (const [name, value] of Object.entries(req.headers)) {
+            if (value === undefined) continue;
+            for (const item of Array.isArray(value) ? value : [value]) {
+                headers.append(name, item);
+            }
+        }
+        return new Request(`http://localhost${req.url ?? "/"}`, { method: "GET", headers });
+    } catch {
+        return undefined;
+    }
+}
+
 export class PenpotMcpServer {
     /**
      * Determines whether the server is running in a Penpot development
@@ -132,9 +240,8 @@ export class PenpotMcpServer {
     /**
      * Resolves the server mode from the environment.
      *
-     * An explicit PENPOT_MCP_MODE wins. When the variable is unset, the mode is `both` if
-     * PENPOT_MCP_BACKEND_URI is configured and `bridge` otherwise, so that bridge-only deployments keep
-     * working without changes.
+     * The mode is `bridge` unless PENPOT_MCP_MODE says otherwise. Setting PENPOT_MCP_BACKEND_URI alone does
+     * not change the mode, so an upgrade does not rename the plugin tools behind the operator's back.
      *
      * @param env - the environment to read
      * @throws Error when the mode is unknown, or when backend or both mode has no PENPOT_MCP_BACKEND_URI
@@ -143,7 +250,7 @@ export class PenpotMcpServer {
         const backendUri = env.PENPOT_MCP_BACKEND_URI?.trim();
         const requested = env.PENPOT_MCP_MODE?.trim().toLowerCase();
         if (requested === undefined || requested === "") {
-            return backendUri ? "both" : "bridge";
+            return "bridge";
         }
         if (!isMcpMode(requested)) {
             throw new Error(`PENPOT_MCP_MODE must be one of ${MCP_MODES.join(", ")} (got "${env.PENPOT_MCP_MODE}").`);
@@ -152,6 +259,38 @@ export class PenpotMcpServer {
             throw new Error(`PENPOT_MCP_MODE=${requested} requires PENPOT_MCP_BACKEND_URI to be set.`);
         }
         return requested;
+    }
+
+    /**
+     * Explains why the server runs in its mode, for the startup log.
+     *
+     * @param env - the environment to read
+     * @returns a short sentence that names the variable that chose the mode, or the default
+     */
+    public static modeReason(env: Record<string, string | undefined>): string {
+        const requested = env.PENPOT_MCP_MODE?.trim() ?? "";
+        if (requested !== "") {
+            return `set by PENPOT_MCP_MODE=${requested}`;
+        }
+        return "PENPOT_MCP_MODE is not set, so the default applies";
+    }
+
+    /**
+     * Warns when a backend URI is configured but the mode is not set, which keeps the backend tools off.
+     *
+     * @param env - the environment to read
+     * @returns the warning text, or undefined when there is nothing to warn about
+     */
+    public static unusedBackendWarning(env: Record<string, string | undefined>): string | undefined {
+        const requested = env.PENPOT_MCP_MODE?.trim() ?? "";
+        const backendUri = env.PENPOT_MCP_BACKEND_URI?.trim() ?? "";
+        if (requested !== "" || backendUri === "") {
+            return undefined;
+        }
+        return (
+            "PENPOT_MCP_BACKEND_URI is set but PENPOT_MCP_MODE is not, so the mode is bridge and the backend tools are off. " +
+            "Set PENPOT_MCP_MODE=both to serve the backend tools beside the plugin tools, or PENPOT_MCP_MODE=backend for the backend tools only."
+        );
     }
 
     /**
@@ -164,30 +303,8 @@ export class PenpotMcpServer {
         return TokenDigest.fingerprintOrNone(token);
     }
 
-    /**
-     * Describes the startup warning for a mode that was implied rather than set, or returns undefined.
-     *
-     * The mode is implied as `both` when PENPOT_MCP_MODE is unset and PENPOT_MCP_BACKEND_URI is configured.
-     * That mode serves the backend tools and the plugin tools side by side, so the warning names the cause.
-     *
-     * @param env - the environment to read
-     * @returns the warning text, or undefined when the mode was set explicitly or no backend is configured
-     */
-    public static impliedModeWarning(env: Record<string, string | undefined>): string | undefined {
-        const requested = env.PENPOT_MCP_MODE?.trim() ?? "";
-        const backendUri = env.PENPOT_MCP_BACKEND_URI?.trim() ?? "";
-        if (requested !== "" || backendUri === "") {
-            return undefined;
-        }
-        return (
-            "PENPOT_MCP_MODE is not set, so the mode is implied as both because PENPOT_MCP_BACKEND_URI is set. " +
-            "Both mode serves the backend tools and the plugin tools side by side. " +
-            "Set PENPOT_MCP_MODE=backend or PENPOT_MCP_MODE=bridge to choose one."
-        );
-    }
-
     private readonly logger = createLogger("PenpotMcpServer");
-    private readonly tools: ToolInfo[];
+    private tools: ToolInfo[] = [];
     public readonly configLoader: ConfigurationLoader;
     private app!: Express;
     private httpServer?: HttpServer;
@@ -197,16 +314,30 @@ export class PenpotMcpServer {
     private readonly bridge?: PluginBridge;
     private readonly mode: McpMode;
     private readonly backendSettings: BackendSettings;
-    private readonly backendClient?: PenpotBackendClient;
-    private readonly backendServices?: BackendServices;
-    /** Checks the token of each new session at initialize, present only when OAuth is enabled and a backend is configured. */
-    private readonly initializeTokenCheck?: InitializeTokenCheck;
+    /** Client of the backend, present when PENPOT_MCP_BACKEND_URI is set. Created at startup. */
+    private backendClient?: PenpotBackendClient;
+    /** Shared backend services, present only in backend and both mode. Created at startup. */
+    private backendServices?: BackendServices;
+    /** Validates the token of each request against the backend, present when a backend is configured. */
+    private tokenValidator?: BackendTokenValidator;
+    /** Checks the token of each request, present when OAuth or backend mode is on. */
+    private tokenCheck?: RequestTokenCheck;
+    /** Answers `/readyz`, present when a backend is configured. */
+    private backendReadiness?: BackendReadiness;
+    /** Connection pool of the backend, used by the readiness probe. */
+    private backendPool?: Dispatcher;
+    /** Every connection pool the server made, closed at shutdown. */
+    private readonly connectionPools: Dispatcher[] = [];
     /** Names of the plugin bridge tools in `both` mode, which carry names other than the plain ones. */
     private bridgeToolNames: string[] = [];
     private readonly replServer: ReplServer | null;
     private apiDocs: ApiDocs;
     private readonly penpotHighLevelOverview: string;
     private readonly connectionInstructions: string;
+    /** Counts and times the tool calls for `/metrics`. */
+    private readonly metrics = new AdapterMetrics();
+    /** Settles when the backend parts and the tools are ready; rejects when they could not be built. */
+    private readonly ready: Promise<void>;
 
     /**
      * Carries the user token through each request and its asynchronous tool execution.
@@ -236,7 +367,7 @@ export class PenpotMcpServer {
 
     constructor(private isMultiUser: boolean = false) {
         this.mode = PenpotMcpServer.resolveMode(process.env);
-        this.backendSettings = BackendSettings.fromEnvironment(process.env);
+        this.backendSettings = BackendSettings.fromEnvironment(process.env, this.mode);
         this.authentication = new McpAuthentication(
             process.env.PENPOT_MCP_AUTH_URI,
             isMultiUser,
@@ -244,10 +375,10 @@ export class PenpotMcpServer {
         );
         // read port configuration from environment variables
         this.host = process.env.PENPOT_MCP_SERVER_HOST ?? "localhost";
-        this.port = parseInt(process.env.PENPOT_MCP_SERVER_PORT ?? "4401", 10);
-        this.webSocketPort = parseInt(process.env.PENPOT_MCP_WEBSOCKET_PORT ?? "4402", 10);
+        this.port = readPortVariable(process.env, "PENPOT_MCP_SERVER_PORT", 4401);
+        this.webSocketPort = readPortVariable(process.env, "PENPOT_MCP_WEBSOCKET_PORT", 4402);
         this.replHost = process.env.PENPOT_MCP_REPL_HOST ?? "localhost";
-        this.replPort = parseInt(process.env.PENPOT_MCP_REPL_PORT ?? "4403", 10);
+        this.replPort = readPortVariable(process.env, "PENPOT_MCP_REPL_PORT", 4403);
         this.tenant = process.env.PENPOT_TENANT ?? "default";
         const toolTimeoutSecs = parseInt(process.env.PENPOT_MCP_TOOL_TIMEOUT_S ?? "120", 10);
 
@@ -260,35 +391,6 @@ export class PenpotMcpServer {
         this.penpotHighLevelOverview = instructions;
         this.connectionInstructions = this.configLoader.getBaseInstructions();
 
-        const backendUri = process.env.PENPOT_MCP_BACKEND_URI?.trim();
-        if (backendUri) {
-            this.backendClient = new PenpotBackendClient(backendUri, this.backendSettings.timeoutSeconds);
-        }
-        if (this.mode !== "bridge" && backendUri && this.backendClient) {
-            this.backendServices = new BackendServices(
-                this.backendClient,
-                this.backendSettings,
-                new HttpExporterClient(
-                    this.backendSettings.exporterUri,
-                    backendUri,
-                    this.backendSettings.timeoutSeconds,
-                    undefined,
-                    this.backendSettings.maxResponseMb,
-                    this.backendSettings.assetsUri
-                )
-            );
-        }
-
-        if (this.authentication.isOAuthEnabled) {
-            const validator =
-                this.backendServices?.validator ??
-                (this.backendClient ? new BackendTokenValidator(this.backendClient) : undefined);
-            if (validator) {
-                this.initializeTokenCheck = new InitializeTokenCheck(this.authentication, validator);
-            }
-        }
-
-        this.tools = this.initTools();
         this.mcpHandler = createMcpHandler(() => this.createMcpServer());
 
         // Enable multi-instance task routing when running in multi-user mode with a
@@ -309,6 +411,87 @@ export class PenpotMcpServer {
         } else {
             this.replServer = null;
         }
+
+        // the tools need the bridge and the flags above, so the backend parts start last
+        this.ready = this.initializeBackendParts();
+        // a failed start is reported by start(); this keeps Node from reporting it as unhandled first
+        this.ready.catch(() => undefined);
+    }
+
+    /**
+     * Builds the parts that depend on the backend, and the tool list.
+     *
+     * The backend modules load here, and only when the server needs them. A bridge-only server therefore
+     * does not load the sandbox, its font catalogue or the backend tools.
+     */
+    private async initializeBackendParts(): Promise<void> {
+        const backendUri = process.env.PENPOT_MCP_BACKEND_URI?.trim();
+        if (backendUri) {
+            const { ConnectionPools } = await import("./backend/ConnectionPools");
+            const pool = ConnectionPools.create(this.backendSettings.timeoutSeconds);
+            this.backendPool = pool;
+            this.connectionPools.push(pool);
+            this.backendClient = new PenpotBackendClient(
+                backendUri,
+                this.backendSettings.timeoutSeconds,
+                this.backendSettings.maxResponseMb,
+                pool
+            );
+            this.tokenValidator = new BackendTokenValidator(this.backendClient);
+            this.backendReadiness = new BackendReadiness(() => this.probeBackend(backendUri));
+            if (this.authentication.isOAuthEnabled || this.mode !== "bridge") {
+                this.tokenCheck = new RequestTokenCheck(this.authentication, this.tokenValidator);
+            }
+
+            if (this.mode !== "bridge") {
+                const [{ BackendServices: Services }, { HttpExporterClient }] = await Promise.all([
+                    import("./backend/BackendServices"),
+                    import("./backend/ExporterClient"),
+                ]);
+                const exporterPool = ConnectionPools.create(this.backendSettings.timeoutSeconds);
+                this.connectionPools.push(exporterPool);
+                const exporter = new HttpExporterClient(
+                    this.backendSettings.exporterUri,
+                    backendUri,
+                    this.backendSettings.timeoutSeconds,
+                    undefined,
+                    this.backendSettings.maxResponseMb,
+                    this.backendSettings.assetsUri,
+                    exporterPool
+                );
+                this.backendServices = new Services(
+                    this.backendClient,
+                    this.backendSettings,
+                    exporter,
+                    Date.now,
+                    this.tokenValidator
+                );
+            }
+        }
+        this.tools = await this.initTools();
+    }
+
+    /**
+     * Asks the backend whether it is ready. A failed or slow answer counts as not ready.
+     *
+     * @param backendUri - the configured backend URI
+     * @returns true when the backend answers its readiness endpoint with a success status
+     */
+    private async probeBackend(backendUri: string): Promise<boolean> {
+        const response = await fetch(
+            new URL("readyz", backendUri),
+            withDispatcher(
+                { method: "GET", redirect: "manual", signal: AbortSignal.timeout(READINESS_PROBE_TIMEOUT_MS) },
+                this.backendPool
+            )
+        );
+        await response.body?.cancel();
+        return response.ok;
+    }
+
+    /** Settles when the server is ready to start; rejects when a backend part could not be built. */
+    public whenReady(): Promise<void> {
+        return this.ready;
     }
 
     /**
@@ -413,16 +596,23 @@ export class PenpotMcpServer {
     }
 
     /**
-     * Logs one structured line for a finished tool call. The line names the tool, the token fingerprint, the
-     * duration and the outcome, and never carries the token. Tools call this hook after each execution.
+     * Logs one structured line for a finished tool call, and counts the call for `/metrics`. The line names the
+     * tool, the request id, the token fingerprint, the duration and the outcome, and never carries the token.
      *
      * @param record - the facts of the call
      */
     public recordToolCall(record: ToolCallRecord): void {
         this.logger.info(
-            { tool: record.tool, tokenFp: record.tokenFp, durationMs: record.durationMs, outcome: record.outcome },
+            {
+                tool: record.tool,
+                requestId: record.requestId,
+                tokenFp: record.tokenFp,
+                durationMs: record.durationMs,
+                outcome: record.outcome,
+            },
             "Tool call finished"
         );
+        this.metrics.recordToolCall(record.tool, record.outcome, record.durationMs);
     }
 
     /**
@@ -434,7 +624,7 @@ export class PenpotMcpServer {
         return this.sessionContext.getStore();
     }
 
-    private initTools(): ToolInfo[] {
+    private async initTools(): Promise<ToolInfo[]> {
         const toolInstances: Tool<any>[] = [new HighLevelOverviewTool(this), new PenpotApiInfoTool(this, this.apiDocs)];
         if (this.mode !== "backend") {
             // in both mode the backend tools own the plain names, so the plugin tools get suffixed names
@@ -454,6 +644,7 @@ export class PenpotMcpServer {
             }
         }
         if (this.backendServices) {
+            const { BackendToolSet } = await import("./tools/backend/BackendToolSet");
             toolInstances.push(...BackendToolSet.create(this, this.backendServices));
         }
         if (this.backendClient) {
@@ -487,47 +678,235 @@ export class PenpotMcpServer {
         );
 
         for (const tool of this.tools) {
-            server.registerTool(tool.name, tool.config, async (args) => tool.instance.execute(args));
+            const annotations: ToolAnnotations = tool.instance.annotations();
+            server.registerTool(tool.name, { ...tool.config, annotations }, async (args, ctx) =>
+                tool.instance.execute(args, ctx.mcpReq.signal, PenpotMcpServer.progressReporterOf(ctx))
+            );
         }
 
         return server;
     }
 
-    private setupHttpEndpoints(): void {
-        const handleMcpRequest = toNodeHandler(this.mcpHandler);
-        this.app.all("/mcp", async (req, res) => {
-            const authResult = this.authentication.authenticate(req, res);
-            if (authResult.isRejected) {
+    /**
+     * Answers whether the request comes from a page that the server should not serve: a Host or an Origin
+     * that is not a loopback name. Runs only when the server binds to a loopback host.
+     *
+     * @param req - the incoming request
+     * @returns the rejection, or undefined when the request may pass
+     */
+    private static hostRejectionOf(req: IncomingMessage): globalThis.Response | undefined {
+        const web = webRequestOf(req);
+        if (web === undefined) {
+            return new globalThis.Response("Bad request headers", { status: 400 });
+        }
+        return (
+            hostHeaderValidationResponse(web, localhostAllowedHostnames()) ??
+            originValidationResponse(web, localhostAllowedOrigins())
+        );
+    }
+
+    /**
+     * Writes a web response from the SDK checks to an Express response.
+     *
+     * @param res - the Express response to write
+     * @param response - the web response to copy
+     */
+    private static async sendWebResponse(res: ExpressResponse, response: globalThis.Response): Promise<void> {
+        res.status(response.status);
+        response.headers.forEach((value, name) => res.setHeader(name, value));
+        res.send(await response.text());
+    }
+
+    /**
+     * Checks the token of a request and the credentials it carries, before the body is read.
+     *
+     * A syntax error, or a missing token under OAuth, gets a 401. A token that the backend rejects gets a 401
+     * with a challenge. Only then does the request get the large body limit.
+     *
+     * @param req - the incoming request
+     * @param res - the response, which carries the 401 when the request is refused
+     * @param next - continues to the body parser and the handler
+     */
+    private async authorizeRequest(req: ExpressRequest, res: ExpressResponse, next: NextFunction): Promise<void> {
+        const auth: McpAuthenticationResult = this.authentication.authenticate(req, res);
+        if (auth.isRejected) {
+            return;
+        }
+        // only a token that the backend validated earns the large body limit; a token that nobody checked
+        // gets the floor, so any Bearer string cannot buy 32 MB
+        let authenticated = false;
+        if (this.tokenCheck !== undefined && auth.userToken !== undefined) {
+            const outcome = await this.tokenCheck.check(res, auth.userToken);
+            if (outcome === "rejected") {
                 return;
             }
-            this.logger.info(
-                `Received MCP request: method=${req.body?.method ?? "<none>"}; userTokenFp=${PenpotMcpServer.tokenFingerprint(authResult.userToken)}`
-            );
-            if (this.initializeTokenCheck && authResult.userToken !== undefined) {
-                const rejected = await this.initializeTokenCheck.rejectsRequest(req, res, authResult.userToken);
-                if (rejected) {
+            authenticated = outcome === "validated";
+        }
+        requestAuthOf.set(res, { userToken: auth.userToken, authenticated });
+        next();
+    }
+
+    private setupHttpEndpoints(json: (options: { limit: number }) => RequestHandler): void {
+        const handleMcpRequest = toNodeHandler(this.mcpHandler);
+        // a request without a token gets the small limit; the large one is for authenticated requests only
+        const smallJson = json({ limit: BodyLimit.UNAUTHENTICATED_BYTES });
+        const largeJson = json({ limit: BodyLimit.bytesOf(process.env) });
+
+        this.app.get("/healthz", (_req, res) => {
+            res.setHeader("Cache-Control", "no-store");
+            res.type("text/plain").send("ok\n");
+        });
+
+        this.app.get("/readyz", async (_req, res) => {
+            res.setHeader("Cache-Control", "no-store");
+            // without a backend, or in bridge mode, there is nothing to wait for; the process being up is ready
+            const ready =
+                this.mode === "bridge" || this.backendReadiness === undefined
+                    ? true
+                    : await this.backendReadiness.isReady();
+            res.status(ready ? 200 : 503)
+                .type("text/plain")
+                .send(ready ? "ready\n" : "not ready\n");
+        });
+
+        // metrics name tools and sandboxes, so they are served on loopback only, or to a validated token
+        this.app.get(
+            "/metrics",
+            async (req, res, next) => {
+                // the same Host check as /mcp, then no token only for a client that is on this machine itself
+                const loopbackBind = LOOPBACK_HOSTS.includes(this.host);
+                if (loopbackBind) {
+                    const rejected = PenpotMcpServer.hostRejectionOf(req);
+                    if (rejected !== undefined) {
+                        await PenpotMcpServer.sendWebResponse(res, rejected);
+                        return;
+                    }
+                }
+                if (loopbackBind && isLoopbackClient(req)) {
+                    next();
                     return;
                 }
+                await this.authorizeRequest(req, res, () => {
+                    if (requestAuthOf.get(res)?.authenticated) {
+                        next();
+                    } else {
+                        this.authentication.rejectOAuth(res);
+                    }
+                });
+            },
+            (_req, res) => {
+                res.setHeader("Cache-Control", "no-store");
+                res.type("text/plain; version=0.0.4").send(this.renderMetrics());
             }
-            await this.sessionContext.run({ userToken: authResult.userToken }, () =>
-                handleMcpRequest(req, res, req.body)
-            );
+        );
+
+        this.app.all(
+            "/mcp",
+            async (req, res, next) => {
+                // a page on another host can reach a loopback server through DNS rebinding; refuse it first
+                if (LOOPBACK_HOSTS.includes(this.host)) {
+                    const rejected = PenpotMcpServer.hostRejectionOf(req);
+                    if (rejected !== undefined) {
+                        await PenpotMcpServer.sendWebResponse(res, rejected);
+                        return;
+                    }
+                }
+                await this.authorizeRequest(req, res, next);
+            },
+            (req, res, next) => {
+                const auth = requestAuthOf.get(res);
+                const parser = auth?.authenticated ? largeJson : smallJson;
+                parser(req, res, next);
+            },
+            async (req, res) => {
+                const auth = requestAuthOf.get(res);
+                const userToken = auth?.userToken;
+                this.logger.info(
+                    `Received MCP request: method=${req.body?.method ?? "<none>"}; userTokenFp=${PenpotMcpServer.tokenFingerprint(userToken)}`
+                );
+                await this.sessionContext.run({ userToken }, () => handleMcpRequest(req, res, req.body));
+            }
+        );
+    }
+
+    /**
+     * Renders the metrics of the tool calls and of the sandboxes as Prometheus text.
+     */
+    private renderMetrics(): string {
+        const stats = this.backendServices?.sandboxes.stats();
+        const calls = stats?.calls ?? { ok: 0, error: 0, interrupted: 0 };
+        const counter = (name: string, help: string, value: number, labels?: Record<string, string>) => ({
+            name,
+            help,
+            type: "counter" as const,
+            samples: [{ labels, value }],
         });
+        return this.metrics.render([
+            {
+                name: "penpot_mcp_active_sandboxes",
+                help: "Sandbox runtimes held by the server.",
+                type: "gauge",
+                samples: [{ value: stats?.live ?? 0 }],
+            },
+            counter("penpot_mcp_sandbox_runtimes_created_total", "Sandbox runtimes created.", stats?.created ?? 0),
+            counter("penpot_mcp_sandbox_runtimes_disposed_total", "Sandbox runtimes disposed.", stats?.disposed ?? 0),
+            counter(
+                "penpot_mcp_sandbox_memory_recycles_total",
+                "Sandbox runtimes recycled for memory growth.",
+                stats?.memoryRecycles ?? 0
+            ),
+            {
+                name: "penpot_mcp_sandbox_calls_total",
+                help: "Sandbox calls by outcome.",
+                type: "counter",
+                samples: Object.entries(calls).map(([outcome, value]) => ({ labels: { outcome }, value })),
+            },
+        ]);
+    }
+
+    /**
+     * Builds the progress reporter of a request, when the client sent a progress token.
+     *
+     * The reporter sends `notifications/progress` with that token, so a long tool keeps the connection alive
+     * and shows progress. Without a token the client asked for no progress, and the result is undefined.
+     *
+     * @param ctx - the request context that the SDK passes to the tool callback
+     * @returns the reporter, or undefined when the request carries no progress token
+     */
+    public static progressReporterOf(ctx: ServerContext): ProgressReporter | undefined {
+        const progressToken = ctx.mcpReq._meta?.progressToken;
+        if (progressToken === undefined) {
+            return undefined;
+        }
+        return (progress, total, message) =>
+            ctx.mcpReq.notify({
+                method: "notifications/progress",
+                params: {
+                    progressToken,
+                    progress,
+                    ...(total !== undefined ? { total } : {}),
+                    ...(message !== undefined ? { message } : {}),
+                },
+            });
     }
 
     async start(): Promise<void> {
+        await this.ready;
         const { default: express } = await import("express");
+        if (this.isFileSystemAccessEnabled()) {
+            // fails at start, not at the first export, when PENPOT_MCP_EXPORT_DIR is not usable
+            ExportDirectory.rootOf(process.env);
+        }
         this.app = express();
-        this.app.use(express.json({ limit: BodyLimit.bytesOf(process.env) }));
 
-        this.setupHttpEndpoints();
+        this.setupHttpEndpoints(express.json);
 
         return new Promise((resolve, reject) => {
             this.httpServer = this.app.listen(this.port, this.host, async () => {
-                this.logger.info(`Server mode: ${this.mode}`);
-                const impliedWarning = PenpotMcpServer.impliedModeWarning(process.env);
-                if (impliedWarning !== undefined) {
-                    this.logger.warn(impliedWarning);
+                this.logger.info(`Server mode: ${this.mode} (${PenpotMcpServer.modeReason(process.env)})`);
+                const unusedBackend = PenpotMcpServer.unusedBackendWarning(process.env);
+                if (unusedBackend !== undefined) {
+                    this.logger.warn(unusedBackend);
                 }
                 if (this.mode === "both") {
                     const { plain, bridge } = partitionToolNames(this.getToolNames(), this.bridgeToolNames);
@@ -570,19 +949,39 @@ export class PenpotMcpServer {
     }
 
     /**
+     * Closes the HTTP server. Requests still open after the deadline have their connections closed, so a long
+     * call cannot block the shutdown.
+     */
+    private closeHttpServer(): Promise<void> {
+        const server = this.httpServer;
+        if (server === undefined) {
+            return Promise.resolve();
+        }
+        return new Promise<void>((resolve, reject) => {
+            const deadline = setTimeout(() => server.closeAllConnections(), HTTP_CLOSE_DEADLINE_MS);
+            server.close((error) => {
+                clearTimeout(deadline);
+                if (error) {
+                    reject(error);
+                } else {
+                    resolve();
+                }
+            });
+        });
+    }
+
+    /**
      * Stops the MCP server and associated services.
      *
      * Gracefully shuts down the REPL server and other components.
      */
     public async stop(): Promise<void> {
         this.logger.info("Stopping Penpot MCP Server...");
-        const httpClosed = this.httpServer
-            ? new Promise<void>((resolve, reject) => {
-                  this.httpServer!.close((error) => (error ? reject(error) : resolve()));
-              })
-            : Promise.resolve();
+        const httpClosed = this.closeHttpServer();
         await this.mcpHandler.close();
         await httpClosed;
+        this.backendServices?.sandboxes.dispose();
+        await Promise.all(this.connectionPools.map((pool) => pool.close()));
         await this.bridge?.close();
         await this.redisBridge?.close();
         if (this.replServer) {

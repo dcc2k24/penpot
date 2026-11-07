@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { ExporterError, HttpExporterClient, type ExportShapeRequest } from "./ExporterClient";
 import { Transit } from "./Transit";
+import { CallContext } from "./CallContext";
 
 const EXPORTER = "http://exporter.example/";
 const BACKEND = "http://backend.example/";
@@ -508,4 +509,59 @@ test("an asset answered with 204 names PENPOT_MCP_ASSETS_URI", async () => {
         assert.match(error.message, /PENPOT_MCP_ASSETS_URI/);
         return true;
     });
+});
+
+test("every exporter and backend call goes through the connection pool", async () => {
+    const pool = { pool: true };
+    const { fetchImpl, calls } = recordingFetch(() => new Response(PNG_BYTES, { status: 200 }));
+    const client = new HttpExporterClient(EXPORTER, BACKEND, 120, fetchImpl, 64, undefined, pool as never);
+    await client.downloadAsset(RENDER_TOKEN, ASSET);
+    assert.equal(calls.length, 1);
+    assert.equal((calls[0].init as { dispatcher?: unknown }).dispatcher, pool);
+});
+
+test("a failed answer quotes at most 200 characters, and the rest of a large body is not read", async () => {
+    const huge = "e".repeat(5 * 1024 * 1024);
+    const { client } = clientOn(() => new Response(huge, { status: 500 }));
+    const error = await client.downloadAsset(RENDER_TOKEN, ASSET).catch((caught: unknown) => caught);
+    assert.ok(error instanceof Error);
+    assert.ok(error.message.length < 400, `message is ${error.message.length} characters`);
+    assert.match(error.message, /HTTP 500/);
+});
+
+/** A fetch that never answers, and rejects when its signal fires. It records the signal of each call. */
+function hangingFetch(seen: AbortSignal[]): typeof fetch {
+    return ((_input: unknown, init?: RequestInit) => {
+        const signal = init?.signal ?? undefined;
+        if (signal !== undefined) {
+            seen.push(signal);
+        }
+        return new Promise<Response>((_resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(new Error("aborted by the signal")));
+        });
+    }) as unknown as typeof fetch;
+}
+
+test("an exporter render stops at once when the call of the tool is abandoned", async () => {
+    const seen: AbortSignal[] = [];
+    const client = new HttpExporterClient(EXPORTER, BACKEND, 120, hangingFetch(seen));
+    const controller = new AbortController();
+    const call = CallContext.run({ requestId: "req-1", signal: controller.signal }, () =>
+        client.exportShape(RENDER_TOKEN, REQUEST)
+    );
+    setTimeout(() => controller.abort(), 10);
+    await assert.rejects(call);
+    assert.equal(seen[0].aborted, true);
+});
+
+test("an asset download stops at once when the call of the tool is abandoned", async () => {
+    const seen: AbortSignal[] = [];
+    const client = new HttpExporterClient(EXPORTER, BACKEND, 120, hangingFetch(seen));
+    const controller = new AbortController();
+    const call = CallContext.run({ requestId: "req-2", signal: controller.signal }, () =>
+        client.downloadAsset(RENDER_TOKEN, ASSET)
+    );
+    setTimeout(() => controller.abort(), 10);
+    await assert.rejects(call);
+    assert.equal(seen[0].aborted, true);
 });

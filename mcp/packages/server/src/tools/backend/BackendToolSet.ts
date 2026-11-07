@@ -11,6 +11,7 @@ import { GetShapesTool } from "./GetShapesTool";
 import { FindShapesTool } from "./FindShapesTool";
 import { GetLibraryTool } from "./GetLibraryTool";
 import { GetTokensTool } from "./GetTokensTool";
+import { DescribeOperationsTool } from "./DescribeOperationsTool";
 import { ApplyOperationsTool } from "./ApplyOperationsTool";
 import { BatchCreateShapesTool } from "./BatchCreateShapesTool";
 import { ApplyRawChangesTool } from "./ApplyRawChangesTool";
@@ -43,6 +44,7 @@ export class BackendToolSet {
             new FindShapesTool(mcpServer, services),
             new GetLibraryTool(mcpServer, services),
             new GetTokensTool(mcpServer, services),
+            new DescribeOperationsTool(mcpServer, services),
             new ApplyOperationsTool(mcpServer, services),
             new BatchCreateShapesTool(mcpServer, services),
             new ApplyRawChangesTool(mcpServer, services),

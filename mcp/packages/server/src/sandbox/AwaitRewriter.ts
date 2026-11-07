@@ -29,6 +29,14 @@ export class AwaitRewriter {
     private static readonly ASYNC_HINT =
         "execute_code runs synchronously in backend mode: async functions do not work; write a plain function and call the penpot facade directly";
 
+    /** Hint for promise use: callbacks run after the last flush, so their writes would be lost. */
+    private static readonly PROMISE_HINT =
+        "execute_code runs synchronously in backend mode: promises and their callbacks (then, catch, finally) are not " +
+        "supported; write plain code and call the penpot facade directly";
+
+    /** Names of the promise methods whose use is refused. */
+    private static readonly PROMISE_METHODS = new Set(["then", "catch", "finally"]);
+
     /** Names of the facade objects whose calls may follow a stripped `await`. */
     private static readonly FACADE_ROOTS = new Set(["penpot", "penpotUtils", "penpotMgmt"]);
 
@@ -97,6 +105,9 @@ export class AwaitRewriter {
             starts.push(node.start);
         } else if (AwaitRewriter.FUNCTION_TYPES.has(node.type) && node.async === true) {
             throw new Error(AwaitRewriter.ASYNC_HINT);
+        } else if (AwaitRewriter.isPromiseUse(node)) {
+            // a promise callback runs after the script has been flushed, so its writes would be lost.
+            throw new Error(AwaitRewriter.PROMISE_HINT);
         }
         for (const child of AwaitRewriter.children(node)) {
             AwaitRewriter.collect(child, starts);
@@ -132,6 +143,26 @@ export class AwaitRewriter {
         }
         const rootName = AwaitRewriter.identifierName(root);
         return rootName !== undefined && AwaitRewriter.FACADE_ROOTS.has(rootName);
+    }
+
+    /**
+     * Tells whether a node uses promises: a `then`, `catch` or `finally` member, or the global `Promise`.
+     *
+     * @param node - the syntax node
+     * @returns true for a node that the sandbox refuses
+     */
+    private static isPromiseUse(node: SyntaxNode): boolean {
+        if (node.type === "Identifier") {
+            return node.name === "Promise";
+        }
+        if (node.type !== "MemberExpression") {
+            return false;
+        }
+        const property = AwaitRewriter.identifierName(node.property);
+        if (node.computed !== true && property !== undefined && AwaitRewriter.PROMISE_METHODS.has(property)) {
+            return true;
+        }
+        return node.computed !== true && AwaitRewriter.identifierName(node.object) === "Promise";
     }
 
     /**

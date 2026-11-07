@@ -1,15 +1,27 @@
 /** Tunables of backend mode, read from the environment. */
 export class BackendSettings {
-    /** Default timeout of backend commands, in seconds. */
-    public static readonly DEFAULT_TIMEOUT_SECONDS = 120;
+    /**
+     * Default timeout of backend commands, in seconds.
+     *
+     * The common MCP client timeout is 60 s. The adapter gives up a little earlier, so the client gets a
+     * clear error from the adapter instead of a silent drop, and a write is not left running unseen.
+     */
+    public static readonly DEFAULT_TIMEOUT_SECONDS = 55;
     /** Default sustained requests per second and MCP token. */
     public static readonly DEFAULT_RATE_LIMIT_PER_SECOND = 10;
     /** Default burst of requests per MCP token. */
     public static readonly DEFAULT_RATE_LIMIT_BURST = 20;
     /** Default base URI of the Penpot exporter service. */
     public static readonly DEFAULT_EXPORTER_URI = "http://localhost:6061/";
-    /** Default cap on the body of one backend response, in megabytes. */
-    public static readonly DEFAULT_MAX_RESPONSE_MB = 64;
+    /**
+     * Default cap on the body of one backend response, in megabytes.
+     *
+     * The tools return at most about 1 MB of JSON, so 8 MB leaves room for an answer that the tools cut.
+     * A larger cap only lets a few concurrent reads hold more heap.
+     */
+    public static readonly DEFAULT_MAX_RESPONSE_MB = 8;
+    /** Largest number of sockets kept open to one origin, for the backend and the exporter. */
+    public static readonly CONNECTIONS_PER_ORIGIN = 32;
 
     /**
      * Creates settings from explicit values.
@@ -35,10 +47,15 @@ export class BackendSettings {
     /**
      * Reads the backend settings from environment variables.
      *
+     * The query-parameter token is accepted by default only in bridge mode. In backend and both mode the
+     * token can write and delete on its own, and a URL leaks into proxy logs and shell history, so the
+     * header is the only default there.
+     *
      * @param env - environment to read
+     * @param mode - the server mode: `bridge`, `backend` or `both`
      * @throws Error naming the variable when a value is malformed
      */
-    public static fromEnvironment(env: Record<string, string | undefined>): BackendSettings {
+    public static fromEnvironment(env: Record<string, string | undefined>, mode: string = "bridge"): BackendSettings {
         return new BackendSettings(
             BackendSettings.positiveNumber(
                 env,
@@ -55,7 +72,7 @@ export class BackendSettings {
                 "PENPOT_MCP_RATE_LIMIT_BURST",
                 BackendSettings.DEFAULT_RATE_LIMIT_BURST
             ),
-            BackendSettings.booleanFlag(env, "PENPOT_MCP_ALLOW_QUERY_TOKEN", true),
+            BackendSettings.booleanFlag(env, "PENPOT_MCP_ALLOW_QUERY_TOKEN", mode === "bridge"),
             BackendSettings.readExporterUri(env),
             BackendSettings.readMaxResponseMb(env),
             BackendSettings.readAssetsUri(env)
@@ -65,19 +82,19 @@ export class BackendSettings {
     /**
      * Reads the cap on the body of one backend response, in megabytes.
      *
-     * Unlike the other settings this never throws: an unset, blank or non-positive value, or one that is
-     * not a number, falls back to {@link BackendSettings.DEFAULT_MAX_RESPONSE_MB}.
+     * An unset or blank value gives the default. A value that is not a positive number throws, like the
+     * other settings, so a typo does not change the cap without a word.
      *
      * @param env - environment to read
      * @returns the cap in megabytes, a positive number
+     * @throws Error naming the variable when the value is not a positive number
      */
     public static readMaxResponseMb(env: Record<string, string | undefined>): number {
-        const raw = env["PENPOT_MCP_BACKEND_MAX_RESPONSE_MB"]?.trim();
-        const value = raw === undefined || raw === "" ? Number.NaN : Number(raw);
-        if (!Number.isFinite(value) || value <= 0) {
-            return BackendSettings.DEFAULT_MAX_RESPONSE_MB;
-        }
-        return value;
+        return BackendSettings.positiveNumber(
+            env,
+            "PENPOT_MCP_BACKEND_MAX_RESPONSE_MB",
+            BackendSettings.DEFAULT_MAX_RESPONSE_MB
+        );
     }
 
     /**

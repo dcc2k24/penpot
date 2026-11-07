@@ -4,6 +4,7 @@ import type { ToolResponse } from "../../ToolResponse";
 import type { BackendServices } from "../../backend/BackendServices";
 import { BackendTool } from "./BackendTool";
 import { BackendIds } from "./BackendIds";
+import { ListWindow } from "./ListWindow";
 
 /** The actions of {@link CommentsTool}. */
 export type CommentsAction =
@@ -34,11 +35,20 @@ export class CommentsArgs {
             .optional()
             .describe("Page position of the thread."),
         content: z.string().min(1).max(4000).optional().describe("Text of the thread's first comment or of a reply."),
+        limit: z
+            .number()
+            .int()
+            .min(1)
+            .max(1000)
+            .optional()
+            .describe("For list: the most threads to return (1 to 1000, default 100)."),
     };
 
     fileId!: string;
 
     action!: CommentsAction;
+
+    limit?: number;
 
     threadId?: string;
 
@@ -91,7 +101,7 @@ export class CommentsTool extends BackendTool<CommentsArgs> {
         const fileId = args.fileId;
         switch (args.action) {
             case "list":
-                return this.callCommand(userToken, "get-comment-threads", { fileId });
+                return this.listThreads(args, userToken);
             case "get":
                 return this.callCommand(userToken, "get-comments", { threadId: this.need(args, "threadId") });
             case "create_thread":
@@ -126,6 +136,21 @@ export class CommentsTool extends BackendTool<CommentsArgs> {
             case "delete":
                 return this.callWrite(userToken, fileId, "delete-comment", { id: this.need(args, "commentId") });
         }
+    }
+
+    /**
+     * Reads the threads of the file and keeps the first ones up to the limit.
+     *
+     * @param args - the tool arguments, which carry the limit
+     * @param userToken - the MCP token of the request
+     */
+    private async listThreads(args: CommentsArgs, userToken: string): Promise<unknown> {
+        const threads = await this.callCommand<unknown>(userToken, "get-comment-threads", { fileId: args.fileId });
+        if (!Array.isArray(threads)) {
+            return threads;
+        }
+        const kept = ListWindow.cut(threads, args.limit, "threads");
+        return { threads: kept.items, shown: kept.shown, total: kept.total, note: kept.note };
     }
 
     /**

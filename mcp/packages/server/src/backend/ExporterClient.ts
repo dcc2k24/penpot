@@ -1,6 +1,9 @@
+import type { Dispatcher } from "undici";
 import { BackendSettings } from "./BackendSettings";
+import { withDispatcher } from "./ConnectionPools";
 import { CappedBody } from "./CappedBody";
 import { Transit } from "./Transit";
+import { CallContext } from "./CallContext";
 
 /** Format that the exporter can render a shape to. */
 export type ExportFormat = "png" | "svg" | "jpeg" | "webp" | "pdf";
@@ -111,6 +114,7 @@ export class HttpExporterClient implements ExporterClient {
      * @param fetchImpl - fetch function used for every call, injectable for tests
      * @param maxResponseMb - cap on the body of one exporter or asset answer, in megabytes
      * @param assetsUri - base URI of the asset downloads, or undefined to use the origin named by the exporter
+     * @param dispatcher - connection pool passed to `fetch` for every call, or undefined for the global pool
      * @throws Error naming the variable when either URI is not an absolute HTTP(S) URI
      */
     constructor(
@@ -119,7 +123,8 @@ export class HttpExporterClient implements ExporterClient {
         private readonly timeoutSeconds: number = 120,
         private readonly fetchImpl: typeof fetch = fetch,
         maxResponseMb: number = BackendSettings.readMaxResponseMb(process.env),
-        assetsUri?: string
+        assetsUri?: string,
+        private readonly dispatcher?: Dispatcher
     ) {
         this.exporterUri = HttpExporterClient.parseHttpUri(exporterUri, "PENPOT_MCP_EXPORTER_URI");
         this.backendUri = HttpExporterClient.parseHttpUri(backendUri, "PENPOT_MCP_BACKEND_URI");
@@ -171,16 +176,22 @@ export class HttpExporterClient implements ExporterClient {
         });
         let response: Response;
         try {
-            response = await this.fetchImpl(this.exporterUri.href, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/transit+json",
-                    Cookie: HttpExporterClient.cookieOf(renderToken),
-                },
-                body,
-                redirect: "manual",
-                signal: AbortSignal.timeout(this.timeoutSeconds * 1000),
-            });
+            response = await this.fetchImpl(
+                this.exporterUri.href,
+                withDispatcher(
+                    {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/transit+json",
+                            Cookie: HttpExporterClient.cookieOf(renderToken),
+                        },
+                        body,
+                        redirect: "manual",
+                        signal: this.callSignal(),
+                    },
+                    this.dispatcher
+                )
+            );
         } catch (error) {
             throw new Error(
                 `The exporter did not respond (${HttpExporterClient.reasonOf(error)}). Check PENPOT_MCP_EXPORTER_URI.`
@@ -303,12 +314,18 @@ export class HttpExporterClient implements ExporterClient {
      */
     private async sendAsset(url: string, renderToken: string): Promise<Response> {
         try {
-            return await this.fetchImpl(url, {
-                method: "GET",
-                headers: { Cookie: HttpExporterClient.cookieOf(renderToken) },
-                redirect: "manual",
-                signal: AbortSignal.timeout(this.timeoutSeconds * 1000),
-            });
+            return await this.fetchImpl(
+                url,
+                withDispatcher(
+                    {
+                        method: "GET",
+                        headers: { Cookie: HttpExporterClient.cookieOf(renderToken) },
+                        redirect: "manual",
+                        signal: this.callSignal(),
+                    },
+                    this.dispatcher
+                )
+            );
         } catch (error) {
             throw new Error(
                 `The backend did not respond (${HttpExporterClient.reasonOf(error)}) while downloading the asset.`
@@ -454,19 +471,46 @@ export class HttpExporterClient implements ExporterClient {
     }
 
     /**
+     * Builds the signal of one exporter or asset call: it fires at the configured timeout, or when the call
+     * of the tool is abandoned, whichever comes first. A render that the caller gave up on then stops at once.
+     */
+    private callSignal(): AbortSignal {
+        const timeout = AbortSignal.timeout(this.timeoutSeconds * 1000);
+        const abandoned = CallContext.current()?.signal;
+        return abandoned === undefined ? timeout : AbortSignal.any([timeout, abandoned]);
+    }
+
+    /** Longest snippet of a failed answer that goes into an error message, in characters. */
+    private static readonly SNIPPET_CHARS = 200;
+
+    /**
      * Reads the first 200 characters of the body of a failed answer.
+     *
+     * Only the bytes needed for the snippet are read, so a large error page costs no more than a small one.
      *
      * @param response - the failed answer
      * @returns the snippet, or an empty text when the body cannot be read
      */
     private static async snippetOf(response: Response): Promise<string> {
-        let text: string;
-        try {
-            text = await response.text();
-        } catch {
-            text = "";
+        if (response.body === null) {
+            return "";
         }
-        return text.slice(0, 200);
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let text = "";
+        try {
+            while (text.length < HttpExporterClient.SNIPPET_CHARS) {
+                const result = await reader.read();
+                if (result.done) {
+                    break;
+                }
+                text += decoder.decode(result.value, { stream: true });
+            }
+        } catch {
+            // unreadable: keep the part that was read
+        }
+        await reader.cancel().catch(() => undefined);
+        return text.slice(0, HttpExporterClient.SNIPPET_CHARS);
     }
 
     /**

@@ -1,7 +1,7 @@
 import type { Request, Response } from "express";
 import { createLogger } from "./logger";
 import { TokenDigest } from "./backend/TokenDigest";
-import { type BackendTokenValidator, TokenRejectedError } from "./backend/BackendTokenValidator";
+import { type BackendTokenValidator, BackendTooOldError, TokenRejectedError } from "./backend/BackendTokenValidator";
 
 /**
  * A set of token fingerprints that keeps at most a fixed number of entries.
@@ -151,12 +151,9 @@ export class McpAuthentication {
             userToken = value;
         }
 
-        // NOTE: The MCP server does not validate userToken against the backend.
-        // It uses the token to match MCP requests to a connection established
-        // from the Penpot webapp. Without that matching connection, requests
-        // cannot access or modify designs. The user must be logged in to Penpot
-        // to establish that connection; Penpot login and file permissions thus
-        // provide the authentication and access control boundary.
+        // NOTE: With backend mode the token is checked against the backend before the body is read
+        // (RequestTokenCheck). Without a backend the token only matches MCP requests to a connection made
+        // from the Penpot webapp, so the Penpot login and file permissions are the access boundary.
 
         if (this.isOAuthEnabled && !userToken) {
             this.rejectOAuth(res);
@@ -212,15 +209,18 @@ export class McpAuthentication {
     }
 }
 
+/** Outcome of checking the token of a request against the backend. */
+export type TokenCheckOutcome = "validated" | "rejected" | "unchecked";
+
 /**
- * Checks the token of a request that starts a new MCP session against the backend.
+ * Checks the token of every request against the backend, before the request body is read.
  *
- * A token that the backend rejects gets a 401 response at `initialize`, so the client learns of the
- * rejection before it starts a session. Other backend failures let the request through, as before,
- * so that the tool calls report them.
+ * A token that the backend rejects gets a 401 response with a WWW-Authenticate challenge, so that an OAuth
+ * client refreshes its token instead of seeing tool errors later. A failure other than a rejection lets the
+ * request through as unchecked. The tool calls then report the failure, so the request is not lost.
  */
-export class InitializeTokenCheck {
-    private readonly logger = createLogger("InitializeTokenCheck");
+export class RequestTokenCheck {
+    private readonly logger = createLogger("RequestTokenCheck");
 
     /**
      * Creates a check.
@@ -234,38 +234,27 @@ export class InitializeTokenCheck {
     ) {}
 
     /**
-     * Indicates whether a request starts a new MCP session.
+     * Validates the token, and sends a 401 response when the backend rejects it.
      *
-     * A session starts with an `initialize` call that carries no `mcp-session-id` header.
-     *
-     * @param req the incoming request, whose JSON body the server has already parsed
-     */
-    public static startsSession(req: Request): boolean {
-        return req.body?.method === "initialize" && req.headers["mcp-session-id"] === undefined;
-    }
-
-    /**
-     * Validates the token of a request that starts a session, and sends a 401 response when the backend rejects it.
-     *
-     * @param req the incoming request
      * @param res the response to answer on rejection
      * @param userToken the MCP token taken from the request
-     * @returns true when the request was rejected and its 401 response sent
+     * @returns `rejected` when the 401 response was sent, `validated` when the backend accepted the token,
+     *   and `unchecked` when the check could not run
      */
-    public async rejectsRequest(req: Request, res: Response, userToken: string): Promise<boolean> {
-        if (!InitializeTokenCheck.startsSession(req)) {
-            return false;
-        }
+    public async check(res: Response, userToken: string): Promise<TokenCheckOutcome> {
         try {
             await this.validator.validate(userToken);
-            return false;
+            return "validated";
         } catch (error) {
             if (error instanceof TokenRejectedError) {
                 this.authentication.rejectOAuth(res, "invalid_token");
-                return true;
+                return "rejected";
             }
-            this.logger.warn(`Could not validate the MCP token at initialize; the request continues. ${String(error)}`);
-            return false;
+            // the validator logs a backend that is too old once; the tool calls report it
+            if (!(error instanceof BackendTooOldError)) {
+                this.logger.warn(`Could not validate the MCP token; the request continues unchecked. ${String(error)}`);
+            }
+            return "unchecked";
         }
     }
 }

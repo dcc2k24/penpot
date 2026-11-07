@@ -21,6 +21,24 @@ const SNAPSHOT = "1b2c3d4e-0000-4000-8000-000000000006";
 const COMMENT = "1b2c3d4e-0000-4000-8000-000000000007";
 const THREAD = "1b2c3d4e-0000-4000-8000-000000000008";
 const LIBRARY = "1b2c3d4e-0000-4000-8000-000000000009";
+const SET = "1b2c3d4e-0000-4000-8000-00000000000b";
+
+/** Attributes that get_shapes returns when no fields are given. */
+const DEFAULT_SHAPE_FIELDS = ["id", "name", "type", "parent-id", "x", "y", "width", "height", "hidden", "shapes"];
+
+/** Shape of a v4 UUID, which the write commands send as requestId. */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/**
+ * Checks that a write carries a requestId, and returns its parameters without it.
+ *
+ * @param params - the parameters of a write command as the fake backend received them
+ */
+function withoutRequestId(params: unknown): Record<string, unknown> {
+    const { requestId, ...rest } = params as Record<string, unknown>;
+    assert.match(String(requestId), UUID_PATTERN);
+    return rest;
+}
 
 /** A request session, as the HTTP layer provides it. */
 interface TestSession {
@@ -39,6 +57,7 @@ function sessionServer(session: TestSession): PenpotMcpServer {
 /** Builds the tool set on a fake backend that accepts every token. */
 function harness(settings: BackendSettings = new BackendSettings(), session: TestSession = { userToken: TOKEN }) {
     const backend = new FakePenpotBackend().respond("mcp-whoami", {
+        contractVersion: 1,
         profileId: "profile-1",
         scopes: ["mcp:read", "mcp:write", "mcp:manage", "mcp:delete"],
     });
@@ -80,21 +99,21 @@ const cases: [string, string, Record<string, unknown>, string, Record<string, un
         "get_page_tree",
         { fileId: FILE, pageId: PAGE, depth: 2, fields: ["id", "type"] },
         "get-mcp-page-tree",
-        { fileId: FILE, pageId: PAGE, depth: 2, fields: ["id", "type"] },
+        { fileId: FILE, pageId: PAGE, depth: 2, fields: ["id", "type"], limit: 100 },
     ],
     [
         "get_page_tree with the nil root",
         "get_page_tree",
         { fileId: FILE, pageId: PAGE, rootId: "00000000-0000-0000-0000-000000000000" },
         "get-mcp-page-tree",
-        { fileId: FILE, pageId: PAGE, rootId: "00000000-0000-0000-0000-000000000000" },
+        { fileId: FILE, pageId: PAGE, rootId: "00000000-0000-0000-0000-000000000000", limit: 100 },
     ],
     [
         "get_shapes",
         "get_shapes",
         { fileId: FILE, pageId: PAGE, ids: [SHAPE], includeChildren: true },
         "get-mcp-shapes",
-        { fileId: FILE, pageId: PAGE, ids: [SHAPE], includeChildren: true },
+        { fileId: FILE, pageId: PAGE, ids: [SHAPE], includeChildren: true, fields: DEFAULT_SHAPE_FIELDS },
     ],
     [
         "find_shapes",
@@ -110,7 +129,14 @@ const cases: [string, string, Record<string, unknown>, string, Record<string, un
         "get-mcp-library",
         { fileId: FILE, kinds: ["colors"] },
     ],
-    ["get_tokens", "get_tokens", { fileId: FILE }, "get-mcp-tokens", { fileId: FILE }],
+    ["get_tokens", "get_tokens", { fileId: FILE }, "get-mcp-tokens", { fileId: FILE, format: "tokens" }],
+    [
+        "get_tokens of one set as dtcg",
+        "get_tokens",
+        { fileId: FILE, setId: SET, format: "dtcg" },
+        "get-mcp-tokens",
+        { fileId: FILE, setId: SET, format: "dtcg" },
+    ],
     [
         "apply_operations",
         "apply_operations",
@@ -319,16 +345,22 @@ for (const [label, toolName, args, command, params] of cases) {
         const calls = backend.callsTo(command);
         assert.ok(calls.length >= 1, `a call to ${command}`);
         const last = calls[calls.length - 1];
-        assert.deepEqual(last.params, params);
+        const actual: Record<string, unknown> = { ...(last.params as Record<string, unknown>) };
+        if (command === "mcp-apply-operations" || command === "mcp-apply-changes") {
+            // every write names itself; the id is checked here and left out of the comparison
+            assert.match(String(actual.requestId), UUID_PATTERN);
+            delete actual.requestId;
+        }
+        assert.deepEqual(actual, params);
         assert.equal(last.userToken, TOKEN);
     });
 }
 
-test("apply_operations returns the backend answer as pretty JSON after validating the token", async () => {
+test("apply_operations returns the backend answer as compact JSON after validating the token", async () => {
     const { backend, tool } = harness();
     backend.respond("mcp-apply-operations", { revn: 9, createdIds: { "$tmp:bg": SHAPE } });
     const response = await tool("apply_operations").execute({ fileId: FILE, operations: [createRect] });
-    assert.equal(textOf(response), JSON.stringify({ revn: 9, createdIds: { "$tmp:bg": SHAPE } }, null, 2));
+    assert.equal(textOf(response), JSON.stringify({ revn: 9, createdIds: { "$tmp:bg": SHAPE } }));
     assert.deepEqual(
         backend.calls.map((call) => call.name),
         ["mcp-whoami", "mcp-apply-operations"]
@@ -436,7 +468,7 @@ test("batch_create_shapes sends the expanded operations and returns the handle m
         ],
     });
     const call = backend.callsTo("mcp-apply-operations")[0];
-    assert.deepEqual(call.params, {
+    assert.deepEqual(withoutRequestId(call.params), {
         fileId: FILE,
         operations: [
             { op: "create_board", pageId: PAGE, id: "$tmp:n0", x: 0, y: 0, width: 320, height: 200, name: "Card" },
@@ -477,21 +509,49 @@ test("batch_create_shapes applies the parent id to the top-level nodes", async (
 
 // ── Responses ──
 
-test("formatJson pretty prints a value", () => {
-    assert.equal(BackendTool.formatJson({ a: 1 }), '{\n  "a": 1\n}');
+test("formatJson prints a value as compact JSON", () => {
+    assert.equal(BackendTool.formatJson({ a: 1 }), '{"a":1}');
 });
 
-test("formatJson cuts a response above 1 MB and says so", () => {
+test("formatJson cuts a response above 100 kB and says so", () => {
     const text = BackendTool.formatJson("a".repeat(1_200_000));
-    assert.ok(Buffer.byteLength(text, "utf8") < BackendTool.MAX_RESPONSE_BYTES + 300);
-    assert.match(text, /truncated: the response exceeded 1 MB/);
+    assert.ok(Buffer.byteLength(text, "utf8") <= BackendTool.MAX_RESPONSE_BYTES);
+    assert.match(text, /truncated: the response exceeded 100 kB/);
 });
 
-test("the tool set holds twenty-one backend tools with unique names", () => {
+test("read tools are marked read-only, and the file and version managers are marked destructive", () => {
+    const { tools } = harness();
+    const readOnly = [
+        "whoami",
+        "list_teams",
+        "list_projects",
+        "list_files",
+        "get_file_outline",
+        "get_page_tree",
+        "get_shapes",
+        "find_shapes",
+        "get_library",
+        "get_tokens",
+        "describe_operations",
+    ];
+    for (const name of readOnly) {
+        const found = tools.find((candidate) => candidate.getToolName() === name);
+        assert.ok(found, `${name} is registered`);
+        assert.deepEqual(found.annotations(), { readOnlyHint: true, destructiveHint: false }, name);
+    }
+    for (const name of ["manage_files", "manage_versions"]) {
+        const found = tools.find((candidate) => candidate.getToolName() === name);
+        assert.ok(found, `${name} is registered`);
+        assert.equal(found.annotations().destructiveHint, true, name);
+    }
+});
+
+test("the tool set holds twenty-two backend tools with unique names", () => {
     const { tools } = harness();
     const names = tools.map((tool) => tool.getToolName());
-    assert.equal(names.length, 21);
-    assert.equal(new Set(names).size, 21);
+    assert.equal(names.length, 22);
+    assert.equal(new Set(names).size, 22);
+    assert.ok(names.includes("describe_operations"));
     assert.ok(names.includes("execute_code"));
     assert.ok(names.includes("apply_operations"));
     assert.ok(names.includes("batch_create_shapes"));

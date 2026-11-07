@@ -21,8 +21,7 @@ const POSITION = { x: 10, y: 20 };
  * @returns the tool and the fake backend that records its calls
  */
 function harness() {
-    const backend = new FakePenpotBackend().respond("mcp-whoami", {
-        profileId: "profile-1",
+    const backend = new FakePenpotBackend().respond("mcp-whoami", { contractVersion: 1, profileId: "profile-1",
         scopes: ["mcp:read"],
     });
     const services = new BackendServices(backend, new BackendSettings(), new FakeExporterClient());
@@ -32,6 +31,27 @@ function harness() {
     } as unknown as PenpotMcpServer;
     return { backend, tool: new CommentsTool(server, services) };
 }
+
+test("comments list keeps the first 100 threads by default and says how many exist", async () => {
+    const { backend, tool } = harness();
+    const threads = Array.from({ length: 130 }, (_, index) => ({ id: `thread-${index}` }));
+    backend.respond("get-comment-threads", threads);
+    const text = (await tool.execute({ fileId: FILE, action: "list" })).content[0] as { text: string };
+    const parsed = JSON.parse(text.text) as { threads: unknown[]; shown: number; total: number; note: string };
+    assert.equal(parsed.threads.length, 100);
+    assert.equal(parsed.shown, 100);
+    assert.equal(parsed.total, 130);
+    assert.match(parsed.note, /Showing 100 of 130 threads/);
+});
+
+test("comments list with a limit cuts the threads to it", async () => {
+    const { backend, tool } = harness();
+    backend.respond("get-comment-threads", [{ id: "a" }, { id: "b" }, { id: "c" }]);
+    const text = (await tool.execute({ fileId: FILE, action: "list", limit: 1 })).content[0] as { text: string };
+    const parsed = JSON.parse(text.text) as { threads: unknown[]; total: number };
+    assert.deepEqual(parsed.threads, [{ id: "a" }]);
+    assert.equal(parsed.total, 3);
+});
 
 test("create_thread without a frame pins the thread to the page background", async () => {
     const { backend, tool } = harness();

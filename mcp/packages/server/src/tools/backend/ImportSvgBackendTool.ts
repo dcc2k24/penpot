@@ -4,6 +4,7 @@ import type { ToolResponse } from "../../ToolResponse";
 import type { BackendServices } from "../../backend/BackendServices";
 import { BackendTool } from "./BackendTool";
 import { BackendIds } from "./BackendIds";
+import { WriteOptions } from "./WriteOptions";
 
 /** Arguments of {@link ImportSvgBackendTool}. */
 export class ImportSvgBackendArgs {
@@ -21,6 +22,7 @@ export class ImportSvgBackendArgs {
             .boolean()
             .optional()
             .describe("When true, convert the SVG and validate the result without saving it."),
+        requestId: WriteOptions.schema.requestId,
     };
 
     fileId!: string;
@@ -38,6 +40,8 @@ export class ImportSvgBackendArgs {
     name?: string;
 
     dryRun?: boolean;
+
+    requestId?: string;
 }
 
 /** Converts SVG markup into shapes on a page of a file. */
@@ -83,7 +87,9 @@ export class ImportSvgBackendTool extends BackendTool<ImportSvgBackendArgs> {
             ...(args.y !== undefined ? { y: args.y } : {}),
             ...(args.name !== undefined ? { name: args.name } : {}),
             ...(args.dryRun !== undefined ? { dryRun: args.dryRun } : {}),
+            requestId: WriteOptions.requestIdOf(args),
         };
-        return this.jsonResponse(await this.callWrite(userToken, args.fileId, "mcp-import-svg", params));
+        const result = await this.callWrite(userToken, args.fileId, "mcp-import-svg", params);
+        return this.jsonResponse(WriteOptions.withAlreadyApplied(result));
     }
 }

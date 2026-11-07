@@ -64,7 +64,8 @@ export const API_SOURCE: string = String.raw`
     "shape.combineAsVariants": "variant ops are not in the facade yet",
     "shape.isVariantHead": "variant ops are not in the facade yet",
     "shape.isVariantContainer": "variant ops are not in the facade yet",
-    "shape.waitForLayoutUpdate": "use penpot.waitForLayoutUpdate"
+    "shape.waitForLayoutUpdate": "use penpot.waitForLayoutUpdate",
+    textBounds: "the rendered text box is not in the backend record; use shape.bounds for the box of the shape"
   };
 
   // attributes the Plugin API reads as unsupported, with the alternative each error names.
@@ -422,7 +423,11 @@ export const API_SOURCE: string = String.raw`
     if (hasOwn(PROP.properties, key)) {
       return readProperty(ref, key, PROP.properties[key]);
     }
-    return undefined;
+    // a promise check and the other probes of the engine read undefined; a member the facade lacks fails by name
+    if (key === "then") {
+      return undefined;
+    }
+    throw new TypeError(key + " is not a shape member in backend mode; check the name against the Plugin API");
   }
 
   function writeMember(ref, key, value) {
@@ -581,7 +586,8 @@ export const API_SOURCE: string = String.raw`
       case "mtype":
         return record.metadata ? record.metadata.mtype : undefined;
       case "textBounds":
-        return record.positionData;
+        // the stored position data is not a box, so the facade does not return it as one
+        throw unavailable("textBounds");
       case "flex":
         return record.layout === "flex" ? layoutView(ref, "flex") : null;
       case "grid":
@@ -659,6 +665,15 @@ export const API_SOURCE: string = String.raw`
     writeTextStyle(ref, entry.attr, value);
   }
 
+  // a path's content goes through set_path_content, which the compiler requires; the box of the path is refitted.
+  function writePathContent(ref, value) {
+    const record = recordOf(ref);
+    if (record && record.type !== "path") {
+      throw new TypeError("content is only available on path shapes");
+    }
+    core.enqueue({ op: "set_path_content", pageId: ref.pageId, id: ref.id, content: value });
+  }
+
   function writeProperty(ref, name, entry, value) {
     if (entry.kind === "unsupported") {
       throw unsupportedError(name);
@@ -668,6 +683,15 @@ export const API_SOURCE: string = String.raw`
     }
     if (entry.kind === "content") {
       writeContent(ref, name, entry, value);
+      return;
+    }
+    // the layout item attributes go through set_layout_child, which the compiler requires for them in props.
+    if (entry.kind === "layout-child") {
+      writeChildField(ref, name, value);
+      return;
+    }
+    if (entry.kind === "path-content") {
+      writePathContent(ref, value);
       return;
     }
     if (entry.kind === "geometry") {
@@ -1544,9 +1568,11 @@ export const API_SOURCE: string = String.raw`
     },
     addFlexLayout: function (ref, options) {
       layoutOp(ref, "set_flex_layout", options);
+      return layoutView(ref, "flex");
     },
     addGridLayout: function (ref, options) {
       gridLayoutOp(ref, options);
+      return layoutView(ref, "grid");
     },
     makeMask: function (ref) {
       core.enqueue({ op: "make_mask", pageId: ref.pageId, groupId: ref.id });

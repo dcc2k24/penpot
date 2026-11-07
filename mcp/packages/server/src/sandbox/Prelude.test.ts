@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import vm from "node:vm";
 import { test } from "node:test";
+import { TOKEN_WRITE_RULE } from "./ApplyTokenValues";
 import { Prelude } from "./Prelude";
 
 /** Root frame id of every page. */
@@ -35,6 +36,10 @@ interface HostCalls {
 interface FakeHost {
     /** Makes the next `flush` call throw a backend error. */
     failNextFlush: boolean;
+    /** Makes the next `loadPage` call throw, as when the file changed during the read. */
+    failNextLoad: boolean;
+    /** Makes the next `flush` call answer with a failure after one chunk was saved, as the host does. */
+    partialFailureNext: boolean;
     /** Calls received so far. */
     readonly calls: HostCalls;
     loadFileOutline(fileId: string): string;
@@ -112,6 +117,8 @@ function createFakeHost(): FakeHost {
     let revn = 1;
     const host: FakeHost = {
         failNextFlush: false,
+        failNextLoad: false,
+        partialFailureNext: false,
         calls,
         loadFileOutline(fileId: string): string {
             calls.loadFileOutline.push(fileId);
@@ -119,6 +126,10 @@ function createFakeHost(): FakeHost {
         },
         loadPage(fileId: string, pageId: string): string {
             calls.loadPage.push({ fileId, pageId });
+            if (host.failNextLoad) {
+                host.failNextLoad = false;
+                throw new Error("the file changed while the page was read");
+            }
             return JSON.stringify({ ...pageFixture(revn), pageId, fileId });
         },
         flush(fileId: string, operationsJson: string, dryRun: boolean): string {
@@ -143,6 +154,18 @@ function createFakeHost(): FakeHost {
                         }
                     }
                 }
+            }
+            if (host.partialFailureNext) {
+                // one chunk is saved and the next one fails: the answer names the saved ids, and the revn is not sent
+                host.partialFailureNext = false;
+                revn += 1;
+                return JSON.stringify({
+                    failure: {
+                        message: "execute_code: chunk 2 of 2 of a flush failed. Chunk 2 was not applied.",
+                        committed: 1,
+                        createdIds,
+                    },
+                });
             }
             if (!dryRun) {
                 revn += 1;
@@ -270,9 +293,9 @@ test("a shape updated earlier in the call reads back before any flush", () => {
     );
     assert.equal(envelope.ok, true);
     assert.equal(envelope.result, 10);
-    // the only flush is the end-of-script one, sent after the read; the touched page is then reloaded.
+    // the only flush is the end-of-script one, sent after the read; a flush does not read the page back.
     assert.equal(host.calls.flush.length, 1);
-    assert.equal(host.calls.loadPage.length, 2);
+    assert.equal(host.calls.loadPage.length, 1);
 });
 
 test("queued creates are visible to a page loaded after they were queued", () => {
@@ -326,18 +349,109 @@ test("a mid-script flush and the end-of-script flush give two flush calls", () =
     assert.equal(host.calls.flush[1].operations.length, 1);
 });
 
-test("a flush reloads the touched page", () => {
+test("a flush does not read the touched page back; the next read loads it again", () => {
     const { host, context } = setup();
     const envelope = runScript(
         context,
         `
         __core.page("F1", "P1");
         __core.enqueue({ op: "update_shape", pageId: "P1", id: "R1", props: { x: 3 } });
+        __core.flush();
+        __core.page("F1", "P1");
         `
     );
     assert.equal(envelope.ok, true);
     assert.equal(host.calls.flush.length, 1);
     assert.equal(host.calls.loadPage.length, 2);
+});
+
+test("a read that fails after a saved flush says that the write is saved", () => {
+    const { host, context } = setup();
+    const envelope = runScript(
+        context,
+        `
+        __core.page("F1", "P1");
+        __core.enqueue({ op: "update_shape", pageId: "P1", id: "R1", props: { x: 3 } });
+        __core.flush();
+        __host.failNextLoad = true;
+        __core.page("F1", "P1");
+        `
+    );
+    assert.equal(envelope.ok, false);
+    assert.equal(host.calls.flush.length, 1);
+    assert.match(envelope.error?.message ?? "", /^execute_code: the writes that ran before this read are saved/);
+    assert.match(envelope.error?.message ?? "", /the file changed while the page was read$/);
+});
+
+test("a read that fails before any write does not mention a saved write", () => {
+    const { context } = setup();
+    const envelope = runScript(context, '__host.failNextLoad = true;\n__core.page("F1", "P1");');
+    assert.equal(envelope.ok, false);
+    assert.equal(envelope.error?.message, "the file changed while the page was read");
+});
+
+test("a page read again after a flush counts once against the page cap", () => {
+    const { host, context } = setup();
+    const envelope = runScript(
+        context,
+        `
+        for (let i = 1; i <= 20; i += 1) {
+            __core.page("F1", "P" + i);
+        }
+        __core.enqueue({ op: "update_shape", pageId: "P1", id: "R1", props: { x: 3 } });
+        __core.flush();
+        __core.page("F1", "P1");
+        return "read";
+        `
+    );
+    assert.equal(envelope.ok, true);
+    assert.equal(envelope.result, "read");
+    assert.equal(host.calls.loadPage.length, 21);
+});
+
+test("a failed write that saved one chunk gives the guest the ids of that chunk", () => {
+    const { host, context } = setup();
+    const envelope = runScript(
+        context,
+        `
+        const handle = __core.enqueue({ op: "create_rect", pageId: "P1", x: 0, y: 0, width: 1, height: 1 });
+        __host.partialFailureNext = true;
+        let message = null;
+        try {
+            __core.end();
+        } catch (err) {
+            message = String(err.message);
+        }
+        // the batch is dropped, so the end-of-script flush sends nothing
+        return [message, __core.resolve(handle)];
+        `
+    );
+    assert.equal(envelope.ok, true);
+    assert.deepEqual(envelope.result, [
+        "execute_code: chunk 2 of 2 of a flush failed. Chunk 2 was not applied.",
+        "uuid-1",
+    ]);
+    assert.equal(host.calls.flush.length, 1);
+});
+
+test("the token write rule of the guest is the host rule", () => {
+    const { host, context } = setup();
+    assert.equal(vm.runInContext("JSON.stringify(TOKEN_WRITE_RULE)", context), JSON.stringify(TOKEN_WRITE_RULE));
+    const envelope = runScript(
+        context,
+        `
+        __core.enqueue({ op: "apply_token", pageId: "P1", shapeIds: ["R1"], tokenName: "t", attributes: ["fill"] });
+        __core.flushTokens();
+        const afterApply = __host.calls.flush.length;
+        __core.enqueue({ op: "create_token", pageId: "P1", tokenName: "t" });
+        __core.flushTokens();
+        return [afterApply, __host.calls.flush.length];
+        `
+    );
+    assert.equal(envelope.ok, true);
+    // a token application is no token write, so only the write before the second check sends the queue
+    assert.deepEqual(envelope.result, [0, 1]);
+    assert.equal(host.calls.flush.length, 1);
 });
 
 test("a dry run flush keeps the pending ops and the end flush sends them again", () => {

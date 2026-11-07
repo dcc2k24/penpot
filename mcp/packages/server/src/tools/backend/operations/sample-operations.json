@@ -8,6 +8,7 @@
   { "op": "create_ellipse", "pageId": "3f2c1a9e-0b7d-4c1e-9a55-2d6f0e8b7c10", "id": "$tmp:ellipse1", "x": 10, "y": 80, "width": 60, "height": 60 },
   { "op": "create_text", "pageId": "3f2c1a9e-0b7d-4c1e-9a55-2d6f0e8b7c10", "id": "$tmp:text1", "characters": "Hello", "x": 0, "y": 0, "width": 120, "height": 24, "growType": "auto-height", "fontSize": "14", "fontFamily": "Source Sans Pro", "fontWeight": "400", "fills": [{ "fillColor": "#000000", "fillOpacity": 1 }] },
   { "op": "create_path", "pageId": "3f2c1a9e-0b7d-4c1e-9a55-2d6f0e8b7c10", "id": "$tmp:path1", "x": 0, "y": 0, "width": 10, "height": 10, "d": "M0 0 L10 10 Z" },
+  { "op": "set_path_content", "pageId": "3f2c1a9e-0b7d-4c1e-9a55-2d6f0e8b7c10", "id": "$tmp:path1", "content": "M0 0 L20 20 Z" },
   { "op": "create_image", "pageId": "3f2c1a9e-0b7d-4c1e-9a55-2d6f0e8b7c10", "id": "$tmp:image1", "x": 0, "y": 0, "width": 200, "height": 100, "mediaId": "9a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d", "mediaWidth": 1024, "mediaHeight": 512, "mediaMtype": "image/png" },
   { "op": "create_svg_raw", "pageId": "3f2c1a9e-0b7d-4c1e-9a55-2d6f0e8b7c10", "id": "$tmp:svg1", "x": 0, "y": 0, "width": 24, "height": 24, "content": { "tag": "svg", "attrs": { "viewBox": "0 0 24 24" }, "content": [] } },
   { "op": "create_group", "pageId": "3f2c1a9e-0b7d-4c1e-9a55-2d6f0e8b7c10", "id": "$tmp:group1", "name": "Group", "childIds": ["6c9f3e2a-4d5b-4f7c-8a81-2b3c4d5e6f70", "8e1a5c2d-6f7b-4a9e-8b03-4c5d6e7f8092"] },

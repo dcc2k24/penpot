@@ -7,6 +7,7 @@ import { BackendServices } from "../../backend/BackendServices";
 import { FakePenpotBackend } from "../../backend/testing/FakePenpotBackend";
 import { FakeExporterClient } from "../../backend/testing/FakeExporterClient";
 import { ExecuteCodeBackendTool } from "./ExecuteCodeBackendTool";
+import { applyToShapes, pageRecords, pageTree, type FakeShape, type Op } from "./ExecuteCodeHarness";
 
 const TOKEN = "carol-token";
 const FILE = "1b2c3d4e-0000-4000-8000-000000000003";
@@ -31,22 +32,31 @@ function sessionServer(userToken: string): PenpotMcpServer {
  * @returns the fake backend and the tool
  */
 function harness(settings: BackendSettings = new BackendSettings()) {
+    // the shapes of the fake page; a write adds to them, so a later page read sees what the write created.
+    const shapes: FakeShape[] = [];
     // the revn of the fake file, advanced by every write so that page reads report the latest one.
     let revn = 1;
     const backend = new FakePenpotBackend()
         .respond("mcp-whoami", {
+            contractVersion: 1,
             profileId: "profile-1",
             scopes: ["mcp:read", "mcp:write", "mcp:manage", "mcp:delete"],
         })
-        .respond("get-mcp-page-tree", () => ({ revn, root: { id: ROOT, children: [] }, truncated: false }))
-        .respond("get-mcp-shapes", (params: object) => ({
-            revn,
-            shapes: [],
-            missing: (params as { ids: string[] }).ids,
-        }))
+        .respond("get-mcp-page-tree", () => ({ revn, root: pageTree(shapes), truncated: false }))
+        .respond("get-mcp-shapes", (params: object) => {
+            const ids = (params as { ids: string[] }).ids;
+            const records = pageRecords(shapes);
+            return {
+                revn,
+                shapes: ids.filter((id) => records.has(id)).map((id) => records.get(id)),
+                missing: ids.filter((id) => !records.has(id)),
+            };
+        })
         .respond("mcp-apply-operations", (params: object) => {
             revn += 1;
-            return applyResult(params, revn);
+            const result = applyResult(params, revn) as { createdIds: Record<string, string> };
+            applyToShapes(shapes, (params as { operations: Op[] }).operations, result.createdIds);
+            return result;
         });
     const services = new BackendServices(backend, settings, new FakeExporterClient());
     allServices.push(services);
