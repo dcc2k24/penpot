@@ -1,0 +1,163 @@
+# Alert rules for the backend-native MCP stack (adapters penpot-mcp-1 and penpot-mcp-2, backend penpot-backend).
+# Every rule has a runbook annotation: the first thing to do when it fires. The thresholds are starting points for
+# a deployment that has not been measured yet; tune them from the soak and capacity numbers.
+#
+# Checked with: promtool check rules alerts.yml
+
+groups:
+  - name: penpot-mcp-availability
+    rules:
+      - alert: PenpotMcpAdapterDown
+        expr: up{job="penpot-mcp"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MCP adapter {{ $labels.instance }} is not scraped"
+          runbook: "Check the container with docker compose ps and docker compose logs penpot-mcp-N; restart it if it exited, and check the nginx upstream."
+
+      - alert: PenpotMcpBackendDown
+        expr: up{job="penpot-backend"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Penpot backend {{ $labels.instance }} is not scraped, so MCP backend mode has no backend"
+          runbook: "Check penpot-backend and its Postgres and Valkey; /readyz on the backend's port 6060 shows whether it is online."
+
+  - name: penpot-mcp-sandbox
+    rules:
+      - alert: PenpotMcpSandboxTerminationsHigh
+        expr: sum by (instance) (rate(penpot_mcp_sandbox_runtimes_disposed_total[10m])) * 60 > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sandbox runtimes on {{ $labels.instance }} are disposed above 5 per minute"
+          runbook: 'Check penpot_mcp_sandbox_memory_recycles_total and penpot_mcp_sandbox_calls_total{outcome="interrupted"}; a memory recycle storm points at a heavy execute_code workload.'
+
+  - name: penpot-mcp-refusals
+    rules:
+      - alert: PenpotMcpRefusalsHigh
+        expr: sum by (reason) (rate(penpot_mcp_refusals_total[5m])) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP calls are refused by the backend at {{ $value | humanize }}/s (reason {{ $labels.reason }})"
+          runbook: 'Read the hint="mcp refused" lines in the backend log for the token-fp and cmd; scope refusals usually mean a client with a read token tried a write.'
+
+  - name: penpot-mcp-writes
+    rules:
+      - alert: PenpotMcpLockTimeouts
+        expr: sum by (code) (rate(penpot_mcp_errors_total{code=~"mcp-file-busy|mcp-lock-timeout"}[10m])) * 60 > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Write calls fail with {{ $labels.code }} at more than 1 per minute"
+          runbook: "Find the file in the backend log (file-id) and the agents writing to it; more than one agent on one file is the usual cause, so lower the parallel writers or split the file."
+
+      - alert: PenpotMcpWriteLatencyP95High
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, instance) (
+              rate(penpot_mcp_tool_duration_seconds_bucket{tool=~"mcp-apply-changes|mcp-apply-operations|mcp-import-svg"}[10m])
+            )
+          ) > 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Write tools on {{ $labels.instance }} have p95 latency above 3 s for 10 minutes"
+          runbook: "Check penpot_rpc_climit_waiting and penpot_rpc_climit_rejected_total, then Postgres connections (hikaricp_active_connections) and the backend log for mcp-tool durations."
+
+  - name: penpot-mcp-readiness
+    rules:
+      - alert: PenpotMcpAdapterNotReady
+        expr: probe_success{job="penpot-mcp-readyz"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MCP adapter {{ $labels.instance }} fails its /readyz probe"
+          runbook: "A reachable adapter that is not ready cannot reach the backend; check its log for the backend URI and the token check, then the backend's /readyz."
+
+      - alert: PenpotMcpBackendNotReady
+        expr: probe_success{job="penpot-backend-readyz"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Penpot backend {{ $labels.instance }} fails its /readyz probe"
+          runbook: "The backend reports itself offline or down: check Postgres and Valkey, then the backend log for the shutdown reason."
+
+  - name: penpot-mcp-shared-state
+    rules:
+      - alert: PenpotMcpRedisDown
+        expr: penpot_mcp_redis_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Adapter {{ $labels.instance }} cannot reach Redis for the rate limiter, sandbox storage or export permits"
+          runbook: "Check penpot-mcp-redis and PENPOT_MCP_REDIS_URI on the adapter; see penpot_mcp_redis_client_up for the client that is down. The adapter falls back to per-process limits, storage and export caps, so lost sharing is the risk."
+
+      - alert: PenpotMcpRateLimitFallback
+        expr: sum by (instance) (increase(penpot_mcp_rate_limit_fallback_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Adapter {{ $labels.instance }} uses the in-process rate limiter instead of Redis"
+          runbook: "Redis calls fail on this adapter; see PenpotMcpRedisDown and the adapter log. Limits are N times too generous while the fallback runs."
+
+      - alert: PenpotMcpExportPermitFallback
+        expr: sum by (instance) (increase(penpot_mcp_export_permit_fallback_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Adapter {{ $labels.instance }} renders without the shared export cap because Redis failed"
+          description: "The shared render cap is not in force on this adapter. N adapters can send 4N renders at once while the fallback runs, so the render load on the exporter is not capped."
+          runbook: "Redis permit takes fail on this adapter; see PenpotMcpRedisDown, penpot_mcp_redis_client_up{client=\"export-permits\"} and the adapter log."
+
+  - name: penpot-mcp-capacity
+    rules:
+      - alert: PenpotMcpBackendPoolSaturated
+        expr: max by (instance) (hikaricp_pending_threads{pool="main"}) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backend {{ $labels.instance }} has calls waiting for a Postgres connection"
+          runbook: "Compare hikaricp_active_connections with hikaricp_max_connections; more agents per backend or a slow query (see the pg_stat_statements plan) are the usual causes."
+
+      - alert: PenpotMcpClimitRejected
+        expr: sum by (name, reason) (rate(penpot_rpc_climit_rejected_total{name=~".*mcp.*"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backend rejects MCP calls at its concurrency limit {{ $labels.name }} ({{ $labels.reason }})"
+          runbook: "Raise the limit only after the pool and the write latency look healthy; otherwise lower the agents per backend."
+
+  - name: penpot-mcp-adapter-process
+    rules:
+      - alert: PenpotMcpAdapterMemoryHigh
+        expr: process_resident_memory_bytes{job="penpot-mcp"} > 1.5 * 1024 * 1024 * 1024
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Adapter {{ $labels.instance }} resident memory is above 1.5 GB"
+          runbook: "Check nodejs_heap_used_bytes and penpot_mcp_sandbox_workers; a flat heap with growing RSS is a native leak, a growing heap a sandbox or cache leak. Restart the adapter after the capture."
+
+      - alert: PenpotMcpAdapterEventLoopLag
+        expr: nodejs_eventloop_lag_p99_seconds{job="penpot-mcp"} > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Adapter {{ $labels.instance }} event loop lag p99 is above 200 ms"
+          runbook: "The main thread is blocked: look for large JSON bodies or a sandbox running on the main thread; compare with penpot_mcp_sandbox_workers."

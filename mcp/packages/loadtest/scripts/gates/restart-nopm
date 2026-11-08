@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Kills every dev backend JVM and starts one fresh; waits for boot or failure.
+me=$$
+pat1='java'; pat2='app.main'
+for p in /proc/[0-9]*; do pid=${p#/proc/}; [ "$pid" = "$me" ] && continue; [ "$pid" = "$PPID" ] && continue
+  c=$(tr "\0" " " < $p/cmdline 2>/dev/null)
+  case "$c" in *"$pat1"*"$pat2"*) kill $pid 2>/dev/null;; esac
+done
+sleep 8
+for p in /proc/[0-9]*; do pid=${p#/proc/}; [ "$pid" = "$me" ] && continue; [ "$pid" = "$PPID" ] && continue
+  c=$(tr "\0" " " < $p/cmdline 2>/dev/null)
+  case "$c" in *"$pat1"*"$pat2"*) kill -9 $pid 2>/dev/null;; esac
+done
+sleep 2
+nohup /tmp/run-backend-dev-nopm > /tmp/backend-dev.log 2>&1 &
+sleep 30
+for i in $(seq 1 420); do
+  if grep -qE "welcome to penpot|Exception|Caused by|^\[.*\] E " /tmp/backend-dev.log; then break; fi
+  sleep 1
+done
+grep -nE "welcome to penpot|Exception|Caused by|^\[.*\] E " /tmp/backend-dev.log | cut -c1-160 | head -5

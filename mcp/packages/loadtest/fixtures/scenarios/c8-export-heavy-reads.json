@@ -1,0 +1,28 @@
+{
+    "name": "C8-export-heavy-reads",
+    "description": "Exporter capacity, the read half of C8-export-heavy. 3 agents read their own file in a closed loop (no rate cap) for --duration 3m, while the export run holds the exporter: each agent gets a page tree (depth 3, limit 500) and a find_shapes for frames (limit 100). The read p95 during the exports is the figure to compare with the read p95 of a run with no exports. No setup: the files come from the setup vars file.",
+    "agents": 3,
+    "iterations": 1,
+    "steps": [
+        {
+            "name": "page tree",
+            "tool": "get_page_tree",
+            "args": {
+                "fileId": "${agentFileIds[agent]}",
+                "pageId": "${agentPageIds[agent]}",
+                "depth": 3,
+                "limit": 500
+            }
+        },
+        {
+            "name": "find frames",
+            "tool": "find_shapes",
+            "args": {
+                "fileId": "${agentFileIds[agent]}",
+                "pageId": "${agentPageIds[agent]}",
+                "type": "frame",
+                "limit": 100
+            }
+        }
+    ]
+}

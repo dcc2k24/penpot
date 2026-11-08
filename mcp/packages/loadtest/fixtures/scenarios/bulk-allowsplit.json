@@ -1,6 +1,6 @@
 {
   "name": "bulk-allowsplit",
-  "description": "Plan 8.1 bulk write row: about 5,000 shapes through apply_operations with allowSplit true, on a fresh page. A call takes at most 2,000 operations, so the run sends 3 calls of 1,667 create_rect operations; the backend splits each into commits of 300 (about 17 commits in all). The total is the sum of the three calls; the budget is 25 s p50, 45 s p95, 60 s p99 for the whole 5,000.",
+  "description": "Plan 8.1 bulk write row: about 5,000 shapes through apply_operations with allowSplit true, on a fresh page. A call takes at most 2,000 operations, so the run sends 3 calls of 1,667 create_rect operations; `commits` counts change batches (one per 2,000 changes), not file writes; 1,667 rects fit one batch, so each call reports 1 (3 in all). The total is the sum of the three calls; the budget is 25 s p50, 45 s p95, 60 s p99 for the whole 5,000.",
   "agents": 1,
   "iterations": 1,
   "freshPage": true,
@@ -28,7 +28,7 @@
           }
         ]
       },
-      "expect": { "path": "$.result.commits", "equals": 6 }
+      "expect": { "path": "$.result.commits", "equals": 1 }
     }
   ]
 }

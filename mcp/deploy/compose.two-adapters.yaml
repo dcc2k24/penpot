@@ -1,0 +1,93 @@
+# Two Penpot MCP adapters behind one nginx, sharing state through Redis.
+# A test stack for the shared-state work (T2). It needs the dev stack on
+# this machine: backend on :6061, exporter on :6062. See README.md here.
+#
+# The adapters also join the penpot_penpot network of the dev stack, so the
+# monitoring stack can scrape them as penpot-mcp-1:4401 and penpot-mcp-2:4401.
+# That network must exist, so start the dev stack first.
+#
+# Validate:  docker compose -f mcp/deploy/compose.two-adapters.yaml config
+# Start:     docker compose -f mcp/deploy/compose.two-adapters.yaml up -d
+
+x-adapter: &adapter
+  # The image is built from the working tree by deploy/build-image.sh, so it
+  # has this branch's code. The bundle must exist first; the script makes it.
+  build:
+    context: ../../docker/images
+    dockerfile: Dockerfile.mcp
+  image: penpot-mcp-local:${PENPOT_MCP_LOCAL_TAG:-two-adapters}
+  restart: always
+
+  # Linux hosts do not define host.docker.internal. Docker Desktop does.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+  environment:
+    PENPOT_MCP_MODE: backend
+    PENPOT_MCP_BACKEND_URI: ${PENPOT_MCP_BACKEND_URI:-http://host.docker.internal:6061/}
+    PENPOT_MCP_EXPORTER_URI: ${PENPOT_MCP_EXPORTER_URI:-http://host.docker.internal:6062/}
+    # Redis holds the rate limit and the sandbox storage, so every adapter sees the same state.
+    PENPOT_MCP_REDIS_URI: redis://redis:6379
+    PENPOT_MCP_SERVER_HOST: 0.0.0.0
+    PENPOT_MCP_SERVER_PORT: 4401
+
+  # 127.0.0.1 and not localhost: the server listens on IPv4 only, and
+  # Node may try ::1 first for localhost.
+  healthcheck:
+    test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4401/healthz').then(r => process.exit(r.status === 200 ? 0 : 1), () => process.exit(1))"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 20s
+
+  depends_on:
+    redis:
+      condition: service_healthy
+
+services:
+  redis:
+    image: "redis:7-alpine"
+    restart: always
+    # Not persistent on purpose: no snapshots and no append-only file.
+    # Counters and storage copies are lost on restart; this is a test stack.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # No ports. Only the adapters reach Redis.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # The name matches what the monitoring stack scrapes. "default" is this
+  # project's network (Redis and nginx); "penpot" is the dev stack's network.
+  penpot-mcp-1:
+    <<: *adapter
+    networks: [default, penpot]
+
+  # A second adapter needs no sticky routing. The rate limit and the
+  # sandbox storage are shared through Redis.
+  penpot-mcp-2:
+    <<: *adapter
+    networks: [default, penpot]
+
+  nginx:
+    image: "nginx:1.27-alpine"
+    restart: always
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    # The only published port. Adapters are reached through this balancer.
+    ports:
+      - "${PENPOT_MCP_LB_PORT:-4415}:8080"
+    depends_on:
+      penpot-mcp-1:
+        condition: service_healthy
+      penpot-mcp-2:
+        condition: service_healthy
+
+networks:
+  # The project network. Redis, nginx and the adapters use it.
+  default:
+  # The dev stack's network. It must exist before this stack starts.
+  penpot:
+    external: true
+    name: penpot_penpot

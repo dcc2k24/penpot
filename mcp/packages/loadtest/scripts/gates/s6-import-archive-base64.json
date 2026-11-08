@@ -1,0 +1,43 @@
+{
+  "name": "S6-import-archive-base64",
+  "description": "S6 with the archive inline (base64): the adapter runs in backend mode, where import_archive offers no filePath. Archive: medium-5000.penpot, an export of the 5,000-shape, 21-page generate-large file (4.0 MB).",
+  "agents": 1,
+  "iterations": 1,
+  "steps": [
+    {
+      "name": "import the archive",
+      "tool": "import_archive",
+      "maxDurationMs": 30000,
+      "args": {
+        "projectId": "${projectId}",
+        "base64": "${archiveBase64}",
+        "name": "S6 import ${runId} i${iteration}"
+      },
+      "capture": {
+        "importedFileId": "$.result.fileIds[0]"
+      }
+    },
+    {
+      "name": "count the imported shapes",
+      "tool": "get_file_outline",
+      "args": {
+        "fileId": "${importedFileId}"
+      },
+      "expect": {
+        "path": "$.result.pages[*].shapeCount",
+        "sum": "${archiveShapeCount}"
+      }
+    },
+    {
+      "name": "count the imported pages",
+      "tool": "get_file_outline",
+      "args": {
+        "fileId": "${importedFileId}"
+      },
+      "expect": {
+        "path": "$.result.pages",
+        "length": "${archivePageCount}"
+      }
+    }
+  ]
+}

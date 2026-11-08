@@ -1,0 +1,132 @@
+{
+ "name": "cold-cache-b",
+ "description": "First calls after a backend restart (100k file first), then 5 warm calls each. Run right after restart-backend-dev.",
+ "agents": 1,
+ "iterations": 1,
+ "steps": [
+  {
+   "name": "100k cold get_file_outline",
+   "tool": "get_file_outline",
+   "repeat": 1,
+   "args": {
+    "fileId": "97d26ac4-fedc-8109-8008-e6b09bf8c998"
+   }
+  },
+  {
+   "name": "100k cold get_page_tree",
+   "tool": "get_page_tree",
+   "repeat": 1,
+   "args": {
+    "fileId": "97d26ac4-fedc-8109-8008-e6b09bf8c998",
+    "pageId": "97d26ac4-fedc-8109-8008-e6b09bf8c999",
+    "depth": 3,
+    "limit": 500
+   }
+  },
+  {
+   "name": "100k cold get_shapes",
+   "tool": "get_shapes",
+   "repeat": 1,
+   "args": {
+    "fileId": "97d26ac4-fedc-8109-8008-e6b09bf8c998",
+    "pageId": "97d26ac4-fedc-8109-8008-e6b09bf8c999",
+    "ids": [
+     "97d26ac4-fedc-8109-8008-e6b09c914990"
+    ]
+   }
+  },
+  {
+   "name": "5k cold get_file_outline",
+   "tool": "get_file_outline",
+   "repeat": 1,
+   "args": {
+    "fileId": "97d26ac4-fedc-8109-8008-e6b26a6bafd5"
+   }
+  },
+  {
+   "name": "5k cold get_page_tree",
+   "tool": "get_page_tree",
+   "repeat": 1,
+   "args": {
+    "fileId": "97d26ac4-fedc-8109-8008-e6b26a6bafd5",
+    "pageId": "97d26ac4-fedc-8109-8008-e6b26a6bafd6",
+    "depth": 3,
+    "limit": 500
+   }
+  },
+  {
+   "name": "5k cold get_shapes",
+   "tool": "get_shapes",
+   "repeat": 1,
+   "args": {
+    "fileId": "97d26ac4-fedc-8109-8008-e6b26a6bafd5",
+    "pageId": "97d26ac4-fedc-8109-8008-e6b26a6bafd6",
+    "ids": [
+     "97d26ac4-fedc-8109-8008-e6b26adab364"
+    ]
+   }
+  },
+  {
+   "name": "100k warm get_file_outline",
+   "tool": "get_file_outline",
+   "repeat": 5,
+   "args": {
+    "fileId": "97d26ac4-fedc-8109-8008-e6b09bf8c998"
+   }
+  },
+  {
+   "name": "100k warm get_page_tree",
+   "tool": "get_page_tree",
+   "repeat": 5,
+   "args": {
+    "fileId": "97d26ac4-fedc-8109-8008-e6b09bf8c998",
+    "pageId": "97d26ac4-fedc-8109-8008-e6b09bf8c999",
+    "depth": 3,
+    "limit": 500
+   }
+  },
+  {
+   "name": "100k warm get_shapes",
+   "tool": "get_shapes",
+   "repeat": 5,
+   "args": {
+    "fileId": "97d26ac4-fedc-8109-8008-e6b09bf8c998",
+    "pageId": "97d26ac4-fedc-8109-8008-e6b09bf8c999",
+    "ids": [
+     "97d26ac4-fedc-8109-8008-e6b09c914990"
+    ]
+   }
+  },
+  {
+   "name": "5k warm get_file_outline",
+   "tool": "get_file_outline",
+   "repeat": 5,
+   "args": {
+    "fileId": "97d26ac4-fedc-8109-8008-e6b26a6bafd5"
+   }
+  },
+  {
+   "name": "5k warm get_page_tree",
+   "tool": "get_page_tree",
+   "repeat": 5,
+   "args": {
+    "fileId": "97d26ac4-fedc-8109-8008-e6b26a6bafd5",
+    "pageId": "97d26ac4-fedc-8109-8008-e6b26a6bafd6",
+    "depth": 3,
+    "limit": 500
+   }
+  },
+  {
+   "name": "5k warm get_shapes",
+   "tool": "get_shapes",
+   "repeat": 5,
+   "args": {
+    "fileId": "97d26ac4-fedc-8109-8008-e6b26a6bafd5",
+    "pageId": "97d26ac4-fedc-8109-8008-e6b26a6bafd6",
+    "ids": [
+     "97d26ac4-fedc-8109-8008-e6b26adab364"
+    ]
+   }
+  }
+ ]
+}

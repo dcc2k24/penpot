@@ -33,7 +33,7 @@ declare -A LINT_CMD=(
   [common]="pnpm run lint:clj"
   [render-wasm]="./lint"
   [exporter]="pnpm run lint:clj"
-  [mcp]=""
+  [mcp]="(cd packages/server && pnpm run types:check) && (cd packages/loadtest && pnpm run types:check) && (cd packages/design-parity && pnpm run types:check)"
   [plugins]="pnpm run lint"
   [library]="pnpm run lint"
   [media-processor]=""
@@ -45,7 +45,7 @@ declare -A TEST_CMD=(
   [common]="clojure -M:dev:test && pnpm run test:quiet"
   [render-wasm]="./test"
   [exporter]="pnpm run test:quiet"
-  [mcp]="pnpm run test"
+  [mcp]="(cd packages/server && pnpm run test) && (cd packages/loadtest && pnpm run test) && (cd packages/design-parity && pnpm run test)"
   [plugins]="pnpm run test"
   [library]="pnpm run test"
   [media-processor]="pnpm run test"
@@ -99,9 +99,17 @@ declare -A PAREN_REPAIR_CMD=(
   [media-processor]=""
 )
 
+# Smoke test against a live MCP stack. Only runs with --mcp-smoke, and reads its target from the environment:
+# PENPOT_MCP_SMOKE_URL (the /mcp endpoint of an adapter), PENPOT_MCP_SMOKE_TOKEN_FILE (a file with one MCP key)
+# and PENPOT_MCP_SMOKE_VARS (the vars.json of the smoke scenario). The ${VAR:?} checks fail the task with a message.
+declare -A SMOKE_CMD=(
+  [mcp]=': "${PENPOT_MCP_SMOKE_URL:?set PENPOT_MCP_SMOKE_URL to the /mcp URL of the adapter}" && : "${PENPOT_MCP_SMOKE_TOKEN_FILE:?set PENPOT_MCP_SMOKE_TOKEN_FILE}" && : "${PENPOT_MCP_SMOKE_VARS:?set PENPOT_MCP_SMOKE_VARS}" && (cd packages/loadtest && pnpm run build && node scripts/smoke.mjs "$PENPOT_MCP_SMOKE_URL" "$PENPOT_MCP_SMOKE_TOKEN_FILE" "$PENPOT_MCP_SMOKE_VARS")'
+)
+
 # Default options
 MODULES=()
 TASKS=("lint" "test" "fmt")
+MCP_SMOKE=false
 FIX_MODE=false
 FAIL_FAST=false
 VERBOSE=true
@@ -220,6 +228,9 @@ run_module() {
       paren-repair)
         cmd="${PAREN_REPAIR_CMD[$module]:-}"
         ;;
+      smoke)
+        cmd="${SMOKE_CMD[$module]:-}"
+        ;;
     esac
 
     if ! run_task "$module" "$task" "$cmd"; then
@@ -318,6 +329,8 @@ OPTIONS:
   --no-build        Skip build
   --fix             Run format fix instead of check
   --paren-repair    Fix delimiter errors in Clojure/CLJS files
+  --mcp-smoke       Also run the smoke test of the mcp module against the stack in
+                    PENPOT_MCP_SMOKE_URL, PENPOT_MCP_SMOKE_TOKEN_FILE, PENPOT_MCP_SMOKE_VARS
   --fail-fast       Stop on first failure
   --verbose         Show command output on failure (default)
   --quiet           Suppress command output
@@ -335,6 +348,7 @@ EXAMPLES:
   $(basename "$0") --paren-repair frontend   # Fix delimiter errors in frontend
   $(basename "$0") --paren-repair --all      # Fix delimiter errors in all Clojure modules
   $(basename "$0") --all --fail-fast --verbose
+  $(basename "$0") --mcp-smoke mcp          # Lint, test, fmt and the smoke test of mcp
 EOF
   exit 0
 }
@@ -387,6 +401,10 @@ main() {
         ;;
       --paren-repair)
         TASKS=("paren-repair")
+        shift
+        ;;
+      --mcp-smoke)
+        MCP_SMOKE=true
         shift
         ;;
       --fix)
@@ -449,6 +467,9 @@ main() {
     fi
   done
   TASKS=("${clean_tasks[@]}")
+  if [[ "$MCP_SMOKE" == "true" ]]; then
+    TASKS+=("smoke")
+  fi
 
   # Set modules
   if [[ "$run_all" == "true" ]]; then

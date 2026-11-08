@@ -168,3 +168,64 @@ size: 913473 bytes (0.9 MB) of stored file data, from Postgres`.
 Every run printed `db statements: not counted (pg_stat_statements is not loaded)`. A near-idle run (one
 `whoami`, 12 s window) counted 23 table scans and 35 transactions, so background work adds little to these
 figures. The first S5 runs (before the fixture fix) and the S9 memory-bomb probes are left out of the table.
+
+## Round 1 gate run, resumed (2026-11-08)
+
+Commit `e4084f80b2` with a dirty tree, dev script flags (pointer-map on, except the no-pointer-map runs), DB pool 8,
+`pg_stat_statements` on, machine note "T1 gates round 1 resumed 2026-11-08, Windows host + docker backend,
+pg_stat_statements on, toolchain container shared with 3 backend test runs". The full record and the findings are in
+`mcp/docs/production-readiness.md`, "Gate run, round 1", "Resumed". Logs and pool samples:
+`results/2026-11-08-round1-resumed/`.
+
+| # | Gate (8.9) | Fixture and run | Measured | Target | Status |
+|---|---|---|---|---|---|
+| 1b | Metadata and page read, cold cache | `cold-a` / `cold-b` scenarios (outline, page tree and get_shapes on the medium and the 100k file, then 5 warm calls each), each right after `restart-backend-dev`, two of each | first outline 845, 901, 1,425, 1,568 ms; first page tree 98-185 ms; first get_shapes 31-59 ms; warm calls 23-74 ms | p95 800 ms / 1 s | metadata **fail**; page read pass |
+| 1e | Page read, large file without pointer-map | backend restarted without `enable-feature-fdata-pointer-map`, a team without the feature, the 100k file exported and imported into it, then `s5-read-large` | p50 351, p95 505, max 913 ms (pointer-map copy: p95 82 ms) | p95 6 s | pass |
+| 1n | Postgres statements | every run, `pg_stat_statements` | page read 7.5 (9.7 without pointer-map); small write 14.3-19.8; C2 write 22.4 | < 10 per read, < 25 per write | pass |
+| 2-S6 | S6 import < 30 s, counts equal | `s6-import-archive` with the archive inline (`base64`), and `import-binfile` called directly | MCP: every call refused (`version` sent as a string, defect R1-G1); backend: 6.2 s for a 5,000-shape, 21-page archive, counts equal | < 30 s | **fail** through the MCP; backend half pass |
+| 2-C1 | C1 at 50 and 100 agents | `c1-different-files --agents 50` and `100`, with a pool watch | 50: p95 507 ms, 1,070 of 2,500 refused; 100: p95 583 ms, 706 of 5,000 refused (`mcp-apply/by-team` queue full); the pool was never the limit, no timeouts | p95 < 1.2 s, no climit errors | **fail** (R1-G3) |
+| 2-C2 | C2 at 10 agents, fresh file | `c2-same-file --agents 10` | p95 198 ms, 0 errors, all rectangles present | p95 < 3 s | pass |
+
+| Run | Summary line (agents, iterations, calls, errors; p50, p95, p99, max) | Backend lines |
+|---|---|---|
+| S6 MCP | agents 1, iterations 0, calls 1, errors 1; 345.6 ms | Postgres counters lost (`too many clients`) |
+| S6 count | agents 1, iterations 1, calls 1, errors 0; 390.9 ms | 59 statements |
+| S5 no pointer-map | agents 1, iterations 1, calls 272, errors 0; p50 350.6 ms, p95 504.6 ms, p99 591.5 ms, max 913.4 ms | heap 1,894 / 1,894 / 941 MB; gc 335, 4.0 s; cpu 159.7 s; 9.7 statements per call |
+| S5 pointer-map | agents 1, iterations 1, calls 272, errors 0; p50 16.9 ms, p95 82.2 ms, p99 125.2 ms, max 454.5 ms | gc 8, 0.1 s; cpu 8.6 s; 7.5 statements per call |
+| C1 50 agents | agents 50, iterations 50, calls 2500, errors 1070; p50 194.0 ms, p95 506.6 ms, p99 793.3 ms, max 3210.6 ms | cpu 6.8 cores; 14.3 statements per call; rss 133 / 374 MB |
+| C1 100 agents | agents 100, iterations 100, calls 5000, errors 706; p50 512.1 ms, p95 582.7 ms, p99 784.3 ms, max 883.2 ms | cpu 4.7 cores; 19.8 statements per call; rss 374 / 421 MB |
+| C2 10 agents | agents 10, iterations 10, calls 1020, errors 0; p50 155.1 ms, p95 197.9 ms, p99 219.2 ms, max 234.1 ms | cpu 1.5 cores; 22.4 statements per call |
+
+The cold-cache scenarios, the inline S6 scenario, the pool sampler and the no-pointer-map backend script live in the
+session scratchpad, not in the package. Add them to `fixtures/` and `scripts/` before round 2 if the gates keep them.
+
+## Round 2 (2026-11-08)
+
+Commit `e4084f80b2` with a dirty tree, dev script flags as round 1, DB pool 8, `pg_stat_statements` on. The stack ran
+behind nginx on `127.0.0.1:4415`. The full record is in `mcp/packages/loadtest/results/2026-11-08-round2/run-notes.md`.
+
+After the fixes (2026-11-08, evening): the shared-state smoke passed on both adapters, and the export cap of 4 held across
+them (see `mcp/docs/production-readiness.md`, "Checks after the fixes").
+
+| # | Gate (8.9) | Fixture and run | Measured | Target | Status |
+|---|---|---|---|---|---|
+| 2-S6 | S6 import through nginx | import of `medium-5000.penpot` via nginx | import 4.07 s; counts equal (5,000 shapes, 21 pages) | < 30 s, counts equal | pass |
+| 2-C1 | C1 at 50 agents, one team | 50 agents, vars-100 files, Default team | p95 946 ms (p50 730, p99 1021, max 1171; 0 errors) | p95 < 1.2 s, no climit errors | pass |
+| 2-C1 | C1 at 50 agents, five teams of 10 | 50 agents, five teams of 10 | p95 930 ms (p50 623, p99 1068, max 1274; 0 errors) | p95 < 1.2 s, no climit errors | pass |
+| 2-C2 | C2, 5 agents, fresh file, via nginx | `c2-same-file --agents 5` via nginx | p95 181 ms, 510 calls, 0 errors | p95 < 3 s | pass |
+| 2-C3 | C3 human tab with 5 agents | `c2-same-file` via nginx, 5 agents, fresh file; human tab in a browser | lost edits (expected x=160 y=160, read back x=145 y=136); raw save p95 rose from 139 ms to 5,046 ms | save rise under 500 ms, no lost edits | fail |
+| 2-C5 | C5 human half, 100k file, 16 readers | `c5-large-readers` (16 agents) via nginx, human tab on the 100k file | login 3.6 s, canvas 6.6 s, save p95 19,031 ms, one lost edit (130 expected, 129 found) | heap < 80 % of -Xmx; tab usable as alone | readers pass (heap 45 %); human half fail (save p95 19 s, one lost edit) |
+| C8 | Export under load: 10 exporters, vars-100 files, 3 readers | exporters and readers via nginx, 3 min | p95 28.2 s, 3 exporter timeouts | export gate, p95 5 s | fail |
+| 3 | 4 h soak | `soak-mixed`, 5 agents, via nginx, 09:49-13:49 UTC | 142,276 calls, 4 errors (nginx 502, R2-14); p95 138 ms; heap, adapter RSS, pool and connections flat; `file_change` +15,600 rows an hour (nightly GC not reached); 138 seq scans on `file_change` | flat memory, bounded file_change, no errors | partly: memory pass; errors fail (nginx config); GC not observed |
+
+| Run | Summary line (agents, iterations, calls, errors; p50, p95, p99, max) | Backend lines |
+|---|---|---|
+| C2-5 nginx | agents 5, iterations 5, calls 510, errors 0; p50 134.9 ms, p95 180.8 ms, p99 231.2 ms, max 247.5 ms | cpu 1.9 cores; 22.5 statements per call; rss of 4406 201 / 222 MB |
+| S6 nginx | agents 1, iterations 1, calls 3, errors 0; import 4,072 ms, count steps 182 and 48 ms | 72.7 statements per call |
+| C1-50 one team | agents 50, iterations 50, calls 2500, errors 0; p50 730 ms, p95 946 ms, p99 1021 ms, max 1171 ms | heap peak 1,132 MB; climit waiting max 42; pool pending max 2; CPU 4.5 cores; 22.6 statements per call; rss of 4406 222 / 377 MB |
+| C1-50 five teams | agents 50 (five teams of 10), iterations 50, calls 2500, errors 0; p50 623 ms, p95 930 ms, p99 1068 ms, max 1274 ms | climit waiting max 36; pool pending max 11 (40% of samples); acquire p95 16 ms; CPU 4.2 cores; 22.6 statements per call |
+| C5 readers | agents 16 (readers), iterations 240, calls 22,411, errors 0; p50 98 ms, p95 216 ms, p99 337 ms, max 1,571 ms | heap 2,748 MB at start, peak 3,592 MB of 7,952 MB (45 %); GC 124 collections, 7.3 s; CPU 4.2 cores; pool pending max 3; climit waiting max 14 |
+| C8 exports | agents 10 (exporters), iterations 97, calls 97, errors 3; p50 19.8 s, p95 28.2 s (97 samples), max 30.3 s | 3 exporter "ResourceRequest timed out"; no permit refusal, no 60 s render timeout |
+| C8 reads | agents 3 (readers), iterations 1769, calls 3,539, errors 0; p50 153.0 ms, p95 275.6 ms, p99 335.8 ms, max 791.7 ms | page tree p95 297 ms, find p95 128 ms |
+| C3 agents | agents 5, iterations 50, calls 5,330, errors 0; p50 364.6 ms, p95 791.3 ms, p99 1342.4 ms, max 7600.7 ms | run with the C3 human tab (10 min) |
+| Soak | agents 5, iterations 7099, calls 142276, errors 4; p50 41.1 ms, p95 137.8 ms, p99 230.0 ms, max 9311.9 ms | heap 1,147 / 2,242 / 760 MB; gc 5,806, 59.4 s; cpu 0.4 cores; 14.6 statements per call; file_change seq scans 138; rss of 4406 485 / 490 / 489 MB |

@@ -1,0 +1,73 @@
+# Prometheus scrape configuration for the backend-native MCP stack.
+#
+# Used by compose.monitoring.yaml. The two adapters are the services penpot-mcp-1 and penpot-mcp-2 on the penpot
+# compose network (port 4401), the backend is penpot-backend (port 6060, where its /metrics is served).
+#
+# /metrics on an adapter is open only to a client on the adapter's own machine. Prometheus is another container, so
+# it presents an MCP token that the backend validates. Put that token in ./secrets/mcp-metrics-token (one line;
+# Prometheus trims the trailing newline). Never commit that file.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    stack: penpot-mcp
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: penpot-mcp
+    metrics_path: /metrics
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/mcp-metrics-token
+    static_configs:
+      - targets: ["penpot-mcp-1:4401", "penpot-mcp-2:4401"]
+
+  - job_name: penpot-backend
+    metrics_path: /metrics
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    # The backend /metrics sends a text/plain Content-Type. This fallback is a safety net if that header is lost.
+    fallback_scrape_protocol: PrometheusText0.0.4
+    static_configs:
+      - targets: ["penpot-backend:6060"]
+
+  # Readiness of each adapter and of the backend: the blackbox exporter probes /readyz (see compose.monitoring.yaml).
+  # probe_success is 1 while the endpoint answers 200. /readyz needs no token.
+  - job_name: penpot-mcp-readyz
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["http://penpot-mcp-1:4401/readyz", "http://penpot-mcp-2:4401/readyz"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+
+  - job_name: penpot-backend-readyz
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["http://penpot-backend:6060/readyz"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115

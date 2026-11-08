@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Runs the Penpot backend from source inside the penpot-tc container, on its own database.
+# Credentials come from the environment, never from this file. Required:
+# PENPOT_DATABASE_PASSWORD, PENPOT_SECRET_KEY, PENPOT_EXPORTER_SHARED_KEY.
+set -e
+export PENPOT_DATABASE_URI=postgresql://penpot-postgres/penpot_mcpdev
+export PENPOT_DATABASE_USERNAME=penpot
+export PENPOT_DATABASE_PASSWORD="${PENPOT_DATABASE_PASSWORD:?set PENPOT_DATABASE_PASSWORD}"
+export PENPOT_REDIS_URI=redis://penpot-valkey/4
+export PENPOT_SECRET_KEY="${PENPOT_SECRET_KEY:?set PENPOT_SECRET_KEY}"
+export PENPOT_PUBLIC_URI=http://localhost:9002
+export PENPOT_HTTP_SERVER_HOST=0.0.0.0
+export PENPOT_HTTP_SERVER_PORT=6060
+export PENPOT_OBJECTS_STORAGE_BACKEND=fs
+export PENPOT_OBJECTS_STORAGE_FS_DIRECTORY=/work/.mcp-dev-assets
+export PENPOT_EXPORTER_SHARED_KEY="${PENPOT_EXPORTER_SHARED_KEY:?set PENPOT_EXPORTER_SHARED_KEY}"
+export PENPOT_TELEMETRY_ENABLED=false
+export PENPOT_FLAGS="enable-login-with-password disable-email-verification disable-secure-session-cookies \
+ enable-mcp enable-access-tokens disable-telemetry enable-backend-asserts \
+ enable-file-validation enable-rpc-climit enable-rpc-rlimit enable-quotes enable-auto-file-snapshot \
+ enable-audit-log enable-nrepl-server disable-registration-captcha enable-registration \
+ disable-remote-media-processing enable-mcp-backend enable-mcp-raw-changes"
+export PENPOT_NREPL_HOST=0.0.0.0
+export PENPOT_DATABASE_MAX_POOL_SIZE=8
+export PENPOT_DATABASE_MIN_POOL_SIZE=1
+mkdir -p $PENPOT_OBJECTS_STORAGE_FS_DIRECTORY
+cd /work/backend
+exec clojure -A:dev -M -m app.main

@@ -1,0 +1,117 @@
+# Prometheus and Grafana for the backend-native MCP stack. Use it next to the penpot compose stack (docker/images)
+# and the two-adapter file, so that it reaches penpot-mcp-1, penpot-mcp-2 and penpot-backend on the penpot network.
+#
+#   docker compose -f compose.monitoring.yaml up -d
+#
+# Before the first start:
+#   - put an MCP token of an operator profile in ./secrets/mcp-metrics-token (one line, never committed); the
+#     adapters serve /metrics to a client that presents a valid token, and Prometheus is another container;
+#   - set GRAFANA_ADMIN_PASSWORD (there is no default);
+#   - set PENPOT_NETWORK to the name of the penpot network: the stack from docker/images is named after its compose
+#     project (penpot here, which gives penpot_penpot). Check with: docker network ls.
+#
+# Prometheus listens on 127.0.0.1:9090 and Grafana on 127.0.0.1:3000 only. Put an access proxy in front of Grafana
+# if other people need it.
+
+services:
+    prometheus:
+        image: prom/prometheus:v3.5.0
+        restart: always
+        command:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=15d
+            - --web.enable-lifecycle
+        volumes:
+            - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+            - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+            - ./secrets:/etc/prometheus/secrets:ro
+            - prometheus_data:/prometheus
+        ports:
+            - "127.0.0.1:9090:9090"
+        healthcheck:
+            test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+        networks:
+            - penpot
+
+    # Probes /readyz of the adapters and the backend for Prometheus (probe_success). Not published to the host.
+    blackbox:
+        image: prom/blackbox-exporter:v0.27.0
+        restart: always
+        command:
+            - --config.file=/etc/blackbox/blackbox.yml
+        configs:
+            - source: blackbox-config
+              target: /etc/blackbox/blackbox.yml
+        networks:
+            - penpot
+
+    grafana:
+        image: grafana/grafana:11.6.0
+        restart: always
+        depends_on:
+            - prometheus
+        environment:
+            GF_SECURITY_ADMIN_USER: admin
+            GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
+            GF_USERS_ALLOW_SIGN_UP: "false"
+            GF_ANALYTICS_REPORTING_ENABLED: "false"
+            GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+        volumes:
+            - grafana_data:/var/lib/grafana
+            - ./grafana-mcp-dashboard.json:/var/lib/grafana/dashboards/penpot-mcp.json:ro
+        configs:
+            - source: grafana-datasource
+              target: /etc/grafana/provisioning/datasources/prometheus.yml
+            - source: grafana-dashboards
+              target: /etc/grafana/provisioning/dashboards/penpot-mcp.yml
+        ports:
+            - "127.0.0.1:3000:3000"
+        networks:
+            - penpot
+
+configs:
+    blackbox-config:
+        content: |
+            modules:
+              http_2xx:
+                prober: http
+                timeout: 5s
+                http:
+                  method: GET
+                  valid_status_codes: [200]
+                  preferred_ip_protocol: ip4
+    grafana-datasource:
+        content: |
+            apiVersion: 1
+            datasources:
+              - name: Prometheus
+                uid: prometheus
+                type: prometheus
+                access: proxy
+                url: http://prometheus:9090
+                isDefault: true
+                editable: false
+    grafana-dashboards:
+        content: |
+            apiVersion: 1
+            providers:
+              - name: penpot-mcp
+                type: file
+                disableDeletion: true
+                allowUiUpdates: false
+                options:
+                  path: /var/lib/grafana/dashboards
+                  foldersFromFilesStructure: false
+
+volumes:
+    prometheus_data:
+    grafana_data:
+
+networks:
+    penpot:
+        name: ${PENPOT_NETWORK:-penpot_penpot}
+        external: true

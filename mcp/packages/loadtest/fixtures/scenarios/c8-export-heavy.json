@@ -1,0 +1,42 @@
+{
+    "name": "C8-export-heavy",
+    "description": "Exporter capacity, run with c8-export-heavy-reads. 10 agents each export their own 1440x900 board as PNG at scale 2 in a closed loop (no rate cap, so the calls queue), for --duration 3m. Each agent has its own file and page, created in setup. The run is 10 exporters, and the per-token export permit is 1 and the process total is 4 (ExportConcurrency). With one token shared by all agents, the calls queue on the token permit. With one token per agent, only the process total of 4 queues them. The stack owner chooses which by the tokens file: repeat one token on every line for the first case, one token per line for the second. Measure the export p50 and p95, the errors, and the render timeouts (60 s). No error text names the permit: a call waiting for a permit has no timeout, so queueing shows as latency.",
+    "agents": 10,
+    "iterations": 1,
+    "setupPer": "agent",
+    "setup": [
+        {
+            "name": "create export board",
+            "tool": "apply_operations",
+            "args": {
+                "fileId": "${agentFileIds[agent]}",
+                "operations": [
+                    {
+                        "op": "create_board",
+                        "id": "$tmp:board",
+                        "pageId": "${agentPageIds[agent]}",
+                        "name": "Export ${agent}",
+                        "x": 0,
+                        "y": 0,
+                        "width": 1440,
+                        "height": 900
+                    }
+                ]
+            },
+            "capture": { "boardId": "$.result.createdIds[\"$tmp:board\"]" }
+        }
+    ],
+    "steps": [
+        {
+            "name": "export board png 2x",
+            "tool": "export_shape",
+            "args": {
+                "fileId": "${agentFileIds[agent]}",
+                "pageId": "${agentPageIds[agent]}",
+                "shapeId": "${boardId}",
+                "format": "png",
+                "scale": 2
+            }
+        }
+    ]
+}
