@@ -320,10 +320,11 @@
  ;; steady use: keep the interval at a minute or less.
  ;; Reads: 10 per second, the adapter limit per token (its own limiter
  ;; allows 10 requests per second), so the backend never refuses a call the
- ;; adapter lets through. Writes: 1 per second steady, 120 burst. A write
- ;; can hold the file for up to 9.5 seconds, so the backend keeps the
- ;; steady rate low on purpose. These buckets are per profile: every MCP
- ;; client of one profile shares them.
+ ;; adapter lets through. Writes: 5 per second steady, 600 burst. An agent
+ ;; that builds a page sends many small writes in a row; the file lock and
+ ;; the concurrency limits bound what the backend does at once, so the
+ ;; bucket only stops a runaway client. These buckets are per profile:
+ ;; every MCP client of one profile shares them.
  #{:main/mcp-whoami
    :main/get-mcp-file-outline
    :main/get-mcp-page-tree
@@ -337,7 +338,7 @@
  #{:main/mcp-apply-changes
    :main/mcp-apply-operations
    :main/mcp-import-svg}
- [[:mcp-write :bucket "120/60/1m"]]
+ [[:mcp-write :bucket "600/300/1m"]]
 
  #{:main/update-mcp-token-scopes}
  [[:access-token :bucket "60/30/1m"]]}

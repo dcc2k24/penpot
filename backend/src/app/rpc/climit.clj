@@ -327,14 +327,23 @@
       :else
       (throw (IllegalArgumentException. "unable to normalize limit")))))
 
+(defn with-cfg
+  "Marks a key function as one that takes the system `cfg` and the params:
+  `(f cfg params)`, so it can look something up in the database before the
+  limiter runs. Every other key function takes only the params, as before."
+  [f]
+  (with-meta f {::with-cfg true}))
+
 (defn- resolve-limit-key
   "The key of a limit, resolved the same way in every path: a keyword is
-  looked up in the params, a function is applied to them, any other value is
-  the key itself."
-  [key params]
+  looked up in the params, a function is applied to them (and to `cfg` when
+  it is marked with `with-cfg`), any other value is the key itself."
+  [key cfg params]
   (cond
     (keyword? key) (get params key)
-    (fn? key)       (key params)
+    (fn? key)       (if (::with-cfg (meta key))
+                      (key cfg params)
+                      (key params))
     :else           key))
 
 (defn wrap
@@ -360,7 +369,7 @@
 
                     (fn [cfg params]
                       (let [config (-> config
-                                       (assoc ::key (resolve-limit-key key-fn params))
+                                       (assoc ::key (resolve-limit-key key-fn cfg params))
                                        (assoc ::label label)
                                        ;; NOTE: only used for debugging output
                                        (assoc ::params params))]

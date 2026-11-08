@@ -230,7 +230,8 @@
         required-token-type (::token-type mdata)
         allow-token-types   (set (::allow-token-types mdata))
         required-perms      (into #{} (::perms mdata))
-        bridge?             (true? (::mcp-bridge mdata))]
+        bridge?             (true? (::mcp-bridge mdata))
+        session-only?      (true? (::session-only mdata))]
     (fn [cfg params]
       (let [profile-id  (::profile-id params)
             auth-type   (::auth-type params)
@@ -256,6 +257,13 @@
             (ex/raise :type :restriction
                       :code :mcp-backend-disabled
                       :hint "backend MCP mode is disabled"))
+
+          ;; A command only a session may run, reached with a token: the
+          ;; answer is `session-required`, the code the command gives itself.
+          (and session-only? (= auth-type :token))
+          (ex/raise :type :authorization
+                    :code :session-required
+                    :hint "only a session can run this command")
 
           (or (and (= required-auth-type :token)
                    (not= auth-type :token))

@@ -240,3 +240,32 @@
         (http/req-with-redirects {} {:method :get :uri "http://10.0.0.1/internal"} {:skip-ssrf-check? true})
         (catch Exception _))
       (t/is (false? @called?) "validate-uri should not be called when :skip-ssrf-check? is true"))))
+
+(t/deftest validate-url-refuses-ambiguous-ip-literals-before-lookup
+  ;; `0177.0.0.1` used to reach DNS and hang for 30 seconds. Each form is
+  ;; refused up front, and no name lookup runs.
+  (let [lookups (atom [])]
+    (with-redefs [ssrf/resolve-host (fn [host] (swap! lookups conj host) nil)]
+      (doseq [url ["http://0177.0.0.1:6060/"
+                   "http://0x7f.0.0.1/"
+                   "http://0x7f000001/"
+                   "http://2130706433/"
+                   "http://127.1/"
+                   "http://010.0.0.1/"
+                   "http://0x7f.0.0.1.1/"
+                   "http://127.0.0.1./"
+                   "http://[::ffff:127.0.0.1]/"
+                   "http://[::FFFF:8.8.8.8]/"]]
+        (let [cause (try (ssrf/validate-uri url) nil
+                         (catch Exception e e))]
+          (t/is (some? cause) url)
+          (t/is (= :ssrf-blocked-target (:code (ex-data cause))) url)))
+      (t/is (empty? @lookups)))))
+
+(t/deftest canonical-ip-literals-are-not-ambiguous
+  (t/is (false? (#'ssrf/ambiguous-ip-literal? "127.0.0.1")))
+  (t/is (false? (#'ssrf/ambiguous-ip-literal? "0.0.0.0")))
+  (t/is (false? (#'ssrf/ambiguous-ip-literal? "93.184.216.34")))
+  (t/is (false? (#'ssrf/ambiguous-ip-literal? "example.com")))
+  (t/is (false? (#'ssrf/ambiguous-ip-literal? "123.example.com")))
+  (t/is (false? (#'ssrf/ambiguous-ip-literal? "example.com."))))

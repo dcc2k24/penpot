@@ -6,13 +6,13 @@
 
 (ns backend-tests.metrics-test
   (:require
-   [app.common.exceptions :as ex]
    [app.main :as main]
    [app.metrics :as mtx]
    [app.metrics.definition :as-alias mdef]
    [clojure.test :as t]
    [integrant.core :as ig]
-   [promesa.exec :as px])
+   [promesa.exec :as px]
+   [yetti.response :as yres])
   (:import
    io.prometheus.client.Collector$MetricFamilySamples
    io.prometheus.client.Collector$MetricFamilySamples$Sample
@@ -36,6 +36,21 @@
                       (.samples family))))
        (set)))
 
+(defn- sample-value
+  "The value of the sample `sample-name` whose labels are exactly `labels`
+  (a map of label name to value), or nil when the registry has none."
+  [metrics sample-name labels]
+  (->> (mtx/get-registry metrics)
+       (.metricFamilySamples)
+       (enumeration-seq)
+       (mapcat (fn [^Collector$MetricFamilySamples family]
+                 (.samples family)))
+       (some (fn [^Collector$MetricFamilySamples$Sample sample]
+               (when (and (= sample-name (.-name sample))
+                          (= labels (zipmap (.-labelNames sample)
+                                            (.-labelValues sample))))
+                 (.-value sample))))))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Tests
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -55,6 +70,29 @@
     (t/is (contains? names "process_open_fds"))
     (t/is (contains? names "process_max_fds"))
     (t/is (contains? names "process_cpu_seconds_total"))))
+
+(t/deftest metrics-handler-sets-content-type
+  ;; The yetti writer reads ::yres/headers and ::yres/body only; a plain
+  ;; :headers key is dropped and /metrics goes out without a content type.
+  (let [metrics  (ig/init-key :app.metrics/metrics {:default {}})
+        response ((mtx/get-handler metrics) {})]
+    (t/is (= "text/plain; version=0.0.4; charset=utf-8"
+             (get-in response [::yres/headers "content-type"])))
+    (t/is (string? (::yres/body response)))
+    (t/is (some? (re-find #"# (HELP|TYPE)" (::yres/body response))))))
+
+(t/deftest mcp-counters-start-at-zero
+  ;; rate() needs the series to exist before the first event after a
+  ;; restart, so the known label values are created at startup.
+  (let [metrics (ig/init-key :app.metrics/metrics {:default main/default-metrics})]
+    (t/is (= 0.0 (sample-value metrics "penpot_mcp_refusals_total"
+                               {"reason" "scope"})))
+    (t/is (= 0.0 (sample-value metrics "penpot_mcp_tool_duration_seconds_count"
+                               {"tool" "mcp-whoami" "outcome" "ok"})))
+    (t/is (= 0.0 (sample-value metrics "penpot_mcp_errors_total"
+                               {"tool" "mcp-whoami" "code" "internal"})))
+    (t/is (= 0.0 (sample-value metrics "penpot_mcp_changes_total"
+                               {"tool" "mcp-apply-changes" "change_type" "add-obj"})))))
 
 (t/deftest label-coercion
   (t/are [value fallback expected]

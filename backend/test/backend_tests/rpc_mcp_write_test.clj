@@ -7,6 +7,7 @@
 (ns backend-tests.rpc-mcp-write-test
   (:require
    [app.common.json :as json]
+   [app.common.time :as ct]
    [app.common.types.shape :as cts]
    [app.common.uuid :as uuid]
    [app.db :as db]
@@ -14,9 +15,13 @@
    [app.http.access-token :as-alias actoken]
    [app.loggers.audit :as-alias audit]
    [app.rpc :as-alias rpc]
+   [app.rpc.climit :as climit]
    [app.rpc.commands.access-token :as access-token]
+   [app.rpc.commands.files-update :as files-update]
+   [app.rpc.commands.mcp :as mcp]
    [app.rpc.commands.mcp-write :as mcp-write]
    [app.storage :as sto]
+   [app.util.cache :as cache]
    [backend-tests.helpers :as th]
    [backend-tests.storage-test :as stt]
    [clojure.string :as str]
@@ -638,3 +643,237 @@
         props  (::audit/replace-props (meta result))]
     (t/is (some? (:snapshot-id result)))
     (t/is (= (:snapshot-id result) (:snapshot-id props)))))
+
+;; --- REQUEST ID IN THE LOG AND THE AUDIT PROPS
+
+(defn- write-props
+  "The audit props of a raw write command with `data`."
+  [data]
+  (::audit/replace-props (meta (th/command-raw! data))))
+
+(t/deftest write-names-its-request-id-as-the-reads-do
+  (let [{:keys [profile file-id page-id]} (create-fixture)
+        base {::th/type :mcp-apply-changes
+              ::rpc/profile-id (:id profile)
+              ::rpc/auth-type :token
+              ::rpc/token-type "mcp"
+              ::rpc/token-perms #{"mcp:write"}
+              :file-id file-id}
+        rpc-id  (uuid/next)
+        body-id (uuid/next)]
+    ;; The RPC request id is the one the reads log.
+    (t/is (= rpc-id
+             (:request-id (write-props (assoc base
+                                              ::rpc/request-id rpc-id
+                                              :changes [(add-frame page-id (uuid/next))])))))
+    ;; A call with only its body request id logs that id.
+    (t/is (= body-id
+             (:request-id (write-props (assoc base
+                                              :request-id body-id
+                                              :changes [(add-frame page-id (uuid/next))])))))
+    ;; A call with neither still names a request.
+    (t/is (uuid? (:request-id (write-props (assoc base
+                                                  :changes [(add-frame page-id (uuid/next))])))))))
+
+;; --- TEAM LIMIT KEY
+
+(t/deftest writes-of-one-team-share-the-team-limit-key
+  (let [profile (th/create-profile* 60 {:is-active true})
+        team-a  (th/create-team* 60 {:profile-id (:id profile)})
+        team-b  (th/create-team* 61 {:profile-id (:id profile)})
+        proj-a1 (th/create-project* 60 {:profile-id (:id profile) :team-id (:id team-a)})
+        proj-a2 (th/create-project* 61 {:profile-id (:id profile) :team-id (:id team-a)})
+        proj-b  (th/create-project* 62 {:profile-id (:id profile) :team-id (:id team-b)})
+        file-a1 (th/create-file* 60 {:profile-id (:id profile) :project-id (:id proj-a1)})
+        file-a2 (th/create-file* 61 {:profile-id (:id profile) :project-id (:id proj-a2)})
+        file-b  (th/create-file* 62 {:profile-id (:id profile) :project-id (:id proj-b)})
+        team-key @#'mcp-write/team-key
+        key-of  (fn [file] (team-key th/*system* {:file-id (:id file)}))]
+    ;; Two files of one team (in two projects) share the key; another team's
+    ;; file gets a different key.
+    (t/is (= (:id team-a) (key-of file-a1)))
+    (t/is (= (key-of file-a1) (key-of file-a2)))
+    (t/is (= (:id team-b) (key-of file-b)))
+    (t/is (not= (key-of file-a1) (key-of file-b)))
+    ;; A file that does not exist has no team: the unkeyed limiter.
+    (t/is (nil? (team-key th/*system* {:file-id (uuid/next)})))))
+
+(t/deftest limit-keys-keep-their-arity-unless-marked
+  ;; A key function takes the params alone, as every key did before; only
+  ;; a function marked with `with-cfg` also takes the system cfg.
+  (let [resolve-key @#'climit/resolve-limit-key
+        seen        (atom nil)
+        plain       (fn [params] (swap! seen conj [:plain (:x params)]) (:x params))
+        marked      (climit/with-cfg (fn [cfg params] (swap! seen conj [:cfg cfg (:x params)]) (:x params)))]
+    (t/is (= 1 (resolve-key :x :cfg {:x 1})))
+    (t/is (= 2 (resolve-key plain :cfg {:x 2})))
+    (t/is (= 3 (resolve-key marked :cfg {:x 3})))
+    (t/is (= #{[:plain 2] [:cfg :cfg 3]} (set @seen)))))
+
+;; --- ADVERSARIAL: INVALID VALUES AND UNKNOWN SHAPES
+
+(t/deftest raw-invalid-value-is-refused-without-the-dump
+  (let [{:keys [profile file-id page-id]} (create-fixture)
+        board (uuid/next)
+        rect  (uuid/next)
+        _     (call! profile :mcp-apply-changes
+                     {:file-id file-id
+                      :changes [(add-frame page-id board)
+                                (add-rect page-id rect board)]})
+        out   (call! profile :mcp-apply-changes
+                     {:file-id file-id
+                      :changes [{:type :mod-obj
+                                 :page-id page-id
+                                 :id rect
+                                 :operations [{:type :set :attr :name :val {"$$" 1}}]}]})
+        data  (ex-data (:error out))]
+    (t/is (= :mcp-invalid-change (:code data)))
+    (t/is (= :validation (:type data)))
+    (t/is (= 0 (:change-index data)))
+    (t/is (= "name" (:field data)))
+    ;; No malli explain and no shape record reach the client.
+    (t/is (not (contains? data :app.common.schema/explain)))
+    (t/is (not (str/includes? (pr-str (:error out)) "invalid shape found")))
+    (t/is (not (str/includes? (str (:hint data)) "#app.common")))))
+
+(t/deftest dry-run-warns-about-a-change-that-hits-no-shape
+  (let [{:keys [profile file-id page-id]} (create-fixture)
+        board (uuid/next)
+        rect  (uuid/next)
+        _     (call! profile :mcp-apply-changes
+                     {:file-id file-id
+                      :changes [(add-frame page-id board)
+                                (add-rect page-id rect board)]})
+        unknown {:type :mod-obj
+                 :page-id page-id
+                 :id (uuid/next)
+                 :operations [{:type :set :attr :name :val "x"}]}
+        dry     (call! profile :mcp-apply-changes
+                       {:file-id file-id
+                        :dry-run true
+                        :changes [unknown
+                                  {:type :mod-obj
+                                   :page-id page-id
+                                   :id rect
+                                   :operations [{:type :set :attr :name :val "y"}]}]})
+        warns   (filter #(= "unknown-shape" (:kind %)) (get-in dry [:result :warnings]))]
+    (t/is (nil? (:error dry)))
+    ;; Only the change on the random id is reported, by its index.
+    (t/is (= 1 (count warns)))
+    (t/is (= [0] (map :change-index warns)))
+    (t/is (= (:id unknown) (:shape-id (first warns))))))
+
+(defn- unknown-shape-warns
+  [out]
+  (filter #(= "unknown-shape" (:kind %)) (get-in out [:result :warnings])))
+
+(t/deftest operations-on-a-shape-the-call-creates-warn-nothing
+  ;; A flex board gets a reflow of its children, which the call creates: those
+  ;; changes name shapes that are not in the file as loaded before the call.
+  (let [{:keys [profile file-id page-id]} (create-fixture)
+        out (call! profile :mcp-apply-operations
+                   {:file-id file-id
+                    :operations [(op-board page-id)
+                                 {:op "set_flex_layout"
+                                  :page-id page-id
+                                  :id "$tmp:board"
+                                  :layout-flex-dir "column"}
+                                 (op-rect page-id "$tmp:a" 1)
+                                 (op-rect page-id "$tmp:b" 2)]})]
+    (t/is (nil? (:error out)))
+    (t/is (empty? (unknown-shape-warns out)))))
+
+(t/deftest operations-on-a-handle-of-the-call-warn-nothing
+  ;; A later operation names the `$tmp:` handle of an earlier create.
+  (let [{:keys [profile file-id page-id]} (create-fixture)
+        out (call! profile :mcp-apply-operations
+                   {:file-id file-id
+                    :operations [(op-board page-id)
+                                 (op-rect page-id "$tmp:a" 1)
+                                 {:op "update_shape"
+                                  :page-id page-id
+                                  :id "$tmp:a"
+                                  :props {:x 30}}]})]
+    (t/is (nil? (:error out)))
+    (t/is (empty? (unknown-shape-warns out)))))
+
+;; --- PROJECT TOUCH AND FILE MIGRATION ROWS
+
+(defn- project-modified-at
+  [project-id]
+  (:modified-at (th/db-get :project {:id project-id})))
+
+(t/deftest write-touches-the-project-only-when-its-stamp-is-stale
+  (let [{:keys [profile file-id page-id]} (create-fixture)
+        project-id (:default-project-id profile)
+        write!     (fn []
+                     (call! profile :mcp-apply-changes
+                            {:file-id file-id
+                             :changes [(add-frame page-id (uuid/next))]}))]
+    ;; A stored stamp older than 5 seconds is moved by the write.
+    (th/db-exec-one! ["UPDATE project SET modified_at = now() - interval '10 seconds' WHERE id = ?"
+                      project-id])
+    (let [stale (project-modified-at project-id)]
+      (t/is (nil? (:error (write!))))
+      (t/is (not= stale (project-modified-at project-id))))
+    ;; A stored stamp newer than 5 seconds is left as it is.
+    (th/db-exec-one! ["UPDATE project SET modified_at = now() WHERE id = ?"
+                      project-id])
+    (let [fresh (project-modified-at project-id)]
+      (t/is (nil? (:error (write!))))
+      (t/is (= fresh (project-modified-at project-id))))))
+
+(t/deftest project-touch-never-moves-the-stamp-backwards
+  ;; The touch takes the stamp of the call's start. A call that started
+  ;; before a newer write must not move that write's stamp back, even when
+  ;; the newer stamp is older than the 5 seconds the touch waits for.
+  (let [{:keys [profile]} (create-fixture)
+        project-id (:default-project-id profile)
+        touch!     (fn [ts]
+                     (th/db-exec-one! [@#'files-update/sql:touch-project ts project-id]))]
+    (th/db-exec-one! ["UPDATE project SET modified_at = now() - interval '30 seconds' WHERE id = ?"
+                      project-id])
+    (let [stored (project-modified-at project-id)]
+      (touch! (ct/minus (ct/now) 60000))
+      (t/is (= stored (project-modified-at project-id))))
+    ;; An older stored stamp still moves forward to the request stamp.
+    (th/db-exec-one! ["UPDATE project SET modified_at = now() - interval '60 seconds' WHERE id = ?"
+                      project-id])
+    (let [stored (project-modified-at project-id)]
+      (touch! (ct/minus (ct/now) 40000))
+      (t/is (pos? (compare (project-modified-at project-id) stored))))))
+
+(t/deftest write-keeps-the-file-migration-rows
+  (let [{:keys [profile file-id page-id]} (create-fixture)
+        migrations (fn []
+                     (mapv :name (th/db-exec! ["SELECT name FROM file_migration
+                                                 WHERE file_id = ?
+                                                 ORDER BY name" file-id])))
+        before     (migrations)]
+    (t/is (seq before))
+    (t/is (nil? (:error (call! profile :mcp-apply-changes
+                               {:file-id file-id
+                                :changes [(add-frame page-id (uuid/next))]}))))
+    (t/is (= before (migrations)))))
+
+(t/deftest read-migrates-a-missing-migration-in-a-transaction
+  ;; A file at the current version that lacks one named migration is still
+  ;; migrated by a read, and the migration is written in a transaction.
+  (let [{:keys [profile file-id]} (create-fixture)
+        missing (:name (first (th/db-exec! ["SELECT name FROM file_migration
+                                              WHERE file_id = ? ORDER BY name" file-id])))
+        _       (th/db-exec-one! ["DELETE FROM file_migration WHERE file_id = ? AND name = ?"
+                                  file-id missing])
+        real-tx db/tx-run!
+        tx-runs (atom 0)
+        out     (with-redefs-fn {#'mcp/root-cache (cache/create :expire "10m" :max-size 256)
+                                 #'db/tx-run! (fn [cfg f]
+                                                (swap! tx-runs inc)
+                                                (real-tx cfg f))}
+                  #(call! profile :get-mcp-file-outline
+                          {:file-id file-id}
+                          :perms #{"mcp:read"}))]
+    (t/is (nil? (:error out)))
+    (t/is (pos? @tx-runs))
+    (t/is (some #{missing} (map :name (th/db-exec! ["SELECT name FROM file_migration
+                                                      WHERE file_id = ?" file-id]))))))

@@ -251,6 +251,7 @@ RETURNING id, perms")
   "Replace the scopes of the caller's MCP token. Session auth only: MCP
   tokens cannot run it, because the command has no MCP opt-in."
   {::doc/added "2.21"
+   ::rpc/session-only true
    ::sm/params schema:update-mcp-token-scopes}
   [cfg {:keys [::rpc/profile-id scopes] :as params}]
   (when (= :token (::rpc/auth-type params))

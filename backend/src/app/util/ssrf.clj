@@ -179,6 +179,37 @@
     (catch UnknownHostException _
       nil)))
 
+(def ^:private number-part-re
+  "One dot-separated part that a resolver may read as hex or as a number
+  of any base."
+  #"0[xX][0-9a-fA-F]*|[0-9]+")
+
+(defn- canonical-ipv4?
+  "True for four decimal parts in range without leading zeros, the one
+  spelling every resolver reads the same way."
+  [parts]
+  (and (= 4 (count parts))
+       (every? #(re-matches #"0|[1-9][0-9]{0,2}" %) parts)
+       (every? #(<= (parse-long %) 255) parts)))
+
+(defn- ambiguous-ip-literal?
+  "True for a host a resolver may read as an IPv4 address in another form:
+  octal (a leading zero), hex, a bare number, fewer than four parts, or a
+  mix of these. Also true for an IPv4-mapped IPv6 literal (::ffff:a.b.c.d).
+  The canonical dotted decimal form is not ambiguous. A numeric host with
+  an empty part (a trailing dot, as in `127.0.0.1.`) is ambiguous too: the
+  split keeps the empty part, so the form is not read as canonical. A name
+  with a trailing dot (`example.com.`) is a plain FQDN and goes to lookup."
+  [^String host]
+  (let [parts (str/split host #"\." -1)]
+    (boolean
+     (or (and (some #(= "" %) parts)
+              (every? #(or (= "" %) (re-matches number-part-re %)) parts))
+         (and (every? #(re-matches number-part-re %) parts)
+              (not (canonical-ipv4? parts)))
+         (and (str/includes? host ":")
+              (re-find #"(?i)::ffff:" host))))))
+
 (defn validate-uri
   "Validates `uri-or-string`:
     - scheme must be http or https,
@@ -219,6 +250,15 @@
                 :hint "url host is missing"
                 :uri (str uri)
                 :host host))
+
+    ;; Refuse an ambiguous IP literal before any lookup. A resolver may read
+    ;; `0177.0.0.1` as octal (127.0.0.1), and a name it cannot read goes to
+    ;; DNS, where the request can hang.
+    (when (ambiguous-ip-literal? host)
+      (ex/raise :type :validation
+                :code :ssrf-blocked-target
+                :hint "uri host is an ambiguous IP address"
+                :uri (str uri)))
 
     ;; Check allowlist
     (let [allowed-hosts (cf/get :ssrf-allowed-hosts #{})

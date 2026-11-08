@@ -281,3 +281,15 @@
       (let [token (db/tx-run! th/*system* access-token/create-access-token
                               (:id profile) "personal" nil nil)]
         (t/is (nil? (:expires-at token)))))))
+
+(t/deftest session-only-command-answers-a-token-with-session-required
+  (let [profile (create-profile)
+        params  {:scopes ["mcp:write"]}]
+    (t/is (= :session-required
+             (error-code (mcp-call profile :update-mcp-token-scopes #{"mcp:manage"} params))))
+    (t/is (= :session-required
+             (error-code (th/command! {::th/type :update-mcp-token-scopes
+                                       ::rpc/profile-id (:id profile)
+                                       ::rpc/auth-type :token
+                                       ::rpc/token-perms #{}
+                                       :scopes ["mcp:write"]}))))))

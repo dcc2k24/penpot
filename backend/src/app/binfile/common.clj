@@ -854,11 +854,22 @@
     nil))
 
 (defn update-file!
-  "Update an existing file on the database. Expects not encoded file."
+  "Update an existing file on the database. Expects not encoded file.
+  With ::skip-stored-migrations? true the migration rows are not upserted
+  when no migration ran in this call and the file already has its migrations
+  loaded."
   [{:keys [::db/conn] :as cfg} {:keys [id] :as file} & {:as opts}]
 
-  (if (::reset-migrations? opts false)
+  (cond
+    (::reset-migrations? opts false)
     (fmigr/reset-migrations! conn file)
+
+    (and (::skip-stored-migrations? opts false)
+         (not (fmg/migrated? file))
+         (seq (:migrations file)))
+    nil
+
+    :else
     (fmigr/upsert-migrations! conn file))
 
   (let [file

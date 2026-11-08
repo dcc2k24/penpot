@@ -10,6 +10,7 @@
    [app.auth.oidc :as-alias oidc]
    [app.auth.oidc.providers :as-alias oidc.providers]
    [app.common.exceptions :as ex]
+   [app.common.files.changes :as cpc]
    [app.common.logging :as l]
    [app.common.time :as ct]
    [app.config :as cf]
@@ -54,6 +55,74 @@
    [promesa.exec :as px])
   (:gen-class))
 
+;; The label values the MCP counters start from (see `::mdef/init-labels`).
+;; Keep these in step with the tool names, error codes and change types
+;; the MCP commands record.
+(def ^:private mcp-read-tool-names
+  ["mcp-whoami"
+   "get-mcp-file-outline"
+   "get-mcp-page-tree"
+   "get-mcp-shapes"
+   "find-mcp-shapes"
+   "get-mcp-library"
+   "get-mcp-tokens"
+   "create-mcp-render-session"])
+
+(def ^:private mcp-write-tool-names
+  ["mcp-apply-changes"
+   "mcp-apply-operations"
+   "mcp-import-svg"])
+
+(def ^:private mcp-tool-names
+  (into mcp-read-tool-names mcp-write-tool-names))
+
+;; The error codes the MCP tools record (`run-tool`). `mcp-scope-required`
+;; is raised before `run-tool` and never recorded, so it is not listed.
+;; `rpc_mcp_config_test` checks this list against the codes the code raises.
+(def mcp-error-codes
+  ["internal"
+   "mcp-batch-split-mismatch"
+   "mcp-batch-too-large"
+   "mcp-change-type-refused"
+   "mcp-compile-failed"
+   "mcp-disabled"
+   "mcp-file-busy"
+   "mcp-foreign-media"
+   "mcp-invalid-change"
+   "mcp-invalid-cursor"
+   "mcp-invalid-operation"
+   "mcp-invalid-pattern"
+   "mcp-invalid-regex"
+   "mcp-invalid-svg"
+   "mcp-lock-timeout"
+   "mcp-raw-changes-disabled"
+   "mcp-revn-conflict"
+   "mcp-root-children-not-allowed"
+   "mcp-stale-cursor"
+   "mcp-time-budget-exceeded"
+   "mcp-too-many-batches"
+   "mcp-unknown-id"
+   "object-not-found"
+   "page-not-found"
+   "processing-failed"
+   "referential-integrity"
+   "schema-failed"
+   "shape-not-found"
+   "token-set-not-found"
+   "profile-blocked"
+   "profile-not-active"
+   "vern-conflict"])
+
+;; The change types, from the change processor: a method per change type.
+(def mcp-change-types
+  (sort (map name (keys (methods cpc/process-change)))))
+
+(def ^:private mcp-refusal-reasons
+  ["backend-disabled"
+   "mcp-disabled"
+   "scope"
+   "restricted"])
+
 (def default-metrics
   {:log-events
    {::mdef/name "penpot_log_events_total"
@@ -89,24 +158,35 @@
     ::mdef/help "MCP tool call duration in seconds, by tool and outcome."
     ::mdef/labels ["tool" "outcome"]
     ::mdef/buckets [0.005 0.01 0.025 0.05 0.1 0.25 0.5 1 2.5 5 10 30 60]
+    ::mdef/init-labels (vec (for [tool    mcp-tool-names
+                                  outcome ["ok" "error"]]
+                              [tool outcome]))
     ::mdef/type :histogram}
 
    :mcp-changes-total
    {::mdef/name "penpot_mcp_changes_total"
     ::mdef/help "Changes applied through MCP tools, by tool and change type."
     ::mdef/labels ["tool" "change_type"]
+    ::mdef/init-labels (vec (for [tool        mcp-write-tool-names
+                                  change-type mcp-change-types]
+                              [tool change-type]))
     ::mdef/type :counter}
 
    :mcp-errors-total
    {::mdef/name "penpot_mcp_errors_total"
     ::mdef/help "MCP tool calls that failed, by tool and error code."
     ::mdef/labels ["tool" "code"]
+    ::mdef/init-labels (vec (for [tool mcp-tool-names
+                                  code mcp-error-codes]
+                              [tool code]))
     ::mdef/type :counter}
 
    :mcp-refusals-total
    {::mdef/name "penpot_mcp_refusals_total"
     ::mdef/help "MCP calls the backend refused before running, by reason (scope, restricted, backend-disabled)."
     ::mdef/labels ["reason"]
+    ::mdef/init-labels (vec (for [reason mcp-refusal-reasons]
+                              [reason]))
     ::mdef/type :counter}
 
    :rpc-main-timing

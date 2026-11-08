@@ -36,19 +36,32 @@
       AND (expires_at IS NULL
            OR (expires_at > now()));")
 
-(def ^:private sql:get-profile-mcp-enabled
-  "SELECT props FROM profile WHERE id = ?")
+(def ^:private sql:get-profile-state
+  "SELECT props, is_active, is_blocked, fullname, email
+     FROM profile
+    WHERE id = ?")
 
-(defn- profile-mcp-enabled?
-  "Whether the profile of an MCP token has MCP on. Read with the token, once
-  per request. A profile that cannot be read counts as off."
+(defn- profile-state
+  "The fields of the profile of an MCP token that the call checks: its
+  props, whether it is active and whether it is blocked. Read once with
+  the token and put on the request as `::profile`, so the command does not
+  read the profile again. Nil when the profile cannot be read."
   [pool profile-id]
-  (let [row   (db/exec-one! pool [sql:get-profile-mcp-enabled profile-id])
-        props (cond-> (:props row)
-                (db/pgobject? (:props row) "jsonb")
-                (db/decode-transit-pgobject))]
-    (and (some? row)
-         (not (false? (:mcp-enabled props))))))
+  (when-let [row (db/exec-one! pool [sql:get-profile-state profile-id])]
+    (let [props (cond-> (:props row)
+                  (db/pgobject? (:props row) "jsonb")
+                  (db/decode-transit-pgobject))]
+      {:props props
+       :is-active (:is-active row)
+       :is-blocked (:is-blocked row)
+       :fullname (:fullname row)
+       :email (:email row)})))
+
+(defn- mcp-enabled-state?
+  "Whether the profile state `state` has MCP on. A missing state is off."
+  [state]
+  (and (some? state)
+       (not (false? (get-in state [:props :mcp-enabled])))))
 
 (defn- get-token-data
   [pool claims]
@@ -60,10 +73,15 @@
         (when (and (= (:uid claims) (:profile-id token))
                    (= mcp-claims? mcp-token?))
           (cond-> (update token :perms db/decode-pgarray #{})
-            ;; The profile's MCP switch, read with the token: an MCP call
-            ;; of a profile that turned MCP off is refused.
+            ;; The profile state, read with the token: an MCP call of a
+            ;; profile that turned MCP off is refused, and the command
+            ;; reads the active and blocked flags from here.
             mcp-token?
-            (assoc :mcp-enabled (profile-mcp-enabled? pool (:profile-id token)))))))))
+            (as-> token
+                  (let [state (profile-state pool (:profile-id token))]
+                    (assoc token
+                           :profile state
+                           :mcp-enabled (mcp-enabled-state? state))))))))))
 
 (defn- wrap-authz
   "Authenticate requests carrying an access token. Personal tokens need the
@@ -81,12 +99,15 @@
                  (if (= mcp-token-issuer (:iss claims))
                    mcp-enabled?
                    personal-enabled?))
-          (let [{:keys [perms profile-id expires-at type mcp-enabled]}
+          (let [{:keys [perms profile-id expires-at type mcp-enabled profile]}
                 (some->> claims (get-token-data pool))
                 token-id (get claims :tid)]
             (handler (cond-> request
                        (some? perms)
                        (assoc ::perms perms)
+
+                       (some? profile)
+                       (assoc ::profile profile)
 
                        (some? mcp-enabled)
                        (assoc ::mcp-enabled mcp-enabled)

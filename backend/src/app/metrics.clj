@@ -12,7 +12,8 @@
    [app.common.schema :as sm]
    [app.metrics.definition :as-alias mdef]
    [integrant.core :as ig]
-   [promesa.exec :as px])
+   [promesa.exec :as px]
+   [yetti.response :as yres])
   (:import
    io.prometheus.client.CollectorRegistry
    io.prometheus.client.Counter
@@ -34,6 +35,7 @@
 (declare create-registry)
 (declare create-collector)
 (declare handler)
+(declare initialize-labels!)
 
 (defprotocol IMetrics
   (get-registry [_])
@@ -71,7 +73,10 @@
     ;; the observation buckets.
     [::mdef/buckets {:optional true} [::sm/vec [:or :int :double]]]
     [::mdef/reg {:optional true} ::registry]
-    [::mdef/instance {:optional true} ::collector]]])
+    [::mdef/instance {:optional true} ::collector]
+    ;; One label-value vector per child to create at startup, so the
+    ;; series exists at zero before its first increment.
+    [::mdef/init-labels {:optional true} [::sm/vec [::sm/vec :string]]]]])
 
 (defn metrics?
   [o]
@@ -93,9 +98,10 @@
   (l/info :action "initialize metrics")
   (let [registry    (create-registry)
         definitions (reduce-kv (fn [res k v]
-                                 (->> (assoc v ::registry registry)
-                                      (create-collector)
-                                      (assoc res k)))
+                                 (let [mdef (->> (assoc v ::registry registry)
+                                                 (create-collector))]
+                                   (initialize-labels! mdef)
+                                   (assoc res k mdef)))
                                {}
                                (:default cfg))]
 
@@ -113,8 +119,8 @@
   (let [samples  (.metricFamilySamples ^CollectorRegistry registry)
         writer   (StringWriter.)]
     (TextFormat/write004 writer samples)
-    {:headers {"content-type" TextFormat/CONTENT_TYPE_004}
-     :body (.toString writer)}))
+    {::yres/headers {"content-type" TextFormat/CONTENT_TYPE_004}
+     ::yres/body (.toString writer)}))
 
 (defmethod ig/assert-key ::routes
   [_ {:keys [::metrics]}]
@@ -283,6 +289,20 @@
   [{:keys [::mdef/instance]} {:keys [val labels] :or {labels default-empty-labels}}]
   (let [instance (.labels ^Histogram instance (if (is-array? labels) labels (into-array String labels)))]
     (.observe ^Histogram$Child instance val)))
+
+(defn- initialize-labels!
+  "Creates the children named by `::mdef/init-labels` without recording
+  anything, so each series is exported at zero from startup. Definitions
+  without init labels are a no-op."
+  [{::mdef/keys [type instance init-labels]}]
+  (doseq [labels init-labels]
+    (let [array (into-array String labels)]
+      (case type
+        :counter   (.labels ^Counter instance array)
+        :gauge     (.labels ^Gauge instance array)
+        :summary   (.labels ^Summary instance array)
+        :histogram (.labels ^Histogram instance array)
+        nil))))
 
 (defmethod create-collector :counter
   [{::mdef/keys [name help reg labels]

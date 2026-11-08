@@ -1097,16 +1097,21 @@
             (update :batches inc)
             (update :snapshot-id #(or % snapshot-id)))))))
 
+;; GREATEST keeps the stored stamp when a newer write touched the project
+;; during this call: the request timestamp is taken at the call start, so a
+;; long call must not move the stamp backwards.
+(def ^:private sql:touch-project
+  "UPDATE project SET modified_at = GREATEST(modified_at, ?)
+    WHERE id = ? AND modified_at < now() - interval '5 seconds'")
+
 (defn finish-batches!
   "Writes the file once, after the last batch: its data and the pointer
-  maps the call changed, each once. Then it updates the project row. That
-  row is the last statement before the commit, so its lock is held as
-  briefly as possible. Queues the cache invalidation for the commit. Returns
-  `{:revn <the stored revn> :snapshot-id <id or nil>}`."
+  maps the call changed, each once. Queues the project touch and the cache
+  invalidation for the commit, so the project row is not locked by this
+  transaction. Returns `{:revn <the stored revn> :snapshot-id <id or nil>}`."
   [{:keys [cfg file file-ids final-schema? tracked snapshot-id tpoint batches]}]
   (let [file-id     (:id file)
         modified-at (or (::timestamp cfg) (ct/now))
-        conn        (::db/conn cfg)
         file        (-> file
                         (dissoc ::snapshot ::repair)
                         (assoc :modified-at modified-at
@@ -1118,12 +1123,15 @@
       ;; raw call does not read every page on every batch.
       (when final-schema?
         (val/validate-file-schema! file))
-      (bfc/update-file! cfg file))
+      (bfc/update-file! cfg file ::bfc/skip-stored-migrations? true))
 
-    (db/update! conn :project
-                {:modified-at modified-at}
-                {:id (:project-id file)}
-                {::db/return-keys false})
+    ;; Runs after the commit, on its own pool connection, as one short
+    ;; statement. It writes only when the stored project row is at least
+    ;; 5 seconds old.
+    (db/after-commit
+     (fn []
+       (db/exec-one! (::db/pool cfg)
+                     [sql:touch-project modified-at (:project-id file)])))
 
     (when (contains? cf/flags :redis-cache)
       (db/after-commit

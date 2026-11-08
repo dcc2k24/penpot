@@ -30,7 +30,7 @@
    [app.loggers.webhooks :as webhooks]
    [app.media.svg :as svg]
    [app.rpc :as-alias rpc]
-   [app.rpc.climit :as-alias climit]
+   [app.rpc.climit :as climit]
    [app.rpc.commands.files :as files]
    [app.rpc.commands.files-update :as files-update]
    [app.rpc.commands.mcp :as mcp]
@@ -493,6 +493,108 @@
              cause)
     cause))
 
+(declare ^:private file-ids-of)
+
+(defn- invalid-change-of
+  "The first change of `changes` that the processor rejects with an
+  assertion, as `{:index i :cause e}`, or nil. The changes are applied one at
+  a time to `data`, so the index is exact. Runs on the failure path only."
+  [cfg file-ids data changes]
+  (binding [pmap/*load-fn* (partial feat.fdata/load-pointer-of-files cfg file-ids)]
+    (loop [data    data
+           index   0
+           changes (seq changes)]
+      (when-let [change (first changes)]
+        (let [outcome (try
+                        (cpc/process-changes data [change])
+                        (catch clojure.lang.ExceptionInfo cause
+                          cause))]
+          (if (instance? clojure.lang.ExceptionInfo outcome)
+            (when (= :assertion (:type (ex-data outcome)))
+              {:index index :cause outcome})
+            (recur outcome (inc index) (next changes))))))))
+
+(defn- explain-path
+  "The first failing path of a rejected shape, as a dotted text, or nil."
+  [cause]
+  (some->> (get-in (ex-data cause) [::sm/explain :errors])
+           first
+           :in
+           seq
+           (map #(if (keyword? %) (name %) (str %)))
+           (str/join ".")))
+
+(defn- raw-change-failure
+  "The error of a change the processor rejects. For `mcp-apply-changes` the
+  changes are the agent's, so an internal assertion is reported as
+  `:mcp-invalid-change`, with the index of the change in the call and the
+  first failing path. It carries no explain and no shape record. The
+  operation tools compile their changes, so the same assertion is a fault
+  of the compiler: it is `:mcp-compile-failed`, with no change index the
+  agent could map. Any other cause is returned unchanged."
+  [tool cfg libraries file offset changes cause]
+  (cond
+    (not= :assertion (:type (ex-data cause)))
+    cause
+
+    (not= "mcp-apply-changes" tool)
+    (ex/raise :type :internal
+              :code :mcp-compile-failed
+              :hint (str "the compiler of " tool " produced a change the processor rejects")
+              :cause cause)
+
+    :else
+    (let [found (invalid-change-of cfg (file-ids-of file libraries) (:data file) changes)
+          index (some-> found :index (+ offset))
+          path  (some-> found :cause explain-path)]
+      (ex/raise :type :validation
+                :code :mcp-invalid-change
+                :hint (str "a change is invalid"
+                           (when index (str ": change " index))
+                           (when path (str ", at " path)))
+                :change-index index
+                :field path))))
+
+(defn- unknown-shape-warnings
+  "A warning for each `:mod-obj` or `:del-obj` change whose shape is not on
+  its page: such a change changes nothing. Read from the loaded file.
+  A shape that an earlier `:add-obj` of the same call creates is not
+  unknown: a later operation may name it, as the reflow of a new layout
+  does. The changes are walked in order, keeping the ids added so far."
+  [cfg libraries file changes]
+  (let [objects (memoize
+                 (fn [page-id]
+                   (binding [pmap/*load-fn* (partial feat.fdata/load-pointer-of-files cfg
+                                                     (file-ids-of file libraries))]
+                     (some-> (get-in file [:data :pages-index page-id])
+                             (as-> page (if (pmap/pointer-map? page) (deref page) page))
+                             :objects))))]
+    (first
+     (reduce
+      (fn [[warnings added] [index change]]
+        (let [page-id   (:page-id change)
+              id        (:id change)
+              shape-key [page-id id]]
+          (cond
+            (= :add-obj (:type change))
+            [warnings (conj added shape-key)]
+
+            (and (contains? #{:mod-obj :del-obj} (:type change))
+                 (some? page-id)
+                 (some? (objects page-id))
+                 (not (contains? (objects page-id) id))
+                 (not (contains? added shape-key)))
+            [(conj warnings {:kind "unknown-shape"
+                             :change-index index
+                             :shape-id id
+                             :page-id page-id})
+             added]
+
+            :else
+            [warnings added])))
+      [[] #{}]
+      (map-indexed vector changes)))))
+
 (defn- over-budget?
   [started-ns]
   (> (/ (- (System/nanoTime) started-ns) 1e6)
@@ -535,7 +637,8 @@
                 ctx' (try
                        (files-update/apply-batch! ctx (:changes batch) opts)
                        (catch Throwable cause
-                         (throw (batch-failure cause (:revn file) offset batch))))]
+                         (throw (batch-failure (raw-change-failure tool cfg libraries (:file ctx) offset (:changes batch) cause)
+                                               (:revn file) offset batch))))]
             (recur (inc index)
                    ctx'
                    (+ offset (count (:changes batch))))))
@@ -577,8 +680,8 @@
   the share lock of the file row before it reads the file, so the commit
   extends the revn it reads. A lock wait that runs out raises a conflict
   (see `lock-wait!`)."
-  [cfg profile-id file-id dry-run?]
-  (mcp/check-profile! cfg profile-id)
+  [cfg params profile-id file-id dry-run?]
+  (mcp/check-profile! cfg profile-id params)
   (let [conn (::db/conn cfg)
         file (if dry-run?
                (do
@@ -792,7 +895,7 @@
   (let [dry-run?   (boolean dry-run)
         request-id (or request-id (uuid/next))
         token-id   (mcp/get-token-id params)
-        file       (load-write-file cfg profile-id file-id dry-run?)
+        file       (load-write-file cfg params profile-id file-id dry-run?)
         ;; The time budget counts from the lock, which the load takes.
         started-ns (System/nanoTime)
         ;; A dry run writes nothing, so it has no session to replay.
@@ -818,7 +921,8 @@
                                    :changed-shape-ids (vec (:overlap lag))
                                    :truncated (boolean (:truncated? lag))))
 
-            warnings   (cond-> (vec (:warnings derived))
+            warnings   (cond-> (into (vec (:warnings derived))
+                                     (unknown-shape-warnings cfg libraries file changes))
                          (some? (:warning lag)) (conj (:warning lag)))
 
             base       {:change-count (count changes)
@@ -893,7 +997,13 @@
 
   The canonical text of the call is built once here: it is checked for size before the file is locked, and it is the digest input of a write."
   [cfg tool params opts]
-  (let [started (System/nanoTime)
+  (let [;; The log line and the audit props name the request as the reads
+        ;; do, by the RPC request id. A call that came with only its body
+        ;; `request-id` (or with none, in tests) takes that id.
+        params  (cond-> params
+                  (nil? (::rpc/request-id params))
+                  (assoc ::rpc/request-id (or (:request-id params) (uuid/next))))
+        started (System/nanoTime)
         audit   (volatile! nil)
         text    (canonical-text (payload-of params))
         _       (check-payload-size! text)
@@ -905,7 +1015,10 @@
                                                               (assoc opts :text text)))]
                                   (vreset! audit props)
                                   [result props])))
+        ;; These props replace the ones `run-tool` attaches, so they carry
+        ;; the request id too.
         props   (assoc @audit
+                       :request-id (::rpc/request-id params)
                        :duration-ms (/ (- (System/nanoTime) started) 1000000.0))
         write?  (and (not (:dry-run params))
                      (not (:already-applied result)))]
@@ -917,6 +1030,31 @@
                  ::webhooks/batch-key (webhooks/key-fn ::rpc/profile-id :file-id)
                  ::webhooks/batch-timeout (ct/duration "2m")))))
 
+;; --- TEAM LIMIT
+
+(def ^:private sql:team-of-file
+  "select p.team_id
+     from file as f
+     join project as p on p.id = f.project_id
+    where f.id = ?")
+
+(defn- team-of-file
+  "The team of the file `file-id`, or nil when the file does not exist.
+  One indexed lookup on the pool: the limiter runs before the transaction."
+  [cfg file-id]
+  (:team-id (db/exec-one! cfg [sql:team-of-file file-id])))
+
+(def ^:private team-key
+  "The key of the `:mcp-apply/by-team` limiter: the team of the write's file.
+  The writes of one team share its permits, so the agents of a team of many
+  profiles cannot saturate the backend. A file that does not exist has no
+  team and takes the unkeyed limiter; the command fails on the file itself.
+  The write commands declare this limit last: `climit/wrap` takes the first
+  declared limit innermost, so the lookup runs before any permit is held."
+  (climit/with-cfg
+    (fn [cfg params]
+      (some->> (:file-id params) (team-of-file cfg)))))
+
 ;; --- COMMAND: mcp-apply-changes
 
 (sv/defmethod ::mcp-apply-changes
@@ -927,7 +1065,8 @@
    ::rpc/mcp-scope write-scope
    ::climit/id [[:mcp-apply/by-profile ::rpc/profile-id]
                 [:mcp-apply/global]
-                [:mcp-update-file/by-profile ::rpc/profile-id]]
+                [:mcp-update-file/by-profile ::rpc/profile-id]
+                [:mcp-apply/by-team team-key]]
    ::db/transaction true
    ::audit/skip false
    ::doc/added "2.20"
@@ -954,7 +1093,8 @@
    ::rpc/mcp-scope write-scope
    ::climit/id [[:mcp-apply/by-profile ::rpc/profile-id]
                 [:mcp-apply/global]
-                [:mcp-update-file/by-profile ::rpc/profile-id]]
+                [:mcp-update-file/by-profile ::rpc/profile-id]
+                [:mcp-apply/by-team team-key]]
    ::db/transaction true
    ::audit/skip false
    ::doc/added "2.20"
@@ -982,7 +1122,8 @@
    ::rpc/mcp-scope write-scope
    ::climit/id [[:mcp-apply/by-profile ::rpc/profile-id]
                 [:mcp-apply/global]
-                [:mcp-update-file/by-profile ::rpc/profile-id]]
+                [:mcp-update-file/by-profile ::rpc/profile-id]
+                [:mcp-apply/by-team team-key]]
    ::db/transaction true
    ::audit/skip false
    ::doc/added "2.20"

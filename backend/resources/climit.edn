@@ -87,6 +87,11 @@
  :mcp-apply/global
  {:permits 6 :queue 50 :timeout 60000}
 
+ ;; Four writes run at once per team and 50 more wait. Further writes are
+ ;; refused with a clear error, which caps what one team can take.
+ :mcp-apply/by-team
+ {:permits 4 :queue 50 :timeout 60000}
+
  ;; Agent writes have their own single permit per profile, so an agent
  ;; write does not hold the owner's own save (update-file/by-profile).
  :mcp-update-file/by-profile

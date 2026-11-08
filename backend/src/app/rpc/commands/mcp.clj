@@ -30,6 +30,7 @@
    [app.common.uuid :as uuid]
    [app.config :as cf]
    [app.db :as db]
+   [app.db.sql :as-alias sql]
    [app.features.fdata :as feat.fdata]
    [app.http.access-token :as-alias actoken]
    [app.http.session :as session]
@@ -165,30 +166,51 @@
 
 ;; --- AUTH
 
+(defn- request-profile
+  "The profile state that the access-token lookup read for this request, or
+  nil when the request carries none (unit tests)."
+  [params]
+  (let [request (-> params meta :app.http/request)]
+    (when (map? request)
+      (get request ::actoken/profile))))
+
+(defn- check-profile-state!
+  "The checks of `check-profile!` on a profile map. Returns it.
+  The `:mcp-disabled` check runs here only when the request carries no
+  profile (unit tests): `wrap-authentication` in `rpc.clj` refuses a
+  disabled profile before the command runs."
+  [profile]
+  (when (:is-blocked profile)
+    (ex/raise :type :authorization
+              :code :profile-blocked
+              :hint "profile is marked as blocked"))
+  (when-not (:is-active profile)
+    (ex/raise :type :authorization
+              :code :profile-not-active
+              :hint "profile is not active"))
+  (when (false? (get-in profile [:props :mcp-enabled]))
+    (ex/raise :type :restriction
+              :code :mcp-disabled
+              :hint "MCP is disabled for this profile"))
+  profile)
+
 (defn check-profile!
   "Rejects blocked and inactive profiles, as `send-mcp-feedback` does, and
   profiles that switched MCP off in settings. The switch is a profile
   prop; the tokens keep existing, so the check happens on every call.
-  Returns the profile."
-  [cfg profile-id]
-  (let [profile (profile/get-profile cfg profile-id)]
-    (when (:is-blocked profile)
-      (ex/raise :type :authorization
-                :code :profile-blocked
-                :hint "profile is marked as blocked"))
-    (when-not (:is-active profile)
-      (ex/raise :type :authorization
-                :code :profile-not-active
-                :hint "profile is not active"))
-    (when (false? (get-in profile [:props :mcp-enabled]))
-      (ex/raise :type :restriction
-                :code :mcp-disabled
-                :hint "MCP is disabled for this profile"))
-    profile))
+
+  The profile comes from the request, where the token lookup read it with
+  the token. The row is read only when the request carries none. Returns
+  the profile."
+  ([cfg profile-id]
+   (check-profile! cfg profile-id nil))
+  ([cfg profile-id params]
+   (check-profile-state! (or (request-profile params)
+                             (profile/get-profile cfg profile-id)))))
 
 (defn- check-access!
-  [cfg profile-id file-id]
-  (check-profile! cfg profile-id)
+  [cfg params profile-id file-id]
+  (check-profile! cfg profile-id params)
   (files/check-read-permissions! cfg profile-id file-id))
 
 ;; --- FILE DATA
@@ -210,11 +232,17 @@
   next page read does not decode the root again. Call it only after the
   permission check."
   [cfg file-id]
-  (let [mfile (files/get-minimal-file cfg file-id)
+  (let [mfile (db/get cfg :file {:id file-id}
+                      {::sql/columns [:id :revn :vern :version]})
         hit   (when (some? mfile)
                 (cache/get root-cache [file-id (:revn mfile) (:vern mfile)]))]
     (or hit
-        (let [file (bfc/get-file cfg file-id)]
+        ;; `bfc/get-file` migrates and persists the file when it is behind
+        ;; the current version and also when a named migration is missing,
+        ;; which keeps the version. Its writes must be atomic, so every miss
+        ;; runs in one transaction: the version alone does not say whether
+        ;; the read will write.
+        (let [file (db/tx-run! cfg (fn [cfg] (bfc/get-file cfg file-id)))]
           (when (pointer-root? file)
             (cache/put root-cache [file-id (:revn file) (:vern file)] file))
           file))))
@@ -484,7 +512,7 @@
   [cfg {:keys [::rpc/profile-id ::rpc/token-perms] :as params}]
   (run-tool cfg "mcp-whoami" params
             (fn []
-              (let [profile  (check-profile! cfg profile-id)
+              (let [profile  (check-profile! cfg profile-id params)
                     token-id (get-token-id params)]
                 [{:profile-id profile-id
                   :fullname (:fullname profile)
@@ -559,14 +587,13 @@
   {::rpc/token-type "mcp"
    ::rpc/mcp-scope "mcp:read"
    ::climit/id [[:mcp-read/by-profile ::rpc/profile-id] [:mcp-read/global]]
-   ::db/transaction true
    ::doc/added "2.20"
    ::doc/module :mcp
    ::sm/params schema:file-outline}
   [cfg {:keys [::rpc/profile-id file-id] :as params}]
   (run-tool cfg "get-mcp-file-outline" params
             (fn []
-              (check-access! cfg profile-id file-id)
+              (check-access! cfg params profile-id file-id)
               (let [file   (load-file-data cfg file-id [:components :colors :typographies
                                                         :tokens-lib :tokens-status])
                     data   (:data file)
@@ -788,14 +815,13 @@
   {::rpc/token-type "mcp"
    ::rpc/mcp-scope "mcp:read"
    ::climit/id [[:mcp-read/by-profile ::rpc/profile-id] [:mcp-read/global]]
-   ::db/transaction true
    ::doc/added "2.20"
    ::doc/module :mcp
    ::sm/params schema:page-tree}
   [cfg {:keys [::rpc/profile-id file-id page-id root-id depth fields limit cursor] :as params}]
   (run-tool cfg "get-mcp-page-tree" params
             (fn []
-              (check-access! cfg profile-id file-id)
+              (check-access! cfg params profile-id file-id)
               (let [file    (load-file-for-page cfg file-id page-id [])
                     data    (:data file)
                     revn    (:revn file)
@@ -911,14 +937,13 @@
   {::rpc/token-type "mcp"
    ::rpc/mcp-scope "mcp:read"
    ::climit/id [[:mcp-read/by-profile ::rpc/profile-id] [:mcp-read/global]]
-   ::db/transaction true
    ::doc/added "2.20"
    ::doc/module :mcp
    ::sm/params schema:shapes}
   [cfg {:keys [::rpc/profile-id file-id page-id ids fields include-children] :as params}]
   (run-tool cfg "get-mcp-shapes" params
             (fn []
-              (check-access! cfg profile-id file-id)
+              (check-access! cfg params profile-id file-id)
               (when (and include-children (contains? (set ids) uuid/zero))
                 (ex/raise :type :validation
                           :code :mcp-root-children-not-allowed
@@ -1142,14 +1167,13 @@
    ::rpc/mcp-scope "mcp:read"
    ::climit/id [[:mcp-read/by-profile ::rpc/profile-id] [:mcp-read/global]
                 [:mcp-find/by-file :file-id]]
-   ::db/transaction true
    ::doc/added "2.20"
    ::doc/module :mcp
    ::sm/params schema:find-shapes}
   [cfg {:keys [::rpc/profile-id file-id page-id within-id limit] :as params}]
   (run-tool cfg "find-mcp-shapes" params
             (fn []
-              (check-access! cfg profile-id file-id)
+              (check-access! cfg params profile-id file-id)
               (let [file     (load-file-for-page cfg file-id page-id [])
                     data     (:data file)
                     revn     (:revn file)
@@ -1224,14 +1248,13 @@
   {::rpc/token-type "mcp"
    ::rpc/mcp-scope "mcp:read"
    ::climit/id [[:mcp-read/by-profile ::rpc/profile-id] [:mcp-read/global]]
-   ::db/transaction true
    ::doc/added "2.20"
    ::doc/module :mcp
    ::sm/params schema:library}
   [cfg {:keys [::rpc/profile-id file-id kinds include-deleted limit] :as params}]
   (run-tool cfg "get-mcp-library" params
             (fn []
-              (check-access! cfg profile-id file-id)
+              (check-access! cfg params profile-id file-id)
               (let [file   (load-file-data cfg file-id [:components :colors :typographies])
                     data   (:data file)
                     kinds  (if (seq kinds) (set kinds) default-library-kinds)
@@ -1292,14 +1315,13 @@
   {::rpc/token-type "mcp"
    ::rpc/mcp-scope "mcp:read"
    ::climit/id [[:mcp-read/by-profile ::rpc/profile-id] [:mcp-read/global]]
-   ::db/transaction true
    ::doc/added "2.20"
    ::doc/module :mcp
    ::sm/params schema:tokens}
   [cfg {:keys [::rpc/profile-id file-id set-id] fmt :format :as params}]
   (run-tool cfg "get-mcp-tokens" params
             (fn []
-              (check-access! cfg profile-id file-id)
+              (check-access! cfg params profile-id file-id)
               (let [file     (load-file-data cfg file-id [:tokens-lib :tokens-status])
                     data     (:data file)
                     lib      (cfo/get-tokens-lib data)
@@ -1372,7 +1394,7 @@
   [cfg {:keys [::rpc/profile-id file-id] :as params}]
   (run-tool cfg "create-mcp-render-session" params
             (fn []
-              (check-access! cfg profile-id file-id)
+              (check-access! cfg params profile-id file-id)
               (let [file-ids   (into #{file-id}
                                      (map :id)
                                      (bfc/get-file-libraries cfg file-id))

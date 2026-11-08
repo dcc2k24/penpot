@@ -10,10 +10,13 @@
   buckets refill under steady use, MCP token calls count under their own
   key, and a weighted cache evicts by weight."
   (:require
+   [app.common.files.changes :as cpc]
+   [app.main :as main]
    [app.rpc :as-alias rpc]
    [app.rpc.rlimit :as rlimit]
    [app.util.cache :as cache]
    [clojure.edn :as edn]
+   [clojure.set :as set]
    [clojure.test :as t]))
 
 (defn- declared-climit-ids
@@ -40,7 +43,7 @@
   ;; The script refills whole tokens each second. A bucket refills
   ;; under steady use when its rate, per second, is at least one.
   (doseq [[opts name] [["1200/600/1m" :mcp-read]
-                       ["120/60/1m" :mcp-write]]]
+                       ["600/300/1m" :mcp-write]]]
     (let [limit    (rlimit/parse-limit [name :bucket opts])
           seconds  (.getSeconds ^java.time.Duration (::rlimit/interval limit))
           per-sec  (/ (double (::rlimit/rate limit)) seconds)]
@@ -89,3 +92,49 @@
   (let [limits (edn/read-string (slurp "resources/climit.edn"))]
     (t/is (= {:permits 1 :queue 5 :timeout 60000}
              (get limits :mcp-apply/by-profile)))))
+
+(t/deftest write-commands-declare-the-team-limit
+  (let [src    (slurp "src/app/rpc/commands/mcp_write.clj")
+        limits (edn/read-string (slurp "resources/climit.edn"))]
+    ;; The three write commands share the per-team ceiling.
+    (t/is (= 3 (count (re-seq #"\[:mcp-apply/by-team team-key\]" src))))
+    (t/is (= {:permits 4 :queue 50 :timeout 60000}
+             (select-keys (get limits :mcp-apply/by-team)
+                          [:permits :queue :timeout])))))
+
+(t/deftest write-commands-take-the-team-limit-last
+  ;; `climit/wrap` takes the first declared limit innermost, so the team
+  ;; lookup must be the last declared: it runs before any permit is held.
+  (let [src     (slurp "src/app/rpc/commands/mcp_write.clj")
+        vectors (re-seq #"(?s)::climit/id \[(.*?)\]\]" src)]
+    (t/is (= 3 (count vectors)))
+    (doseq [[_ body] vectors]
+      (t/is (= "mcp-apply/by-team" (second (last (re-seq #":(mcp-[a-z/-]+)" body))))))))
+
+(defn- mcp-codes-raised-from
+  "The `:code :mcp-...` literals of the source at `path`, from the first
+  occurrence of `marker` on."
+  [path marker]
+  (let [src  (slurp path)
+        from (.indexOf ^String src ^String marker)]
+    (assert (<= 0 from) (str marker " is not in " path))
+    (into #{} (map second) (re-seq #":code :(mcp-[a-z-]+)" (subs src from)))))
+
+(t/deftest change-type-labels-are-the-processor-methods
+  (let [labels (set main/mcp-change-types)]
+    (t/is (> (count labels) 40))
+    (t/is (= labels (set (map name (keys (methods cpc/process-change))))))))
+
+(t/deftest recorded-mcp-error-codes-are-listed
+  ;; The codes the tools raise after `run-tool` (in `mcp.clj`) and the
+  ;; codes of `mcp_write.clj`, which all run inside a tool, must appear in
+  ;; the list the metrics start from, or their first error is invisible
+  ;; to `rate()`. Codes raised before `run-tool` are not recorded and are
+  ;; not listed.
+  (let [listed (set main/mcp-error-codes)
+        raised (set/union
+                (mcp-codes-raised-from "src/app/rpc/commands/mcp.clj" "(defn run-tool")
+                (mcp-codes-raised-from "src/app/rpc/commands/mcp_write.clj" "(ns "))]
+    (t/is (contains? raised "mcp-invalid-change"))
+    (doseq [code raised]
+      (t/is (contains? listed code) (str code " is raised but not in mcp-error-codes")))))
