@@ -1136,3 +1136,59 @@
                                [:cause-type :code :retrying :queued-commits])))))
      (fn [_ _]
        (rx/throw (ex-info "invalid" {:type :validation :code :referential-integrity}))))))
+
+;; Scenario: a queued commit and a buffered commit are both pending. A remote
+;; rebase must undo and redo both, so `get-pending-commits` lists the queue
+;; first, then the buffer, each in commit order. Proves: buffered local edits
+;; take part in the rebase.
+(t/deftest pending-commits-list-queued-then-buffered
+  (let [queued   {:id (uuid/next)}
+        buffered {:id (uuid/next)}
+        state    {:persistence {:queue (into #queue [] [(:id queued)])
+                                :index {(:id queued) queued}
+                                :buffer [buffered]}}]
+    (t/is (= [queued buffered] (#'dch/get-pending-commits state)))))
+
+;; Scenario: nothing is queued or buffered. Proves: the rebase has nothing to
+;; undo, so `get-pending-commits` answers nil and the remote path skips it.
+(t/deftest pending-commits-are-nil-without-local-edits
+  (t/is (nil? (#'dch/get-pending-commits {:persistence {:queue #queue []}}))))
+
+;; Scenario: two commits of one file merge into one. Undo must replay the
+;; later commit first, so it ends at the state before the first commit.
+;; Proves: merged undo runs in reverse commit order.
+(t/deftest merged-commit-undoes-the-latest-commit-first
+  (let [file-id (uuid/next)
+        c1      {:id (uuid/next) :file-id file-id :undo-changes [:undo-1] :redo-changes [:redo-1]}
+        c2      {:id (uuid/next) :file-id file-id :undo-changes [:undo-2] :redo-changes [:redo-2]}
+        merged  (#'dps/merge-commits [c1 c2])]
+    (t/is (= [:undo-2 :undo-1] (:undo-changes merged)))))
+
+;; Scenario: the same two commits merge into one. Proves: redo and changes keep
+;; commit order, and the merged commit keeps the id of the first commit.
+(t/deftest merged-commit-keeps-redo-in-commit-order
+  (let [file-id (uuid/next)
+        c1      {:id (uuid/next) :file-id file-id :undo-changes [:undo-1] :redo-changes [:redo-1]}
+        c2      {:id (uuid/next) :file-id file-id :undo-changes [:undo-2] :redo-changes [:redo-2]}
+        merged  (#'dps/merge-commits [c1 c2])]
+    (t/is (= [:redo-1 :redo-2] (:redo-changes merged)))
+    (t/is (= [:redo-1 :redo-2] (:changes merged)))
+    (t/is (= (:id c1) (:id merged)))))
+
+;; Scenario: a local edit is applied and waits in the buffer. Until the flush it
+;; is not queued. The flush moves it into the queue and empties the buffer in
+;; one update. Proves: a commit is never in both lists, nor in neither.
+(t/deftest ^:async buffered-edit-moves-to-the-queue-on-flush
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id store]}]
+       (ptk/emit! store (local-commit file-id))
+       (await (async/wait-for #(= 1 (count (get-in @store [:persistence :buffer])))
+                              "edit waits in the buffer"))
+       (let [commit-id (:id (first (get-in @store [:persistence :buffer])))]
+         (t/is (empty? (get-in @store [:persistence :queue])))
+         (ptk/emit! store ::dps/force-persist)
+         (await (async/wait-for #(= 1 (count (get-in @store [:persistence :queue])))
+                                "flush queues the edit"))
+         (t/is (empty? (get-in @store [:persistence :buffer])))
+         (t/is (= commit-id (first (get-in @store [:persistence :queue])))))))))

@@ -293,10 +293,23 @@
                                                :slow-failures :attempts :retry-token
                                                :retry-for)))))))
 
+(defn- buffer-commit
+  "Event used internally to track a local commit while it waits in the
+  buffer for the next flush. The commit is already applied to the file
+  data, so a remote-change rebase must see it to undo and redo it."
+  [commit]
+  (ptk/reify ::buffer-commit
+    ptk/UpdateEvent
+    (update [_ state]
+      (update-in state [:persistence :buffer] (fnil conj []) commit))))
+
 (defn- append-commit
   "Event used internally to append the current change to the
-  persistence queue."
-  [{:keys [id] :as commit}]
+  persistence queue. `flushed` holds the ids of the buffered commits
+  this flush settles. They leave `:buffer` in the same update that
+  queues the merged commit, so no commit is missing from both lists
+  or counted in both."
+  [{:keys [id] :as commit} flushed]
   (let [run-id (uuid/next)]
     (ptk/reify ::append-commit
       ptk/UpdateEvent
@@ -308,7 +321,8 @@
                       (cond-> (not= :error (:status pstate))
                         (update :run-id d/nilv run-id))
                       (update :queue queue-conj id)
-                      (update :index assoc id commit)))))
+                      (update :index assoc id commit)
+                      (update :buffer #(into [] (remove (fn [c] (contains? flushed (:id c)))) %))))))
 
       ptk/WatchEvent
       (watch [_ state _]
@@ -728,6 +742,12 @@
   when the user acts on them."
   []
   (ptk/reify ::initialize-persistence-state
+    ptk/UpdateEvent
+    (update [_ state]
+      ;; A replaced watcher owns the commits still in its buffer. Keeping
+      ;; them here would make every later rebase replay them.
+      (assoc-in state [:persistence :buffer] []))
+
     ptk/WatchEvent
     (watch [_ state _]
       (let [{:keys [queue status run-id]} (:persistence state)]
@@ -802,16 +822,23 @@
 (def ^:private xf-mapcat-redo
   (mapcat :redo-changes))
 
+(defn- merge-commits
+  "Merges the commits of one file into a single commit. Undo runs in
+  reverse commit order so it ends at the state before the first commit.
+  Redo and changes keep commit order."
+  [commits]
+  (let [item (first commits)
+        uchg (into [] xf-mapcat-undo (reverse commits))
+        rchg (into [] xf-mapcat-redo commits)]
+    (-> item
+        (assoc :undo-changes uchg)
+        (assoc :redo-changes rchg)
+        (assoc :changes rchg))))
+
 (defn- merge-commit
   [buffer]
   (->> (rx/from (group-by :file-id buffer))
-       (rx/map (fn [[_ [item :as commits]]]
-                 (let [uchg (into [] xf-mapcat-undo commits)
-                       rchg (into [] xf-mapcat-redo commits)]
-                   (-> item
-                       (assoc :undo-changes uchg)
-                       (assoc :redo-changes rchg)
-                       (assoc :changes rchg)))))))
+       (rx/map (fn [[_ commits]] (merge-commits commits)))))
 
 (defn- resume-on-online
   "Re-enters the runner for a retrying episode when the browser reports
@@ -934,6 +961,12 @@
                         (update-status :pending)))
               (rx/take-until stoper-s))
 
+         ;; Each local commit joins `:buffer` until its flush, so a remote
+         ;; rebase undoes and redoes it along with the queued commits.
+         (->> local-commits-s
+              (rx/map buffer-commit)
+              (rx/take-until stoper-s))
+
          ;; Here we watch for local commits, buffer them in a small
          ;; chunks (very near in time commits) and append them to the
          ;; persistence queue
@@ -941,8 +974,10 @@
               (rx/take-until stoper-s)
               (rx/buffer-until notifier-s)
               (rx/tap (fn [_] (vreset! buffered? false)))
-              (rx/mapcat merge-commit)
-              (rx/map append-commit)
+              (rx/mapcat (fn [buffer]
+                           (let [flushed (into #{} (map :id) buffer)]
+                             (rx/map #(append-commit % flushed)
+                                     (merge-commit buffer)))))
               (rx/finalize (fn []
                              (log/debug :hint "finalize persistence: changes watcher"))))
 

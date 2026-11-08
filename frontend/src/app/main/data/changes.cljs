@@ -72,9 +72,13 @@
              (rx/ignore))))))
 
 (defn- get-pending-commits
+  "Returns the local commits not yet saved, in commit order: the queued
+  ones first, then the buffered ones still waiting for their flush. The
+  rebase must see both, because a buffered commit is already applied to
+  the file data."
   [{:keys [persistence]}]
-  (->> (:queue persistence)
-       (map (d/getf (:index persistence)))
+  (->> (concat (map (d/getf (:index persistence)) (:queue persistence))
+               (:buffer persistence))
        (not-empty)))
 
 (def ^:private xf:map-page-id
