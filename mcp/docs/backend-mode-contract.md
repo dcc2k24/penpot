@@ -368,8 +368,10 @@ map keys and leaves out nil values, so key order does not matter. A reused reque
 write. A call without a request id gets a new one, so it is never a replay. Under the lock, and before the changes
 are compiled, the call looks for change rows with that session id. If it finds any, it writes nothing, sends no
 event, and answers `alreadyApplied: true` with `commits: 0`, the change count and types of the earlier call, and an
-empty `warnings` list. The window lasts while those change rows exist. The code comment says about one hour. The
-garbage collector sets the exact time. A dry run skips the check.
+empty `warnings` list. Each commit writes its change rows with a deletion time one hour after the commit
+(`rpc/commands/files_update.clj`). The objects garbage collector (`tasks/objects_gc.clj`) deletes rows once that time
+has passed. So the check finds the rows from the commit until the first collector run after that hour. Later, a retry
+with the same request id and payload applies the changes again. A dry run skips the check.
 
 Dry run (`dryRun: true`): reads the file with read permission only, takes no lock, and writes nothing. It applies the
 changes in memory and runs the same checks as a commit, with the same forced and flag-driven choices. Its result
@@ -735,7 +737,8 @@ Limits (defaults, all set by `PENPOT_MCP_SANDBOX_*`, section 4.6):
 - operations per script: 5000, counted after folding
 - live sandbox runtimes: 20 (`PENPOT_MCP_SANDBOX_MAX_SESSIONS`), evicted after 30 idle minutes
   (`PENPOT_MCP_SANDBOX_IDLE_MIN`)
-- calls that run at once: 4 (`PENPOT_MCP_SANDBOX_MAX_CONCURRENT`), with a 60 s wait for a slot
+- calls that run at once in one process: 20 (`PENPOT_MCP_SANDBOX_MAX_CONCURRENT`). A call that finds every slot taken
+  waits up to 60 s for one.
 - one running script per token. Up to 2 more calls of the same token may wait in a short queue.
 - the log, the result and the error text are each capped at 256 kB
 - `storage` (the script's own data) is kept per MCP token, across files. It holds JSON values only: a cycle or a
@@ -802,25 +805,30 @@ variable.
 | `PENPOT_MCP_BACKEND_MAX_RESPONSE_MB` | `8` | Cap on one backend response |
 | `PENPOT_MCP_RATE_LIMIT_RPS` | `10` | Sustained requests per second per MCP token |
 | `PENPOT_MCP_RATE_LIMIT_BURST` | `20` | Requests per MCP token that may be sent at once |
+| `PENPOT_MCP_TOKEN_CACHE_S` | `60` | Seconds a good token check is reused. A rejected token is kept 5 s. Any positive number. |
 | `PENPOT_MCP_ALLOW_QUERY_TOKEN` | `true` in bridge mode, `false` otherwise | Accepts `?userToken=`. When `true`, a warning is logged once per token. |
 | `PENPOT_MCP_MAX_BODY_MB` | `32` | Request body limit after authentication. Before it, the limit is 4 MB. |
 | `PENPOT_MCP_MAX_TOOL_RESPONSE_KB` | `100` | Cap on a tool reply (1 to 10000) |
 | `PENPOT_MCP_EXPORT_DIR` | `~/penpot-exports` | Export root for `export_shape` `filePath` |
 | `PENPOT_MCP_IMPORT_DIR` | `~/penpot-imports` | Import root for `filePath` arguments |
-| `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` | `4` | Renders at once against the backend; 0 means no limit |
+| `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` | `0` in bridge mode, `4` in backend mode | Renders at once in one process against the backend; 0 means no limit |
+| `PENPOT_MCP_EXPORT_TOTAL_PERMITS` | `4` | Renders at once across all adapters that share `PENPOT_MCP_REDIS_URI`. Needs Redis. |
 | `PENPOT_MCP_SANDBOX_TIMEOUT_S` | `3` | Guest CPU time of one `execute_code` call |
 | `PENPOT_MCP_SANDBOX_WALL_S` | `120` | Wall-clock limit of one call |
 | `PENPOT_MCP_SANDBOX_IDLE_MIN` | `30` | Idle minutes before a session sandbox is evicted |
 | `PENPOT_MCP_SANDBOX_MAX_HOST_CALLS` | `1000` | Host primitive calls per script |
+| `PENPOT_MCP_SANDBOX_HOST_MS` | `30000` | Host time of one script, in milliseconds. It counts backend and exporter calls, rate-limit waits included. |
+| `PENPOT_MCP_SANDBOX_PAGE_MB` | `16` | Page data one call may hold, in MB of JSON |
 | `PENPOT_MCP_SANDBOX_MAX_SESSIONS` | `20` | Live sandbox runtimes |
-| `PENPOT_MCP_SANDBOX_MAX_CONCURRENT` | `4` | Calls that run at once |
+| `PENPOT_MCP_SANDBOX_MAX_CONCURRENT` | `20` | Calls that run at once in one process. Set on its own: it does not follow `PENPOT_MCP_SANDBOX_MAX_SESSIONS`. |
 | `PENPOT_MCP_SANDBOX_WORKERS` | `true` | Runs each guest in a worker thread. `false` or `0` runs it on the main thread. Any other value that is not true or false stops the start. |
 | `PENPOT_MCP_SERVER_HOST` | `localhost` | Listen host |
 | `PENPOT_MCP_SERVER_PORT` | `4401` | Listen port |
+| `PENPOT_MCP_KEEPALIVE_S` | `65` | Seconds the server keeps an idle HTTP connection open. Keep it above the idle timeout of the proxy in front (`deploy/nginx.conf` uses 60 s). |
 | `PENPOT_MCP_WEBSOCKET_PORT` | `4402` | Plugin bridge port (bridge mode) |
 | `PENPOT_MCP_TOOL_TIMEOUT_S` | `120` | Plugin bridge tool timeout (bridge mode) |
-| `PENPOT_MCP_REDIS_URI` | unset | Redis for the bridge |
-| `PENPOT_MCP_REMOTE_MODE` | unset | `true` enables remote mode |
+| `PENPOT_MCP_REDIS_URI` | unset | `redis://` or `rediss://` URI. In backend and both modes it shares the rate limit and the sandbox storage between instances, whatever the multi-user setting. Unset: each instance keeps its own. In bridge and both modes, with multi-user, it routes plugin tasks between instances. |
+| `PENPOT_MCP_REMOTE_MODE` | `false` | `true` enables remote mode. Only the exact value `true` enables it. |
 | `PENPOT_MCP_REPL_ENABLE` | unset | `true` or `false` sets whether the REPL starts. When unset, the REPL starts only if `PENPOT_MCP_DEVENV` is `true`, in single-user mode. |
 | `PENPOT_MCP_REPL_HOST` / `PENPOT_MCP_REPL_PORT` | `localhost` / `4403` | REPL listen address |
 | `PENPOT_MCP_DEVENV` | unset | `true` starts the REPL, unless `PENPOT_MCP_REPL_ENABLE` says otherwise |
@@ -1010,3 +1018,69 @@ Compatible additions and fixes. `contractVersion` stays at 1.
 - The MCP-off check runs after the backend switch and the token-type rules (section 1.2). Section 1.8 covers the
   token transport: `Bearer` from the agent to the adapter, `Token` from the adapter to the backend.
 - `get_tokens` takes `setId` and `format` (section 4.2). The server build has two entries (section 4.7).
+
+## 8. Audit matrix
+
+This section says what each MCP command writes to the audit log, and whether the request id is in it. Read it with
+section 5.4 of `docs/technical-guide/mcp-production.md`. Every statement points at code. The rules come first.
+
+### 8.1 How an event is written
+
+- Every command runs through the audit wrapper (`rpc.clj`, `wrap-audit`). Commands marked `::audit/skip true` are not
+  wrapped. The wrapper submits an event only when the command returns. A command that throws writes no event.
+- The event name is `::audit/name` when the result sets it. Otherwise it is the command name.
+- The props are `::replace-props` when the result sets them. Otherwise they are the command params, without the
+  qualified keys, merged with the props the command adds (`loggers/audit.clj`, `prepare-rpc-event` and `clean-props`).
+- The context holds `request-id` for every event (`loggers/audit.clj`, `prepare-rpc-event`).
+- Rows reach `audit_log` only when the `audit-log` flag is on. Webhook events are sent only when the `webhooks` flag
+  is on and the command marks `::webhooks/event? true` (`loggers/audit.clj`, `process-event`).
+- A refusal before the command runs writes no event. It writes a log line `mcp refused` with the reason, the command,
+  the token fingerprint and the request id, and it counts in `penpot_mcp_refusals_total` (`rpc.clj`, `note-refusal!`).
+- The `mcp-tool` log line and the tool timing and error metrics come only from the eight read tools that call
+  `run-tool` and from the three write commands (`rpc/commands/mcp.clj`, `mcp_write.clj`).
+
+### 8.2 The commands
+
+"Context" means `context.request-id`. "Props" means `props.request-id`. "Webhook" means a webhook event on success.
+
+| Command | Scope | Event name on success | Props | Request id | Webhook | Notes |
+|---|---|---|---|---|---|---|
+| `mcp-whoami`, `get-mcp-file-outline`, `get-mcp-page-tree`, `get-mcp-shapes`, `find-mcp-shapes`, `get-mcp-library`, `get-mcp-tokens`, `create-mcp-render-session` | read | The command name | `tool`, `file-id`, `page-ids`, `change-count` (0), `change-types` ({}), `revn-before`, `revn-after`, `token-id`, `duration-ms`, `request-id` (from `audit-props` in `mcp.clj`). Nil values are dropped. | Context and props | No | Through `run-tool`: one `mcp-tool` line and timing metrics. A failed call has the line and the error metric, and no event. |
+| `get-teams`, `get-projects`, `get-project-files`, `search-files`, `get-team-shared-files`, `get-team-recent-files`, `get-team-deleted-files`, `get-file-snapshots`, `get-comment-threads`, `get-comments` | read | The command name | The params without qualified keys, for example `team-id`, `project-id`, `file-id` | Context only | No | Not through `run-tool`: no `mcp-tool` line and no tool metric. **Gap G3.** |
+| `send-mcp-feedback` | read (bridge) | `send-mcp-feedback` | None. The command sets empty props (`feedback.clj`). | Context | No | The subject and the text are not logged, by design. |
+| `mcp-apply-changes`, `mcp-apply-operations`, `mcp-import-svg`, committed | write | `update-file` | `tool`, `file-id`, `id`, `name`, `features`, `project-id`, `team-id`, `page-ids`, `change-count`, `change-types`, `revn-before`, `revn-after`, `revn`, `modified-at`, `snapshot-id` (when a snapshot was taken), `token-id`, `request-id`, `duration-ms` | Props and context | Yes, batched per file for two minutes | The name is the same as an editor save. Filter on `props.tool`. **Gap G4.** |
+| The same three, dry run | write (read scope) | The command name | As above, without a new `modified-at` | Props and context | No | No change is written. **Gap G4.** |
+| The same three, replay (`alreadyApplied`) | write | The command name | As above, with the revn of the file | Props and context | No | Nothing is written. The counts come from the earlier change rows. |
+| The same three, failed | write | None | None | Log line only | No | The `mcp-tool` line has `outcome=error`. The error counter has the code. **Gap G1.** |
+| `upload-file-media-object` | write | The command name | `name`, `file-id`, `team-id`, `is-local`, `size`, `mtype` (`media.clj`). No content. | Context | No | |
+| `create-file-media-object-from-url` | write | The command name | `name`, `file-id`, `is-local`, `mtype` (`media.clj`) | Context | No | |
+| `create-comment-thread`, `create-comment` | write | The command name | The params, plus the thread or comment row and `team-id` (`comments.clj`) | Context | Yes | |
+| `update-comment-thread`, `update-comment-thread-position`, `delete-comment-thread`, `delete-comment` | write, delete | The command name | The params | Context | No | |
+| `create-file-snapshot`, `update-file-snapshot`, `lock-file-snapshot`, `unlock-file-snapshot`, `restore-file-snapshot`, `delete-file-snapshot` | write, delete | The command name | The params | Context | No | |
+| `create-team`, `update-team`, `restore-deleted-team-files` | manage | The command name | The params | Context | No | |
+| `create-project`, `rename-project`, `update-project-pin`, `create-file`, `rename-file`, `set-file-shared`, `duplicate-file`, `duplicate-project`, `move-files`, `move-project`, `link-file-to-library`, `unlink-file-from-library` | manage | The command name | The params, plus the row props the command sets | Context | Yes. `update-project-pin` is batched for 5 s. | |
+| `import-binfile` | manage | `import-binfile`, written by the command itself (`binfile.clj`). The wrapper is skipped. | The params without `file`, plus `generated-by`, `referer`, `file-ids`, `file-count` and `status` (`completed` or `failed`). Each new file also gets a `create-file` event. | Context | Yes | Records a failed import as `status: failed`. The one exception to Gap G1. |
+| `delete-project`, `delete-file` | delete | The command name | The params, plus the row props the command sets | Context | Yes | |
+| `update-mcp-token-scopes` | session only | The command name | The params | Context | No | Not reachable with an MCP token. |
+
+Commands that run only in the adapter, with no backend command (`contract` section 4.2): `describe_operations`,
+`penpot_api_info`, `high_level_overview`. `submit_feedback` calls `send-mcp-feedback`.
+
+### 8.3 Gaps
+
+- **G1. Failed calls write no event.** Only the `mcp-tool` line and the error counter record them. The exception is
+  `import-binfile`, which records `status: failed`.
+- **G2. Refused calls write no event.** Token, scope, profile, flag and RPC rate-limit refusals stop before the command
+  runs. The backend logs `mcp refused` and counts `penpot_mcp_refusals_total`.
+- **G3. Opt-in commands have no tool line and no tool metric.** The reads and writes that are not in `run-tool` or
+  `write-command` write no `mcp-tool` line and no `penpot_mcp_tool_*` sample. Their request id is in the event context
+  only, so a request id search must check the audit table.
+- **G4. MCP writes share the editor's event name.** A committed MCP write is `update-file`. A dry run and a replay are
+  named after the command and send no webhook. Filter on `props.tool` to find MCP writes.
+- **G5. Adapter actions leave no backend event.** The adapter writes export files to its disk, reads import files, runs
+  sandbox scripts and keeps sandbox `storage`, and refuses calls at its own rate limit. These appear only in the
+  adapter log (`mcp/packages/server`, `PENPOT_MCP_LOG_DIR`).
+- **G6. Renders by the exporter are not linked to the MCP call.** The exporter reads the file with the restricted
+  render session. Each of its reads is a command, and the wrapper gives it an event unless the command skips audit.
+  I did not check each read command. Whether the exporter sends the request id is not confirmed in the code.
+- **G7. The feedback event holds no text, by design.** It names the sender and nothing else (`feedback.clj`).

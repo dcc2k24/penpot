@@ -998,22 +998,27 @@ mode means the `backend` or `both` value of `PENPOT_MCP_MODE`. Bridge mode means
 | `PENPOT_MCP_ALLOW_QUERY_TOKEN` | `true` in bridge mode, `false` in backend mode | Accepts the MCP token in the `userToken` query parameter. Set `false` to accept only the `Authorization` header. |
 | `PENPOT_MCP_RATE_LIMIT_RPS` | `10` | Sustained requests per second for each MCP token. Backend mode. |
 | `PENPOT_MCP_RATE_LIMIT_BURST` | `20` | Requests that each MCP token may send at once. Backend mode. |
+| `PENPOT_MCP_TOKEN_CACHE_S` | `60` | Seconds that a good token check is reused before the backend is asked again. A rejected token is kept 5 s. Backend mode. |
 | `PENPOT_MCP_BACKEND_TIMEOUT_S` | `55` | Timeout, in seconds, for each backend call. Backend mode. |
 | `PENPOT_MCP_BACKEND_MAX_RESPONSE_MB` | `8` | Cap, in megabytes, on the body of one backend or exporter response. A larger response fails. Backend mode. |
 | `PENPOT_MCP_MAX_BODY_MB` | `32` | Largest HTTP request body, in megabytes. A request without a token gets 4 MB. The same cap limits the inline base64 of `import_archive` and `import_image`. |
 | `PENPOT_MCP_MAX_TOOL_RESPONSE_KB` | `100` | Largest JSON answer of one backend tool, in kilobytes (1 to 10000). Longer answers are cut. Backend mode. |
 | `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` | `0` (no limit), or `4` in backend mode | Most export shape requests that run at once. Zero means no limit. |
+| `PENPOT_MCP_EXPORT_TOTAL_PERMITS` | `4` | Most renders that run at once across all adapters that share `PENPOT_MCP_REDIS_URI`. Each permit lasts at most 65 s. Without Redis, each process uses its own cap. |
 | `PENPOT_MCP_SANDBOX_TIMEOUT_S` | `3` | CPU time, in seconds, that one `execute_code` call may use. Backend mode. |
 | `PENPOT_MCP_SANDBOX_WALL_S` | `120` | Wall-clock limit, in seconds, of one `execute_code` call. Backend mode. |
 | `PENPOT_MCP_SANDBOX_IDLE_MIN` | `30` | Minutes without a call after which a session's sandbox is dropped. Backend mode. |
 | `PENPOT_MCP_SANDBOX_MAX_HOST_CALLS` | `1000` | Most host calls that one script may make. Backend mode. |
-| `PENPOT_MCP_SANDBOX_MAX_SESSIONS` | `20` | Most live sandbox runtimes, and most saved `storage` copies. Backend mode. |
-| `PENPOT_MCP_SANDBOX_MAX_CONCURRENT` | `4` | Most `execute_code` calls that run at once. Backend mode. |
+| `PENPOT_MCP_SANDBOX_HOST_MS` | `30000` | Most host time of one script, in milliseconds. It counts backend and exporter calls, rate-limit waits included. Backend mode. |
+| `PENPOT_MCP_SANDBOX_PAGE_MB` | `16` | Most page data one call may hold, in MB of JSON. Backend mode. |
+| `PENPOT_MCP_SANDBOX_MAX_SESSIONS` | `20` | Most live sandbox runtimes, and most saved `storage` copies kept in memory. Backend mode. |
+| `PENPOT_MCP_SANDBOX_MAX_CONCURRENT` | `20` | Most `execute_code` calls that run at once in one process. Set on its own: it does not follow `PENPOT_MCP_SANDBOX_MAX_SESSIONS`. Backend mode. |
 | `PENPOT_MCP_SANDBOX_WORKERS` | `true` | Runs each sandbox script in a worker thread. `false` runs it on the server thread. Backend mode. |
 | `PENPOT_MCP_EXPORT_DIR` | `penpot-exports` in the home directory | Absolute path. Export tools may write only inside it. Paths through a symbolic link are refused. |
 | `PENPOT_MCP_IMPORT_DIR` | `penpot-imports` in the home directory | Absolute path. Import tools may read only files inside it. Paths through a symbolic link are refused. |
 | `PENPOT_MCP_SERVER_HOST` | `localhost` | Address that the MCP HTTP server listens on. |
 | `PENPOT_MCP_SERVER_PORT` | `4401` | Port of the MCP HTTP server. |
+| `PENPOT_MCP_KEEPALIVE_S` | `65` | Seconds that the HTTP server keeps an idle connection open. Keep it above the idle timeout of the proxy in front, which is 60 s on common balancers. Positive integer. |
 | `PENPOT_MCP_WEBSOCKET_PORT` | `4402` | Port of the WebSocket server for the plugin. Bridge mode. |
 | `PENPOT_MCP_REPL_HOST` | `localhost` | Address that the REPL server listens on. |
 | `PENPOT_MCP_REPL_PORT` | `4403` | Port of the REPL server. |
@@ -1022,7 +1027,7 @@ mode means the `backend` or `both` value of `PENPOT_MCP_MODE`. Bridge mode means
 | `PENPOT_MCP_REMOTE_MODE` | `false` | `true` turns off file system access. Multi-user mode always runs in remote mode. |
 | `PENPOT_MCP_TOOL_TIMEOUT_S` | `120` | Timeout, in seconds, for tool calls sent to the plugin. Bridge mode. |
 | `PENPOT_MCP_AUTH_URI` | (unset) | Public base URI of the OAuth service. Setting it turns on OAuth. It needs multi-user mode and HTTPS, or HTTP on loopback. |
-| `PENPOT_MCP_REDIS_URI` | (unset) | Redis URI for routing tasks between several server instances. Multi-user mode only. |
+| `PENPOT_MCP_REDIS_URI` | (unset) | `redis://` or `rediss://` URI. In backend and both modes it shares the rate limit and the sandbox storage between instances, whatever the multi-user setting. Unset: each instance keeps its own. In bridge and both modes, with multi-user, it routes plugin tasks between instances. |
 | `PENPOT_MCP_LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn` or `error`. |
 | `PENPOT_MCP_LOG_DIR` | (unset) | Directory for log files. Log files are written only when this is set to a non-empty path. |
 

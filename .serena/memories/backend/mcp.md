@@ -13,7 +13,7 @@ Token rules, including the one-token-per-OAuth-client rules: `mem:backend/auth-p
 ## Dispatch
 
 - Every command with `::rpc/token-type "mcp"` or `::rpc/allow-token-types #{"mcp"}` is refused with `:mcp-backend-disabled` while the flag is off. The exception is `::rpc/mcp-bridge` (`send-mcp-feedback`).
-- Profile switch: when the profile prop `:mcp-enabled` is `false`, every MCP-token call is refused with `:mcp-disabled` (`:restriction`), whatever the command. The bridge is exempt. This check runs before the flag check. It costs one profile query per call (`profile-mcp-disabled?`, `rpc.clj`). A profile row that cannot be read counts as off.
+- Profile switch: when the profile prop `:mcp-enabled` is `false`, every MCP-token call is refused with `:mcp-disabled` (`:restriction`), whatever the command. The bridge is exempt. This check runs before the flag check. The token lookup reads the state once per request (`profile-state`, `http/access_token.clj`), not once per call in `rpc.clj`. A profile row that cannot be read counts as off.
 - `::rpc/token-type "mcp"`: only MCP tokens may run it. Sessions and personal tokens get `:token-auth-required`.
 - `::rpc/allow-token-types #{"mcp"}`: MCP tokens may run it next to sessions and personal tokens. Scope is checked only for MCP tokens.
 - Scope check: `wrap-mcp-scope` (`rpc.clj`), inside params validation. Sessions and personal tokens skip it.
@@ -49,7 +49,7 @@ Allow-token-types `mcp` (product commands; still behind the flag):
 - Never renewed while restricted.
 - Media: the file-media handler (`generic-handler`, `render-covers?` in `http/assets.clj`) serves a render session only the media of the files its `:file-ids` name: the file and its libraries. Other media answers 404.
 - Die with their token: each use checks that the `access_token` row exists and is not expired. No `:token-id` fails closed.
-- Die when MCP is off for the profile: each use reads profile prop `:mcp-enabled`. No profile row fails closed.
+- Die when MCP is off for the profile: the token lookup reads profile prop `:mcp-enabled` on each request. No profile row fails closed.
 - Age: refused at 10 min. The session GC (`sql:delete-expired-v2`) deletes them once `created_at` is past 10 min. The GC runs on the daily cron, so the row can outlive the age, but auth refuses it at once. See `mem:backend/session-expiration`.
 
 ## Write path invariants
@@ -76,11 +76,12 @@ Allow-token-types `mcp` (product commands; still behind the flag):
 
 - Rate limits (`backend/resources/rlimit.edn`, key `<profile-id>.mcp` from `rlimit.clj` `get-uid`; bucket is capacity/refill/interval):
   - `:mcp-read` `1200/600/1m` for the read commands.
-  - `:mcp-write` `120/60/1m` for the three write commands.
+  - `:mcp-write` `600/300/1m` for the three write commands.
   - `update-mcp-token-scopes` uses `:access-token` `60/30/1m`.
 - Concurrency (`backend/resources/climit.edn`, `app.rpc.climit`):
   - `:mcp-apply/by-profile` 1 permit, queue 5, timeout 60 s.
   - `:mcp-apply/global` 6 permits, queue 50, timeout 60 s.
+  - `:mcp-apply/by-team` 4 permits, queue 50, timeout 60 s. Refusals name the limit in the `climit` metric.
   - `:mcp-update-file/by-profile` 1 permit, queue 5, timeout 60 s. A write never holds the owner's own save slot.
   - `:mcp-read/by-profile` 4 permits, queue 20, timeout 30 s.
   - `:mcp-read/global` 8 permits, queue 64, timeout 30 s.
