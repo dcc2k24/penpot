@@ -42,11 +42,14 @@ import { ApiDocs } from "./ApiDocs";
 import { McpAuthentication, type McpAuthenticationResult, RequestTokenCheck } from "./McpAuthentication";
 import { BackendSettings } from "./backend/BackendSettings";
 import { BackendTokenValidator } from "./backend/BackendTokenValidator";
-import { AdapterMetrics } from "./backend/AdapterMetrics";
+import { AdapterMetrics, type MetricFamily } from "./backend/AdapterMetrics";
+import { ProcessMetrics } from "./backend/ProcessMetrics";
 import { BackendReadiness } from "./backend/BackendReadiness";
 import { withDispatcher } from "./backend/ConnectionPools";
 import { TokenDigest } from "./backend/TokenDigest";
 import { BodyLimit } from "./utils/BodyLimit";
+import { JSON_RPC_INVALID_REQUEST, failureOf, jsonRpcErrorBody, type RequestFailure } from "./utils/RequestErrors";
+import { jsonNestingDepth } from "./utils/JsonDepth";
 import { ExportDirectory } from "./utils/ExportDirectory";
 import type { BackendServices } from "./backend/BackendServices";
 import type { ToolCallRecord, ToolAnnotations } from "./Tool";
@@ -73,6 +76,29 @@ const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "::1", "[::1]"];
 
 /** Time the HTTP server waits for open requests before it closes their connections, in milliseconds. */
 const HTTP_CLOSE_DEADLINE_MS = 10_000;
+
+/** Seconds an idle keep-alive connection stays open by default. Longer than the 60 s idle timeout of common balancers. */
+const DEFAULT_KEEPALIVE_S = 65;
+
+/**
+ * Reads PENPOT_MCP_KEEPALIVE_S: the seconds that the HTTP server keeps an idle connection open. It must exceed the
+ * idle timeout of the proxy in front, so that the proxy never reuses a connection the server has closed.
+ *
+ * @param env - environment to read
+ * @returns the seconds, the default when the variable is unset or empty
+ * @throws Error when the value is not a positive integer
+ */
+export function readKeepAliveSeconds(env: Record<string, string | undefined>): number {
+    const raw = env.PENPOT_MCP_KEEPALIVE_S?.trim();
+    if (raw === undefined || raw === "") {
+        return DEFAULT_KEEPALIVE_S;
+    }
+    const value = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+    if (!Number.isInteger(value) || value < 1) {
+        throw new Error(`PENPOT_MCP_KEEPALIVE_S must be a positive integer of seconds (got "${raw}").`);
+    }
+    return value;
+}
 
 /** Time the readiness probe waits for the backend, in milliseconds. */
 const READINESS_PROBE_TIMEOUT_MS = 2_000;
@@ -103,6 +129,20 @@ const FORWARDING_HEADERS = ["x-forwarded-for", "x-forwarded-host", "x-real-ip", 
 function isLoopbackClient(req: ExpressRequest): boolean {
     const forwarded = FORWARDING_HEADERS.some((name) => req.headers[name] !== undefined);
     return !forwarded && isLoopbackAddress(req.socket.remoteAddress);
+}
+
+/** Deepest JSON nesting that a request body may have. */
+const MAX_JSON_NESTING = 64;
+
+/**
+ * Writes a JSON-RPC error answer with no cache.
+ *
+ * @param res - the response to answer
+ * @param failure - the status, code and message of the answer
+ */
+function sendJsonRpcError(res: ExpressResponse, failure: RequestFailure): void {
+    res.setHeader("Cache-Control", "no-store");
+    res.status(failure.status).json(jsonRpcErrorBody(failure));
 }
 
 /**
@@ -308,6 +348,8 @@ export class PenpotMcpServer {
     public readonly configLoader: ConfigurationLoader;
     private app!: Express;
     private httpServer?: HttpServer;
+    /** Seconds an idle keep-alive connection of the HTTP server stays open. */
+    private readonly keepAliveSeconds = readKeepAliveSeconds(process.env);
     private readonly mcpHandler: McpHttpHandler;
     private readonly authentication: McpAuthentication;
     /** Plugin bridge, absent in backend mode. */
@@ -336,6 +378,8 @@ export class PenpotMcpServer {
     private readonly connectionInstructions: string;
     /** Counts and times the tool calls for `/metrics`. */
     private readonly metrics = new AdapterMetrics();
+    /** Memory and event loop delay of the process, for `/metrics`. */
+    private readonly processMetrics = new ProcessMetrics();
     /** Settles when the backend parts and the tools are ready; rejects when they could not be built. */
     private readonly ready: Promise<void>;
 
@@ -416,6 +460,7 @@ export class PenpotMcpServer {
         this.ready = this.initializeBackendParts();
         // a failed start is reported by start(); this keeps Node from reporting it as unhandled first
         this.ready.catch(() => undefined);
+        this.processMetrics.start();
     }
 
     /**
@@ -437,7 +482,12 @@ export class PenpotMcpServer {
                 this.backendSettings.maxResponseMb,
                 pool
             );
-            this.tokenValidator = new BackendTokenValidator(this.backendClient);
+            // the cache period is the time a revoked token keeps working on this adapter
+            this.tokenValidator = new BackendTokenValidator(
+                this.backendClient,
+                Date.now,
+                this.backendSettings.tokenCacheSeconds * 1000
+            );
             this.backendReadiness = new BackendReadiness(() => this.probeBackend(backendUri));
             if (this.authentication.isOAuthEnabled || this.mode !== "bridge") {
                 this.tokenCheck = new RequestTokenCheck(this.authentication, this.tokenValidator);
@@ -818,6 +868,18 @@ export class PenpotMcpServer {
                 const parser = auth?.authenticated ? largeJson : smallJson;
                 parser(req, res, next);
             },
+            (req, res, next) => {
+                // a deeply nested body would make the request validation of the SDK fail; refuse it first
+                if (jsonNestingDepth(req.body, MAX_JSON_NESTING) > MAX_JSON_NESTING) {
+                    sendJsonRpcError(res, {
+                        status: 400,
+                        code: JSON_RPC_INVALID_REQUEST,
+                        message: "request nested too deeply",
+                    });
+                    return;
+                }
+                next();
+            },
             async (req, res) => {
                 const auth = requestAuthOf.get(res);
                 const userToken = auth?.userToken;
@@ -827,6 +889,25 @@ export class PenpotMcpServer {
                 await this.sessionContext.run({ userToken }, () => handleMcpRequest(req, res, req.body));
             }
         );
+
+        // every request that no route answered gets a JSON answer, and every error gets the short JSON answer
+        // below; the default handler of Express would print the stack and the local paths
+        this.app.use((_req, res) => {
+            sendJsonRpcError(res, { status: 404, code: JSON_RPC_INVALID_REQUEST, message: "not found" });
+        });
+        this.app.use((error: unknown, _req: ExpressRequest, res: ExpressResponse, _next: NextFunction) => {
+            if (res.headersSent) {
+                // the answer has started, so it cannot become a JSON error; end it without the default page
+                this.logger.error(error, "Request failed after the answer started");
+                res.end();
+                return;
+            }
+            const failure = failureOf(error);
+            if (failure.status >= 500) {
+                this.logger.error(error, "Request failed");
+            }
+            sendJsonRpcError(res, failure);
+        });
     }
 
     /**
@@ -842,11 +923,42 @@ export class PenpotMcpServer {
             samples: [{ labels, value }],
         });
         return this.metrics.render([
+            ...this.processMetrics.families(),
+            {
+                name: "penpot_mcp_process_resident_bytes",
+                help: "Resident memory of the adapter process.",
+                type: "gauge",
+                samples: [{ value: process.memoryUsage().rss }],
+            },
+            {
+                name: "penpot_mcp_process_heap_used_bytes",
+                help: "Heap in use by the adapter process.",
+                type: "gauge",
+                samples: [{ value: process.memoryUsage().heapUsed }],
+            },
+            {
+                name: "penpot_mcp_validator_entries",
+                help: "Token answers held by the token validator.",
+                type: "gauge",
+                samples: [{ value: this.tokenValidator?.size ?? 0 }],
+            },
+            {
+                name: "penpot_mcp_render_sessions",
+                help: "Render sessions held by the adapter.",
+                type: "gauge",
+                samples: [{ value: this.backendServices?.renderSessions.size ?? 0 }],
+            },
             {
                 name: "penpot_mcp_active_sandboxes",
                 help: "Sandbox runtimes held by the server.",
                 type: "gauge",
                 samples: [{ value: stats?.live ?? 0 }],
+            },
+            {
+                name: "penpot_mcp_sandbox_workers",
+                help: "Live sandbox runtimes, each holding one worker thread in worker mode.",
+                type: "gauge",
+                samples: [{ value: this.backendServices?.sandboxes.stats().live ?? 0 }],
             },
             counter("penpot_mcp_sandbox_runtimes_created_total", "Sandbox runtimes created.", stats?.created ?? 0),
             counter("penpot_mcp_sandbox_runtimes_disposed_total", "Sandbox runtimes disposed.", stats?.disposed ?? 0),
@@ -861,7 +973,47 @@ export class PenpotMcpServer {
                 type: "counter",
                 samples: Object.entries(calls).map(([outcome, value]) => ({ labels: { outcome }, value })),
             },
+            counter(
+                "penpot_mcp_rate_limit_fallback_total",
+                "Rate limit checks answered by the in-process bucket because Redis failed.",
+                this.backendServices?.redisLimiter?.fallbackCount ?? 0
+            ),
+            // a render that the shared cap did not gate, because Redis failed, is visible here
+            counter(
+                "penpot_mcp_export_permit_fallback_total",
+                "Export renders that went on without the shared permit because Redis failed.",
+                this.backendServices?.exportPermits?.fallbackCount ?? 0
+            ),
+            // only with Redis configured; without it the families are left out
+            ...this.redisFamilies(),
         ]);
+    }
+
+    /**
+     * Builds the Redis health families: one gauge per configured client, and `penpot_mcp_redis_up`, which is 1
+     * only when every configured client reaches its server.
+     *
+     * @returns the families, empty when no Redis is configured
+     */
+    private redisFamilies(): MetricFamily[] {
+        const states = this.backendServices?.redisClientStates() ?? [];
+        if (states.length === 0) {
+            return [];
+        }
+        return [
+            {
+                name: "penpot_mcp_redis_up",
+                help: "1 when every Redis client of this adapter reaches its server, 0 when one does not.",
+                type: "gauge",
+                samples: [{ value: states.every((state) => state.up) ? 1 : 0 }],
+            },
+            {
+                name: "penpot_mcp_redis_client_up",
+                help: "1 when the Redis client reaches its server, 0 when it does not.",
+                type: "gauge",
+                samples: states.map((state) => ({ labels: { client: state.client }, value: state.up ? 1 : 0 })),
+            },
+        ];
     }
 
     /**
@@ -944,6 +1096,9 @@ export class PenpotMcpServer {
 
                 resolve();
             });
+            // the proxy in front reuses idle connections; the server must not close one before the proxy stops using it
+            this.httpServer.keepAliveTimeout = this.keepAliveSeconds * 1000;
+            this.httpServer.headersTimeout = this.keepAliveSeconds * 1000 + 1000;
             this.httpServer.once("error", reject);
         });
     }
@@ -961,7 +1116,8 @@ export class PenpotMcpServer {
             const deadline = setTimeout(() => server.closeAllConnections(), HTTP_CLOSE_DEADLINE_MS);
             server.close((error) => {
                 clearTimeout(deadline);
-                if (error) {
+                // a second stop finds the server already closed; that is not a failure
+                if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
                     reject(error);
                 } else {
                     resolve();
@@ -980,7 +1136,9 @@ export class PenpotMcpServer {
         const httpClosed = this.closeHttpServer();
         await this.mcpHandler.close();
         await httpClosed;
-        this.backendServices?.sandboxes.dispose();
+        this.processMetrics.stop();
+        await this.backendServices?.sandboxes.shutdown();
+        await this.backendServices?.close();
         await Promise.all(this.connectionPools.map((pool) => pool.close()));
         await this.bridge?.close();
         await this.redisBridge?.close();

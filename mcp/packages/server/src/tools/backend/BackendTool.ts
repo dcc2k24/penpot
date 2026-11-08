@@ -67,7 +67,7 @@ export abstract class BackendTool<TArgs extends object> extends Tool<TArgs> {
         if (!userToken?.trim()) {
             throw new Error("No MCP token was given. Send it as an Authorization: Bearer header.");
         }
-        this.services.rateLimiter.acquire(userToken);
+        await this.services.rateLimiter.acquire(userToken);
         await this.services.validator.validate(userToken);
         return this.executeBackend(args, userToken);
     }

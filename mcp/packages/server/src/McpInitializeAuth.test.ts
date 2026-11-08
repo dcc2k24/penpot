@@ -450,3 +450,31 @@ test("bridge mode answers readyz 200 without probing a configured backend", asyn
         await backend.close();
     }
 });
+
+test("with a backend and OAuth, a 40 MB body from a validated token is a 413 JSON error", async () => {
+    const backend = await startFakeBackend(200);
+    try {
+        const port = await freePort();
+        await withEnvironment(serverEnvironment(port, backend.url), async () => {
+            const server = new PenpotMcpServer(true);
+            await server.start();
+            try {
+                const body = JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "tools/list",
+                    params: { pad: "x".repeat(40 * 1024 * 1024) },
+                });
+                const response = await postMcp(`http://127.0.0.1:${port}/mcp`, "good-token", body);
+                assert.equal(response.status, 413);
+                const text = await response.text();
+                assert.match(text, /request body too large/);
+                assert.doesNotMatch(text, /node_modules|\n\s+at /);
+            } finally {
+                await server.stop();
+            }
+        });
+    } finally {
+        await backend.close();
+    }
+});

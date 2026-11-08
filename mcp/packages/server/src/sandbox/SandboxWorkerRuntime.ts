@@ -156,7 +156,7 @@ export class SandboxWorkerRuntime implements GuestRuntime {
         }, SandboxWorkerRuntime.READY_TIMEOUT_MS);
         worker.on("message", (msg: WorkerMessage) => this.onMessage(worker, msg));
         worker.on("error", (error: Error) => this.onLost(worker, error));
-        worker.on("exit", () => this.onLost(worker, undefined));
+        worker.on("exit", (exitCode: number) => this.onLost(worker, undefined, exitCode));
         // a worker that is idle must not keep the process alive; a call holds its own timer.
         worker.unref();
     }
@@ -572,7 +572,7 @@ export class SandboxWorkerRuntime implements GuestRuntime {
      * @param worker - worker that was lost
      * @param error - the error that stopped it, when there was one
      */
-    private onLost(worker: Worker, error: Error | undefined): void {
+    private onLost(worker: Worker, error: Error | undefined, exitCode?: number): void {
         if (worker !== this.worker) {
             return;
         }
@@ -588,7 +588,13 @@ export class SandboxWorkerRuntime implements GuestRuntime {
                       true,
                       "memory"
                   )
-                : new SandboxRuntimeError("The sandbox worker stopped unexpectedly", undefined, true);
+                : error !== undefined
+                  ? new SandboxRuntimeError(`The sandbox worker failed: ${error.message}`, undefined, true)
+                  : new SandboxRuntimeError(
+                        `The sandbox worker stopped unexpectedly (exit code ${exitCode ?? "unknown"})`,
+                        undefined,
+                        true
+                    );
         if (!this.startSettled) {
             this.failStart(failure);
         }

@@ -21,7 +21,9 @@ const POSITION = { x: 10, y: 20 };
  * @returns the tool and the fake backend that records its calls
  */
 function harness() {
-    const backend = new FakePenpotBackend().respond("mcp-whoami", { contractVersion: 1, profileId: "profile-1",
+    const backend = new FakePenpotBackend().respond("mcp-whoami", {
+        contractVersion: 1,
+        profileId: "profile-1",
         scopes: ["mcp:read"],
     });
     const services = new BackendServices(backend, new BackendSettings(), new FakeExporterClient());

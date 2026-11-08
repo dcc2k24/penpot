@@ -339,9 +339,14 @@ test("a relative filePath is refused", async () => {
     assert.equal(exporter.exports.length, 0);
 });
 
-test("the filePath argument is offered only when file system access is enabled", () => {
-    assert.ok(!("filePath" in harness(false).tool.getInputSchema()));
+test("filePath stays in the schema, so that multi-user mode refuses it and does not strip it", async () => {
+    assert.ok("filePath" in harness(false).tool.getInputSchema());
     assert.ok("filePath" in harness(true).tool.getInputSchema());
+    const { exporter, tool } = harness(false);
+    const response = await tool.execute({ ...shapeArgs, filePath: path.join(os.tmpdir(), "out.png") });
+    assert.equal(response.isError, true);
+    assert.match(textOf(response), /File paths are off in multi-user mode/);
+    assert.equal(exporter.exports.length, 0, "nothing is exported before the refusal");
 });
 
 test("a busy exporter is reported as busy", async () => {

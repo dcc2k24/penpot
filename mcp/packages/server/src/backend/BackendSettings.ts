@@ -20,6 +20,10 @@ export class BackendSettings {
      * A larger cap only lets a few concurrent reads hold more heap.
      */
     public static readonly DEFAULT_MAX_RESPONSE_MB = 8;
+    /** Default time, in seconds, that a successful token check is reused before the backend is asked again. */
+    public static readonly DEFAULT_TOKEN_CACHE_SECONDS = 60;
+    /** Default number of renders at once across all adapters that share one Redis. */
+    public static readonly DEFAULT_EXPORT_TOTAL_PERMITS = 4;
     /** Largest number of sockets kept open to one origin, for the backend and the exporter. */
     public static readonly CONNECTIONS_PER_ORIGIN = 32;
 
@@ -33,6 +37,9 @@ export class BackendSettings {
      * @param exporterUri - base URI of the Penpot exporter service
      * @param maxResponseMb - cap on the body of one backend response, in megabytes
      * @param assetsUri - base URI of the asset downloads, or undefined to use the origin named by the exporter
+     * @param redisUri - Redis URI of the shared rate limit, or undefined to limit within this process only
+     * @param tokenCacheSeconds - time a successful token check is reused, in seconds
+     * @param exportTotalPermits - renders at once across all adapters that share the Redis of the rate limit
      */
     constructor(
         public readonly timeoutSeconds: number = BackendSettings.DEFAULT_TIMEOUT_SECONDS,
@@ -41,7 +48,10 @@ export class BackendSettings {
         public readonly allowQueryToken: boolean = true,
         public readonly exporterUri: string = BackendSettings.DEFAULT_EXPORTER_URI,
         public readonly maxResponseMb: number = BackendSettings.DEFAULT_MAX_RESPONSE_MB,
-        public readonly assetsUri: string | undefined = undefined
+        public readonly assetsUri: string | undefined = undefined,
+        public readonly redisUri: string | undefined = undefined,
+        public readonly tokenCacheSeconds: number = BackendSettings.DEFAULT_TOKEN_CACHE_SECONDS,
+        public readonly exportTotalPermits: number = BackendSettings.DEFAULT_EXPORT_TOTAL_PERMITS
     ) {}
 
     /**
@@ -75,7 +85,18 @@ export class BackendSettings {
             BackendSettings.booleanFlag(env, "PENPOT_MCP_ALLOW_QUERY_TOKEN", mode === "bridge"),
             BackendSettings.readExporterUri(env),
             BackendSettings.readMaxResponseMb(env),
-            BackendSettings.readAssetsUri(env)
+            BackendSettings.readAssetsUri(env),
+            BackendSettings.readRedisUri(env, mode),
+            BackendSettings.positiveNumber(
+                env,
+                "PENPOT_MCP_TOKEN_CACHE_S",
+                BackendSettings.DEFAULT_TOKEN_CACHE_SECONDS
+            ),
+            BackendSettings.positiveInteger(
+                env,
+                "PENPOT_MCP_EXPORT_TOTAL_PERMITS",
+                BackendSettings.DEFAULT_EXPORT_TOTAL_PERMITS
+            )
         );
     }
 
@@ -117,6 +138,22 @@ export class BackendSettings {
     }
 
     /**
+     * Reads a positive whole number, falling back to a default when the variable is unset or blank.
+     *
+     * @param env - environment to read
+     * @param name - variable name
+     * @param fallback - value used when the variable is unset or blank
+     * @throws Error naming the variable when the value is not a positive whole number
+     */
+    private static positiveInteger(env: Record<string, string | undefined>, name: string, fallback: number): number {
+        const value = BackendSettings.positiveNumber(env, name, fallback);
+        if (!Number.isInteger(value)) {
+            throw new Error(`${name} must be a positive whole number (got "${env[name]?.trim()}").`);
+        }
+        return value;
+    }
+
+    /**
      * Reads a `true` or `false` flag, falling back to a default when the variable is unset or blank.
      *
      * @param env - environment to read
@@ -132,6 +169,37 @@ export class BackendSettings {
             throw new Error(`${name} must be "true" or "false" (got "${env[name]}").`);
         }
         return raw === "true";
+    }
+
+    /**
+     * Reads the Redis URI of the shared rate limit, which is optional.
+     *
+     * The value is checked in every mode, so a typo shows at startup. It is kept only in backend and both
+     * mode, because bridge mode does not use this limiter.
+     *
+     * @param env - environment to read
+     * @param mode - the server mode: `bridge`, `backend` or `both`
+     * @returns the URI, or undefined when the variable is unset, blank or not used in this mode
+     * @throws Error naming the variable when the value is not a redis: or rediss: URI
+     */
+    public static readRedisUri(env: Record<string, string | undefined>, mode: string): string | undefined {
+        const name = "PENPOT_MCP_REDIS_URI";
+        const raw = env[name]?.trim();
+        if (raw === undefined || raw === "") {
+            return undefined;
+        }
+        // the value may hold a password, so the error names the variable only
+        const message = `${name} must be a redis:// or rediss:// URI.`;
+        let uri: URL;
+        try {
+            uri = new URL(raw);
+        } catch {
+            throw new Error(message);
+        }
+        if (uri.protocol !== "redis:" && uri.protocol !== "rediss:") {
+            throw new Error(message);
+        }
+        return mode === "backend" || mode === "both" ? raw : undefined;
     }
 
     /**

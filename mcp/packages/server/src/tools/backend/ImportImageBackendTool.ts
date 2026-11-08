@@ -7,6 +7,7 @@ import type { BackendServices } from "../../backend/BackendServices";
 import { FileUtils } from "../../utils/FileUtils";
 import { BackendTool } from "./BackendTool";
 import { BackendIds } from "./BackendIds";
+import { FilePathAccess } from "./FilePathAccess";
 import { ImportDirectory } from "./ImportDirectory";
 import { WriteOptions } from "./WriteOptions";
 
@@ -179,12 +180,8 @@ export class ImportImageBackendTool extends BackendTool<ImportImageBackendArgs> 
      * @param services - backend, validator, rate limiter and write queue shared by all backend tools
      */
     constructor(mcpServer: PenpotMcpServer, services: BackendServices) {
-        const schema: Record<string, z.ZodType> = { ...ImportImageBackendArgs.schema };
-        if (!mcpServer.isFileSystemAccessEnabled()) {
-            // local file paths are only accepted when the server may read the local file system
-            delete schema.filePath;
-        }
-        super(mcpServer, schema, services);
+        // filePath stays in the schema even in multi-user mode, so that a call with it is refused and not stripped
+        super(mcpServer, ImportImageBackendArgs.schema, services);
     }
 
     public getToolName(): string {
@@ -212,6 +209,9 @@ export class ImportImageBackendTool extends BackendTool<ImportImageBackendArgs> 
      * @param userToken - the MCP token of the request
      */
     protected async executeBackend(args: ImportImageBackendArgs, userToken: string): Promise<ToolResponse> {
+        if (args.filePath !== undefined) {
+            FilePathAccess.assertAllowed(this.mcpServer);
+        }
         const sourceCount = [args.base64, args.url, args.filePath].filter((value) => value !== undefined).length;
         if (sourceCount !== 1) {
             throw new Error("Give exactly one of base64, url or filePath.");

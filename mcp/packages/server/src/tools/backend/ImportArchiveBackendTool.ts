@@ -10,6 +10,7 @@ import { BodyLimit } from "../../utils/BodyLimit";
 import { PublicAddressPolicy } from "../../utils/PublicAddressPolicy";
 import { BackendTool } from "./BackendTool";
 import { BackendIds } from "./BackendIds";
+import { FilePathAccess } from "./FilePathAccess";
 import { ImportDirectory } from "./ImportDirectory";
 import { ImportGate } from "./ImportGate";
 
@@ -96,11 +97,8 @@ export class ImportArchiveBackendTool extends BackendTool<ImportArchiveBackendAr
      * @param services - backend, validator, rate limiter and write queue shared by all backend tools
      */
     constructor(mcpServer: PenpotMcpServer, services: BackendServices) {
+        // filePath stays in the schema even in multi-user mode, so that a call with it is refused and not stripped
         const schema: Record<string, z.ZodType> = { ...ImportArchiveBackendArgs.schema };
-        if (!mcpServer.isFileSystemAccessEnabled()) {
-            // local file paths are only accepted when the server may read the local file system
-            delete schema.filePath;
-        }
         if (mcpServer.isRemoteMode()) {
             // the server must not fetch addresses on behalf of remote users
             delete schema.url;
@@ -136,6 +134,9 @@ export class ImportArchiveBackendTool extends BackendTool<ImportArchiveBackendAr
      * @throws Error when no source or more than one source is given, the archive is invalid, or the server is busy
      */
     protected async executeBackend(args: ImportArchiveBackendArgs, userToken: string): Promise<ToolResponse> {
+        if (args.filePath !== undefined) {
+            FilePathAccess.assertAllowed(this.mcpServer);
+        }
         const sourceCount = [args.base64, args.url, args.filePath].filter((value) => value !== undefined).length;
         if (sourceCount !== 1) {
             throw new Error("Give exactly one of base64, url or filePath.");
@@ -152,7 +153,7 @@ export class ImportArchiveBackendTool extends BackendTool<ImportArchiveBackendAr
                 this.callMultipart<unknown>(
                     userToken,
                     "import-binfile",
-                    { name, "project-id": args.projectId, version: "3" },
+                    { name, "project-id": args.projectId },
                     [
                         {
                             fieldName: "file",

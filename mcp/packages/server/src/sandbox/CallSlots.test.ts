@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CallSlots } from "./CallSlots";
+import { CallSlots, SlotHolder } from "./CallSlots";
 
 test("calls up to the cap run at once and the next call waits", async () => {
     const slots = new CallSlots(2, 1000);
@@ -99,4 +99,80 @@ test("a call past the queue limit is refused at once, without waiting", async ()
     (await queuedOne)();
     (await queuedTwo)();
     assert.equal(turn.running, 0);
+});
+
+test("a holder gives its slot back while the script waits, and takes one again after the wait", async () => {
+    const slots = new CallSlots(1, 1000);
+    const holder = new SlotHolder(slots);
+    await holder.take();
+    assert.equal(slots.running, 1);
+
+    const resume = holder.yieldForWait();
+    assert.equal(slots.running, 0, "the slot is free during the wait");
+    const other = await slots.acquire();
+    assert.equal(slots.running, 1, "another script runs during the wait");
+    other();
+
+    await resume();
+    assert.equal(slots.running, 1, "the script holds a slot again");
+    holder.free();
+    assert.equal(slots.running, 0);
+    holder.free();
+    assert.equal(slots.running, 0, "freeing twice frees one slot only");
+});
+
+test("two rate-limit waits at once give one slot back and take it once", async () => {
+    const slots = new CallSlots(1, 1000);
+    const holder = new SlotHolder(slots);
+    await holder.take();
+    const resumeA = holder.yieldForWait();
+    const resumeB = holder.yieldForWait();
+    assert.equal(slots.running, 0, "the slot is free while both waits run");
+    await Promise.all([resumeA(), resumeB()]);
+    assert.equal(slots.running, 1, "one slot is held after both waits resume");
+    holder.free();
+    assert.equal(slots.running, 0, "freeing once gives the one slot back");
+});
+
+test("a resume that runs twice takes the slot once", async () => {
+    const slots = new CallSlots(1, 1000);
+    const holder = new SlotHolder(slots);
+    await holder.take();
+    const resume = holder.yieldForWait();
+    await resume();
+    await resume();
+    assert.equal(slots.running, 1);
+    holder.free();
+    assert.equal(slots.running, 0);
+});
+
+test("take is a no-op while the holder already holds a slot", async () => {
+    const slots = new CallSlots(2, 1000);
+    const holder = new SlotHolder(slots);
+    await holder.take();
+    await holder.take();
+    assert.equal(slots.running, 1);
+    holder.free();
+    assert.equal(slots.running, 0);
+});
+
+test("concurrent waits do not leak global slots across repeated pairs", async () => {
+    const slots = new CallSlots(20, 1000);
+    for (let round = 0; round < 25; round += 1) {
+        const holder = new SlotHolder(slots);
+        await holder.take();
+        const resumeA = holder.yieldForWait();
+        const resumeB = holder.yieldForWait();
+        await Promise.all([resumeA(), resumeB()]);
+        assert.equal(slots.running, 1, `round ${round}: one slot held after both resume`);
+        holder.free();
+        assert.equal(slots.running, 0, `round ${round}: no slot held after free`);
+    }
+    const held: Array<() => void> = [];
+    for (let index = 0; index < 20; index += 1) {
+        held.push(await slots.acquire());
+    }
+    assert.equal(slots.running, 20);
+    assert.equal(slots.queued, 0);
+    held.forEach((release) => release());
 });

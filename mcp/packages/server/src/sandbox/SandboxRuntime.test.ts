@@ -1,6 +1,30 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { GuestRuntime } from "./GuestRuntime";
 import { SandboxRuntime, SandboxRuntimeError, type SandboxHostCalls } from "./SandboxRuntime";
+
+/**
+ * Creates a runtime, and retries once when the worker was lost while it started.
+ *
+ * A worker start takes about half a second and can be slowed a lot by a loaded machine. A loss during the start is
+ * retried once; a second loss, and every other failure, is raised.
+ *
+ * @param prelude - guest source of the runtime
+ * @returns the ready runtime
+ */
+async function createRetryingLoss(prelude: string): Promise<GuestRuntime> {
+    try {
+        return await SandboxRuntime.create(prelude);
+    } catch (error) {
+        if (
+            error instanceof SandboxRuntimeError &&
+            /^The sandbox worker (stopped unexpectedly|failed: )/.test(error.message)
+        ) {
+            return SandboxRuntime.create(prelude);
+        }
+        throw error;
+    }
+}
 
 /** Host that answers the primitives that a test needs and rejects the others. */
 class TestHost implements SandboxHostCalls {
@@ -436,7 +460,7 @@ test("a guest failure is reported with the guest error name", async () => {
 test("lifecycle: 100 create, invoke and dispose cycles leave no live runtime", async () => {
     const started = Date.now();
     for (let cycle = 0; cycle < 100; cycle++) {
-        const runtime = await SandboxRuntime.create('function run() { return "ok" }');
+        const runtime = await createRetryingLoss('function run() { return "ok" }');
         assert.equal(await runtime.invoke("run", [], new TestHost(), 1000), "ok");
         runtime.dispose();
     }

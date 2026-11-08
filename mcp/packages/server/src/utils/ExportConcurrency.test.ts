@@ -57,7 +57,7 @@ test("different tokens run side by side, up to the process limit", async () => {
 
 test("a render that runs past the timeout fails, and frees its token for the next render", async () => {
     await assert.rejects(
-        ExportConcurrency.withBackendPermit("token-slow", () => new Promise<never>(() => undefined), 20),
+        ExportConcurrency.withBackendPermit("token-slow", () => new Promise<never>(() => undefined), { timeoutMs: 20 }),
         /did not finish within 0\.02 seconds/
     );
     assert.equal(await ExportConcurrency.withBackendPermit("token-slow", async () => "next"), "next");
@@ -74,7 +74,7 @@ test("at the deadline the signal of the render is aborted, so the render can sto
                     signal.addEventListener("abort", () => reject(signal.reason));
                 });
             },
-            20
+            { timeoutMs: 20 }
         ),
         /did not finish within/
     );
@@ -88,6 +88,104 @@ test("a render that finishes in time gets a signal that is not aborted", async (
     assert.equal(value, "yes");
 });
 
+/**
+ * Holds one render of a token until the returned release function is called.
+ *
+ * @param digest - the token digest the render runs under
+ */
+function holdRender(digest: string): { started: Promise<void>; release: () => void; done: Promise<unknown> } {
+    let release: () => void = () => undefined;
+    let markStarted: () => void = () => undefined;
+    const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+        release = resolve;
+    });
+    const done = ExportConcurrency.withBackendPermit(digest, async () => {
+        markStarted();
+        await gate;
+        return "held";
+    });
+    return { started, release, done };
+}
+
+test("a call that waits longer than the slot wait is refused as busy, and leaves the queue", async () => {
+    const holder = holdRender("token-busy");
+    await holder.started;
+    await assert.rejects(
+        ExportConcurrency.withBackendPermit("token-busy", async () => "late", { waitMs: 20 }),
+        /export is busy, retry later: no slot was free for 0\.02 seconds/
+    );
+    holder.release();
+    assert.equal(await holder.done, "held");
+    // the refused call did not keep its place: the next call runs at once
+    assert.equal(await ExportConcurrency.withBackendPermit("token-busy", async () => "next"), "next");
+});
+
+test("the timeout covers the wait for a slot as well as the render", async () => {
+    const holder = holdRender("token-queued");
+    await holder.started;
+    const queued = ExportConcurrency.withBackendPermit("token-queued", async () => "never", {
+        timeoutMs: 30,
+        waitMs: 5_000,
+    });
+    await assert.rejects(queued, /did not finish within 0\.03 seconds/);
+    holder.release();
+    await holder.done;
+});
+
 test("the render timeout is 60 seconds", () => {
     assert.equal(ExportConcurrency.RENDER_TIMEOUT_MS, 60_000);
+});
+
+test("the shared permit is taken after the process permit, and given back when the render fails", async () => {
+    const events: string[] = [];
+    ExportConcurrency.setSharedPermits({
+        acquire: async (wait) => {
+            events.push(`take within ${wait.waitMs <= ExportConcurrency.PERMIT_WAIT_MS ? "budget" : "too long"}`);
+            return async () => {
+                events.push("give");
+            };
+        },
+    });
+    try {
+        await assert.rejects(
+            ExportConcurrency.withBackendPermit("token-shared", async () => {
+                events.push("render");
+                throw new Error("render failed");
+            }),
+            /render failed/
+        );
+        assert.deepEqual(events, ["take within budget", "render", "give"]);
+    } finally {
+        ExportConcurrency.setSharedPermits(undefined);
+    }
+});
+
+test("a refused shared permit gives the busy error and frees the token and process slots", async () => {
+    let refuse = true;
+    ExportConcurrency.setSharedPermits({
+        acquire: async () => {
+            if (refuse) {
+                throw new Error("export is busy, retry later: no slot was free for 0.02 seconds.");
+            }
+            return async () => undefined;
+        },
+    });
+    try {
+        await assert.rejects(
+            ExportConcurrency.withBackendPermit("token-refused", async () => "never"),
+            /export is busy/
+        );
+        refuse = false;
+        assert.equal(await ExportConcurrency.withBackendPermit("token-refused", async () => "next"), "next");
+    } finally {
+        ExportConcurrency.setSharedPermits(undefined);
+    }
+});
+
+test("the shared permit lease covers the render timeout with a margin of 5 seconds", () => {
+    assert.equal(ExportConcurrency.PERMIT_LEASE_MS, 65_000);
+    assert.equal(ExportConcurrency.PERMIT_LEASE_MS, ExportConcurrency.RENDER_TIMEOUT_MS + 5_000);
 });

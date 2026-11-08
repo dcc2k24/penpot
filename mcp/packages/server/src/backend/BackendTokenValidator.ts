@@ -75,8 +75,9 @@ interface CacheEntry {
  * Checks MCP tokens against the backend and caches the answers.
  *
  * The cache is keyed by the SHA-256 digest of the token, so the raw token is never stored. A successful answer
- * is kept for 60 seconds. A rejection is kept for 5 seconds, so a flood of random tokens does not become a
- * flood of backend calls.
+ * is kept for the cache period, 60 seconds by default. A revoked token therefore works on this adapter until
+ * that period ends. A rejection is kept for 5 seconds, so a flood of random tokens does not become a flood of
+ * backend calls.
  */
 export class BackendTokenValidator {
     /** Time a successful validation is trusted, in milliseconds. */
@@ -85,6 +86,11 @@ export class BackendTokenValidator {
     public static readonly REJECTION_TTL_MS = 5_000;
     /** Smallest time between two sweeps of the expired entries, in milliseconds. */
     public static readonly PRUNE_INTERVAL_MS = 1_000;
+    /**
+     * Largest number of answers kept in each of the two maps. A flood of distinct tokens fills them, and the
+     * oldest entries then make room, so the memory stays bounded whatever the clients send.
+     */
+    public static readonly MAX_ENTRIES = 10_000;
 
     private readonly logger = createLogger("BackendTokenValidator");
     private readonly entries = new Map<string, CacheEntry>();
@@ -98,14 +104,17 @@ export class BackendTokenValidator {
      *
      * @param backend - backend used to call `mcp-whoami`
      * @param now - clock in milliseconds, injectable for tests
+     * @param cacheTtlMs - time a successful answer is trusted, in milliseconds
      */
     constructor(
         private readonly backend: PenpotBackend,
-        private readonly now: () => number = Date.now
+        private readonly now: () => number = Date.now,
+        private readonly cacheTtlMs: number = BackendTokenValidator.CACHE_TTL_MS
     ) {}
 
     /**
-     * Validates a token, reusing a successful answer for up to 60 seconds and a rejection for up to 5 seconds.
+     * Validates a token, reusing a successful answer for the cache period (60 seconds by default) and a rejection
+     * for up to 5 seconds.
      *
      * Also binds the token id of the answer to the current tool call, so the log line carries the same
      * fingerprint as the backend. Every call checks that the backend speaks the supported contract.
@@ -144,7 +153,8 @@ export class BackendTokenValidator {
      */
     private async fill(key: string, token: string): Promise<WhoAmI> {
         const promise = this.fetchWhoAmI(token);
-        this.entries.set(key, { promise, expiresAt: this.now() + BackendTokenValidator.CACHE_TTL_MS });
+        BackendTokenValidator.makeRoom(this.entries);
+        this.entries.set(key, { promise, expiresAt: this.now() + this.cacheTtlMs });
         try {
             return await promise;
         } catch (error) {
@@ -152,6 +162,7 @@ export class BackendTokenValidator {
                 this.entries.delete(key);
             }
             if (error instanceof TokenRejectedError) {
+                BackendTokenValidator.makeRoom(this.rejections);
                 this.rejections.set(key, this.now() + BackendTokenValidator.REJECTION_TTL_MS);
             }
             throw error;
@@ -216,6 +227,25 @@ export class BackendTokenValidator {
             if (until <= current) {
                 this.rejections.delete(key);
             }
+        }
+    }
+    /** Number of answers held in the two maps, for the metrics and the tests. */
+    public get size(): number {
+        return this.entries.size + this.rejections.size;
+    }
+
+    /**
+     * Drops the oldest entries until a new one fits under the cap.
+     *
+     * @param map - the map to make room in; a Map keeps insertion order, so the first key is the oldest
+     */
+    private static makeRoom<V>(map: Map<string, V>): void {
+        while (map.size >= BackendTokenValidator.MAX_ENTRIES) {
+            const oldest = map.keys().next();
+            if (oldest.done === true) {
+                return;
+            }
+            map.delete(oldest.value);
         }
     }
 }

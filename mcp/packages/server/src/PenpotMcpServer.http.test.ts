@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
 import { type CallToolResult, Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { request as httpRequest } from "node:http";
-import { PenpotMcpServer } from "./PenpotMcpServer";
+import { request as httpRequest, type Server as HttpServer } from "node:http";
+import { PenpotMcpServer, readKeepAliveSeconds } from "./PenpotMcpServer";
 
 let server: PenpotMcpServer;
 let baseUrl: string;
@@ -258,7 +258,44 @@ test("metrics count the finished tool calls in Prometheus text", async (t) => {
     assert.match(text, /penpot_mcp_tool_calls_total{tool="execute_code",outcome="ok"} 1/);
     assert.match(text, /# TYPE penpot_mcp_tool_call_duration_seconds histogram/);
     assert.match(text, /penpot_mcp_active_sandboxes 0/);
+    assert.match(text, /^penpot_mcp_sandbox_workers 0$/m);
+    assert.match(text, /^# TYPE process_resident_memory_bytes gauge$/m);
+    assert.match(text, /^# TYPE nodejs_heap_used_bytes gauge$/m);
+    assert.match(text, /^nodejs_eventloop_lag_p99_seconds [0-9.e+-]+$/m);
     assert.match(text, /penpot_mcp_sandbox_calls_total{outcome="ok"} 0/);
+    assert.match(text, /^penpot_mcp_rate_limit_fallback_total 0$/m);
+    assert.doesNotMatch(text, /^penpot_mcp_redis_up /m);
+});
+
+test("stop resolves, and a second stop does not throw", async () => {
+    await server.stop();
+    await assert.doesNotReject(server.stop());
+    server = new PenpotMcpServer(true);
+    baseUrl = `http://127.0.0.1:${server.port}`;
+    await server.start();
+});
+
+test("metrics show the Redis gauge when Redis is configured", async () => {
+    await server.stop();
+    process.env.PENPOT_MCP_MODE = "backend";
+    process.env.PENPOT_MCP_BACKEND_URI = "http://127.0.0.1:1/";
+    process.env.PENPOT_MCP_EXPORTER_URI = "http://127.0.0.1:1/";
+    process.env.PENPOT_MCP_REDIS_URI = "redis://127.0.0.1:1";
+    server = new PenpotMcpServer(true);
+    baseUrl = `http://127.0.0.1:${server.port}`;
+    await server.start();
+    const text = await (await fetch(`${baseUrl}/metrics`)).text();
+    assert.match(text, /^# TYPE penpot_mcp_redis_up gauge$/m);
+    // the URI points at a dead port, so the gauge reads 0 before and after the first call
+    assert.match(text, /^penpot_mcp_redis_up 0$/m);
+    assert.match(text, /^penpot_mcp_rate_limit_fallback_total 0$/m);
+    // the export permits have their own counter and one gauge per configured client
+    assert.match(text, /^# TYPE penpot_mcp_export_permit_fallback_total counter$/m);
+    assert.match(text, /^penpot_mcp_export_permit_fallback_total 0$/m);
+    assert.match(text, /^# TYPE penpot_mcp_redis_client_up gauge$/m);
+    assert.match(text, /^penpot_mcp_redis_client_up\{client="rate-limiter"\} 0$/m);
+    assert.match(text, /^penpot_mcp_redis_client_up\{client="storage"\} 1$/m);
+    assert.match(text, /^penpot_mcp_redis_client_up\{client="export-permits"\} 1$/m);
 });
 
 test("metrics on a non-loopback bind need a validated token", async () => {
@@ -293,4 +330,119 @@ test("metrics on a loopback bind need a token for a request that a proxy forward
     assert.equal(forwarded.status, 401);
     const direct = await fetch(`${baseUrl}/metrics`);
     assert.equal(direct.status, 200);
+});
+
+/** Parses a JSON error body and asserts that it is the short answer: no stack, no path, no library name. */
+function assertShortJsonError(text: string): { error: { code: number; message: string } } {
+    const body = JSON.parse(text) as { error: { code: number; message: string } };
+    for (const leak of ["\n    at ", "node_modules", ".ts:", ".js:"]) {
+        assert.equal(text.includes(leak), false, `the answer carries ${JSON.stringify(leak)}`);
+    }
+    assert.doesNotMatch(text, /[A-Z]:/);
+    assert.equal(body.error.message.length < 60, true);
+    return body;
+}
+
+test("a 5 MB body without a token is a 413 with a short JSON-RPC error, not the Express page", async () => {
+    const response = await fetch(`${baseUrl}/mcp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+        body: paddedListBody(5 * 1024 * 1024),
+    });
+    assert.equal(response.status, 413);
+    assert.match(response.headers.get("content-type") ?? "", /application\/json/);
+    const body = assertShortJsonError(await response.text());
+    assert.deepEqual(body.error, { code: -32600, message: "request body too large" });
+});
+
+test("a body that is truncated JSON is a 400 parse error, with no SyntaxError stack", async () => {
+    const response = await fetch(`${baseUrl}/mcp`, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            Authorization: "Bearer alice",
+        },
+        body: '{"jsonrpc":"2.0",',
+    });
+    assert.equal(response.status, 400);
+    const body = assertShortJsonError(await response.text());
+    assert.deepEqual(body.error, { code: -32700, message: "invalid JSON" });
+});
+
+test("10,000 levels of nesting are a 400 before the MCP handler runs, and the server stays up", async (t) => {
+    const run = t.mock.method(server.pluginBridge, "executePluginTask", async () => ({ data: 1 }));
+    const nested = `${'{"a":'.repeat(10_000)}1${"}".repeat(10_000)}`;
+    const body = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":${nested}}`;
+    const response = await fetch(`${baseUrl}/mcp`, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            Authorization: "Bearer alice",
+        },
+        body,
+    });
+    assert.equal(response.status, 400);
+    const parsed = assertShortJsonError(await response.text());
+    assert.deepEqual(parsed.error, { code: -32600, message: "request nested too deeply" });
+    assert.equal(run.mock.callCount(), 0);
+    assert.equal((await fetch(`${baseUrl}/healthz`)).status, 200);
+});
+
+test("an unknown route is a 404 JSON answer, not the Express page", async () => {
+    const response = await fetch(`${baseUrl}/no-such-route`);
+    assert.equal(response.status, 404);
+    assert.match(response.headers.get("content-type") ?? "", /application\/json/);
+    const body = assertShortJsonError(await response.text());
+    assert.equal(body.error.message, "not found");
+});
+
+test("metrics include the process memory and the cache sizes", async (t) => {
+    t.mock.method(server.pluginBridge, "executePluginTask", async () => ({ data: 1 }));
+    const text = await (await fetch(`${baseUrl}/metrics`)).text();
+    assert.match(text, /^penpot_mcp_process_resident_bytes \d+$/m);
+    assert.match(text, /^penpot_mcp_process_heap_used_bytes \d+$/m);
+    assert.match(text, /^penpot_mcp_render_sessions 0$/m);
+});
+
+/**
+ * Reads the Node HTTP server that a PenpotMcpServer started.
+ *
+ * @param target - the server
+ * @returns the Node HTTP server of the target
+ */
+function nodeHttpServerOf(target: PenpotMcpServer): HttpServer {
+    const found = (target as unknown as { httpServer?: HttpServer }).httpServer;
+    assert.ok(found, "the HTTP server is listening");
+    return found;
+}
+
+test("the HTTP server keeps idle connections 65 s by default, with headers allowed one second more", () => {
+    const http = nodeHttpServerOf(server);
+    assert.equal(http.keepAliveTimeout, 65_000);
+    assert.equal(http.headersTimeout, 66_000);
+});
+
+test("PENPOT_MCP_KEEPALIVE_S sets the keep-alive timeout of the HTTP server", async () => {
+    process.env.PENPOT_MCP_KEEPALIVE_S = "120";
+    process.env.PENPOT_MCP_SERVER_PORT = String(nextPort++);
+    const other = new PenpotMcpServer(true);
+    await other.start();
+    try {
+        const http = nodeHttpServerOf(other);
+        assert.equal(http.keepAliveTimeout, 120_000);
+        assert.equal(http.headersTimeout, 121_000);
+    } finally {
+        await other.stop();
+    }
+});
+
+test("readKeepAliveSeconds takes a positive integer and refuses anything else", () => {
+    assert.equal(readKeepAliveSeconds({}), 65);
+    assert.equal(readKeepAliveSeconds({ PENPOT_MCP_KEEPALIVE_S: "" }), 65);
+    assert.equal(readKeepAliveSeconds({ PENPOT_MCP_KEEPALIVE_S: " 90 " }), 90);
+    for (const bad of ["0", "-3", "1.5", "abc"]) {
+        assert.throws(() => readKeepAliveSeconds({ PENPOT_MCP_KEEPALIVE_S: bad }), /PENPOT_MCP_KEEPALIVE_S/, bad);
+    }
 });

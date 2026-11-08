@@ -5,6 +5,7 @@ import { BackendServices } from "../backend/BackendServices";
 import { FakeExporterClient } from "../backend/testing/FakeExporterClient";
 import { FakePenpotBackend } from "../backend/testing/FakePenpotBackend";
 import { TokenDigest } from "../backend/TokenDigest";
+import { CallSlots, SlotHolder } from "./CallSlots";
 import { SandboxHost } from "./SandboxHost";
 
 const TOKEN = "alice-token";
@@ -1148,4 +1149,35 @@ test("a page far above the setting stops after its first batch, before the rest 
 
     await assert.rejects(host.loadPage(FILE, PAGE), { message: /^page .* has 2001 shapes \(about [0-9.]+ MB\)/ });
     assert.equal(backend.callsTo("get-mcp-shapes").length, 1);
+});
+
+test("a rate-limit wait gives the script's global slot back, and the script takes it again after the wait", async () => {
+    const backend = new FakePenpotBackend().respond("mcp-apply-operations", countingWrites(2));
+    const services = new BackendServices(backend, new BackendSettings(10, 1000), new FakeExporterClient());
+    let refusals = 2;
+    (services as unknown as { rateLimiter: { acquire(token: string): void } }).rateLimiter = {
+        acquire() {
+            if (refusals > 0) {
+                refusals -= 1;
+                throw new Error("rate limited, retry after 1 s");
+            }
+        },
+    };
+    const slots = new CallSlots(1, 1000);
+    const holder = new SlotHolder(slots);
+    await holder.take();
+    const host = new SandboxHost(services, TOKEN);
+    host.beginCall(Date.now() + 5_000, {});
+    host.setWaitHook(() => holder.yieldForWait());
+
+    const flush = host.flush(FILE, JSON.stringify(deleteOps(10)), false);
+    // while the flush waits for its rate-limit token, another token's script takes the only slot
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const other = await slots.acquire();
+    other();
+    await flush;
+
+    assert.equal(backend.callsTo("mcp-apply-operations").length, 1);
+    assert.equal(slots.running, 1, "the script holds its slot again after the wait");
+    holder.free();
 });

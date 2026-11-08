@@ -64,8 +64,7 @@ export class TokenRateLimiter {
         // sweep before the lookup: a bucket dropped during the sweep is recreated full, which is equivalent
         this.sweepEveryInterval(current);
         const bucket = this.buckets.get(key) ?? { available: this.burst, updatedAt: current };
-        const elapsedSeconds = Math.max(0, current - bucket.updatedAt) / 1000;
-        bucket.available = Math.min(this.burst, bucket.available + elapsedSeconds * this.ratePerSecond);
+        bucket.available = this.refilledLevel(bucket, current);
         bucket.updatedAt = current;
         this.buckets.set(key, bucket);
 
@@ -74,6 +73,45 @@ export class TokenRateLimiter {
             throw new RateLimitError(`rate limited, retry after ${retryAfter} s`);
         }
         bucket.available -= 1;
+    }
+
+    /**
+     * Reads how many requests a token may still send now, refilled up to the burst.
+     *
+     * @param token - the MCP user token
+     * @returns the tokens left, the burst for a token that is not known yet
+     */
+    public levelOf(token: string): number {
+        const bucket = this.buckets.get(TokenDigest.sha256Hex(token));
+        if (bucket === undefined) {
+            return this.burst;
+        }
+        return this.refilledLevel(bucket, this.now());
+    }
+
+    /**
+     * Consumes one request of a token without refusing it. Used to mirror requests that another limiter
+     * admitted, so this bucket reflects them. When no request is left, nothing is consumed.
+     *
+     * @param token - the MCP user token
+     */
+    public record(token: string): void {
+        const key = TokenDigest.sha256Hex(token);
+        const current = this.now();
+        this.sweepEveryInterval(current);
+        const bucket = this.buckets.get(key) ?? { available: this.burst, updatedAt: current };
+        bucket.available = this.refilledLevel(bucket, current);
+        bucket.updatedAt = current;
+        this.buckets.set(key, bucket);
+        if (bucket.available >= 1) {
+            bucket.available -= 1;
+        }
+    }
+
+    /** Tokens of a bucket at the given instant, refilled at the rate and capped at the burst. */
+    private refilledLevel(bucket: Bucket, current: number): number {
+        const elapsedSeconds = Math.max(0, current - bucket.updatedAt) / 1000;
+        return Math.min(this.burst, bucket.available + elapsedSeconds * this.ratePerSecond);
     }
 
     /** Runs a sweep on every SWEEP_INTERVAL-th call and does nothing on the others. */
@@ -94,5 +132,9 @@ export class TokenRateLimiter {
                 this.buckets.delete(key);
             }
         }
+    }
+    /** Number of token buckets held, for the metrics and the tests. */
+    public get size(): number {
+        return this.buckets.size;
     }
 }

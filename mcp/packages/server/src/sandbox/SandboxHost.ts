@@ -190,6 +190,8 @@ export class SandboxHost implements SandboxHostCalls {
 
     /** Id of the script, which the request ids and the snapshot label of its writes are derived from. */
     private scriptId: string = randomUUID();
+    /** Gives the slot of the script back during a rate-limit wait; set by the tool. */
+    private waitHook: (() => () => Promise<void>) | undefined = undefined;
     /** Receives a line after each chunk of a flush; set by the tool. */
     private progress: ProgressSink | undefined = undefined;
     /** Calls of the flush in flight or still to start; the watchdog allows time for them. */
@@ -936,17 +938,33 @@ export class SandboxHost implements SandboxHostCalls {
      * @throws Error when the deadline passes before a token is free
      */
     private async takeRateToken(): Promise<void> {
+        // the caller's global slot is given back while this waits, so other tokens' scripts can run
+        let resume: (() => Promise<void>) | undefined = undefined;
         for (;;) {
             try {
-                this.services.rateLimiter.acquire(this.userToken);
+                await this.services.rateLimiter.acquire(this.userToken);
+                // a resume that fails is yielded again on the next attempt, so each yield gets exactly one resume
+                const resumeNow = resume;
+                resume = undefined;
+                await resumeNow?.();
                 return;
             } catch {
                 if (Date.now() + SandboxHost.RATE_RETRY_MS >= this.deadlineAt) {
                     throw new Error(SandboxHost.WALL_CLOCK_MESSAGE);
                 }
+                resume ??= this.waitHook?.();
                 await new Promise<void>((resolve) => setTimeout(resolve, SandboxHost.RATE_RETRY_MS));
             }
         }
+    }
+
+    /**
+     * Sets the hook that a rate-limit wait calls to give back the slot of the script.
+     *
+     * @param hook - gives the slot back and returns the function that takes it again
+     */
+    public setWaitHook(hook: (() => () => Promise<void>) | undefined): void {
+        this.waitHook = hook;
     }
 
     /**

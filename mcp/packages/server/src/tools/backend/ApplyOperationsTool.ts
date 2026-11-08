@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { PenpotMcpServer } from "../../PenpotMcpServer";
 import type { ToolResponse } from "../../ToolResponse";
 import type { BackendServices } from "../../backend/BackendServices";
-import { TokenDigest } from "../../backend/TokenDigest";
+import type { PenpotBackend } from "../../PenpotBackendClient";
 import { BackendTool } from "./BackendTool";
 import { BackendIds } from "./BackendIds";
 import { TokenCatalogueCache } from "./TokenCatalogueCache";
@@ -10,6 +10,46 @@ import { WriteOptions } from "./WriteOptions";
 import { OPERATION_NAMES } from "./operations/OperationSchemas";
 import { OperationValidator } from "./operations/OperationValidator";
 import { ApplyTokenValues, TokenCatalogue, type TokenValueWarning } from "../../sandbox/ApplyTokenValues";
+import type { TokenResolver } from "../../sandbox/TokenResolver";
+
+/**
+ * The token catalogue of one call. It answers from a token set that is already known, and otherwise reads the
+ * file's tokens with the MCP token of the call and reports the set it read.
+ *
+ * The object lives for one call only, so the MCP token it holds is released when the call ends. Only the token set
+ * is handed on, through `learn`, so the cache never holds a token.
+ */
+class CallTokenCatalogue extends TokenCatalogue {
+    /**
+     * Creates the catalogue of one call.
+     *
+     * @param backend - backend that answers `get-mcp-tokens`
+     * @param userToken - the MCP token of the call, used only when the token set is not known
+     * @param fileId - the file whose tokens are read
+     * @param known - the token set kept for the file, when one is kept for the current write count
+     * @param learn - receives the token set when the file is read
+     */
+    public constructor(
+        backend: PenpotBackend,
+        userToken: string,
+        fileId: string,
+        private readonly known: TokenResolver | undefined,
+        private readonly learn: (resolver: TokenResolver) => void
+    ) {
+        super(backend, userToken, fileId);
+    }
+
+    /** Returns the token set: the known one, or the one read now, which is then reported through `learn`. */
+    public override resolver(): Promise<TokenResolver> {
+        if (this.known !== undefined) {
+            return Promise.resolve(this.known);
+        }
+        return super.resolver().then((resolver) => {
+            this.learn(resolver);
+            return resolver;
+        });
+    }
+}
 
 /** Arguments of {@link ApplyOperationsTool}. */
 export class ApplyOperationsArgs {
@@ -73,7 +113,8 @@ export class ApplyOperationsTool extends BackendTool<ApplyOperationsArgs> {
         " Fix the token, or pass resolvedValue to set the value yourself."
     );
 
-    private readonly catalogues: TokenCatalogueCache;
+    /** Token sets of the files this process read recently, without the tokens that read them. */
+    private readonly tokenSets: TokenCatalogueCache;
 
     /**
      * Creates the tool.
@@ -84,7 +125,7 @@ export class ApplyOperationsTool extends BackendTool<ApplyOperationsArgs> {
      */
     constructor(mcpServer: PenpotMcpServer, services: BackendServices, now: () => number = Date.now) {
         super(mcpServer, ApplyOperationsArgs.schema, services);
-        this.catalogues = new TokenCatalogueCache(ApplyOperationsTool.CATALOGUE_TTL_MS, now);
+        this.tokenSets = new TokenCatalogueCache(ApplyOperationsTool.CATALOGUE_TTL_MS, undefined, now);
     }
 
     public getToolName(): string {
@@ -130,11 +171,14 @@ export class ApplyOperationsTool extends BackendTool<ApplyOperationsArgs> {
         args: ApplyOperationsArgs,
         userToken: string
     ): Promise<{ result: unknown; tokenWarnings: TokenValueWarning[] }> {
-        const key = `${TokenDigest.sha256Hex(userToken)}:${args.fileId}`;
-        const catalogue = this.catalogues.get(
-            key,
-            this.writeCount(userToken, args.fileId),
-            () => new TokenCatalogue(this.services.backend, userToken, args.fileId)
+        const key = TokenCatalogueCache.keyOf(userToken, args.fileId);
+        const writes = this.writeCount(userToken, args.fileId);
+        const catalogue = new CallTokenCatalogue(
+            this.services.backend,
+            userToken,
+            args.fileId,
+            this.tokenSets.lookup(key, writes),
+            (resolver) => this.tokenSets.store(key, writes, resolver)
         );
         const tokenWarnings = await this.tokenValues.fill(args.operations, catalogue);
         const operations = this.validator.validate(args.operations);

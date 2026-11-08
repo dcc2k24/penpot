@@ -136,3 +136,80 @@ test("PENPOT_MCP_ASSETS_URI is optional and must be an HTTP(S) URI without crede
         assert.throws(() => BackendSettings.readAssetsUri({ PENPOT_MCP_ASSETS_URI: value }), /PENPOT_MCP_ASSETS_URI/);
     }
 });
+
+test("the token cache period defaults to 60 seconds in every mode", () => {
+    for (const mode of ["bridge", "backend", "both"]) {
+        assert.equal(BackendSettings.fromEnvironment({}, mode).tokenCacheSeconds, 60);
+    }
+});
+
+test("PENPOT_MCP_TOKEN_CACHE_S sets the token cache period in every mode", () => {
+    const env = { PENPOT_MCP_TOKEN_CACHE_S: "15" };
+    assert.equal(BackendSettings.fromEnvironment(env, "bridge").tokenCacheSeconds, 15);
+    assert.equal(BackendSettings.fromEnvironment(env, "backend").tokenCacheSeconds, 15);
+    assert.equal(BackendSettings.fromEnvironment({ PENPOT_MCP_TOKEN_CACHE_S: " 2.5 " }).tokenCacheSeconds, 2.5);
+});
+
+for (const value of ["soon", "0", "-5"]) {
+    test(`PENPOT_MCP_TOKEN_CACHE_S=${value} is a startup error that names the variable`, () => {
+        assert.throws(
+            () => BackendSettings.fromEnvironment({ PENPOT_MCP_TOKEN_CACHE_S: value }),
+            /PENPOT_MCP_TOKEN_CACHE_S/
+        );
+    });
+}
+
+test("PENPOT_MCP_REDIS_URI is unset by default", () => {
+    assert.equal(BackendSettings.fromEnvironment({}).redisUri, undefined);
+    assert.equal(BackendSettings.readRedisUri({ PENPOT_MCP_REDIS_URI: "  " }, "backend"), undefined);
+});
+
+test("a valid PENPOT_MCP_REDIS_URI is kept in backend and both mode", () => {
+    const env = { PENPOT_MCP_REDIS_URI: " redis://cache.example:6379/0 " };
+    assert.equal(BackendSettings.fromEnvironment(env, "backend").redisUri, "redis://cache.example:6379/0");
+    assert.equal(BackendSettings.fromEnvironment(env, "both").redisUri, "redis://cache.example:6379/0");
+    assert.equal(
+        BackendSettings.fromEnvironment({ PENPOT_MCP_REDIS_URI: "rediss://cache.example:6380" }, "backend").redisUri,
+        "rediss://cache.example:6380"
+    );
+});
+
+test("PENPOT_MCP_REDIS_URI is ignored in bridge mode", () => {
+    assert.equal(
+        BackendSettings.fromEnvironment({ PENPOT_MCP_REDIS_URI: "redis://cache.example:6379" }, "bridge").redisUri,
+        undefined
+    );
+});
+
+test("PENPOT_MCP_REDIS_URI with another scheme is a startup error that does not echo the value", () => {
+    const value = "http://user:s3cret-password@cache.example:6379";
+    assert.throws(
+        () => BackendSettings.fromEnvironment({ PENPOT_MCP_REDIS_URI: value }, "backend"),
+        (error: Error) =>
+            error.message.includes("PENPOT_MCP_REDIS_URI") &&
+            !error.message.includes("s3cret-password") &&
+            !error.message.includes("cache.example")
+    );
+});
+
+test("a malformed PENPOT_MCP_REDIS_URI is a startup error that does not echo the value", () => {
+    assert.throws(
+        () => BackendSettings.readRedisUri({ PENPOT_MCP_REDIS_URI: "s3cret not a uri" }, "backend"),
+        (error: Error) => error.message.includes("PENPOT_MCP_REDIS_URI") && !error.message.includes("s3cret")
+    );
+});
+
+test("the shared export permits default to 4 and read PENPOT_MCP_EXPORT_TOTAL_PERMITS", () => {
+    assert.equal(BackendSettings.fromEnvironment({}).exportTotalPermits, 4);
+    assert.equal(BackendSettings.fromEnvironment({ PENPOT_MCP_EXPORT_TOTAL_PERMITS: " " }).exportTotalPermits, 4);
+    assert.equal(BackendSettings.fromEnvironment({ PENPOT_MCP_EXPORT_TOTAL_PERMITS: "6" }).exportTotalPermits, 6);
+});
+
+for (const value of ["soon", "0", "-2", "1.5"]) {
+    test(`PENPOT_MCP_EXPORT_TOTAL_PERMITS=${value} is a startup error that names the variable`, () => {
+        assert.throws(
+            () => BackendSettings.fromEnvironment({ PENPOT_MCP_EXPORT_TOTAL_PERMITS: value }),
+            /PENPOT_MCP_EXPORT_TOTAL_PERMITS/
+        );
+    });
+}

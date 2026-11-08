@@ -117,3 +117,29 @@ test("a backend read of a later call sees the signal of that call, not the signa
     assert.equal(seenSignals[0], first.signal);
     assert.equal(seenSignals[1], second.signal);
 });
+
+test("a read flood ends at the host-time budget, with an error that names the setting", async () => {
+    const saved = process.env.PENPOT_MCP_SANDBOX_HOST_MS;
+    process.env.PENPOT_MCP_SANDBOX_HOST_MS = "150";
+    let harnessed: ReturnType<typeof harness>;
+    try {
+        harnessed = harness({
+            responses: {
+                "get-teams": async () => {
+                    await new Promise((resolve) => setTimeout(resolve, 60));
+                    return [];
+                },
+            },
+        });
+    } finally {
+        if (saved === undefined) {
+            delete process.env.PENPOT_MCP_SANDBOX_HOST_MS;
+        } else {
+            process.env.PENPOT_MCP_SANDBOX_HOST_MS = saved;
+        }
+    }
+    const { backend, tool } = harnessed;
+    const text = textOf(await run(tool, "for (let i = 0; i < 10; i++) { penpotMgmt.listTeams(); } return 'done';"));
+    assert.match(text, /host-time budget of 150 ms \(PENPOT_MCP_SANDBOX_HOST_MS\)/);
+    assert.ok(backend.callsTo("get-teams").length <= 3, `the script made ${backend.callsTo("get-teams").length} reads`);
+});

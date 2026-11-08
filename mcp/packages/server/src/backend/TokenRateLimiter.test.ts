@@ -88,6 +88,32 @@ test("a full bucket used during the sweep still admits a full burst", () => {
     assert.equal(admit(limiter, "alice", 25), 20);
 });
 
+test("record consumes one request, so the next acquire is refused after the burst", () => {
+    const limiter = new TokenRateLimiter(10, 2, new ManualClock().read);
+    limiter.record("alice");
+    assert.equal(admit(limiter, "alice", 5), 1);
+});
+
+test("record never throws and consumes nothing at zero", () => {
+    const limiter = new TokenRateLimiter(10, 2, new ManualClock().read);
+    admit(limiter, "alice", 2);
+    assert.equal(limiter.levelOf("alice"), 0);
+    assert.doesNotThrow(() => limiter.record("alice"));
+    assert.equal(limiter.levelOf("alice"), 0);
+});
+
+test("levelOf reports the burst for an unknown token and the refilled level otherwise", () => {
+    const clock = new ManualClock();
+    const limiter = new TokenRateLimiter(10, 20, clock.read);
+    assert.equal(limiter.levelOf("alice"), 20);
+    admit(limiter, "alice", 20);
+    assert.equal(limiter.levelOf("alice"), 0);
+    clock.now = 1000;
+    assert.equal(limiter.levelOf("alice"), 10);
+    clock.now = 60_000;
+    assert.equal(limiter.levelOf("alice"), 20);
+});
+
 test("rejects non-positive limits", () => {
     assert.throws(() => new TokenRateLimiter(0, 20), /rate limit per second/);
     assert.throws(() => new TokenRateLimiter(10, 0), /burst/);

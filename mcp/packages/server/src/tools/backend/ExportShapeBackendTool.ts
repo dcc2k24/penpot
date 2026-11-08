@@ -12,6 +12,7 @@ import { FileUtils } from "../../utils/FileUtils";
 import { BackendTool } from "./BackendTool";
 import { BackendIds } from "./BackendIds";
 import { BackendShapeTypes } from "./BackendShapeTypes";
+import { FilePathAccess } from "./FilePathAccess";
 
 /** Largest raster image returned inline in the response, in bytes. Larger images need filePath. */
 const IMAGE_OUTPUT_MAX_BYTES = 8 * 1024 * 1024;
@@ -104,21 +105,8 @@ export class ExportShapeBackendTool extends BackendTool<ExportShapeBackendArgs> 
      * @param services - backend, exporter and render sessions shared by all backend tools
      */
     constructor(mcpServer: PenpotMcpServer, services: BackendServices) {
-        super(mcpServer, ExportShapeBackendTool.schemaFor(mcpServer.isFileSystemAccessEnabled()), services);
-    }
-
-    /**
-     * Returns the argument schema, without the file arguments when file system access is off.
-     *
-     * @param fileSystemAccess - whether the server offers file system access
-     */
-    private static schemaFor(fileSystemAccess: boolean): z.ZodRawShape {
-        if (fileSystemAccess) {
-            return ExportShapeBackendArgs.schema;
-        }
-        // leave the file keys out of the copy
-        const { filePath: _filePath, overwrite: _overwrite, ...withoutFileArgs } = ExportShapeBackendArgs.schema;
-        return withoutFileArgs;
+        // the file keys stay in the schema even in multi-user mode, so that a call with them is refused and not stripped
+        super(mcpServer, ExportShapeBackendArgs.schema, services);
     }
 
     public getToolName(): string {
@@ -138,6 +126,8 @@ export class ExportShapeBackendTool extends BackendTool<ExportShapeBackendArgs> 
                 "\nAlternatively, set filePath to save the file instead. filePath must lie inside the export " +
                 "directory (PENPOT_MCP_EXPORT_DIR, or penpot-exports in the home directory by default), end in the " +
                 "format's extension, and not replace a file unless overwrite is true.";
+        } else {
+            description += "\nIn multi-user mode file paths are off, so a filePath is refused.";
         }
         return description;
     }
@@ -168,10 +158,8 @@ export class ExportShapeBackendTool extends BackendTool<ExportShapeBackendArgs> 
      *   extension, or names a file that exists and may not be replaced
      */
     private checkFilePath(filePath: string, overwrite: boolean, format: ExportFormat): void {
+        FilePathAccess.assertAllowed(this.mcpServer);
         FileUtils.checkPathIsAbsolute(filePath);
-        if (!this.mcpServer.isFileSystemAccessEnabled()) {
-            throw new Error("File system access is not enabled on the MCP server!");
-        }
         ExportDirectory.assertInside(filePath, process.env);
         ExportDirectory.assertExtension(filePath, EXTENSIONS[format]);
         if (!overwrite) {

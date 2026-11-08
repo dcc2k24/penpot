@@ -93,6 +93,19 @@ test("invalidate drops the session so that the next call mints again", async () 
     assert.equal(backend.callsTo("create-mcp-render-session").length, 2);
 });
 
+test("two user tokens never share a render session, even for the same file", async () => {
+    const now = (): number => 0;
+    const backend = issuingBackend(now);
+    const cache = new RenderSessionCache(backend, now);
+    const alice = await cache.tokenFor("alice-token", "file-1");
+    const bob = await cache.tokenFor("bob-token", "file-1");
+    assert.notEqual(alice, bob);
+    // dropping one token's session leaves the other token's session in place
+    cache.invalidate("alice-token", "file-1");
+    assert.equal(await cache.tokenFor("bob-token", "file-1"), bob);
+    assert.equal(backend.callsTo("create-mcp-render-session").length, 2);
+});
+
 const malformedAnswers: Array<{ label: string; answer: unknown }> = [
     { label: "no token", answer: { expiresAt: new Date(LIFETIME_MS).toISOString() } },
     { label: "a token that is not a string", answer: { token: 42, expiresAt: new Date(LIFETIME_MS).toISOString() } },
@@ -110,3 +123,17 @@ for (const { label, answer } of malformedAnswers) {
         );
     });
 }
+
+test("the cache keeps at most MAX_ENTRIES render sessions, so many files cannot grow it without bound", async () => {
+    const backend = new FakePenpotBackend().respond("create-mcp-render-session", {
+        token: "render-token",
+        expiresAt: new Date(Date.now() + LIFETIME_MS).toISOString(),
+    });
+    const cache = new RenderSessionCache(backend);
+    const total = RenderSessionCache.MAX_ENTRIES + 100;
+    for (let i = 0; i < total; i++) {
+        await cache.tokenFor("alice-token", `file-${i}`);
+    }
+    assert.ok(cache.size <= RenderSessionCache.MAX_ENTRIES, `size ${cache.size} is over the cap`);
+    assert.equal(cache.size, RenderSessionCache.MAX_ENTRIES);
+});

@@ -46,7 +46,8 @@ test("the new limits default to their documented values", () => {
     assert.equal(settings.wallMs, 120_000);
     assert.equal(settings.maxHostCalls, 1000);
     assert.equal(settings.maxSessions, 20);
-    assert.equal(settings.maxConcurrentCalls, 4);
+    assert.equal(settings.maxConcurrentCalls, 20);
+    assert.equal(settings.maxHostMs, 30_000);
     assert.equal(settings.slotWaitMs, 60_000);
 });
 
@@ -55,7 +56,8 @@ test("the defaults of the new limits apply when the environment is empty", () =>
     assert.equal(settings.wallMs, 120_000);
     assert.equal(settings.maxHostCalls, 1000);
     assert.equal(settings.maxSessions, 20);
-    assert.equal(settings.maxConcurrentCalls, 4);
+    assert.equal(settings.maxConcurrentCalls, 20);
+    assert.equal(settings.maxHostMs, 30_000);
     assert.equal(settings.slotWaitMs, 60_000);
 });
 
@@ -125,5 +127,18 @@ test("a malformed page cap throws an error that names its variable", () => {
     assert.throws(
         () => SandboxSettings.fromEnvironment({ PENPOT_MCP_SANDBOX_PAGE_MB: "0" }),
         /PENPOT_MCP_SANDBOX_PAGE_MB/
+    );
+});
+
+test("the global slots follow the worker limit, and the default is maxSessions", () => {
+    assert.equal(SandboxSettings.DEFAULT_MAX_CONCURRENT_CALLS, SandboxSettings.DEFAULT_MAX_SESSIONS);
+    assert.equal(SandboxSettings.fromEnvironment({}).maxConcurrentCalls, 20);
+});
+
+test("PENPOT_MCP_SANDBOX_HOST_MS sets the host-time budget of a script, in milliseconds", () => {
+    assert.equal(SandboxSettings.fromEnvironment({ PENPOT_MCP_SANDBOX_HOST_MS: "5000" }).maxHostMs, 5000);
+    assert.throws(
+        () => SandboxSettings.fromEnvironment({ PENPOT_MCP_SANDBOX_HOST_MS: "soon" }),
+        /PENPOT_MCP_SANDBOX_HOST_MS/
     );
 });

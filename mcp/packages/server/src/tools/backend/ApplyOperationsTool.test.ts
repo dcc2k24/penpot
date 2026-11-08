@@ -8,6 +8,7 @@ import { FakeExporterClient } from "../../backend/testing/FakeExporterClient";
 import { FakePenpotBackend } from "../../backend/testing/FakePenpotBackend";
 import type { PenpotBackend, RpcCallOptions } from "../../PenpotBackendClient";
 import { ApplyOperationsTool } from "./ApplyOperationsTool";
+import { TokenCatalogueCache } from "./TokenCatalogueCache";
 
 /** A fake backend whose first apply write waits until the test releases it, so that calls can queue behind it. */
 class HeldWriteBackend extends FakePenpotBackend implements PenpotBackend {
@@ -289,4 +290,14 @@ test("a write whose request is cancelled before its turn in the queue is not sen
     assert.equal(response.isError, true);
     assert.match(textOf(response), /The write was abandoned before it started/);
     assert.equal(backend.callsTo("mcp-apply-operations").length, 1);
+});
+
+test("the token cache keeps one token set per file, never the MCP token, and stays within its capacity", async () => {
+    const { tool } = harness();
+    await tool.execute({ fileId: FILE, operations: [applyToken("color.brand", ["fill"])], dryRun: true });
+    const cache = (tool as unknown as { tokenSets: TokenCatalogueCache }).tokenSets;
+    assert.equal(cache.size, 1);
+    const kept = (cache as unknown as { entries: Map<string, unknown> }).entries;
+    assert.equal(JSON.stringify([...kept.entries()]).includes(TOKEN), false, "no MCP token in the cache");
+    assert.ok(cache.size <= TokenCatalogueCache.DEFAULT_CAPACITY);
 });

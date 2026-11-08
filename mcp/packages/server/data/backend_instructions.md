@@ -254,7 +254,7 @@ Use the typed tools for one or two simple changes.
   starts to run.
 - A host call is a `penpot`, `penpotUtils`, `penpotMgmt` or `rpc` call that reaches the server. It counts against the
   token's rate limit (10 per second, burst 20).
-- One script runs at a time for each token, and two more of that token may wait. At most 4 scripts run at once. A script that waits more than 60 s for a free slot fails with a busy error.
+- One script runs at a time for each token, and two more of that token may wait. At most 20 scripts run at once, and a script may spend 30 s in backend and exporter calls before its next call fails. A script that waits more than 60 s for a free slot fails with a busy error.
 - Not available: selection, viewport, `ui`, events, `openPage`, `openViewer`, `createImage`, `createVariantContainer`,
   variants, `generateMarkup`, `generateStyle`, `generateFontFaces`, `penpotMgmt.listDeletedProjects`, `penpotMgmt.on`
   and `penpotMgmt.off`. Reading selection or viewport gives empty values. Use `manage_files` for other file work.

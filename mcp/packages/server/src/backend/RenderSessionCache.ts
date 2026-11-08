@@ -31,6 +31,8 @@ interface RenderSessionAnswer {
 export class RenderSessionCache {
     /** Time before expiry after which a session is no longer reused, in milliseconds. */
     public static readonly REFRESH_MARGIN_MS = 60_000;
+    /** Largest number of render sessions kept; the oldest make room for a new one. */
+    public static readonly MAX_ENTRIES = 1_000;
 
     private readonly entries = new Map<string, CacheEntry>();
 
@@ -61,6 +63,13 @@ export class RenderSessionCache {
             return (await cached.promise).token;
         }
         const promise = this.mint(userToken, fileId);
+        while (this.entries.size >= RenderSessionCache.MAX_ENTRIES) {
+            const oldest = this.entries.keys().next();
+            if (oldest.done === true) {
+                break;
+            }
+            this.entries.delete(oldest.value);
+        }
         const entry: CacheEntry = { promise, expiresAt: Number.POSITIVE_INFINITY };
         this.entries.set(key, entry);
         try {
@@ -125,5 +134,9 @@ export class RenderSessionCache {
                 this.entries.delete(key);
             }
         }
+    }
+    /** Number of render sessions held, for the metrics and the tests. */
+    public get size(): number {
+        return this.entries.size;
     }
 }

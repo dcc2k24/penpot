@@ -366,12 +366,14 @@ test("import_image reports a missing file inside the import directory", async ()
     }
 });
 
-test("import_image has no filePath in its schema when file system access is off", () => {
-    const { services } = harness();
-    const enabled = new ImportImageBackendTool(serverStub(true), services);
+test("import_image keeps filePath in its schema, and multi-user mode refuses a call that passes it", async () => {
+    const { backend, services } = harness();
     const disabled = new ImportImageBackendTool(serverStub(false), services);
-    assert.equal("filePath" in enabled.getInputSchema(), true);
-    assert.equal("filePath" in disabled.getInputSchema(), false);
+    assert.equal("filePath" in disabled.getInputSchema(), true);
+    const response = await disabled.execute({ fileId: FILE, pageId: PAGE, filePath: "/tmp/photo.png" });
+    assert.equal(response.isError, true);
+    assert.match(textOf(response), /File paths are off in multi-user mode/);
+    assert.equal(backend.callsTo("upload-file-media-object").length, 0);
 });
 
 // ── import_svg ──
@@ -410,7 +412,9 @@ test("import_archive uploads a base64 archive and returns the new file ids", asy
         name: "Team kit",
     });
     const call = lastCall(backend, "import-binfile");
-    assert.deepEqual(call.fields, { name: "Team kit", "project-id": PROJECT, version: "3" });
+    // the backend reads the version from the archive, so no version field is sent
+    assert.deepEqual(call.fields, { name: "Team kit", "project-id": PROJECT });
+    assert.equal("version" in call.fields, false);
     const part = filePartOf(call);
     assert.equal(part.fieldName, "file");
     assert.equal(part.fileName, "archive.penpot");
@@ -474,12 +478,14 @@ test("import_archive refuses a url that is not http or https", async () => {
     assert.equal(backend.callsTo("import-binfile").length, 0);
 });
 
-test("import_archive has no filePath in its schema when file system access is off", () => {
-    const { services } = harness();
-    const enabled = new ImportArchiveBackendTool(serverStub(true), services);
+test("import_archive keeps filePath in its schema, and multi-user mode refuses a call that passes it", async () => {
+    const { backend, services } = harness();
     const disabled = new ImportArchiveBackendTool(serverStub(false), services);
-    assert.equal("filePath" in enabled.getInputSchema(), true);
-    assert.equal("filePath" in disabled.getInputSchema(), false);
+    assert.equal("filePath" in disabled.getInputSchema(), true);
+    const response = await disabled.execute({ projectId: PROJECT, filePath: "/tmp/archive.penpot" });
+    assert.equal(response.isError, true);
+    assert.match(textOf(response), /File paths are off in multi-user mode/);
+    assert.equal(backend.callsTo("import-binfile").length, 0);
 });
 
 // ── names and schema documentation ──

@@ -5,7 +5,7 @@ import type { ToolResponse } from "../../ToolResponse";
 import type { BackendServices } from "../../backend/BackendServices";
 import { TokenDigest } from "../../backend/TokenDigest";
 import { AwaitRewriter } from "../../sandbox/AwaitRewriter";
-import { CallSlots } from "../../sandbox/CallSlots";
+import { CallSlots, SlotHolder } from "../../sandbox/CallSlots";
 import { SandboxHost, type SandboxSummary, type SandboxWriteOptions } from "../../sandbox/SandboxHost";
 import {
     HOST_PRIMITIVE_NAMES,
@@ -114,27 +114,53 @@ interface CallState {
     scriptId: string;
     /** Context of the tool call, which every backend read and write of the script runs in. */
     context: CallContextData | undefined;
+    /** The global slot of the call, which it gives back while it waits for a rate-limit token. */
+    slot: SlotHolder;
+    /** Host time that the script may still spend in backend and exporter calls. */
+    hostBudget: { maxMs: number; usedMs: number };
+}
+
+/** Message of the error that a script raises once it has spent its host-time budget. */
+function hostBudgetMessage(maxMs: number): string {
+    return (
+        `execute_code spent its host-time budget of ${maxMs} ms (PENPOT_MCP_SANDBOX_HOST_MS) on backend and ` +
+        "exporter calls, so the script stops here; narrow the script, or raise PENPOT_MCP_SANDBOX_HOST_MS"
+    );
 }
 
 /**
- * Wraps the host so that each primitive runs in the context of the tool call that made it.
+ * Wraps the host so that each primitive runs in the context of the tool call that made it, and counts its time
+ * against the host-time budget of the script.
  *
  * A runtime is shared by the calls of one token, and a continuation inside it can belong to an earlier call. The
  * backend reads its request signal from the context, and the signal of an earlier call is already closed, so a
  * later call would fail at its first read. Binding the context here keeps every read on its own call.
  *
+ * The budget is checked before each primitive: a script that has spent it gets an error at once, so a read flood
+ * ends early. Time spent waiting for a rate-limit token is host time too.
+ *
  * @param host - host of the call
- * @param context - context of the tool call, or undefined outside a call
+ * @param state - state of the call: its context and its host-time budget
  * @returns the host that runs each primitive in the context
  */
-function bindCallContext(host: SandboxHostCalls, context: CallContextData | undefined): SandboxHostCalls {
-    if (context === undefined) {
-        return host;
-    }
+function bindCallContext(host: SandboxHostCalls, state: CallState): SandboxHostCalls {
+    const context = state.context;
+    const run = <T>(action: () => T): T => (context === undefined ? action() : CallContext.run(context, action));
     const bound: Record<string, unknown> = {};
     for (const name of HOST_PRIMITIVE_NAMES) {
         const method = (host as unknown as Record<string, (...args: unknown[]) => Promise<string>>)[name];
-        bound[name] = (...args: unknown[]) => CallContext.run(context, () => method.apply(host, args));
+        bound[name] = async (...args: unknown[]): Promise<string> => {
+            const budget = state.hostBudget;
+            if (budget.usedMs >= budget.maxMs) {
+                throw new Error(hostBudgetMessage(budget.maxMs));
+            }
+            const started = Date.now();
+            try {
+                return await run(() => method.apply(host, args));
+            } finally {
+                budget.usedMs += Date.now() - started;
+            }
+        };
     }
     return bound as unknown as SandboxHostCalls;
 }
@@ -189,8 +215,9 @@ export class ExecuteCodeBackendTool extends BackendTool<ExecuteCodeBackendArgs> 
             "storage keeps its data for the MCP access token, across files, and drops it after 30 minutes idle. " +
             "Limits per call: 5000 operations, 20 pages (16 MB of page data by default; PENPOT_MCP_SANDBOX_PAGE_MB), 1000 host calls, " +
             "20 exports and media uploads, 120 s wall-clock time, 3 s CPU time, 128 MB memory. " +
-            "One script runs at a time for each token, and two more may wait; at most 4 scripts run at once across " +
-            "all tokens, and a queued script waits up to 60 s. " +
+            "One script runs at a time for each token, and two more may wait; at most 20 scripts run at once across " +
+            "all tokens, and a queued script waits up to 60 s. A script may spend 30 s in backend and exporter calls " +
+            "(PENPOT_MCP_SANDBOX_HOST_MS); after that its next call fails. " +
             "The facade objects and the built-in prototypes are frozen, so a script cannot add to Array.prototype " +
             "or replace a facade member. " +
             "Bridge-only members are not available in backend mode: selection, viewport, ui, events, " +
@@ -204,16 +231,18 @@ export class ExecuteCodeBackendTool extends BackendTool<ExecuteCodeBackendArgs> 
         // the token's turn comes first, so that one token cannot hold every global slot.
         const releaseTurn = await this.admit(() => sessions.acquireTurn(key));
         try {
-            const release = await this.admit(() => this.slots.acquire());
+            const slot = new SlotHolder(this.slots);
+            await this.admit(() => slot.take());
             try {
-                return await this.runWithRetry(args, userToken, key);
+                return await this.runWithRetry(args, userToken, key, slot);
             } finally {
                 // a runtime whose memory grew past the recycle size is dropped, so the memory goes back to the process.
                 sessions.recycleIfSpent(key);
-                release();
+                slot.free();
             }
         } finally {
-            releaseTurn();
+            // waits for the save of the storage, so that the next call on another adapter reads the new copy.
+            await releaseTurn();
         }
     }
 
@@ -242,13 +271,24 @@ export class ExecuteCodeBackendTool extends BackendTool<ExecuteCodeBackendArgs> 
      * @param key - session key of the token
      * @returns the tool response with the result and the totals of the call
      */
-    private async runWithRetry(args: ExecuteCodeBackendArgs, userToken: string, key: string): Promise<ToolResponse> {
+    private async runWithRetry(
+        args: ExecuteCodeBackendArgs,
+        userToken: string,
+        key: string,
+        slot: SlotHolder
+    ): Promise<ToolResponse> {
         const scriptId = args.requestId ?? randomUUID();
         for (let attempt = 1; ; attempt += 1) {
             const runtime = await this.services.sandboxes.acquire(key);
             const settings = this.services.sandboxes.settings;
             const host = new SandboxHost(this.services, userToken, settings.maxHostCalls, settings.maxPageBytes);
-            const state: CallState = { started: false, scriptId, context: CallContext.current() };
+            const state: CallState = {
+                started: false,
+                scriptId,
+                context: CallContext.current(),
+                slot,
+                hostBudget: { maxMs: settings.maxHostMs, usedMs: 0 },
+            };
             try {
                 return await this.runOn(runtime, host, args, key, state);
             } catch (error) {
@@ -300,7 +340,7 @@ export class ExecuteCodeBackendTool extends BackendTool<ExecuteCodeBackendArgs> 
                     this.services.sandboxes.discard(key);
                     throw new Error(ExecuteCodeBackendTool.capText(error.message) + applied + notice);
                 }
-                const log = await this.drainLog(runtime, bindCallContext(host, state.context));
+                const log = await this.drainLog(runtime, bindCallContext(host, state));
                 throw new Error(
                     ExecuteCodeBackendTool.capText(error.message) +
                         ExecuteCodeBackendTool.logSuffix(log) +
@@ -332,6 +372,9 @@ export class ExecuteCodeBackendTool extends BackendTool<ExecuteCodeBackendArgs> 
             .split("\n")
             .filter((line) => line.length > 0);
         this.services.sandboxes.recordOutcome("ok");
+        // the store's note for this call is taken here, once the call has run.
+        const sessionNotice = this.services.sandboxes.takeStorageNotice(key);
+        const storageNotice = [notice, sessionNotice].filter((text): text is string => text !== undefined).join(" ");
         return this.jsonResponse({
             ...(envelope.undefinedResult === true ? {} : { result: ExecuteCodeBackendTool.capResult(envelope.result) }),
             console: consoleLines,
@@ -342,7 +385,7 @@ export class ExecuteCodeBackendTool extends BackendTool<ExecuteCodeBackendArgs> 
             chunks: summary.chunks,
             warnings: summary.warnings,
             createdIds: summary.createdIds,
-            ...(notice === undefined ? {} : { storageNotice: notice }),
+            ...(storageNotice.length === 0 ? {} : { storageNotice }),
         });
     }
 
@@ -363,10 +406,11 @@ export class ExecuteCodeBackendTool extends BackendTool<ExecuteCodeBackendArgs> 
     ): Promise<string> {
         const settings = this.services.sandboxes.settings;
         const writeOptions = ExecuteCodeBackendTool.writeOptionsOf(args);
+        host.setWaitHook(() => state.slot.yieldForWait());
         return runtime.invoke(
             ExecuteCodeBackendTool.RUN_FUNCTION,
             [AwaitRewriter.rewrite(args.code), args.fileId, args.pageId ?? ""],
-            bindCallContext(host, state.context),
+            bindCallContext(host, state),
             settings.cpuBudgetMs,
             {
                 wallMs: settings.wallMs,

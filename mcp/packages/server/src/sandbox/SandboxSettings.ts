@@ -16,7 +16,7 @@ export class SandboxSettings {
     /** Default most live sandbox runtimes. */
     public static readonly DEFAULT_MAX_SESSIONS = 20;
     /** Default most calls that run at once. */
-    public static readonly DEFAULT_MAX_CONCURRENT_CALLS = 4;
+    public static readonly DEFAULT_MAX_CONCURRENT_CALLS = SandboxSettings.DEFAULT_MAX_SESSIONS;
     /** Default time a queued call waits for a free slot, in milliseconds. */
     public static readonly DEFAULT_SLOT_WAIT_MS = 60_000;
     /** Default: each guest runs in a worker thread. `PENPOT_MCP_SANDBOX_WORKERS=false` runs them on the main thread. */
@@ -27,6 +27,13 @@ export class SandboxSettings {
      * script's own data fit in that memory; a larger page needs a larger setting and a bigger memory.
      */
     public static readonly DEFAULT_MAX_PAGE_MB = 16;
+    /**
+     * Default host time of one script, in milliseconds: the wall time it spends in backend and exporter calls,
+     * rate-limit waits included. A script that reads in a flood ends here with a clear error.
+     */
+    public static readonly DEFAULT_MAX_HOST_MS = 30_000;
+    /** Environment variable that sets the host time of one script, in milliseconds. */
+    public static readonly HOST_MS_VARIABLE = "PENPOT_MCP_SANDBOX_HOST_MS";
     /** Environment variable that sets the most page data one call may hold, in MB of JSON. */
     public static readonly PAGE_MB_VARIABLE = "PENPOT_MCP_SANDBOX_PAGE_MB";
     /** Environment variable that switches the worker threads on or off. */
@@ -53,7 +60,8 @@ export class SandboxSettings {
         public readonly maxConcurrentCalls: number = SandboxSettings.DEFAULT_MAX_CONCURRENT_CALLS,
         public readonly slotWaitMs: number = SandboxSettings.DEFAULT_SLOT_WAIT_MS,
         public readonly workers: boolean = SandboxSettings.DEFAULT_WORKERS,
-        public readonly maxPageBytes: number = SandboxSettings.DEFAULT_MAX_PAGE_MB * 1024 * 1024
+        public readonly maxPageBytes: number = SandboxSettings.DEFAULT_MAX_PAGE_MB * 1024 * 1024,
+        public readonly maxHostMs: number = SandboxSettings.DEFAULT_MAX_HOST_MS
     ) {}
 
     /**
@@ -110,6 +118,11 @@ export class SandboxSettings {
             SandboxSettings.PAGE_MB_VARIABLE,
             SandboxSettings.DEFAULT_MAX_PAGE_MB
         );
+        const hostMs = SandboxSettings.positiveNumber(
+            env,
+            SandboxSettings.HOST_MS_VARIABLE,
+            SandboxSettings.DEFAULT_MAX_HOST_MS
+        );
         return new SandboxSettings(
             timeoutSeconds * 1000,
             idleMinutes * 60_000,
@@ -119,7 +132,8 @@ export class SandboxSettings {
             maxConcurrentCalls,
             SandboxSettings.DEFAULT_SLOT_WAIT_MS,
             workers,
-            pageMb * 1024 * 1024
+            pageMb * 1024 * 1024,
+            hostMs
         );
     }
 

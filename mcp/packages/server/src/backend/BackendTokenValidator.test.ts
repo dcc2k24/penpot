@@ -131,9 +131,32 @@ test("other backend failures propagate unchanged", async () => {
     await assert.rejects(validator.validate("alice-token"), (error: unknown) => error === failure);
 });
 
+test("a configured cache period replaces the 60 second default", async () => {
+    const clock = new ManualClock();
+    const backend = new FakePenpotBackend().respond("mcp-whoami", whoami);
+    const validator = new BackendTokenValidator(backend, clock.read, 5_000);
+    await validator.validate("alice-token");
+    clock.now = 4_999;
+    await validator.validate("alice-token");
+    assert.equal(backend.callsTo("mcp-whoami").length, 1);
+    clock.now = 5_000;
+    await validator.validate("alice-token");
+    assert.equal(backend.callsTo("mcp-whoami").length, 2);
+});
+
 test("concurrent validations of one token share a single backend call", async () => {
     const backend = new FakePenpotBackend().respond("mcp-whoami", whoami);
     const validator = new BackendTokenValidator(backend);
     await Promise.all([validator.validate("alice-token"), validator.validate("alice-token")]);
     assert.equal(backend.callsTo("mcp-whoami").length, 1);
+});
+
+test("the validator keeps at most MAX_ENTRIES rejected tokens, so a flood cannot grow it without bound", async () => {
+    const backend = new FakePenpotBackend().fail("mcp-whoami", new BackendRpcError(401, "mcp-whoami", undefined));
+    const validator = new BackendTokenValidator(backend);
+    const total = BackendTokenValidator.MAX_ENTRIES + 500;
+    for (let i = 0; i < total; i++) {
+        await assert.rejects(validator.validate(`random-token-${i}`), /rejected/);
+    }
+    assert.ok(validator.size <= BackendTokenValidator.MAX_ENTRIES, `size ${validator.size} is over the cap`);
 });
