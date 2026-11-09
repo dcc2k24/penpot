@@ -1122,6 +1122,13 @@
          (ptk/data-event :layout/update {:ids selected})
          (dwu/commit-undo-transaction undo-id))))))
 
+(defn- get-nudge-step
+  "Displacement of one nudge event: the unit vector of its direction
+  scaled by the small or big nudge size of the profile."
+  [nudge [direction shift?]]
+  (let [size (if shift? (or (:big nudge) 10) (or (:small nudge) 1))]
+    (gpt/multiply (get-displacement direction) (gpt/point size))))
+
 (defn nudge-selected-shapes
   "Move shapes a fixed increment in one direction, from a keyboard action."
   [direction shift?]
@@ -1129,7 +1136,7 @@
   (let [same-event (js/Symbol "same-event")]
     (ptk/reify ::nudge-selected-shapes
       IDeref
-      (-deref [_] direction)
+      (-deref [_] [direction shift?])
 
       ptk/UpdateEvent
       (update [_ state]
@@ -1145,8 +1152,7 @@
           (let [selected (dsh/lookup-selected state {:omit-blocked? true})
                 nudge (get-in state [:profile :props :nudge] {:big 10 :small 1})
                 move-events (->> stream
-                                 (rx/filter (ptk/type? ::nudge-selected-shapes))
-                                 (rx/filter #(= direction (deref %))))
+                                 (rx/filter (ptk/type? ::nudge-selected-shapes)))
 
                 stopper
                 (->> move-events
@@ -1159,51 +1165,44 @@
                                            (rx/delay 250))))
                      (rx/take 1))
 
-                scale (if shift? (gpt/point (or (:big nudge) 10)) (gpt/point (or (:small nudge) 1)))
-                mov-vec (gpt/multiply (get-displacement direction) scale)]
+                modif-stream
+                (->> move-events
+                     (rx/scan #(gpt/add %1 (get-nudge-step nudge (deref %2))) (gpt/point 0 0))
+                     (rx/map #(dwm/create-modif-tree selected (ctm/move-modifiers %)))
+                     (rx/take-until stopper))]
 
             (if (features/active-feature? state "render-wasm/v1")
-              (let [modif-stream
-                    (->> move-events
-                         (rx/scan #(gpt/add %1 mov-vec) (gpt/point 0 0))
-                         (rx/map #(dwm/create-modif-tree selected (ctm/move-modifiers %)))
-                         (rx/take-until stopper))]
-                (rx/concat
-                 (rx/merge
-                  (->> modif-stream
-                       ;; Sample at a fixed cadence to cap re-renders, mirroring the
-                       ;; drag/resize/rotation paths throttled in #10560.
-                       (rx/sample mconst/move-sample-time)
-                       (rx/map #(dwm/set-wasm-modifiers % {:ignore-snap-pixel true})))
+              (rx/concat
+               (rx/merge
+                (->> modif-stream
+                     ;; Sample at a fixed cadence to cap re-renders, mirroring the
+                     ;; drag/resize/rotation paths throttled in #10560.
+                     (rx/sample mconst/move-sample-time)
+                     (rx/map #(dwm/set-wasm-modifiers % {:ignore-snap-pixel true})))
 
-                  (->> modif-stream
-                       (rx/last)
-                       (rx/map #(dwm/apply-wasm-modifiers % {:ignore-snap-pixel true})))
-                  (rx/of (nudge-selected-shapes direction shift?)))
-                 (rx/of (finish-transform))))
+                (->> modif-stream
+                     (rx/last)
+                     (rx/map #(dwm/apply-wasm-modifiers % {:ignore-snap-pixel true})))
+                (rx/of (nudge-selected-shapes direction shift?)))
+               (rx/of (finish-transform)))
 
-              (let [modif-stream
-                    (->> move-events
-                         (rx/scan #(gpt/add %1 mov-vec) (gpt/point 0 0))
-                         (rx/map #(dwm/create-modif-tree selected (ctm/move-modifiers %)))
-                         (rx/take-until stopper))]
-                (rx/concat
-                 (rx/merge
-                  (->> modif-stream
-                       ;; Sample at a fixed cadence to cap re-renders, mirroring the
-                       ;; drag/resize/rotation paths throttled in #10560.
-                       (rx/sample mconst/move-sample-time)
-                       (rx/map #(dwm/set-modifiers % false true)))
-                  ;; Un-sampled final write ensures the modifiers atom holds the
-                  ;; exact cumulative position before `apply-modifiers` commits,
-                  ;; even if `sample` drops the tail value on completion.
-                  (->> modif-stream
-                       (rx/last)
-                       (rx/map #(dwm/set-modifiers % false true)))
-                  (rx/of (nudge-selected-shapes direction shift?)))
+              (rx/concat
+               (rx/merge
+                (->> modif-stream
+                     ;; Sample at a fixed cadence to cap re-renders, mirroring the
+                     ;; drag/resize/rotation paths throttled in #10560.
+                     (rx/sample mconst/move-sample-time)
+                     (rx/map #(dwm/set-modifiers % false true)))
+                ;; Un-sampled final write ensures the modifiers atom holds the
+                ;; exact cumulative position before `apply-modifiers` commits,
+                ;; even if `sample` drops the tail value on completion.
+                (->> modif-stream
+                     (rx/last)
+                     (rx/map #(dwm/set-modifiers % false true)))
+                (rx/of (nudge-selected-shapes direction shift?)))
 
-                 (rx/of (dwm/apply-modifiers)
-                        (finish-transform))))))
+               (rx/of (dwm/apply-modifiers)
+                      (finish-transform)))))
           (rx/empty))))))
 
 (defn move-selected

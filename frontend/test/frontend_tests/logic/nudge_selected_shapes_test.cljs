@@ -87,6 +87,14 @@
         rect  (grc/points->rect (:points shape))]
     (:y rect)))
 
+(defn- burst-mixed-move-events
+  "Builds the event sequence: select rect, then one `move-selected` event per
+  `[direction shift?]` pair in `steps`, in order."
+  [file steps]
+  (let [rect (cths/get-shape file :rect1)]
+    (into [(dws/select-shape (:id rect))]
+          (map (fn [[direction shift?]] (dwt/move-selected direction shift?)) steps))))
+
 (defn- make-file
   []
   (-> (cthf/sample-file :file1)
@@ -170,3 +178,61 @@
                final-y  (shape-y file' :rect1)]
            (t/is (= (- 200 (* 10 nudge-event-count)) final-y)
                  "Legacy branch: final y equals original - N * big-nudge after a throttled burst")))))))
+
+;; ---------------------------------------------------------------------------
+;; A second direction inside the open gesture joins it: every nudge event of
+;; the burst adds its own displacement, whatever its direction or step size.
+;; ---------------------------------------------------------------------------
+
+(t/deftest nudge-burst-in-two-directions-commits-both-displacements-wasm
+  (t/async
+    done
+    (let [file   (make-file)
+          store  (ths/setup-store file)
+          events (burst-mixed-move-events
+                  file
+                  (concat (repeat 10 [:right false])
+                          (repeat 10 [:down false])))]
+      (run-nudge-store
+       store done events
+       (fn [new-state]
+         (let [file' (ths/get-file-from-state new-state)]
+           (t/is (= 110 (shape-x file' :rect1))
+                 "WASM branch: right nudges are kept after a down nudge joins the gesture")
+           (t/is (= 210 (shape-y file' :rect1))
+                 "WASM branch: down nudges are kept after joining the right-nudge gesture")))))))
+
+(t/deftest nudge-burst-in-two-directions-commits-both-displacements-legacy
+  (t/async
+    done
+    (let [file   (make-file)
+          store  (ths/setup-store file {:renderer :svg})
+          events (burst-mixed-move-events
+                  file
+                  (concat (repeat 10 [:right false])
+                          (repeat 10 [:down false])))]
+      (run-nudge-store
+       store done events
+       (fn [new-state]
+         (let [file' (ths/get-file-from-state new-state)]
+           (t/is (= 110 (shape-x file' :rect1))
+                 "Legacy branch: right nudges are kept after a down nudge joins the gesture")
+           (t/is (= 210 (shape-y file' :rect1))
+                 "Legacy branch: down nudges are kept after joining the right-nudge gesture")))))))
+
+(t/deftest nudge-burst-with-mixed-step-sizes-commits-the-sum
+  (t/async
+    done
+    (let [file   (make-file)
+          store  (ths/setup-store file)
+          events (burst-mixed-move-events
+                  file
+                  (concat (repeat 5 [:right false])
+                          (repeat 5 [:right true])))]
+      (run-nudge-store
+       store done events
+       (fn [new-state]
+         (let [file' (ths/get-file-from-state new-state)]
+           ;; 5 small nudges (1 px) plus 5 big nudges (10 px) = 55 px.
+           (t/is (= 155 (shape-x file' :rect1))
+                 "WASM branch: each event adds its own step size to the gesture")))))))
