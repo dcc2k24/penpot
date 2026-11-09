@@ -169,10 +169,12 @@
 
 (defn- busy-server-error?
   "True when the backend was too busy to apply the save: it refused it
-  (429) or a database timeout rolled it back. Resending it is safe."
+  (a 429 from a rate or a concurrency limit) or a database timeout rolled
+  it back. Resending it is safe."
   [{:keys [type cause-type code]}]
   (let [type (or cause-type type)]
     (or (= :rate-limit type)
+        (= :concurrency-limit type)
         (and (= :server-error type)
              (contains? busy-server-codes code)))))
 

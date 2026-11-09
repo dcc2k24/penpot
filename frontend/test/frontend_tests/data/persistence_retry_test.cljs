@@ -226,6 +226,17 @@
 (t/deftest ^:async concurrency-limit-save-is-retried
   (await (check-busy-server-response-retries {:status 429 :body nil})))
 
+;; Variant: the backend refused the save at a concurrency limit and said so in
+;; the body, so the refusal arrives typed as `:concurrency-limit`.
+(t/deftest ^:async concurrency-limit-with-a-body-save-is-retried
+  (await (check-busy-server-response-retries
+          {:status 429
+           :body {:type :concurrency-limit
+                  :code :capacity-limit-reached
+                  :hint "concurrency limit update-file/by-profile reached (queue-full), retry later"
+                  :limit "update-file/by-profile"
+                  :reason "queue-full"}})))
+
 ;; Variant: the database cancelled the save while it waited for the file lock.
 (t/deftest ^:async statement-timeout-save-is-retried
   (await (check-busy-server-response-retries

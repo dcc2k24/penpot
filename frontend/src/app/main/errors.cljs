@@ -615,6 +615,10 @@
   [error]
   (handle-transport-error error "Rate Limit Error"))
 
+(defmethod ptk/handle-error :concurrency-limit
+  [error]
+  (handle-transport-error error "Concurrency Limit Error"))
+
 (defmethod ptk/handle-error :unexpected-response
   [error]
   (handle-transport-error error "Unexpected Response"))
