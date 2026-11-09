@@ -175,12 +175,54 @@ narrows the window. The harness should wait for save responses before its readba
 
 ### Fix (2026-11-08)
 
-The frontend keeps the buffered local commits in `:persistence :buffer` (`persistence.cljs`). `get-pending-commits`
-returns the queued commits, then the buffered ones, so a remote change undoes and redoes both. A flush moves the
-flushed commits from `:buffer` to `:queue` in one update. A merged commit's undo changes run in reverse commit order
-(`changes.cljs`). Unit tests cover the order and the flush. The fix is not re-run under the C3 load; that needs a
-frontend build. The harness readback race is fixed in `human-tab.mjs`: it waits for the save responses before it
-reads back.
+The frontend keeps the buffered local commits in `:persistence :buffer` (`persistence.cljs`).
+`get-pending-commits` returns the queued commits, then the buffered ones, so a remote change undoes
+and redoes both. A flush moves the flushed commits from `:buffer` to `:queue` in one update. A
+merged commit's undo changes run in reverse commit order (`changes.cljs`). Unit tests cover the
+order and the flush. The re-run under the C3 load is below. The harness readback race is fixed in
+`human-tab.mjs`: it waits for the save responses before it reads back.
+
+### Re-run under load (2026-11-08, evening)
+
+Frontend built from this tree (shadow-cljs release in `penpot-tc`, served on port 9003 through the
+2.18 image's nginx; build notes and result files in
+`mcp/packages/loadtest/results/2026-11-08-round2/human/after-fix/run-notes.md`). Harness:
+`run-c3.mjs`, five agents (c2-same-file), 10 min, 120 s baseline, one adapter on 4405. The decoded
+rows named below are in that folder (`human-rows-decoded.txt` in each run's directory).
+
+- C3 with agents: 120 presses, 120 saves, 0 lost (160/160). The tab's 119 decoded rows carry one
+  `:x` or `:y` each and every value is one above the previous. Save p95 was 0.76 s during the agents
+  (round 2 run 1: 5 s), so the queue was mostly empty when a press landed in the buffer: the window
+  described above opened rarely.
+- Control, no agents: 120 presses, 120 saves, 0 lost.
+- Slow saves on the fixed build (`--save-delay-ms 5000`: the harness holds each `update-file`
+  response 5 s, the server commits at once): 43 saves, 48 `:x`/`:y` operations, none backwards and
+  none repeated, last x=128 y=120. 72 presses never reached the server inside the run (the stall
+  below).
+- Slow saves on the stock 2.18 frontend (port 9002), same load: 40 rows, 51 operations, 10 not
+  forward. Last x=117 y=131 against 160/160. This is the pattern of round 2 run 1; the fixed build
+  does not show it under the same conditions.
+
+```
+[2970 [[:x 117] [:y 117] [:x 117] [:y 117] [:x 117] [:y 117] [:x 117]]]
+[3437 [[:y 116] [:x 118]]]   after y=117
+[3941 [[:y 118] [:x 117]]]   after x=118
+[5221 [[:y 120] [:y 120]]] [5882 [[:y 121] [:y 121]]] [6521 [[:y 133] [:y 122]]]
+```
+
+Stall under slow saves, both builds: after the agents start, the tab's saves thin out. Fixed build
+row times: 23:34:49, :54, :59, 35:04, :10, :16, :21, :27, :34, :42, :55, 36:16, 36:40, 37:09, 37:46,
+38:33, 39:25, 40:33, 41:51 (gaps from 5 s to 78 s). Rows merge several presses (`[4081 [[:y 119] [:x
+120] [:y 120] [:x 121]]]`, `[8072 [[:x 126] [:x 127] [:x 128]]]`), and from 37:09 the rows carry
+only `:x`: `nudge-selected-shapes` (`frontend/src/app/main/data/workspace/transforms.cljs`) keeps a
+gesture open until `finish-transform`, a nudge in another direction during an open gesture does
+nothing (`::current-move-selected`), and same-direction presses join the open gesture. The gesture
+closes 1 s after the last press, so this needs a main thread blocked for seconds. Websocket frames
+received: 5,383 (fixed build) and 6,245 (stock) against 7,098 with fast saves, so the backend's
+`dropping-buffer 64` dropped frames for the slow tab. Candidate cause: `apply-changes-localy` and
+`update-indexes` run for every pending commit on every remote frame (about 9 a second here), and
+with 5 s saves the pending set is never empty. Not measured; needs a profile. Pre-existing, since
+2.18 stalls the same way. Recorded as R2-15 in `production-readiness.md`.
 
 ## Q2: the 138 sequential scans on file_change in the soak
 

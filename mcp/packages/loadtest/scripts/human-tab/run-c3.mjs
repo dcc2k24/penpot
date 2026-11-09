@@ -62,6 +62,7 @@ export function parseArgs(argv) {
                     [
                         "--minutes",
                         "--interval-ms",
+                        "--save-delay-ms",
                         "--frontend",
                         "--backend",
                         "--mcp",

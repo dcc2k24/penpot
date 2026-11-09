@@ -17,6 +17,7 @@ the last edit survived. It covers the human half of the C3 and C5 gates in `PERF
   Optional: `PENPOT_HUMAN_EMAIL` (default `mcpdev@example.com`).
 - `npx playwright install chromium` must have run for the Playwright version in `package.json` (1.62.1).
 - Vars file: the `setup` output (`fileId`, `pageId`, `teamId`, `projectId`). For C5, the `generate-large` output.
+- The harness works with both routers of the dev frontend. It accepts the hash router (`#/dashboard/...`) and the query-string router (`?screen=...`).
 
 ## Human tab alone
 
@@ -32,7 +33,8 @@ ArrowRight or ArrowDown once every 3 s. Each press is one change, and Penpot sav
 start position plus the presses.
 
 Other options: `--interval-ms`, `--frontend`, `--backend`, `--mcp`, `--results`, `--headed` (show the browser),
-`--login-only` (log in, open the workspace, stop: a check that needs no MCP token).
+`--login-only` (log in, open the workspace, stop: a check that needs no MCP token), `--save-delay-ms` (holds each
+save response for that many milliseconds, so the tab sees slow saves while the server commits at once).
 
 Output: `results/human-tab-<timestamp>.json` with `saves` (count, errors, p50, p95, max), `notifications` (websocket
 frames, and those whose text contains `file-change`), `lostEdits` (expected and actual position, `count` of

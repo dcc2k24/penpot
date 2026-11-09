@@ -46,6 +46,7 @@ export const DEFAULTS = Object.freeze({
     headed: false,
     loginOnly: false,
     freshFile: false,
+    saveDelayMs: 0,
 });
 
 const USAGE = `Usage: node scripts/human-tab/human-tab.mjs --tokens <file> --vars <vars.json> [options]
@@ -64,6 +65,7 @@ Options:
   --login-only        log in, open the workspace and stop (no seed, no edits)
   --fresh-file        create a new file in the vars' project and run on it; writes
                       results/human-tab-vars-<file id>.json (pass that file to the agents too)
+  --save-delay-ms <n> hold each save response for n ms before the tab sees it (default 0; reproduces slow saves)
   --help              print this text
 
 Environment: PENPOT_HUMAN_PASSWORD (required).
@@ -130,6 +132,9 @@ export function parseArgs(argv) {
             case "--fresh-file":
                 opts.freshFile = true;
                 break;
+            case "--save-delay-ms":
+                opts.saveDelayMs = Number(next());
+                break;
             case "--help":
             case "-h":
                 opts.help = true;
@@ -152,6 +157,9 @@ export function parseArgs(argv) {
     }
     if (!(Number.isFinite(opts.intervalMs) && opts.intervalMs >= 500)) {
         throw new Error("--interval-ms must be at least 500");
+    }
+    if (!(Number.isFinite(opts.saveDelayMs) && opts.saveDelayMs >= 0)) {
+        throw new Error("--save-delay-ms must be zero or more");
     }
     return opts;
 }
@@ -381,7 +389,17 @@ async function login(page, opts, password) {
     await email.fill(opts.email);
     await passwordInput.fill(password);
     await page.locator('button[type="submit"]').first().click();
-    await page.waitForFunction(() => !location.hash.startsWith("#/auth"), null, { timeout: 120000 });
+    // The frontend may route by hash (`#/dashboard/...`) or by query (`?screen=dashboard-recent`).
+    await page.waitForFunction(
+        () => {
+            const hashOk = location.hash !== "" && !location.hash.startsWith("#/auth");
+            const screen = new URLSearchParams(location.search).get("screen");
+            const queryOk = !!screen && !screen.startsWith("auth");
+            return hashOk || queryOk;
+        },
+        null,
+        { timeout: 120000 }
+    );
 }
 
 function workspaceUrl(opts, vars) {
@@ -492,6 +510,7 @@ export async function runHumanTab(input, hooks = {}) {
         options: {
             minutes: opts.minutes,
             intervalMs: opts.intervalMs,
+            saveDelayMs: opts.saveDelayMs,
             frontend: opts.frontend,
             mcp: opts.mcp,
             fileId: vars.fileId,
@@ -533,6 +552,18 @@ export async function runHumanTab(input, hooks = {}) {
     try {
         const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
         const page = await context.newPage();
+
+        // The server answers at once; only the tab waits.
+        if (opts.saveDelayMs > 0) {
+            await page.route(
+                (url) => isSaveUrl(url.href),
+                async (route) => {
+                    const response = await route.fetch();
+                    await new Promise((resolve) => setTimeout(resolve, opts.saveDelayMs));
+                    await route.fulfill({ response });
+                }
+            );
+        }
 
         // Websocket frames come through the DevTools protocol of the context, so they are seen from the first
         // request on (a page-level listener missed the notifications socket).
