@@ -178,6 +178,52 @@ Not fixed in this round: R2-08 (queue limit), R2-13 (snapshot cost; the operatio
   `penpot_rpc_climit_rejected_total{name="mcp-apply/by-profile",reason="queue-full"}` counted 6.
 - Not re-run: the load scenarios. These changes alter no limit and no save path timing.
 
+#### F2-20: full C8 run against the shared export cap (2026-11-09)
+
+The full C8 scenario, 3 minutes, on the round-2 stack rebuilt for the run: Redis, two host adapters (4406 and 4407)
+with `PENPOT_MCP_EXPORT_TOTAL_PERMITS=4`, nginx in front, and Prometheus with `deploy/alerts.yml` unchanged.
+10 exporters with one token each and 3 readers, at commit c07e1083e4. Record:
+`mcp/packages/loadtest/results/2026-11-09-f2-20-c8-shared-cap/` (`run-notes.md`, `permit-report.txt`).
+
+- Exports: 141 calls, 133 rendered, 8 refused as busy (5.7 %). No exporter timeout and no 60 s render timeout.
+  0.71 exports a second, against 0.51 in round 2 without the shared cap.
+- Call time, wait and render together (nearest-rank; under 200 samples, so p95 is a rough figure):
+
+  | Adapter | Calls | Busy | p50 | p95 | max |
+  |---|---|---|---|---|---|
+  | 4406 | 71 | 2 | 10.7 s | 31.1 s | 34.7 s |
+  | 4407 | 70 | 6 | 11.9 s | 30.1 s | 33.5 s |
+  | both | 141 | 8 | 11.5 s | 30.1 s | 34.7 s |
+
+- Render time, measured as the time each permit was held (Redis MONITOR log): 133 permits taken, 133 given back;
+  p50 5.5 s, p95 6.9 s, max 7.5 s.
+- The 30 s wait: 8 calls ended with "export is busy, retry later", seven after 30 s and one after 24.7 s (what was
+  left of its 30 s after the process gate). 6 more calls took 30 to 35 s: a wait of 23 s or more, then the render.
+  With 5.5 s renders on four slots, callers served in arrival order would wait about 8 s. The shared permit has no
+  queue: each waiter asks Redis again every 20 to 250 ms (2,579 refused requests in the run) and the first to ask
+  after a release gets the permit. That is the likely cause of the long waits; this run did not isolate it.
+- Permit count, sampled every 250 ms (852 samples): 4 in 702 samples, 3 in 14, 2 in 1, 1 in 6, and 0 in 129 (before
+  the first take and after the last release). Never above 4. Four permits were held for 183 of the 188 s between the
+  first take and the last release. The set was empty at the last release and stayed empty.
+- Lease: holds. The longest hold was 7.5 s, 12 % of the 65 s lease. No permit expired while held, so no render
+  exceeded the lease. The longest call took 34.7 s of the 60 s call limit, so no call reached the deadline that the
+  lease is sized for. No change.
+- Alerts: the 15 rules loaded; none was pending or firing during the run.
+  - `PenpotMcpExportPermitFallback` would not fire. The fallback counter stayed at 0 on both adapters, and Redis
+    answered all 2,712 permit requests.
+  - Export latency: `alerts.yml` has no export latency rule. Its one latency rule covers the write tools, and the
+    adapter's duration histogram has no tool label, so there is no threshold to tune. A full export cap raises no
+    alert: four permits were held for 97 % of the run and 5.7 % of the calls were refused.
+  - Other rules, peak against threshold: event-loop lag p99 53 ms against 200 ms; adapter resident memory 647 MiB
+    against 1.5 GiB; pool pending 0; concurrency-limit rejections 0. No change to the thresholds.
+  - Adapter memory rose from 141 and 189 MiB at the start of the run to 566 and 647 MiB at its end. Three minutes
+    do not show whether it levels off.
+- Readers: 11,438 calls, of which the per-token rate limit (10 a second) refused 6,051. The fixture's readers run
+  with no pacing, and reads were faster than in round 2. The 5,387 reads that ran: page tree p95 135 ms, find p95
+  56 ms (round 2: 297 and 128 ms).
+- Verdict: the 65 s lease and the alert thresholds stand, and nothing was changed. Two gaps are left for later: no
+  alert on a full export cap, and no arrival order among callers that wait for the shared permit.
+
 ### Checks after the fixes (2026-11-08, evening)
 
 - Backend restarted with the metrics fixes. `/metrics` answers `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
@@ -269,10 +315,11 @@ Still open:
 - R2-08: the queue limit stands (about 54 writers per team), the refusal now names the limit, and the guide gives the sizing rule.
 - R2-13: snapshot cost on 100k-shape files. Pre-existing.
 - R2-15: the second-direction drop is fixed; the stall (saves one per 60-80 s under 5 s saves, five agents on the file) is open and not profiled; it is pre-existing and only seen with the artificial delay.
-- Fable notes not acted on: F2-20 (the lease and the alert thresholds were checked in one 90 s export run, not in a full 3 min C8 run on the round-2 stack).
+- F2-20 is closed: the full 3 min C8 run measured the lease and the alert thresholds (see "F2-20" above). It left two gaps: no alert on a full export cap, and no arrival order among callers that wait for the shared export permit (8 of 141 calls refused as busy with ten exporters on four slots).
 
 Recommended next:
 
 - Profile the frontend rebase cost under slow saves (R2-15: `apply-changes-localy` and `update-indexes` run for every pending commit on every remote frame).
 - Decide the snapshot policy for large files (R2-13: a lower `auto-file-snapshot-every` for agent writes, or a snapshot taken off the save path, is a product decision).
-- Run the full 3 min C8 export scenario on the round-2 stack with the shared cap to measure the lease and alert thresholds (F2-20).
+- Add an alert for a full export cap. It needs a metric first: a count of busy export refusals, or the permits held, on the adapter's /metrics (F2-20).
+- Serve callers that wait for the shared export permit in arrival order, or state the busy rate in the operations guide (F2-20).
