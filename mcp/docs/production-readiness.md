@@ -172,6 +172,10 @@ Not fixed in this round: R2-08 (queue limit), R2-13 (snapshot cost; the operatio
   being dropped (`transforms.cljs`, `nudge-selected-shapes`; unit tests cover two directions and mixed step sizes).
   The stall under 5 s saves is still open and not profiled.
 - F2-19: the MCP write test checks that no after-commit callback failed.
+- Live check of R2-08 on the restarted dev backend: twelve writes at once from one token to twelve files, through
+  the adapter. Six committed (one running, five queued) and six answered `Backend error capacity-limit-reached:
+  concurrency limit mcp-apply/by-profile reached (queue-full), retry later`.
+  `penpot_rpc_climit_rejected_total{name="mcp-apply/by-profile",reason="queue-full"}` counted 6.
 - Not re-run: the load scenarios. These changes alter no limit and no save path timing.
 
 ### Checks after the fixes (2026-11-08, evening)
