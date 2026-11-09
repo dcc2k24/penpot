@@ -180,6 +180,10 @@ Rules behind the values:
 - Backend concurrency. The `climit` permits live in each backend process (`rpc/climit.clj`), so the total for the
   deployment is the per-process permits times the number of backends. The MCP permits per process are listed in
   section 6.
+- Team write queue. The by-team limit (`mcp-apply/by-team`) admits its permits and its queue callers at once:
+  4 + 50 = 54 with the shipped `climit.edn`. The 55th concurrent call is refused, and the body names
+  `mcp-apply/by-team`. Raise the `:queue` of `:mcp-apply/by-team` in the production climit file when one team runs
+  more agents than that. Watch `penpot_rpc_climit_waiting` for that limit before you raise `:permits`.
 - Postgres pool. No default is set in the code (`database-max-pool-size` in `config.clj` has no default). The pool
   should cover the MCP calls that can run at once, plus the editor. Round 2 found the pool of 8 and the CPU as the
   limit, at about 42 writes a second on that host.
@@ -336,11 +340,11 @@ There are two layers of limits. The adapter limits each token. The backend limit
 | Adapter, per token | 10 calls a second, burst 20 (`PENPOT_MCP_RATE_LIMIT_*`). Shared through Redis when set. | `rate limited, retry after N s` | Wait N seconds |
 | Backend reads, per profile | Bucket of 1200, refill 600 a minute (10 a second). `rlimit` `:mcp-read` (`backend/resources/rlimit.edn`). | `Backend error request-blocked: rate limit reached` (HTTP 429) | Back off, then retry |
 | Backend writes, per profile | Bucket of 600, refill 300 a minute (5 a second). `rlimit` `:mcp-write` (`backend/resources/rlimit.edn`) | Same as above | Back off. Retry a write with the same `requestId`. |
-| Backend reads per profile, in flight | 4 at once, queue 20, 30 s (`:mcp-read/by-profile`) | HTTP 429 (see the note below the table) | Retry later |
+| Backend reads per profile, in flight | 4 at once, queue 20, 30 s (`:mcp-read/by-profile`) | HTTP 429 naming the limit (see the note below the table) | Retry later |
 | Backend reads, all profiles, per process | 8 at once, queue 64, 30 s (`:mcp-read/global`) | Same | Retry later |
 | `find_shapes`, per file, per process | 2 at once, queue 10, 30 s (`:mcp-find/by-file`) | Same | Retry later |
 | Writes, per profile, per process | 1 at once, queue 5, 60 s (`:mcp-apply/by-profile`) and 1 for `update-file` (`:mcp-update-file/by-profile`) | Same | Retry later |
-| Writes, per team, per process | 4 at once, queue 50, 60 s (`:mcp-apply/by-team`) | HTTP 429. The adapter shows `Backend error HTTP 429: no details were returned`. | Retry later |
+| Writes, per team, per process | 4 at once, queue 50, 60 s (`:mcp-apply/by-team`) | HTTP 429 with the limit in the body. The adapter shows `Backend error capacity-limit-reached: concurrency limit mcp-apply/by-team reached (queue-full), retry later`. | Retry later |
 | Writes, all profiles, per process | 6 at once, queue 50, 60 s (`:mcp-apply/global`) | Same | Retry later |
 | File lock | 15 s wait for the file lock | `mcp-file-busy` (HTTP 409) | Re-read `revn`, then retry with the same `requestId` |
 | Row or project lock | 15 s | `mcp-lock-timeout` (HTTP 409) | Retry later |
@@ -353,10 +357,13 @@ There are two layers of limits. The adapter limits each token. The backend limit
 | Sandbox | CPU 3 s, wall 120 s, 1000 host calls, 20 calls at once per process (`PENPOT_MCP_SANDBOX_MAX_CONCURRENT`), 16 MB of page data, 8 MB of `storage` | Interrupted, refused or capped, with a message that names the limit | Split the work. Use `storage` for state that must survive a call. |
 | Export renders | One per token. Four per process. With Redis, four across all adapters on it (`PENPOT_MCP_EXPORT_TOTAL_PERMITS`). | A call waits up to 30 s for a slot, then answers `export is busy, retry later`. A render over 60 s fails. | Retry the export later |
 
-The concurrency limits answer HTTP 429 with no error code in the body (`http/errors.clj`, `:concurrency-limit`).
+The concurrency limits answer HTTP 429 with a body whose `type` is `concurrency-limit` and whose `code` is
+`capacity-limit-reached`. The body names the `limit` (for example `mcp-apply/by-team`) and the `reason`
+(`queue-full` or `timeout`). The `hint` repeats both in a sentence (`http/errors.clj`, `:concurrency-limit`).
 The backend logs and counts each refusal as `capacity-limit-reached`, with the limit name (`rpc/climit.clj`). The
 alert `PenpotMcpClimitRejected` keys on `penpot_rpc_climit_rejected_total{name=~".*mcp.*"}`, so match the limit name
-(for example `mcp-apply/by-team`) to tell the layers apart.
+(for example `mcp-apply/by-team`) to tell the layers apart. The frontend retries a save refused this way; a
+frontend older than 2026-11-09 retried only a 429 with no body, so deploy the frontend with or before the backend.
 
 Rules for the agent (put them in the agent's instructions):
 

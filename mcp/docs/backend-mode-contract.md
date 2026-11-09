@@ -434,7 +434,7 @@ HTTP status follows the error type (`app.http.errors`):
 | `validation` | 400 | input and operation errors. `vern-conflict` is 409 and `request-body-too-large` is 413. |
 | `not-found` | 404 | |
 | `conflict` | 409 | the caller's state against the stored one: a stale `revn`, a busy lock. Not logged as a server fault. The reply is the error data without `state`, `path` and `context`, with `type` set to `conflict`. |
-| `rate-limit`, `concurrency-limit` | 429 | |
+| `rate-limit`, `concurrency-limit` | 429 | `concurrency-limit` carries `code` `capacity-limit-reached`, `limit` (the limit name, for example `mcp-apply/by-team`), `reason` (`queue-full` or `timeout`) and a `hint` that repeats them. |
 | `internal` | 500 | the reply has `type` `server-error`. |
 
 Codes raised by the MCP code, with type and location in the code:

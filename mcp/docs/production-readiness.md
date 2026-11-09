@@ -161,6 +161,19 @@ Changed after the runs. The runs were not repeated for these changes.
 
 Not fixed in this round: R2-08 (queue limit), R2-13 (snapshot cost; the operations guide now states it).
 
+### Fixes after the C3 re-run (2026-11-09)
+
+- R2-08: the refusal names its limit and reason in the 429 body (`type` `concurrency-limit`, `code`
+  `capacity-limit-reached`, `limit`, `reason`, and a `hint`), so an agent sees `concurrency limit mcp-apply/by-team
+  reached (queue-full), retry later` instead of `HTTP 429: no details were returned`. The frontend retries a save
+  refused this way. The operations guide states the sizing rule: permits plus queue writers per team, 54 with the
+  shipped file. The queue size itself is unchanged.
+- R2-15, in part: a keyboard nudge in a second direction while a nudge gesture is open joins the gesture instead of
+  being dropped (`transforms.cljs`, `nudge-selected-shapes`; unit tests cover two directions and mixed step sizes).
+  The stall under 5 s saves is still open and not profiled.
+- F2-19: the MCP write test checks that no after-commit callback failed.
+- Not re-run: the load scenarios. These changes alter no limit and no save path timing.
+
 ### Checks after the fixes (2026-11-08, evening)
 
 - Backend restarted with the metrics fixes. `/metrics` answers `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
@@ -249,7 +262,13 @@ The stack will be torn down at the end of the session. This list is the record o
 
 Still open:
 
-- R2-08: the queue limit. The by-team queue of 50 holds about 54 concurrent writers per team; above that the backend refuses calls.
+- R2-08: the queue limit stands (about 54 writers per team), the refusal now names the limit, and the guide gives the sizing rule.
 - R2-13: snapshot cost on 100k-shape files. Pre-existing.
-- R2-15: the tab stalls under 5 s saves with five agents on the file (saves one per 60-80 s, presses in a second direction dropped by the open nudge gesture). Pre-existing: the stock 2.18 frontend stalls the same way. Seen only with the artificial 5 s save delay.
-- Fable notes not acted on: F2-19 (after-commit callbacks swallow errors) and F2-20 (the lease and the alert thresholds were checked in one 90 s export run, not in a full 3 min C8 run).
+- R2-15: the second-direction drop is fixed; the stall (saves one per 60-80 s under 5 s saves, five agents on the file) is open and not profiled; it is pre-existing and only seen with the artificial delay.
+- Fable notes not acted on: F2-20 (the lease and the alert thresholds were checked in one 90 s export run, not in a full 3 min C8 run on the round-2 stack).
+
+Recommended next:
+
+- Profile the frontend rebase cost under slow saves (R2-15: `apply-changes-localy` and `update-indexes` run for every pending commit on every remote frame).
+- Decide the snapshot policy for large files (R2-13: a lower `auto-file-snapshot-every` for agent writes, or a snapshot taken off the save path, is a product decision).
+- Run the full 3 min C8 export scenario on the round-2 stack with the shared cap to measure the lease and alert thresholds (F2-20).
