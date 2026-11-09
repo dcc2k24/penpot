@@ -102,9 +102,15 @@
 
 (defmethod handle-error :concurrency-limit
   [err _ _]
-  (let [headers (-> err ex-data ::http/headers)]
-    {::yres/status 429
-     ::yres/headers headers}))
+  (let [data    (ex-data err)
+        headers (::http/headers data)]
+    {::yres/status  429
+     ::yres/headers headers
+     ::yres/body    {:type   :concurrency-limit
+                     :code   (:code data)
+                     :hint   (:hint data)
+                     :limit  (:limit data)
+                     :reason (:reason data)}}))
 
 (defmethod handle-error :validation
   [err request parent-cause]

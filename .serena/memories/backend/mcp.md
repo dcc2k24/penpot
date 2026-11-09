@@ -81,7 +81,7 @@ Allow-token-types `mcp` (product commands; still behind the flag):
 - Concurrency (`backend/resources/climit.edn`, `app.rpc.climit`):
   - `:mcp-apply/by-profile` 1 permit, queue 5, timeout 60 s.
   - `:mcp-apply/global` 6 permits, queue 50, timeout 60 s.
-  - `:mcp-apply/by-team` 4 permits, queue 50, timeout 60 s. Refusals name the limit in the `climit` metric.
+  - `:mcp-apply/by-team` 4 permits, queue 50, timeout 60 s. Refusals name the limit in the `climit` metric and in the 429 body (`type` `concurrency-limit`, `code` `capacity-limit-reached`, `limit`, `reason`, hint). The frontend retries a save refused this way (`persistence/busy-server-error?`).
   - `:mcp-update-file/by-profile` 1 permit, queue 5, timeout 60 s. A write never holds the owner's own save slot.
   - `:mcp-read/by-profile` 4 permits, queue 20, timeout 30 s.
   - `:mcp-read/global` 8 permits, queue 64, timeout 30 s.

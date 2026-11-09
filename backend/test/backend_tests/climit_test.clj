@@ -57,6 +57,14 @@
     (catch Throwable cause
       (:type (ex-data cause)))))
 
+(defn- failed-data
+  "Run `f` and return its value, or the ex-data of the error it raised."
+  [f]
+  (try
+    (f)
+    (catch Throwable cause
+      (ex-data cause))))
+
 (def ^:private no-timeout-hint
   "limiter without timeout, a saturated one parks its threads forever")
 
@@ -358,6 +366,10 @@
            (t/is (true? (wait-until #(= 1 (waiting-last name)) 5000)))
            (t/is (= :concurrency-limit (failed-type #(invoke! cfg (fn [_ _] :extra) {}))))
            (t/is (= [[name "queue-full"]] (rejections)))
+           (let [data (failed-data #(invoke! cfg (fn [_ _] :extra) {}))]
+             (t/is (= name (:limit data)))
+             (t/is (= "queue-full" (:reason data)))
+             (t/is (= :capacity-limit-reached (:code data))))
 
            (deliver gate true)
            (t/is (= :held (deref holder 5000 :timeout)))
@@ -377,6 +389,10 @@
          (reset! calls [])
          (t/is (= :concurrency-limit (failed-type #(invoke! cfg (fn [_ _] :late) {}))))
          (t/is (= [[name "timeout"]] (rejections)))
+         (let [data (failed-data #(invoke! cfg (fn [_ _] :late-again) {}))]
+           (t/is (= name (:limit data)))
+           (t/is (= "timeout" (:reason data)))
+           (t/is (= :capacity-limit-reached (:code data))))
 
          (deliver gate true)
          (t/is (= :held (deref holder 5000 :timeout))))))))

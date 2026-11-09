@@ -59,6 +59,25 @@
     (t/is (= "120" (get headers "x-rate-limit-reset")))
     (t/is (= "120" (get headers "retry-after")))))
 
+(t/deftest concurrency-limit-answers-429-with-the-limit-in-the-body
+  (let [cause    (ex-info "concurrency limit reached"
+                          {:type :concurrency-limit
+                           :code :capacity-limit-reached
+                           :hint "concurrency limit mcp-apply/by-team reached (queue-full), retry later"
+                           :limit "mcp-apply/by-team"
+                           :reason "queue-full"
+                           ::http/headers {"x-test" "1"}})
+        response (http-errors/handle cause {})
+        headers  (::yres/headers response)
+        body     (::yres/body response)]
+    (t/is (= 429 (::yres/status response)))
+    (t/is (= "1" (get headers "x-test")))
+    (t/is (= :concurrency-limit (:type body)))
+    (t/is (= :capacity-limit-reached (:code body)))
+    (t/is (= "concurrency limit mcp-apply/by-team reached (queue-full), retry later" (:hint body)))
+    (t/is (= "mcp-apply/by-team" (:limit body)))
+    (t/is (= "queue-full" (:reason body)))))
+
 (t/deftest rate-limit-without-ttl-has-no-retry-after
   (let [cause    (ex-info "rate limit reached"
                           {:type :rate-limit

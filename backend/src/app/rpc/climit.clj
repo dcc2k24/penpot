@@ -289,7 +289,9 @@
               (log limit "rejected" req-id stats elapsed code reason)
               (ex/raise :type :concurrency-limit
                         :code code
-                        :hint "concurrency limit reached"
+                        :hint (str "concurrency limit " limit-name " reached (" reason "), retry later")
+                        :limit limit-name
+                        :reason reason
                         :cause cause))
             (throw cause))))
 

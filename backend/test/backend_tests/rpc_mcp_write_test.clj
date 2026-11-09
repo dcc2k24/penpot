@@ -7,6 +7,7 @@
 (ns backend-tests.rpc-mcp-write-test
   (:require
    [app.common.json :as json]
+   [app.common.logging :as l]
    [app.common.time :as ct]
    [app.common.types.shape :as cts]
    [app.common.uuid :as uuid]
@@ -822,6 +823,37 @@
     (let [fresh (project-modified-at project-id)]
       (t/is (nil? (:error (write!))))
       (t/is (= fresh (project-modified-at project-id))))))
+
+(t/deftest write-logs-no-failed-after-commit-callback
+  ;; A failing after-commit callback is only logged, so the write still
+  ;; answers ok. Log records reach the watcher on a single-thread executor:
+  ;; a sentinel record is logged after the write and waited for. Once the
+  ;; sentinel has arrived, every earlier record has arrived too.
+  (let [records (atom [])]
+    (add-watch l/log-record ::capture
+               (fn [_ _ _ record] (swap! records conj record)))
+    (try
+      (let [{:keys [profile file-id page-id]} (create-fixture)
+            project-id (:default-project-id profile)
+            hint-of    (fn [record] (get (::l/props record) :hint))
+            sentinel?  (fn []
+                         (some #(= "after-commit log check" (hint-of %)) @records))]
+        (th/db-exec-one! ["UPDATE project SET modified_at = now() - interval '10 seconds' WHERE id = ?"
+                          project-id])
+        (t/is (nil? (:error (call! profile :mcp-apply-changes
+                                   {:file-id file-id
+                                    :changes [(add-frame page-id (uuid/next))]}))))
+        (l/wrn :hint "after-commit log check")
+        (let [deadline (+ (System/currentTimeMillis) 5000)]
+          (t/is (true? (loop []
+                         (cond
+                           (sentinel?) true
+                           (> (System/currentTimeMillis) deadline) false
+                           :else (do (Thread/sleep 10) (recur)))))))
+        (t/is (empty? (filter #(= "after-commit callback failed" (hint-of %))
+                              @records))))
+      (finally
+        (remove-watch l/log-record ::capture)))))
 
 (t/deftest project-touch-never-moves-the-stamp-backwards
   ;; The touch takes the stamp of the call's start. A call that started
