@@ -117,6 +117,8 @@ Limits and timeouts:
 | `PENPOT_MCP_MAX_BODY_MB` | `32` | Request body cap after the token check. Before it, 4 MB (contract 4.8). |
 | `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` | `4` in backend mode | Exports that run at once in one process. `0` means no limit. |
 | `PENPOT_MCP_EXPORT_TOTAL_PERMITS` | `4` | Renders that run at once across all adapters that share `PENPOT_MCP_REDIS_URI`. Each permit lasts at most 65 s. If Redis fails, each process uses its own cap. |
+| `PENPOT_MCP_EXPORT_BATCH_SIZE` | `10` | Shapes that one exporter request renders in a `shapeIds` batch, from 1 to 50. Each batch takes one render permit. |
+| `PENPOT_MCP_EXPORT_CACHE_MB` | `64` | Memory of the render cache in each adapter process, in MB, from 0 to 4096. The cache holds the image bytes, so it sits near this size once full. `0` turns it off. |
 | `PENPOT_MCP_TOKEN_CACHE_S` | `60` | How long a good token check is reused |
 | `PENPOT_MCP_ALLOW_QUERY_TOKEN` | `false` in backend mode | Accepts the token in the URL. Keep it `false` (section 7). |
 
@@ -345,7 +347,8 @@ There are two layers of limits. The adapter limits each token. The backend limit
 | Backend writes, per profile | Bucket of 600, refill 300 a minute (5 a second). `rlimit` `:mcp-write` (`backend/resources/rlimit.edn`) | Same as above | Back off. Retry a write with the same `requestId`. |
 | Backend reads per profile, in flight | 4 at once, queue 20, 30 s (`:mcp-read/by-profile`) | HTTP 429 naming the limit (see the note below the table) | Retry later |
 | Backend reads, all profiles, per process | 8 at once, queue 64, 30 s (`:mcp-read/global`) | Same | Retry later |
-| `find_shapes`, per file, per process | 2 at once, queue 10, 30 s (`:mcp-find/by-file`) | Same | Retry later |
+| Scans per file, per process: `find_shapes`, `find_connectors`, `list_fonts`, `lint_page`, `find_similar_boards` | 2 at once, queue 10, 30 s (`:mcp-find/by-file`) | Same | Retry later |
+| `export_subtree`, `get_interactions`, `get_shapes` and the other reads | The read limits above. The six new reads use the same `:mcp-read` bucket as the other reads. | Same | Retry later |
 | Writes, per profile, per process | 1 at once, queue 5, 60 s (`:mcp-apply/by-profile`) and 1 for `update-file` (`:mcp-update-file/by-profile`) | Same | Retry later |
 | Writes, per team, per process | 4 at once, queue 50, 60 s (`:mcp-apply/by-team`) | HTTP 429 with the limit in the body. The adapter shows `Backend error capacity-limit-reached: concurrency limit mcp-apply/by-team reached (queue-full), retry later`. | Retry later |
 | Writes, all profiles, per process | 6 at once, queue 50, 60 s (`:mcp-apply/global`) | Same | Retry later |
@@ -359,6 +362,19 @@ There are two layers of limits. The adapter limits each token. The backend limit
 | Client tokens per profile | 20 (`mcp-client-limit`) | `mcp-client-limit` (restriction). An OAuth approval answers `access_denied`. | Revoke a client token |
 | Sandbox | CPU 3 s, wall 120 s, 1000 host calls, 20 calls at once per process (`PENPOT_MCP_SANDBOX_MAX_CONCURRENT`), 16 MB of page data, 8 MB of `storage` | Interrupted, refused or capped, with a message that names the limit | Split the work. Use `storage` for state that must survive a call. |
 | Export renders | One per token. Four per process. With Redis, four across all adapters on it (`PENPOT_MCP_EXPORT_TOTAL_PERMITS`). | A call waits up to 30 s for a slot. With Redis, waiting calls get slots in arrival order. Then it answers `export is busy, retry later`. A render over 60 s fails. | Retry the export later |
+| Export batch | 200 shapes per call (`shapeIds`). The ids go to the exporter in chunks of `PENPOT_MCP_EXPORT_BATCH_SIZE` (default 10, from 1 to 50), one render permit for each chunk. | A shape that fails is listed under `failed` and does not stop the others. | Export the failed shapes again |
+| Export call budget | 10 minutes per call. Past it, the call starts no more renders. | The shapes left are listed as not rendered: `the call ran out of time; call again, the shapes already rendered are cached.` | Call again. The rendered shapes come from the cache. |
+| Export batch refusal | An exporter that answers a batch with a 5xx, or a ZIP that does not map back to the shapes, gets one shape per request for 10 minutes in that process. This applies when the single renders of that chunk all succeed. | None. The call goes on one shape at a time. | None |
+| Export retry | A single render that answers 5xx is tried once more after 500 ms. A 4xx answer is not retried. | The shape's error, for example the exporter's 4xx text | Fix the call, or retry later |
+| Export cache | `PENPOT_MCP_EXPORT_CACHE_MB` (64 MB by default) for each adapter process, 15 minutes for each render. A render is not kept when a font of it did not resolve, or when the font check failed or ran past 3 s. | None. A cached shape is not rendered again. | `refresh: true` renders it again. |
+
+Export answers name the cause in text. These are the texts a client may see:
+
+- `export is busy, retry later; shapes already rendered are cached.` The render slots are full and the call stops.
+- `the call was cancelled; shapes already rendered are cached.` The client went away.
+- `the inline total reached the 8 MB limit; pass outputDir to save every shape, or ask for fewer shapes.` Images that do not fit inline are listed as not returned.
+- `an earlier shape failed, so the shapes after it were not rendered.` Only a `shapeId: "page"` export stops at a failed shape.
+- `Font warning: these fonts did not resolve, so the render used a fallback font: ...` The reply names each font with its reason. Run `list_fonts` to see it.
 
 The concurrency limits answer HTTP 429 with a body whose `type` is `concurrency-limit` and whose `code` is
 `capacity-limit-reached`. The body names the `limit` (for example `mcp-apply/by-team`) and the `reason`

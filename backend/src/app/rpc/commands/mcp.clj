@@ -43,6 +43,7 @@
    [app.rpc.commands.profile :as profile]
    [app.rpc.doc :as-alias doc]
    [app.rpc.helpers :as rph]
+   [app.rpc.mcp-fonts :as mcp-fonts]
    [app.rpc.mcp-scope :as mcp-scope]
    [app.tokens :as tokens]
    [app.util.cache :as cache]
@@ -583,7 +584,15 @@
 (sv/defmethod ::get-mcp-file-outline
   "Summary of a file: pages with their shape counts, libraries, library
   contents counts, tokens summary and the pointer-map flag. Page
-  summaries are cached until their page changes."
+  summaries are cached until their page changes.
+
+  `warnings` lists the fonts that do not resolve, per page (at most 50;
+  `warnings-truncated` says when more exist). The warnings cover the pages
+  that the call could read within one second, and a page above 5,000 shapes
+  only when `get-mcp-fonts` has read it before. `warnings-complete` false means
+  that some pages are not covered, so the warnings may be short. Call
+  `get-mcp-fonts` for the complete font report: it reads every page, and its
+  reads fill the cache for the next outline."
   {::rpc/token-type "mcp"
    ::rpc/mcp-scope "mcp:read"
    ::climit/id [[:mcp-read/by-profile ::rpc/profile-id] [:mcp-read/global]]
@@ -601,7 +610,19 @@
                     lib    (cfo/get-tokens-lib data)
                     status (or (cfo/get-tokens-status data)
                                (ctos/make-tokens-status))
-                    pages  (page-summaries cfg file-id (:vern file) revn data)]
+                    pages  (page-summaries cfg file-id (:vern file) revn data)
+                    ctx    (mcp-fonts/get-font-context cfg (:team-id file))
+                    scan   (mcp-fonts/get-pages-usage
+                            {:pages (mapv (fn [{page-id :id shape-count :shape-count}]
+                                            {:id page-id
+                                             :shape-count shape-count
+                                             :key (mcp-fonts/get-page-key file-id (:vern file) revn data page-id)})
+                                          pages)
+                             :load-objects (fn [page-id]
+                                             (:objects (get-page-data cfg file-id revn data page-id)))
+                             :budget-ns mcp-fonts/outline-budget-ns
+                             :max-shapes mcp-fonts/outline-max-shapes})
+                    warnings (mcp-fonts/get-outline-warnings ctx (:page-usages scan))]
                 [{:id file-id
                   :name (:name file)
                   :revn revn
@@ -613,6 +634,9 @@
                   :is-shared (:is-shared file)
                   :modified-at (:modified-at file)
                   :pages pages
+                  :warnings (vec (take 50 warnings))
+                  :warnings-truncated (> (count warnings) 50)
+                  :warnings-complete (:complete scan)
                   :libraries (mapv #(select-keys % [:id :name])
                                    (bfc/get-file-libraries cfg file-id))
                   :components (count (ctkl/components-seq data))
@@ -1004,7 +1028,7 @@
         (concat (paint-colors data (:fills shape) :fill-color :fill-color-ref-id)
                 (paint-colors data (:strokes shape) :stroke-color :stroke-color-ref-id))))
 
-(defn- deadline-chars
+(defn deadline-chars
   "A `CharSequence` over `text` whose `charAt` throws once `deadline`
   (nanoTime) has passed, so a regex run over it cannot outlive the
   search budget."
@@ -1021,7 +1045,7 @@
     (toString [_]
       text)))
 
-(defn- regex-timeout?
+(defn regex-timeout?
   [cause]
   (boolean (::deadline (ex-data cause))))
 

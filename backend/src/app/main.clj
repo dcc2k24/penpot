@@ -66,7 +66,13 @@
    "find-mcp-shapes"
    "get-mcp-library"
    "get-mcp-tokens"
-   "create-mcp-render-session"])
+   "create-mcp-render-session"
+   "get-mcp-subtree"
+   "get-mcp-interactions"
+   "find-mcp-connectors"
+   "get-mcp-fonts"
+   "get-mcp-page-lint"
+   "find-mcp-similar-boards"])
 
 (def ^:private mcp-write-tool-names
   ["mcp-apply-changes"

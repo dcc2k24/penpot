@@ -24,6 +24,10 @@ Token rules, including the one-token-per-OAuth-client rules: `mem:backend/auth-p
 
 Token-type `mcp` (MCP-only):
 - `mcp-whoami`, `get-mcp-file-outline`, `get-mcp-page-tree`, `get-mcp-shapes`, `find-mcp-shapes`, `get-mcp-library`, `get-mcp-tokens`, `create-mcp-render-session`: `mcp:read`. Module `app.rpc.commands.mcp`.
+- `get-mcp-subtree`: `mcp:read`. Module `app.rpc.commands.mcp-subtree`.
+- `get-mcp-interactions`, `find-mcp-connectors`: `mcp:read`. Module `app.rpc.commands.mcp-prototype`.
+- `get-mcp-fonts`: `mcp:read`. Module `app.rpc.commands.mcp-fonts`. Logic in `app.rpc.mcp-fonts`: pure, no require of `app.rpc.commands.mcp` (`mcp.clj` calls it for the outline warnings).
+- `get-mcp-page-lint`, `find-mcp-similar-boards`: `mcp:read`. Module `app.rpc.commands.mcp-lint`.
 - `mcp-apply-changes`, `mcp-apply-operations`, `mcp-import-svg`: `mcp:write`, or `mcp:read` for a dry run. Module `app.rpc.commands.mcp-write`.
 - `send-mcp-feedback`: `mcp:read`, `::mcp-bridge`, works with the flag off.
 
@@ -76,6 +80,7 @@ Allow-token-types `mcp` (product commands; still behind the flag):
 
 - Rate limits (`backend/resources/rlimit.edn`, key `<profile-id>.mcp` from `rlimit.clj` `get-uid`; bucket is capacity/refill/interval):
   - `:mcp-read` `1200/600/1m` for the read commands.
+  - The six new reads (`get-mcp-subtree`, `get-mcp-interactions`, `find-mcp-connectors`, `get-mcp-fonts`, `get-mcp-page-lint`, `find-mcp-similar-boards`) are in the `:mcp-read` list of `rlimit.edn`, with the other reads.
   - `:mcp-write` `600/300/1m` for the three write commands.
   - `update-mcp-token-scopes` uses `:access-token` `60/30/1m`.
 - Concurrency (`backend/resources/climit.edn`, `app.rpc.climit`):
@@ -85,7 +90,7 @@ Allow-token-types `mcp` (product commands; still behind the flag):
   - `:mcp-update-file/by-profile` 1 permit, queue 5, timeout 60 s. A write never holds the owner's own save slot.
   - `:mcp-read/by-profile` 4 permits, queue 20, timeout 30 s.
   - `:mcp-read/global` 8 permits, queue 64, timeout 30 s.
-  - `:mcp-find/by-file` 2 permits, queue 10, timeout 30 s (`find-mcp-shapes`).
+  - `:mcp-find/by-file` 2 permits, queue 10, timeout 30 s. Taken by `find-mcp-shapes`, `find-mcp-connectors`, `get-mcp-fonts`, `get-mcp-page-lint`, `find-mcp-similar-boards`. Not by `get-mcp-subtree` or `get-mcp-interactions`.
 - Call size (`mcp_limits.clj`): 2000 items per call (`max-changes`, `max-operations`); payload 8 MB transit; compiled changes capped by `:mcp-max-compiled-changes` (default 100000), checked for dry runs too. A call commits at most 50 batches of 2000 changes (`max-batches`, `notify-changes` in `mcp_write.clj`).
 - SVG: text at most 8 MB (`schema:mcp-import-svg`). Parse failure: `:mcp-invalid-svg`.
 - Tokens: `:mcp-token-max-age` default 90 days (`config.clj`). Applied only when a new MCP token has no explicit expiry (`access_token.clj`). Nil means no expiry.
@@ -101,6 +106,14 @@ Allow-token-types `mcp` (product commands; still behind the flag):
 - Cursors: base64 `[page-id version index root-id depth]`. Version is a pointer id or a revn. Wrong page, root or depth: `:mcp-invalid-cursor`. Version changed: `:mcp-stale-cursor`. Past end: `:mcp-invalid-cursor`.
 - Reply budget: 1,000,000 bytes. A cut reply sets `truncated`; tree walks add `nextCursor`.
 - Search: 5 s budget across pages; timeout sets `truncated`.
+- `get-mcp-subtree`: `limit` 1-5000 (default 500), `max-bytes` 1000-1000000 (default 1 MB). Root default is the page root (`uuid/zero`), skipped in the walk. Pre-order, stored child order, `depth` and `index`. Walk cached per (file, page, version, root) in `walk-cache` (keepalive 10 min, weight = entries, budget 400000). A repeated id is listed once and a missing id is skipped, so a cycle cannot loop. Cursor `[page-id version index root-id 0]`. Missing root: `:shape-not-found`. A window always keeps one shape.
+- `get-mcp-interactions`: `limit` 1-5000 (default 1000), about 1 MB encoded. `flows` sorted by name, then id. `totalInteractions` and `totalShapes` count the whole page. Walk is cycle-safe (`get-walk-entries`). `overlay-position` is a point map `{x, y}`.
+- `find-mcp-connectors`: `max-distance` 0-2000 (default 64), `limit` 1-2000 (default 500), `within-id` (not on page: `:shape-not-found`). Candidates `:path` and `:bool`, shallowest first; skipped when hidden, under a hidden ancestor or under a boolean. Boards use the true bounding box of the points (`shape-rect`). Ends: open path with stroke = first and last point; otherwise `farthest-pair` (three farthest-point passes; its docstring still says two). Sampling 400 points. Cap rule for open paths only. A candidate inside its nearest ancestor frame, with no board in that frame, is skipped (`inside-own-frame?`). `length` = straight distance. 5 s budget (`search-budget-ns`) covers boards and candidates.
+- `get-mcp-fonts`: `root-ids` 1-200, needs `page-id`. Usage cached per page key in `usage-cache` (10 min, weight = fonts, budget 200000); resolution read on every call (`get-font-context`). Without `page-id`: 5 s budget (`scan-budget-ns`), first page always read, `complete` false when cut. Reply at most 500 fonts and within the response budget; `unresolved` counts all fonts. Runs of one face merge under the listed variant id (`get-variant-reports`). Empty text leaves are not runs (`get-text-runs`). Google catalogue `common/resources/fonts/gfonts.2025.11.28.json` via `fonts/load-gfonts` in a `delay`; a read failure is logged once and the index is empty. Reasons: `google-fonts-disabled`, `not-in-google-catalog`, `custom-font-not-in-team`, `unknown-font-id`, `variant-not-found`. A variant of an unresolved font takes the font's reason.
+- `get-mcp-page-lint`: `depth` 1-5 (default 1), `min-shapes` 0-1000 (default 3), `rules` 1-8 of six names, `limit` 1-2000 (default 500), `board-name-regex` max 200 (bad regex: `mcp-invalid-regex`, hint names `board-name-regex`). 5 s budget (`budget-ns`). Boxes are the point bounds (`get-box`). Rest rules use full frame boxes; `show-content` exempts a frame (`clips?`). Scroll rule: `get-scroll-frame` and `reachable?` (nearest scrolling ancestor; outer frames clip its viewport). One finding per control: `inside-selected?` keeps the innermost selected board. Rule order `control-rule-order`. `counts` total all findings (`count-lint-findings`); `findings` cut at `limit`.
+- `find-mcp-similar-boards`: `threshold` 0.5-1 (default 0.9), `min-shapes` 1-1000 (default 3), `limit` 1-500 (default 100). At most 1000 boards (`max-similar-boards`). Tokens: type, component id, collapsed text. Distinct signatures interned and sorted by size; size-ratio pruning in `find-similar-pairs`; deadline checked every 256 pairs (`pair-check-interval`); single link. Result `compared`. 5 s budget.
+- Outline `warnings`: `get-mcp-file-outline` adds `warnings` (at most 50, `warningsTruncated`) and `warningsComplete` (false when pages were left out). One-second budget (`outline-budget-ns`); a page above 5000 shapes (`outline-max-shapes`) is scanned only when its usage is cached. Usage is cached per page in `usage-cache`, not with the page summary; page summaries carry no `:fonts`. `pages` keys do not change.
+- Board `overflow-scroll` (`:none`, `:horizontal`, `:vertical`, `:both`; JSON `overflowScroll`; absent is `:none`): frame attr in `schema:frame-attrs` (`common/types/shape.cljc`). Accepted by `create_board` and `update_shape` props; an invalid value is a validation error. Marks a scroll container only: the viewer does not scroll it. `get-mcp-page-lint` `scroll-hidden-control` reads it: a control hidden at rest that the nearest scrolling ancestor brings into view (`reachable?`). Sandbox reads and writes it (`PropertyMap.ts`).
 
 ## Idempotency
 

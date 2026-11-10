@@ -332,7 +332,13 @@
    :main/find-mcp-shapes
    :main/get-mcp-library
    :main/get-mcp-tokens
-   :main/create-mcp-render-session}
+   :main/create-mcp-render-session
+   :main/get-mcp-subtree
+   :main/get-mcp-interactions
+   :main/find-mcp-connectors
+   :main/get-mcp-fonts
+   :main/get-mcp-page-lint
+   :main/find-mcp-similar-boards}
  [[:mcp-read :bucket "1200/600/1m"]]
 
  #{:main/mcp-apply-changes
