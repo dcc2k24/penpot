@@ -7,6 +7,7 @@
 - `ongoing-tasks` controls `window.onbeforeunload`: any non-empty set blocks tab unload.
 - `app.main.streams/wasm-modifiers` and `workspace-selrect` are behavior subjects used for high-frequency interactive preview state that bypasses normal store updates and lenses.
 - Keyboard modifier streams merge a window blur signal so stuck modifier-key state is cleared after focus loss.
+- `app.util.worker` finds the reply to a request by its sender id in a `js/Map` (`:pending` of the `Worker` record). Do not go back to one `rx/filter` per request on a shared subject: each reply was then tested against every waiting request. The message codec (`app.worker.messages`) does not carry `:dropped`, so a dropped buffered request gets a reply with no payload instead of an empty stream.
 
 ## Repo calls
 
@@ -18,7 +19,7 @@
 ## Commits, undo, persistence
 
 - `commit-changes` refuses to create commits unless `:permissions :can-edit` is true. It captures file revn/vern, selected-before, features, tags, undo group, and translation flag into a `::commit` event. A refusal answers with an empty stream, never nil, so callers subscribe uniformly instead of branching on nil.
-- Applying a remote commit first rolls back pending local commits, applies the remote changes, then replays pending local redo changes. Index updates are emitted for undo, remote redo, and replayed redo paths.
+- Applying a remote commit first rolls back pending local commits, applies the remote changes, then replays pending local redo changes. One `update-indexes` per commit: `get-rebase-changes` lists the pending undo changes (latest commit first), the remote changes and the pending redo changes, and the worker gets one `:index/update` per page. Never one request per pending commit: at nine remote frames a second the worker fell behind by tens of thousands of requests and the tab stalled.
 - Local commits are independently consumed by undo, persistence, WASM model updates, thumbnail/library watchers, and text position-data recalculation.
 - Persistence buffers local commits: status becomes pending after about 200ms, commits are flushed after about 3s or `::force-persist`, and buffered commits are merged per file before `:update-file`.
 - Persistence sends revn as the max of the commit revn and locally tracked latest revn; remote commits update that revn tracker.

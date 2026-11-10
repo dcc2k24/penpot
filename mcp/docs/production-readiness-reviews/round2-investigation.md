@@ -224,6 +224,116 @@ received: 5,383 (fixed build) and 6,245 (stock) against 7,098 with fast saves, s
 with 5 s saves the pending set is never empty. Not measured; needs a profile. Pre-existing, since
 2.18 stalls the same way. Recorded as R2-15 in `production-readiness.md`.
 
+Measured on 2026-11-09 and fixed on 2026-11-10: the candidate cause was wrong. See 'Stall under slow
+saves' below.
+
+### Stall under slow saves: profile and fix (2026-11-09 and 2026-11-10)
+
+**Method.** Headless Chromium runs `mcp/packages/loadtest/scripts/human-tab/run-c3.mjs --fresh-file
+--agents 5 --minutes 8 --baseline-s 60 --save-delay-ms 5000 --frontend http://localhost:9003`. The
+agents start at +60 s. A Node preload, kept outside the repo, takes 30 s CPU profiles of the tab's
+main thread at +75 s, +200 s and +380 s after the first key press. Every 10 s it samples timer lag,
+websocket frames delivered to the page, and requests sent to and answered by the web worker. Two
+runs came before the fix (`before` and `before2`, 2026-11-09, frontend built from commit
+`d42fc19da9`). Three runs came after it (`after`, `after2` and `after3`, 2026-11-10). Result files:
+`mcp/packages/loadtest/results/2026-11-09-r2-15-stall/` (git-ignored, local).
+
+**What the profile shows.** The candidate cause, the rebase, was wrong. `apply-changes-localy` took
+1.1-1.2 % of main-thread time at +75 s and 0.2 % at +380 s. `update-indexes` took under 0.5 %. The
+real cause has two parts.
+
+- For a remote commit with N pending local commits, the `commit` event in
+  `frontend/src/app/main/data/changes.cljs` emitted 2N+1 `update-indexes` events: N for undo, one
+  for the remote change, and N for redo. Each one was an `:index/update` request to the web worker.
+  Run `before2` sent 34,272 such requests for 5,222 remote frames: 5.0 requests a frame while two
+  commits were pending, and up to 14.6 a frame as the save queue grew. The worker answered 60 to 120
+  requests a second, so requests piled up. 218 waited 14 s after the agents started, and 36,049 were
+  waiting at the end of the run. A reply came about 300 s after its request. Snap queries joined the
+  pile (30,310 `:index/query-snap` requests in that run).
+- `frontend/src/app/util/worker.cljs` gave every request its own `rx/filter` on one shared subject,
+  so every worker reply was tested against every waiting request. That handler took 9.0 % (run
+  `before`) and 13.7 % (run `before2`) of the main thread at +75 s, 49.8 % at +200 s, and 65.8 % and
+  66.2 % at +380 s. UUID equality alone was 9.6 % of the samples at +200 s.
+
+Other shares in run `before` at +75 s / +200 s / +380 s: React rendering 44.6 % / 30.1 % / 19.2 %;
+the websocket message handler 19.8 % / 9.8 % / 4.7 %; idle 5.0 % / 0.2 % / 0.1 %.
+
+**Effect.** Timer lag on the main thread reached 21.4 s (run `before`) and 17.3 s (run `before2`).
+There were 36 and 28 saves in the 8 min. The longest gap between two save starts while the agents
+wrote was 65 s and 49 s. The tab received 5,635 and 5,301 `file-change` frames for 7,859 and 8,317
+agent calls (72 % and 64 %). The backend dropped the rest for the slow tab. The agents had 0 errors
+and a p50 of 247 and 237 ms.
+
+**The fix.** The fix was uncommitted at the time of writing, on branch
+`perf/render-wasm-large-files`. In `frontend/src/app/main/data/changes.cljs` there is one
+`update-indexes` per commit. `get-rebase-changes` builds one list: the undo changes of the pending
+commits (latest first), the remote changes, then the redo changes of the pending commits in commit
+order. The worker gets one `:index/update` request per page. `apply-changes-localy` and the file
+data path are unchanged. In `frontend/src/app/util/worker.cljs`, each request waits in a `js/Map`
+keyed by its sender id, and a reply is looked up by `reply-to`. The cost of a reply no longer grows
+with the number of waiting requests. The public functions (`ask!`, `emit!`, `ask-many!`,
+`ask-buffered!`, `init`) are unchanged. Unit tests: 5 in
+`frontend/test/frontend_tests/data/changes_test.cljs` and 6 in
+`frontend/test/frontend_tests/util_worker_test.cljs`. The full frontend suite passed with 1,716
+tests, 6,880 assertions, 0 failures and 0 errors.
+
+**Re-run.** Three runs on 2026-11-10 (`after`, `after2`, `after3`). The frontend was built from
+`9362a12b75` plus the fix. This build also has the nudge fix `2706dfb8ed` and the save retry
+`628365d39f`, which the `before` build did not have.
+
+| | before | before2 | after | after2 | after3 |
+|---|---|---|---|---|---|
+| Agent calls (0 errors in all) | 7,859 | 8,317 | 3,373 | 3,170 | 1,597 |
+| Agent p50, ms | 247 | 237 | 363 | 547 | 1,061 |
+| `file-change` frames the tab received | 5,635 | 5,301 | 3,333 | 3,130 | 1,579 |
+| `:index/update` requests | not counted | 34,272 | 3,429 | 3,208 | 1,675 |
+| Most worker requests waiting | not counted | 36,049 | 23 | 1,069 | 150 |
+| Longest timer lag, s | 21.4 | 17.3 | 2.3 | 8.2 | 4.1 |
+| Saves in 8 min | 36 | 28 | 83 | 63 | 71 |
+| Longest gap between save starts while agents wrote, s | 65 | 49 | 12 | 56 | 16 |
+| Worker reply handler, share of main thread at +75 / +200 / +380 s, % | 9.0 / 49.8 / 65.8 | 13.7 / not taken / 66.2 | 0.6 / 0.4 / 0.7 | 4.0 / 2.6 / 0.9 | 1.3 / 1.4 / 1.1 |
+| React rendering, same windows, % | 44.6 / 30.1 / 19.2 | 47.1 / not taken / 20.1 | 38.3 / 42.0 / 46.1 | 56.0 / 51.6 / 50.9 | 32.8 / 39.6 / 36.1 |
+
+- Index requests per remote frame: 1.0 in all three runs (before: 5 to 14.6).
+- The tab received 99 % of the agents' changes in each run (3,333 of 3,373; 3,130 of 3,170; 1,579 of
+  1,597), against 72 % and 64 % before.
+- The worker's pile no longer grows without end. It peaks and returns to 0-5 waiting requests.
+- Remaining cost after the fix: React rendering of the remote changes is the largest share (33-56
+  %); the websocket handler takes 8-15 %; the rebase 1-2 %.
+
+**What the re-run does not show.**
+
+1. The load was lower in the `after` runs. The machine ran at 90-100 % CPU on 2026-11-10 (a game and
+   other test sessions ran on it), so the agents were slower and sent 41 %, 38 % and 19 % of the
+   calls of run `before2`. Run `after` also overlapped a Postgres incident (connection limit reached
+   09:17-09:23 UTC). So the runs show the cause removed and the stall reduced. They do not show the
+   tab at the frame rate of 2026-11-09. A re-run on an idle machine is still to do.
+
+2. Run `after2` still slowed for about three minutes (+68 s to +260 s): timer lag up to 8.2 s, save
+   starts at 61, 70, 94, 124 and 180 s, then one every 6-8 s again. In that stretch the tab sent up
+   to 1,230 `:index/query-snap` requests in 10 s (40 in 10 s without agents), and 1,069 requests
+   waited. Index updates stayed at one a frame. React rendering was 52-56 % of the main thread, and
+   the thread had no idle time. The tab recovered without help; the `before` runs never did. Not
+   investigated: where the snap queries come from while a nudge gesture is open and remote frames
+   arrive.
+
+3. The readback at the end found fewer presses than sent in every `after` run: x/y found 143/142,
+   148/147 and 140/139, against 148/148 expected. With each save response held 5 s, a save takes
+   5.8-6.9 s (p50). The tab presses a key every 5 s, and each flush is one save, so the queue grows.
+   The harness waits at most 60 s after the last press and then closes the browser. Saves were still
+   starting every 5-7 s when it closed (run `after`: 485, 492, 499, 508, 516, 523 and 529 s; the
+   last press was at 475 s). The decoded `file_change` rows were not checked in these runs, so
+   "queued, not lost" is the likely reading, not a proven one. The fix does not touch the file data
+   path.
+
+**Side findings.** Both are pre-existing and not fixed.
+
+- The worker message codec (`frontend/src/app/worker/messages.cljs`, `encode`/`decode`) does not
+  carry the `:dropped` flag that `app.worker` sets when it drops a buffered request. The caller of a
+  dropped request gets a reply with no payload instead of an empty stream.
+- `mcp/packages/loadtest/scripts/human-tab/README.md` says the harness reads `PENPOT_HUMAN_EMAIL`,
+  but `human-tab.mjs` reads only the `--email` flag.
+
 ## Q2: the 138 sequential scans on file_change in the soak
 
 ### Answer in short
