@@ -409,7 +409,7 @@ The `high_level_overview` tool returns the backend instructions in this mode; th
 Each MCP token is validated against the backend (`mcp-whoami`, cached for 60 seconds) and limited to
 `PENPOT_MCP_RATE_LIMIT_RPS` requests per second. Writes by one token to one file run one after another in each server process.
 Request bodies are capped at `PENPOT_MCP_MAX_BODY_MB`, and backend responses at `PENPOT_MCP_BACKEND_MAX_RESPONSE_MB`.
-Exports wait for a slot: at most `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` run at once in one process (4 by default in backend mode). With Redis, at most `PENPOT_MCP_EXPORT_TOTAL_PERMITS` (4 by default) run at once across all adapters.
+Exports wait for a slot: at most `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` run at once in one process (4 by default in backend mode). With Redis, at most `PENPOT_MCP_EXPORT_TOTAL_PERMITS` (4 by default) run at once across all adapters. With Redis, callers that wait for the shared cap are served in arrival order. The counter `penpot_mcp_export_busy_total{gate}` counts the refusals.
 A failed tool call returns `isError: true` with the failure text.
 Each tool call writes one log line with the tool name, the token fingerprint, the duration and the outcome.
 A token needs the scopes of the tools it calls: `mcp:read` for reads, `mcp:write` for design changes,

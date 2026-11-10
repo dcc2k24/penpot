@@ -224,6 +224,27 @@ with `PENPOT_MCP_EXPORT_TOTAL_PERMITS=4`, nginx in front, and Prometheus with `d
 - Verdict: the 65 s lease and the alert thresholds stand, and nothing was changed. Two gaps are left for later: no
   alert on a full export cap, and no arrival order among callers that wait for the shared permit.
 
+#### After F2-20: arrival order and a busy counter (2026-11-10)
+
+- The shared export permit now serves waiting callers in arrival order. A refused caller joins a queue in Redis,
+  beside the permit set. A caller that has not asked for 3 s loses its place, so a crashed adapter cannot block the
+  queue. Arrival order holds once every adapter is upgraded.
+- The likely cause of the long waits in the F2-20 run: a caller fresh from the process gate asked Redis right after
+  a release, and so beat callers that had waited longer.
+- `penpot_mcp_export_busy_total{gate}` counts exports refused as busy, by the gate that refused them (`token`,
+  `process` or `shared`). The alert `PenpotMcpExportCapFull` fires on the `process` and `shared` gates.
+- The permit report script reads the three-key take, so the waiter keys do not count as takes or releases.
+- Re-measure (2026-11-10, the same C8 run on the new code; record in
+  `mcp/packages/loadtest/results/2026-11-10-fair-permits-c8/`): 100 exports, none refused as busy, against 8 of 141
+  on 2026-11-09. Call time p50 17.8 s, p95 24.3 s, max 28.6 s; no call took 30 s or more, against 14. Renders were
+  slower on this day (permit held p50 7.7 s against 5.5 s; another test run shared the machine), which is why
+  fewer exports ran; the four permits were held for 182 of 197 s. The wait for the shared permit, from the first
+  ask to the take, was p50 7.6 s and at most 9.5 s: about one render. No waiter key was left in Redis.
+- The counter, live: an overload run (24 exporters, 75 s) ended 6 of 76 calls as busy, and
+  `penpot_mcp_export_busy_total{gate="shared"}` read 4 on one adapter and 2 on the other.
+- Not checked: an older adapter and a new one on the same Redis, and the alert firing in Prometheus (the rule
+  passes `promtool check rules`; 16 rules).
+
 ### Checks after the fixes (2026-11-08, evening)
 
 - Backend restarted with the metrics fixes. `/metrics` answers `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
@@ -315,11 +336,9 @@ Still open:
 - R2-08: the queue limit stands (about 54 writers per team), the refusal now names the limit, and the guide gives the sizing rule.
 - R2-13: snapshot cost on 100k-shape files. Pre-existing.
 - R2-15: the second-direction drop is fixed; the stall (saves one per 60-80 s under 5 s saves, five agents on the file) is open and not profiled; it is pre-existing and only seen with the artificial delay.
-- F2-20 is closed: the full 3 min C8 run measured the lease and the alert thresholds (see "F2-20" above). It left two gaps: no alert on a full export cap, and no arrival order among callers that wait for the shared export permit (8 of 141 calls refused as busy with ten exporters on four slots).
+- F2-20 is closed: the full 3 min C8 run measured the lease and the alert thresholds (see "F2-20" above). Both gaps are closed in code (see "After F2-20").
 
 Recommended next:
 
 - Profile the frontend rebase cost under slow saves (R2-15: `apply-changes-localy` and `update-indexes` run for every pending commit on every remote frame).
 - Decide the snapshot policy for large files (R2-13: a lower `auto-file-snapshot-every` for agent writes, or a snapshot taken off the save path, is a product decision).
-- Add an alert for a full export cap. It needs a metric first: a count of busy export refusals, or the permits held, on the adapter's /metrics (F2-20).
-- Serve callers that wait for the shared export permit in arrival order, or state the busy rate in the operations guide (F2-20).

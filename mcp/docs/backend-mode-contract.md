@@ -786,7 +786,7 @@ The sandbox facade maps the layout setters to backend ops: `layoutItem*` setters
   The total image output stays under 8 MB. The reply says how many were rendered, and that the rest must be exported
   by id. `filePath` is refused with `shapeId: "page"`: export one shape by id to save it to a file.
 - Concurrency: each token gets one render at a time. The whole process runs at most 4 renders against the backend at a
-  time (`PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS`; 0 means no limit). A render waits at most 60 s.
+  time (`PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS`; 0 means no limit). A render waits at most 60 s. With Redis, the renders of all adapters share `PENPOT_MCP_EXPORT_TOTAL_PERMITS` permits, and callers that wait for one are served in arrival order.
 - The render session cookie is taken from `create-mcp-render-session` (section 2.9).
 
 ### 4.6 Adapter settings

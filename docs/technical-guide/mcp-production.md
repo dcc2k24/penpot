@@ -46,7 +46,7 @@ Ports: the adapter serves MCP and its health and metrics endpoints on 4401
 | Sandbox runtime (one per token) | The adapter that serves the call | No | `sandbox/SandboxSessions.ts` |
 | Sandbox `storage` | Redis key `penpot.mcp.sandbox.storage.<digest>`, expires after the idle eviction time (30 min). Adapter memory otherwise. | Yes, with Redis. A runtime reads the shared copy before each call. | `sandbox/StorageStore.ts`, `sandbox/SandboxSessions.ts` (before each call) |
 | Write queue, one per token and file | Adapter memory | No. The backend file lock orders writes across adapters. | `backend/FileWriteQueue.ts`, `rpc/commands/mcp_write.clj` (15 s lock wait) |
-| Render slots | One render per token and four per process, in adapter memory. With Redis set, `PENPOT_MCP_EXPORT_TOTAL_PERMITS` (default 4) is shared by every adapter on that Redis. | Yes, with Redis | `utils/ExportConcurrency.ts`, `utils/RedisExportPermits.ts` |
+| Render slots | One render per token and four per process, in adapter memory. With Redis set, `PENPOT_MCP_EXPORT_TOTAL_PERMITS` (default 4) is shared by every adapter on that Redis. Callers that wait for a shared slot are served in arrival order. | Yes, with Redis | `utils/ExportConcurrency.ts`, `utils/RedisExportPermits.ts` |
 | Render session | Postgres row, 10 minutes. The adapter caches the session per token and file. | Rows are shared. The cache is per adapter. | contract 1.5, `backend/RenderSessionCache.ts` |
 | Export and import files | Local disk of each adapter host, under the roots | Only if the hosts share a disk | `utils/ExportDirectory.ts`, `tools/backend/ImportDirectory.ts` |
 | Files, changes, snapshots, tokens, audit rows | Postgres | Yes | contract, migrations `0158`, `0159` |
@@ -188,9 +188,10 @@ Rules behind the values:
   should cover the MCP calls that can run at once, plus the editor. Round 2 found the pool of 8 and the CPU as the
   limit, at about 42 writes a second on that host.
 - Exporter. One render per token (`RENDERS_PER_TOKEN` is 1). Four renders per adapter process by default. With
-  Redis set, `PENPOT_MCP_EXPORT_TOTAL_PERMITS` (default 4) caps the renders of all adapters on that Redis. Each permit
-  is held for at most 60 s. If Redis fails, each adapter falls back to its own four, so two adapters can send eight
-  renders at once. Plan one exporter per four concurrent renders.
+  Redis set, `PENPOT_MCP_EXPORT_TOTAL_PERMITS` (default 4) caps the renders of all adapters on that Redis. Callers that
+  wait for a shared slot are served in arrival order. Each permit is held for at most 65 s. If Redis fails, each
+  adapter falls back to its own four, so two adapters can send eight renders at once. Plan one exporter per four
+  concurrent renders.
 
 ## 4. Deploy order and rollback
 
@@ -242,6 +243,7 @@ Check the row count of `access_token` before the deploy.
 
 | Pair | What happens | Source |
 |---|---|---|
+| Old and new adapters on one Redis | Work together. An old adapter takes a free permit without queuing, so the cap still holds. Arrival order holds only once every adapter is upgraded. | `utils/RedisExportPermits.ts` |
 | Old adapter, new backend | Works. The old adapter ignores new fields. Behaviour changes in the backend can still show as new error codes (the 50-batch limit, the replay key, the lock codes). | contract 6; `mcp/packages/loadtest/README.md`, "Deploy order" |
 | New adapter, old backend | Refused on every call with "backend too old for backend mode". The adapter needs `contractVersion` 1 or later. | contract 4.7; `mcp/packages/loadtest/README.md` |
 
@@ -285,6 +287,7 @@ numbers. Each rule has a runbook note in the file. The first step is below.
 | `PenpotMcpRateLimitFallback` | An adapter used the in-process limiter for 5 min | See the Redis alert. While the fallback runs, the limit is about N times too generous. |
 | `PenpotMcpBackendPoolSaturated` | Calls wait for a Postgres connection for 5 min | Compare `hikaricp_active_connections` with `hikaricp_max_connections`. Look for slow queries. |
 | `PenpotMcpClimitRejected` | The backend refuses MCP calls at its concurrency limit | Raise the limit only if the pool and the write latency look healthy. Otherwise lower the agents per backend. |
+| `PenpotMcpExportCapFull` | Exports refused as busy by the process or the shared cap for 10 min (`penpot_mcp_export_busy_total{gate="process"}` or `{gate="shared"}`) | Check the exporter CPU and the export duration. If the exporter has room, raise `PENPOT_MCP_EXPORT_TOTAL_PERMITS` and `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS`. If not, add exporter capacity or lower the export load. `gate="token"` is one client and is not part of this alert. |
 | `PenpotMcpAdapterMemoryHigh` | Adapter resident memory above 1.5 GB for 10 min | Compare `nodejs_heap_used_bytes` with `penpot_mcp_sandbox_workers`. A flat heap and rising RSS is a native leak. A rising heap is a cache or sandbox leak. |
 | `PenpotMcpAdapterEventLoopLag` | Event loop lag p99 above 200 ms for 5 min | Look for large JSON bodies, or a sandbox that runs on the server thread. |
 
@@ -296,7 +299,7 @@ One thing to know before you use the rules:
 ### 5.2 Dashboard
 
 `mcp/deploy/grafana-mcp-dashboard.json` is provisioned by `mcp/deploy/compose.monitoring.yaml`. It shows the
-tool p95, refusals by reason, errors by code, Postgres pool use and waiting threads, Redis state, the fallback count
+tool p95, refusals by reason (with the export refusals by gate), errors by code, Postgres pool use and waiting threads, Redis state, the fallback count
 and the concurrency rejections.
 
 Prometheus scrapes the adapters with an MCP token. `/metrics` answers without a token only when the adapter binds a loopback address, the client is on the same
@@ -355,7 +358,7 @@ There are two layers of limits. The adapter limits each token. The backend limit
 | Backend call | 55 s (`PENPOT_MCP_BACKEND_TIMEOUT_S`) | A timeout error. A sent write may still commit. | Check the file state before you retry the write |
 | Client tokens per profile | 20 (`mcp-client-limit`) | `mcp-client-limit` (restriction). An OAuth approval answers `access_denied`. | Revoke a client token |
 | Sandbox | CPU 3 s, wall 120 s, 1000 host calls, 20 calls at once per process (`PENPOT_MCP_SANDBOX_MAX_CONCURRENT`), 16 MB of page data, 8 MB of `storage` | Interrupted, refused or capped, with a message that names the limit | Split the work. Use `storage` for state that must survive a call. |
-| Export renders | One per token. Four per process. With Redis, four across all adapters on it (`PENPOT_MCP_EXPORT_TOTAL_PERMITS`). | A call waits up to 30 s for a slot, then answers `export is busy, retry later`. A render over 60 s fails. | Retry the export later |
+| Export renders | One per token. Four per process. With Redis, four across all adapters on it (`PENPOT_MCP_EXPORT_TOTAL_PERMITS`). | A call waits up to 30 s for a slot. With Redis, waiting calls get slots in arrival order. Then it answers `export is busy, retry later`. A render over 60 s fails. | Retry the export later |
 
 The concurrency limits answer HTTP 429 with a body whose `type` is `concurrency-limit` and whose `code` is
 `capacity-limit-reached`. The body names the `limit` (for example `mcp-apply/by-team`) and the `reason`
@@ -396,8 +399,8 @@ Round 2 measures how these limits behave under load (section 3).
   - Give the adapter a Redis user with only the commands it needs. The rate limit script uses `EVALSHA` and falls
     back to the full script when Redis does not know it (`backend/RedisRateLimiter.ts`). It also reads the time with
     `TIME`, and uses `HMGET`, `HSET` and `PEXPIRE`. The storage uses `GET`, `SET ... PX` and `DEL`
-    (`sandbox/StorageStore.ts`). The export permits use `EVALSHA` (with `EVAL` as the fallback), `TIME`,
-    `ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`, `ZREM` and `PEXPIRE` on the key `penpot.mcp.export.permits`
+    (`sandbox/StorageStore.ts`). The export permits use `EVALSHA` (with `EVAL` as the fallback), `TIME`, `ZADD`,
+    `ZREM`, `ZCARD`, `ZRANK`, `ZSCORE`, `ZRANGEBYSCORE`, `ZREMRANGEBYSCORE` and `PEXPIRE`
     (`utils/RedisExportPermits.ts`). The ops script also uses `EXISTS` (section 8.4).
   - Eviction. Every MCP key has a time to live. Under memory pressure, a `volatile-*` policy can evict MCP keys. With
     `noeviction`, a full Redis makes writes fail: the limiter falls back to its own bucket, and a storage save fails
@@ -405,8 +408,10 @@ Round 2 measures how these limits behave under load (section 3).
   - Version. Redis 5 or later. Both Lua scripts call `TIME` and then write, which Redis before 5 refuses. The sample
     stack uses `redis:7-alpine`.
   - Key prefixes, so you can scope an ACL and find the keys: `penpot.mcp.ratelimit.` and
-    `penpot.mcp.sandbox.storage.`, each followed by the SHA-256 hex of the token. The export permits use one key,
-    `penpot.mcp.export.permits`.
+    `penpot.mcp.sandbox.storage.`, each followed by the SHA-256 hex of the token. The export permits use three keys:
+    `penpot.mcp.export.permits` (the permits), `{penpot.mcp.export.permits}:waiters` (waiting callers by arrival
+    time) and `{penpot.mcp.export.permits}:seen` (the same callers by the time they last asked). The braces put all
+    three in one Redis Cluster slot, so the scripts run on a cluster too.
   - The sample stack's Redis is not persistent (`mcp/deploy/compose.two-adapters.yaml`). A restart clears the limits
     and the storage.
 - Secrets to keep out of git: the metrics token file (`mcp/deploy/secrets/mcp-metrics-token`), the Grafana password,
@@ -543,6 +548,7 @@ Watch for one hour after each step:
 - `probe_success` for both adapters and the backend (readiness).
 - `penpot_mcp_redis_up` and `penpot_mcp_rate_limit_fallback_total`. Both should stay flat.
 - `penpot_mcp_refusals_total` by reason. A rise means a client is trying what it should not.
+- `penpot_mcp_export_busy_total` by gate. `process` and `shared` rises mean the render cap is full.
 - `penpot_mcp_errors_total` by code. Watch `mcp-file-busy` and `mcp-lock-timeout` most closely.
 - `penpot_mcp_tool_duration_seconds` p95 for the write tools.
 - `hikaricp_pending_threads` and `penpot_rpc_climit_rejected_total`.
