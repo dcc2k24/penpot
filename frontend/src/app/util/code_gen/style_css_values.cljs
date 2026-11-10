@@ -317,7 +317,13 @@
   (when (and (cfh/frame-shape? shape)
              (not (cgc/svg-markup? shape))
              (not (:show-content shape)))
-    "hidden"))
+    ;; CSS `overflow: <x> <y>`. The board's scroll setting only changes
+    ;; the axes that scroll; a clipping board with no scroll is `hidden`.
+    (case (:overflow-scroll shape)
+      :vertical "hidden auto"
+      :horizontal "auto hidden"
+      :both "auto"
+      "hidden")))
 
 (defn- get-flex-direction
   [shape]

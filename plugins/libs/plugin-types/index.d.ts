@@ -226,6 +226,17 @@ export interface Board extends ShapeBase {
   showInViewMode: boolean;
 
   /**
+   * How the board scrolls its content, for prototypes and code export.
+   * It can be one of the following values:
+   * - 'none': The board does not scroll.
+   * - 'horizontal': The board scrolls horizontally.
+   * - 'vertical': The board scrolls vertically.
+   * - 'both': The board scrolls in both directions.
+   * The viewer does not scroll the board yet.
+   */
+  overflowScroll: 'none' | 'horizontal' | 'vertical' | 'both';
+
+  /**
    * The grid layout configuration of the board, if applicable.
    */
   readonly grid?: GridLayout;

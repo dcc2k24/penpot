@@ -1992,6 +1992,24 @@
                      :else
                      (st/emit! (dwsh/update-shapes [id] #(assoc % :hide-in-viewer (not value))))))}
 
+                {:name "overflowScroll"
+                 :get #(-> % u/proxy->shape :overflow-scroll (d/nilv :none) d/name)
+                 :set
+                 (fn [_ value]
+                   (let [value (when (string? value) (keyword value))]
+                     (cond
+                       (not (contains? #{:none :horizontal :vertical :both} value))
+                       (u/not-valid plugin-id :overflowScroll value)
+
+                       (not (r/check-permission plugin-id "content:write"))
+                       (u/not-valid plugin-id :overflowScroll "Plugin doesn't have 'content:write' permission")
+
+                       (not (u/page-active? page-id))
+                       (u/not-valid plugin-id :overflowScroll "Cannot modify a page that is not currently active")
+
+                       :else
+                       (st/emit! (dwsh/update-shapes [id] (fn [shape] (if (= value :none) (dissoc shape :overflow-scroll) (assoc shape :overflow-scroll value))))))))}
+
                 {:name "grid"
                  :get
                  (fn [self]

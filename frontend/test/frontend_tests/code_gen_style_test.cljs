@@ -171,6 +171,40 @@
       (is (= "100px" (css/get-css-value objs c :left)))
       (is (= "100px" (css/get-css-value objs c :top))))))
 
+;; --- Board overflow -----------------------------------------------------
+
+(deftest board-overflow-without-scroll-is-hidden
+  (testing "a clipping board with no scroll setting, or :none, is hidden"
+    (let [board (frame (uuid/next))
+          none  (frame (uuid/next) :overflow-scroll :none)
+          objs  (objects board none)]
+      (is (= "hidden" (css/get-css-value objs board :overflow)))
+      (is (= "hidden" (css/get-css-value objs none :overflow))))))
+
+(deftest board-overflow-follows-overflow-scroll
+  (testing "the scroll axes of a clipping board come from :overflow-scroll"
+    (doseq [[value expected] [[:vertical "hidden auto"]
+                              [:horizontal "auto hidden"]
+                              [:both "auto"]]]
+      (let [board (frame (uuid/next) :overflow-scroll value)
+            objs  (objects board)]
+        (is (= expected (css/get-css-value objs board :overflow))
+            (str "overflow-scroll " value))))))
+
+(deftest board-showing-content-has-no-overflow
+  (testing "a board that shows its content emits no overflow, whatever the scroll"
+    (let [board (frame (uuid/next) :show-content true :overflow-scroll :vertical)
+          objs  (objects board)]
+      (is (nil? (css/get-css-value objs board :overflow))))))
+
+(deftest rect-has-no-overflow
+  (testing "a non-board shape emits no overflow"
+    (let [pid  (uuid/next)
+          cid  (uuid/next)
+          c    (child cid pid :overflow-scroll :vertical)
+          objs (objects (frame pid) c)]
+      (is (nil? (css/get-css-value objs c :overflow))))))
+
 ;; --- Text node markup ----------------------------------------------------
 
 (def ^:private text-content

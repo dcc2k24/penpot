@@ -285,6 +285,10 @@
    [:shapes [:vector {:gen/max 10 :gen/min 1} ::sm/uuid]]
    [:hide-fill-on-export {:optional true} :boolean]
    [:show-content {:optional true} :boolean]
+   ;; `overflow-scroll` says which axes a clipping board scrolls on. It is a
+   ;; scroll container for prototypes and code export. The viewer does not act
+   ;; on it yet. Absent means `:none`.
+   [:overflow-scroll {:optional true} [::sm/one-of #{:none :horizontal :vertical :both}]]
    ;; `hide-in-viewer` moved to `schema:shape-generic-attrs`: stored files carry
    ;; it on circles, rects and texts too, not only on frames.
    ;; `use-for-thumbnail` is a frame attribute the model has long had, since
@@ -521,7 +525,7 @@
                                           :transform-inverse :parent-id :frame-id})
 (def ^:private allowed-bool-attrs #{:shapes :bool-type :content})
 (def ^:private allowed-group-attrs #{:shapes})
-(def ^:private allowed-frame-attrs #{:shapes :hide-fill-on-export :show-content :hide-in-viewer
+(def ^:private allowed-frame-attrs #{:shapes :hide-fill-on-export :show-content :overflow-scroll :hide-in-viewer
                                      :layout :layout-flex-dir :layout-gap-type :layout-gap
                                      :layout-align-items :layout-justify-content :layout-align-content
                                      :layout-wrap-type :layout-padding-type :layout-padding

@@ -207,6 +207,10 @@
   gap: deprecated.$s-4;
 }
 
+.overflow-scroll {
+  grid-column: 1 / -1;
+}
+
 .clip-content,
 .show-in-viewer {
   .clip-content-input {

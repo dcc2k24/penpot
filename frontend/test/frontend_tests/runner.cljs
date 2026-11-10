@@ -16,6 +16,7 @@
    [frontend-tests.data.exports-assets-test]
    [frontend-tests.data.exports-files-test]
    [frontend-tests.data.fix-deleted-fonts-test]
+  [frontend-tests.data.fonts-missing-test]
    [frontend-tests.data.imports-test]
    [frontend-tests.data.jobs-test]
    [frontend-tests.data.modal-test]
@@ -150,6 +151,7 @@
    [frontend-tests.ui.settings-password-schema-test]
    [frontend-tests.ui.settings-shortcuts-test]
    [frontend-tests.ui.shape-filters-test]
+  [frontend-tests.ui.shapes-per-side-stroke-test]
    [frontend-tests.ui.shortcuts-labels-test]
    [frontend-tests.ui.sidebar-scroll-test]
    [frontend-tests.ui.sortable-auto-scroll-test]
@@ -198,6 +200,7 @@
    'frontend-tests.data.dashboard-test
    'frontend-tests.data.event-test
    'frontend-tests.data.fix-deleted-fonts-test
+   'frontend-tests.data.fonts-missing-test
    'frontend-tests.data.modal-test
    'frontend-tests.data.nitrate-test
    'frontend-tests.data.objects-hints-consumers-test
@@ -337,6 +340,7 @@
    'frontend-tests.ui.settings-password-schema-test
    'frontend-tests.ui.settings-shortcuts-test
    'frontend-tests.ui.shape-filters-test
+   'frontend-tests.ui.shapes-per-side-stroke-test
    'frontend-tests.ui.shortcuts-labels-test
    'frontend-tests.ui.sidebar-scroll-test
    'frontend-tests.ui.sortable-auto-scroll-test

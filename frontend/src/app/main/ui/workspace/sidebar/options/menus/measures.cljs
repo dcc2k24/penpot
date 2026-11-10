@@ -28,6 +28,7 @@
    [app.main.ui.components.radio-buttons :refer [radio-button radio-buttons]]
    [app.main.ui.components.search-bar :refer [search-bar*]]
    [app.main.ui.ds.buttons.icon-button :refer [icon-button*]]
+   [app.main.ui.ds.controls.select :refer [select*]]
    [app.main.ui.ds.foundations.assets.icon :refer [icon*] :as i]
    [app.main.ui.icons :as deprecated-icon]
    [app.main.ui.workspace.sidebar.options.menus.border-radius :refer  [border-radius-menu*]]
@@ -48,6 +49,7 @@
    :selrect
    :points
    :show-content
+   :overflow-scroll
    :hide-in-viewer
 
    ;; Needed to disable/enable width/height and x/y
@@ -63,7 +65,8 @@
   #{:size :position :rotation :radius})
 
 (def ^:private frame-options
-  #{:presets :size :position :rotation :radius :clip-content :show-in-viewer})
+  #{:presets :size :position :rotation :radius :clip-content :show-in-viewer
+    :overflow-scroll})
 
 (defn- type->options
   [type]
@@ -156,6 +159,8 @@
                      (get n-values :hide-in-viewer))
          (identical? (get o-values :show-content)
                      (get n-values :show-content))
+         (identical? (get o-values :overflow-scroll)
+                     (get n-values :overflow-scroll))
          (identical? (get o-values :width)
                      (get n-values :width))
          (identical? (get o-values :height)
@@ -221,6 +226,13 @@
           (if (= type :multiple)
             (into #{} xf:mapcat-type-to-options all-types)
             (type->options type)))
+
+        ;; Overflow scroll is only offered when every selected shape is a board
+        board-only?
+        (mf/with-memo [type all-types]
+          (if (= type :multiple)
+            (= all-types #{:frame})
+            (= type :frame)))
 
         frames
         (mf/with-memo [shapes]
@@ -321,6 +333,22 @@
 
         proportion-lock
         (get values :proportion-lock)
+
+        overflow-scroll-value
+        (get values :overflow-scroll)
+
+        overflow-scroll-mixed?
+        (= overflow-scroll-value :multiple)
+
+        overflow-scroll-options
+        (mf/with-memo [overflow-scroll-mixed?]
+          (let [mixed-label (tr "settings.multiple")]
+            (cond-> [{:id "none" :label (tr "workspace.options.overflow-scroll.none")}
+                     {:id "vertical" :label (tr "workspace.options.overflow-scroll.vertical")}
+                     {:id "horizontal" :label (tr "workspace.options.overflow-scroll.horizontal")}
+                     {:id "both" :label (tr "workspace.options.overflow-scroll.both")}]
+              overflow-scroll-mixed?
+              (conj {:id mixed-label :label mixed-label :dimmed true}))))
 
         clip-content-ref
         (mf/use-ref nil)
@@ -464,6 +492,18 @@
          (fn [event]
            (let [value (-> event dom/get-target dom/checked?)]
              (st/emit! (dwsh/update-shapes ids (fn [shape] (assoc shape :show-content (not value))))))))
+
+        on-overflow-scroll-change
+        (mf/use-fn
+         (mf/deps ids)
+         (fn [value]
+           (let [value (keyword value)]
+             (when (contains? #{:none :horizontal :vertical :both} value)
+               (st/emit! (dwsh/update-shapes ids
+                                             (fn [shape]
+                                               (if (= value :none)
+                                                 (dissoc shape :overflow-scroll)
+                                                 (assoc shape :overflow-scroll value)))))))))
 
         on-change-show-in-viewer
         (mf/use-fn
@@ -735,4 +775,15 @@
                     :title (tr "workspace.options.show-in-viewer")
                     :class (stl/css-case  :clip-content-label true
                                           :selected (not (:hide-in-viewer values)))}
-            [:> icon* {:icon-id i/play}]]])])]))
+            [:> icon* {:icon-id i/play}]]])])
+
+     (when (and (options :overflow-scroll) board-only?)
+       [:> select*
+        {:class (stl/css :overflow-scroll)
+         :aria-label (tr "workspace.options.overflow-scroll")
+         :title (tr "workspace.options.overflow-scroll.tooltip")
+         :default-selected (if overflow-scroll-mixed?
+                             (tr "settings.multiple")
+                             (d/name (or overflow-scroll-value :none)))
+         :options overflow-scroll-options
+         :on-change on-overflow-scroll-change}])]))

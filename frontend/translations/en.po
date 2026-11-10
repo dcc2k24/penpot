@@ -551,6 +551,12 @@ msgstr ""
 msgid "dashboard.export-shapes.how-to-link"
 msgstr "Info how to set exports at Penpot."
 
+#: src/app/main/ui/exports/assets.cljs:171
+msgid "dashboard.export-shapes.missing-fonts"
+msgstr ""
+"Some text uses fonts that are not available (%s). The export will draw it "
+"with a fallback font."
+
 #: src/app/main/ui/exports/assets.cljs:178
 msgid "dashboard.export-shapes.no-elements"
 msgstr "There are no elements with export settings."
@@ -7464,6 +7470,12 @@ msgstr "Flow start"
 msgid "workspace.options.flows.flow-starts"
 msgstr "Flow starts"
 
+#: src/app/main/ui/workspace/sidebar/options/menus/text.cljs:553
+msgid "workspace.options.font-missing-warning"
+msgstr ""
+"Missing font: %s. This text is drawn with a fallback font, here and "
+"in exports."
+
 #: src/app/main/ui/workspace/sidebar/options/menus/text.cljs:526
 msgid "workspace.options.font-not-available"
 msgstr ""
@@ -7897,6 +7909,30 @@ msgstr "No matching size preset"
 #: src/app/main/ui/workspace/sidebar/options/menus/layer.cljs:240, src/app/main/ui/workspace/sidebar/options/menus/layer.cljs:297
 msgid "workspace.options.opacity"
 msgstr "Opacity"
+
+#: src/app/main/ui/workspace/sidebar/options/menus/measures.cljs:783
+msgid "workspace.options.overflow-scroll"
+msgstr "Scrolling"
+
+#: src/app/main/ui/workspace/sidebar/options/menus/measures.cljs:349
+msgid "workspace.options.overflow-scroll.both"
+msgstr "Both directions"
+
+#: src/app/main/ui/workspace/sidebar/options/menus/measures.cljs:348
+msgid "workspace.options.overflow-scroll.horizontal"
+msgstr "Horizontal"
+
+#: src/app/main/ui/workspace/sidebar/options/menus/measures.cljs:346
+msgid "workspace.options.overflow-scroll.none"
+msgstr "No scrolling"
+
+#: src/app/main/ui/workspace/sidebar/options/menus/measures.cljs:784
+msgid "workspace.options.overflow-scroll.tooltip"
+msgstr "Marks this board as a scroll container for prototypes and code export. The viewer does not scroll it yet."
+
+#: src/app/main/ui/workspace/sidebar/options/menus/measures.cljs:347
+msgid "workspace.options.overflow-scroll.vertical"
+msgstr "Vertical"
 
 #: src/app/main/ui/workspace/sidebar/options/page.cljs:99, src/app/main/ui/workspace/sidebar/options/page.cljs:106
 msgid "workspace.options.pixel-grid-color"

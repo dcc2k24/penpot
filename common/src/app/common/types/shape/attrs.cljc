@@ -20,6 +20,7 @@
             :selrect
             :points
             :show-content
+            :overflow-scroll
             :hide-in-viewer
 
             :applied-tokens

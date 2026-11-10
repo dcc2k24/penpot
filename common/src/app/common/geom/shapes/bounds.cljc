@@ -121,6 +121,14 @@
          (reduce d/max 0))
     0))
 
+(defn- stroke-width-of
+  "Width that sets the margin of `stroke` on `shape`. A rect or frame stroke
+  with sides of different widths reaches as far as its widest side."
+  [shape stroke]
+  (if (cts/per-side-stroke? shape stroke)
+    (cts/max-side-width stroke)
+    (:stroke-width stroke 0)))
+
 (defn calculate-padding
   ([shape]
    (calculate-padding shape false false))
@@ -133,9 +141,9 @@
          stroke-width
          (->> strokes
               (map #(case (get % :stroke-alignment :center)
-                      :center (/ (:stroke-width % 0) 2)
-                      :outer  (:stroke-width % 0)
-                      (if open-path? (:stroke-width % 0) 0)))
+                      :center (/ (stroke-width-of shape %) 2)
+                      :outer  (stroke-width-of shape %)
+                      (if open-path? (stroke-width-of shape %) 0)))
               (reduce d/max 0))
 
          stroke-margin

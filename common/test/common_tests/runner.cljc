@@ -110,6 +110,7 @@
    [common-tests.types.shape-decode-encode-test]
    [common-tests.types.shape-interactions-test]
    [common-tests.types.shape-layout-test]
+   [common-tests.types.shape-overflow-scroll-test]
    [common-tests.types.stroke-test]
    [common-tests.types.text-test]
    [common-tests.types.token-test]
@@ -221,6 +222,7 @@
    'common-tests.types.shape-decode-encode-test
    'common-tests.types.shape-interactions-test
    'common-tests.types.shape-layout-test
+   'common-tests.types.shape-overflow-scroll-test
    'common-tests.types.stroke-test
    'common-tests.types.text-test
    'common-tests.types.token-test

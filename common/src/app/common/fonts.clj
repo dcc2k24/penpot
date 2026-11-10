@@ -43,8 +43,21 @@
                               (filter identity))
                      variants)}))
 
-(defmacro preload-gfonts
+(def gfonts-resource
+  "The Google catalogue: the JSON resource on the classpath that
+  `load-gfonts` and the CLJS macro `preload-gfonts` read."
+  "fonts/gfonts.2025.11.28.json")
+
+(defn load-gfonts
+  "The Google catalogue read from the JSON resource at `path` (a classpath
+  path): a vector of fonts, each with `:id` (`gfont-<slug>`), `:uuid`,
+  `:family`, `:name` and `:variants` (`:id`, `:name`, `:weight`, `:style`,
+  `:ttf-url`). The one parser for the CLJS macro and for the JVM backend."
   [path]
-  (let [data (slurp (io/resource path))
-        data (json/read-str data)]
-    `~(mapv parse-gfont (get data "items"))))
+  (let [data (json/read-str (slurp (io/resource path)))]
+    (mapv parse-gfont (get data "items"))))
+
+(defmacro preload-gfonts
+  "The Google catalogue at `path`, embedded as a literal at compile time."
+  [path]
+  `~(load-gfonts path))

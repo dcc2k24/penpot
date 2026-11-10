@@ -18,7 +18,7 @@
    [app.util.object :as obj]
    [cuerdas.core :as str]))
 
-(defn- calculate-dasharray
+(defn calculate-dasharray
   [style width dash gap]
   (let [w+5  (+ 5 width)
         w+1  (+ 1 width)

@@ -11,6 +11,7 @@
    [app.common.types.text :as txt]
    [app.common.uuid :as uuid]
    [app.config :as cf]
+   [app.main.data.fonts-missing :as fonts-missing]
    [app.main.data.workspace.libraries :as dwl]
    [app.main.data.workspace.shapes :as dwsh]
    [app.main.data.workspace.shortcuts :as sc]
@@ -29,6 +30,7 @@
    [app.main.ui.ds.controls.radio-buttons :refer [radio-buttons*]]
    [app.main.ui.ds.controls.shared.searchable-options-dropdown :refer [searchable-options-dropdown*]]
    [app.main.ui.ds.foundations.assets.icon :as i]
+   [app.main.ui.ds.notifications.context-notification :refer [context-notification*]]
    [app.main.ui.hooks :as hooks]
    [app.main.ui.workspace.sidebar.options.menus.token-typography-row :refer [token-typography-row*]]
    [app.main.ui.workspace.sidebar.options.menus.typography :refer [text-options* typography-entry*]]
@@ -313,6 +315,10 @@
         fonts           (mf/deref fonts/fontsdb)
         font            (get fonts font-id)
 
+        objects         (mf/deref refs/workspace-page-objects)
+        missing         (mf/with-memo [objects ids fonts]
+                          (fonts-missing/get-missing-fonts objects ids fonts/installed?))
+
         token-dropdown-open* (mf/use-state false)
         token-dropdown-open? (deref token-dropdown-open*)
 
@@ -540,6 +546,12 @@
 
      (when main-menu-open?
        [:div {:class (stl/css :element-content)}
+        (when (seq missing)
+          [:> context-notification* {:type :context
+                                     :appearance "neutral"
+                                     :level :warning}
+           (tr "workspace.options.font-missing-warning"
+               (fonts-missing/families-label missing))])
         (cond
           (and token-typography-row-enabled? (= :multiple current-token-name) (= typography-id :multiple))
           [:div {:class (stl/css :multiple-typography)}

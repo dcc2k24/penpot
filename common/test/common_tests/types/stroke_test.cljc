@@ -6,8 +6,10 @@
 
 (ns common-tests.types.stroke-test
   (:require
+   [app.common.geom.shapes.bounds :as gsb]
    [app.common.types.stroke :as cts]
-   [clojure.test :as t]))
+   [clojure.test :as t]
+   [clojure.walk :as walk]))
 
 ;; --- materialize-stroke-side-widths
 
@@ -170,3 +172,120 @@
              (mapv simple [:stroke-width-top :stroke-width-right :stroke-width-bottom :stroke-width-left])))
     (t/is (= :simple (cts/width-type simple)))
     (t/is (not (contains? simple :stroke-width-type)))))
+
+;; --- per-side bands and the rect/frame margin
+
+(defn- as-doubles
+  "Every number in `value` as a double, so JVM and JS compare alike."
+  [value]
+  (walk/postwalk #(if (number? %) (double %) %) value))
+
+(def ^:private band-rect {:x 0 :y 0 :width 100 :height 50})
+(def ^:private band-widths [2 4 6 8])
+
+(t/deftest per-side-band-inner-alignment
+  (let [band (cts/per-side-band band-rect nil band-widths :inner)]
+    (t/is (= (as-doubles {:x 0 :y 0 :width 100 :height 50
+                          :radii [[0 0] [0 0] [0 0] [0 0]]})
+             (as-doubles (:outer band))))
+    (t/is (= (as-doubles {:x 8 :y 2 :width 88 :height 42
+                          :radii [[0 0] [0 0] [0 0] [0 0]]})
+             (as-doubles (:inner band))))))
+
+(t/deftest per-side-band-center-alignment
+  (let [band (cts/per-side-band band-rect nil band-widths :center)]
+    (t/is (= (as-doubles {:x -4 :y -1 :width 106 :height 54
+                          :radii [[0 0] [0 0] [0 0] [0 0]]})
+             (as-doubles (:outer band))))
+    (t/is (= (as-doubles {:x 4 :y 1 :width 94 :height 46
+                          :radii [[0 0] [0 0] [0 0] [0 0]]})
+             (as-doubles (:inner band))))))
+
+(t/deftest per-side-band-outer-alignment
+  (let [band (cts/per-side-band band-rect nil band-widths :outer)]
+    (t/is (= (as-doubles {:x -8 :y -2 :width 112 :height 58
+                          :radii [[0 0] [0 0] [0 0] [0 0]]})
+             (as-doubles (:outer band))))
+    (t/is (= (as-doubles {:x 0 :y 0 :width 100 :height 50
+                          :radii [[0 0] [0 0] [0 0] [0 0]]})
+             (as-doubles (:inner band))))))
+
+(t/deftest per-side-band-square-corners-stay-square
+  (let [band (cts/per-side-band band-rect nil band-widths :outer)]
+    (t/is (every? (fn [[rx ry]] (and (zero? rx) (zero? ry))) (get-in band [:outer :radii])))))
+
+(t/deftest per-side-band-radius-grows-outside-and-shrinks-inside
+  (let [radii  (vec (repeat 4 [10 10]))
+        outer  (:outer (cts/per-side-band band-rect radii band-widths :inner))
+        inner  (:inner (cts/per-side-band band-rect radii band-widths :inner))]
+    (t/testing "outer alignment grows the outer radii by the adjacent sides"
+      (t/is (= (as-doubles [[18 12] [14 12] [14 16] [18 16]])
+               (as-doubles (get-in (cts/per-side-band band-rect radii band-widths :outer)
+                                   [:outer :radii])))))
+    (t/testing "inner alignment shrinks the inner radii, never below zero"
+      (t/is (= (as-doubles [[2 8] [6 8] [6 4] [2 4]])
+               (as-doubles (:radii inner)))))
+    (t/is (= (as-doubles [[10 10] [10 10] [10 10] [10 10]])
+             (as-doubles (:radii outer))))))
+
+(t/deftest per-side-band-scales-radii-that-do-not-fit
+  (let [band (cts/per-side-band {:x 0 :y 0 :width 20 :height 20}
+                                (vec (repeat 4 [15 15])) [1 1 1 1] :center)]
+    (t/testing "two radii on one side never exceed that side, all radii scale together"
+      (let [[[tl-x _] [tr-x _] _ _] (get-in band [:outer :radii])]
+        (t/is (<= (+ tl-x tr-x) 21.000001))
+        (t/is (apply = (map first (get-in band [:outer :radii]))))))))
+
+(t/deftest per-side-band-wide-side-leaves-no-hole
+  (t/testing "a side wider than the shape gives no inner rect and a full outer rect"
+    (let [band (cts/per-side-band band-rect nil [2 60 2 60] :inner)]
+      (t/is (nil? (:inner band)))
+      (t/is (= 1 (count (re-seq #"M" (cts/per-side-band-path band))))))))
+
+(t/deftest per-side-band-zero-side-draws-no-thickness-there
+  (let [band  (cts/per-side-band band-rect nil [0 4 6 8] :inner)]
+    (t/is (== 0 (get-in band [:inner :y])))
+    (t/is (== 0 (get-in band [:outer :y])))))
+
+(t/deftest per-side-band-path-square-case
+  (let [band (cts/per-side-band band-rect nil band-widths :inner)]
+    (t/is (= "M 0 0 L 100 0 L 100 50 L 0 50 Z M 8 2 L 96 2 L 96 44 L 8 44 Z"
+             (cts/per-side-band-path band)))))
+
+(t/deftest per-side-band-path-has-two-subpaths-only-with-a-hole
+  (let [with-hole    (cts/per-side-band band-rect nil band-widths :inner)
+        without-hole (cts/per-side-band band-rect nil [2 60 2 60] :inner)]
+    (t/is (= 2 (count (re-seq #"M" (cts/per-side-band-path with-hole)))))
+    (t/is (= 1 (count (re-seq #"M" (cts/per-side-band-path without-hole)))))))
+
+(t/deftest per-side-band-path-rounded-uses-arcs
+  (let [band (cts/per-side-band band-rect (vec (repeat 4 [10 10])) band-widths :outer)]
+    (t/is (= 8 (count (re-seq #" A " (cts/per-side-band-path band)))))))
+
+(t/deftest per-side-stroke-predicate
+  (let [different {:stroke-width 2 :stroke-width-top 2 :stroke-width-right 4
+                   :stroke-width-bottom 2 :stroke-width-left 2}
+        equal     {:stroke-width 2 :stroke-width-top 2 :stroke-width-right 2
+                   :stroke-width-bottom 2 :stroke-width-left 2}]
+    (t/is (true? (cts/per-side-stroke? {:type :rect} different)))
+    (t/is (true? (cts/per-side-stroke? {:type :frame} different)))
+    (t/is (false? (cts/per-side-stroke? {:type :rect} equal)))
+    (t/is (false? (cts/per-side-stroke? {:type :circle} different)))
+    (t/is (false? (cts/per-side-stroke? {:type :path} different)))))
+
+(t/deftest max-side-width-takes-the-widest-side
+  (t/is (== 8 (cts/max-side-width {:stroke-width 2 :stroke-width-top 2 :stroke-width-right 4
+                                   :stroke-width-bottom 6 :stroke-width-left 8})))
+  (t/is (== 2 (cts/max-side-width {:stroke-width 2}))))
+
+(t/deftest padding-of-outer-stroke-uses-widest-side
+  (let [uniform {:strokes [{:stroke-alignment :outer :stroke-style :solid :stroke-width 2}]
+                 :type :rect}
+        per-side {:strokes [{:stroke-alignment :outer :stroke-style :solid :stroke-width 2
+                             :stroke-width-top 2 :stroke-width-right 10
+                             :stroke-width-bottom 2 :stroke-width-left 2}]
+                  :type :rect}]
+    (t/testing "a uniform outer stroke keeps its margin"
+      (t/is (== 3 (:horizontal (gsb/calculate-padding uniform)))))
+    (t/testing "a wide outer side sets the margin"
+      (t/is (== 15 (:horizontal (gsb/calculate-padding per-side)))))))

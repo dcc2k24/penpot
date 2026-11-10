@@ -14,6 +14,8 @@
    [app.common.geom.shapes.bounds :as gsb]
    [app.common.geom.shapes.text :as gst]
    [app.common.types.path :as path]
+   [app.common.types.shape.radius :as ctsr]
+   [app.common.types.stroke :as cts]
    [app.common.uuid :as uuid]
    [app.config :as cf]
    [app.main.ui.context :as muc]
@@ -461,6 +463,124 @@
     [:g.fills {:id (dm/fmt "fills-%" shape-id)}
      (build-fill-element shape child position render-id)]))
 
+(defn- per-side-corners
+  "Corner radii of a rect or frame as four [r r] pairs, top-left first."
+  [shape]
+  (let [radii (case (ctsr/radius-mode shape)
+                :radius-1 (let [r (gsh/shape-corners-1 shape)] [r r r r])
+                (gsh/shape-corners-4 shape))]
+    (mapv (fn [r] (let [r (d/nilv r 0)] [r r])) radii)))
+
+(defn- per-side-widths
+  "Effective widths of a stroke as [top right bottom left]."
+  [stroke]
+  [(d/nilv (cts/side-width stroke :stroke-width-top) 0)
+   (d/nilv (cts/side-width stroke :stroke-width-right) 0)
+   (d/nilv (cts/side-width stroke :stroke-width-bottom) 0)
+   (d/nilv (cts/side-width stroke :stroke-width-left) 0)])
+
+(defn- mask-lines
+  "The middle line of each side strip of a band, clockwise from the top:
+  top left to right, right top to bottom, bottom right to left, left
+  bottom to top. Each map carries its :side and end points."
+  [outer inner]
+  (let [outer-right  (+ (:x outer) (:width outer))
+        outer-bottom (+ (:y outer) (:height outer))
+        inner-right  (+ (:x inner) (:width inner))
+        inner-bottom (+ (:y inner) (:height inner))
+        mid-top      (/ (+ (:y outer) (:y inner)) 2.0)
+        mid-right    (/ (+ outer-right inner-right) 2.0)
+        mid-bottom   (/ (+ outer-bottom inner-bottom) 2.0)
+        mid-left     (/ (+ (:x outer) (:x inner)) 2.0)]
+    [{:side :top    :x1 (:x outer) :y1 mid-top    :x2 outer-right :y2 mid-top}
+     {:side :right  :x1 mid-right  :y1 (:y outer) :x2 mid-right   :y2 outer-bottom}
+     {:side :bottom :x1 outer-right :y1 mid-bottom :x2 (:x outer) :y2 mid-bottom}
+     {:side :left   :x1 mid-left   :y1 outer-bottom :x2 mid-left :y2 (:y outer)}]))
+
+;; A rect or frame stroke whose sides differ in width is drawn as the band
+;; between an outer and an inner rounded rect. One rect is painted, clipped
+;; to the band, so a gradient or image paint maps to the shape's own box as a
+;; uniform stroke does. Dashed styles also mask that rect with one line per
+;; side. Known gaps against the workspace renderer: strokes that share a box
+;; are not mitred against each other; dashes are not fitted to a whole number
+;; per side; rounded corners do not get the solid corner patches the workspace
+;; renderer adds for dashed styles.
+(mf/defc per-side-stroke
+  {::mf/wrap-props false}
+  [{:keys [shape stroke index render-id]}]
+  (let [style        (:stroke-style stroke :solid)
+        shape-id     (dm/get-prop shape :id)
+        alignment    (:stroke-alignment stroke :center)
+        dash         (:stroke-dash stroke)
+        gap          (:stroke-gap stroke)
+        widths       (per-side-widths stroke)
+        [top right bottom left] widths
+        side-widths  {:top top :right right :bottom bottom :left left}
+        max-width    (reduce d/max 0 widths)
+        rect         (select-keys shape [:x :y :width :height])
+        band         (cts/per-side-band rect (per-side-corners shape) widths alignment)
+        outer        (:outer band)
+        inner        (:inner band)
+        band-d       (cts/per-side-band-path band)
+        transform    (gsh/transform-str shape)
+        dashed?      (and (some? inner) (contains? #{:dashed :dotted :mixed} style))
+
+        ;; Paint and opacity come from the same rules a uniform stroke uses.
+        paint-attrs  (attrs/add-stroke! #js {} stroke render-id index false)
+        paint        (if (some? (:stroke-image stroke))
+                       (dm/fmt "url(#stroke-fill-%-%)" render-id index)
+                       (obj/get paint-attrs "stroke"))
+        opacity      (obj/get paint-attrs "strokeOpacity")
+
+        ;; The gradient and image paints need the stroke defs. They are
+        ;; sized for the widest side, so the paint covers the whole band.
+        defs-el      (mf/html [:& stroke-defs {:shape shape
+                                               :stroke (assoc stroke :stroke-width max-width)
+                                               :render-id render-id
+                                               :index index}])
+
+        ;; The painted rect's stroke is wider than the shape, so it covers
+        ;; the whole band even around inner rounded corners. The clip cuts
+        ;; it to the band, so the extra width is never visible.
+        cover-width  (+ (max (:width shape) (:height shape)) (* 2 max-width))
+        clip-id      (dm/str "per-side-clip-" render-id "-" shape-id "-" index)
+        mask-id      (dm/str "per-side-mask-" render-id "-" shape-id "-" index)]
+
+    (when-not (= style :none)
+      [:g {:transform transform}
+       [:defs
+        defs-el
+        [:> "clipPath" {:id clip-id}
+         [:path {:d band-d :clipRule "evenodd"}]]
+        (when dashed?
+          [:mask {:id mask-id
+                  :maskUnits "userSpaceOnUse"
+                  :x (- (:x outer) max-width)
+                  :y (- (:y outer) max-width)
+                  :width (+ (:width outer) (* 2 max-width))
+                  :height (+ (:height outer) (* 2 max-width))}
+           (for [{:keys [side x1 y1 x2 y2]} (mask-lines outer inner)
+                 :let [width (get side-widths side)]
+                 :when (pos? width)]
+             ;; No strokeOpacity here: opacity sits on the painted rect only.
+             [:line {:key (name side)
+                     :x1 x1 :y1 y1 :x2 x2 :y2 y2
+                     :stroke "white"
+                     :strokeWidth width
+                     :strokeDasharray (attrs/calculate-dasharray style width dash gap)
+                     :strokeLinecap (if (= style :dotted) "round" "butt")
+                     :fill "none"}])])]
+       [:rect {:x (:x shape)
+               :y (:y shape)
+               :width (:width shape)
+               :height (:height shape)
+               :fill "none"
+               :stroke paint
+               :strokeOpacity opacity
+               :strokeWidth cover-width
+               :clipPath (dm/str "url(#" clip-id ")")
+               :mask (when dashed? (dm/str "url(#" mask-id ")"))}]])))
+
 (mf/defc shape-strokes
   {::mf/wrap-props false}
   [props]
@@ -513,11 +633,17 @@
       [:> :g props
        (for [[index value] (reverse (d/enumerate shape-strokes))
              :when (not (:hidden value))]
-         [:& shape-custom-stroke {:shape shape
-                                  :stroke value
-                                  :index index
-                                  :key (dm/str index "-" stroke-id)}
-          (build-stroke-element child value index render-id open-path?)])])))
+         (if (cts/per-side-stroke? shape value)
+           [:& per-side-stroke {:shape shape
+                                :stroke value
+                                :index index
+                                :render-id render-id
+                                :key (dm/str index "-" stroke-id)}]
+           [:& shape-custom-stroke {:shape shape
+                                    :stroke value
+                                    :index index
+                                    :key (dm/str index "-" stroke-id)}
+            (build-stroke-element child value index render-id open-path?)]))])))
 
 (mf/defc shape-custom-strokes
   {::mf/wrap-props false}

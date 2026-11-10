@@ -313,6 +313,25 @@
     (t/is (= uuid/zero (:parent-id board)))
     (assert-box board 10 20 200 100)))
 
+(t/deftest create-board-and-update-overflow-scroll-test
+  (let [file     (thf/sample-file :file1)
+        pid      (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_board" :page-id pid :id "$tmp:b"
+                                         :x 0 :y 0 :width 200 :height 100
+                                         :props {:overflow-scroll "vertical"}}])
+        board-id (created result "$tmp:b")
+        data-create (thrown-data #(compile-ops file [{:op "create_board" :page-id pid :id "$tmp:c"
+                                                      :x 0 :y 0 :width 200 :height 100
+                                                      :props {:overflow-scroll "diagonal"}}]))
+        [file'' _] (apply-ops file' [{:op "update_shape" :page-id pid :id board-id
+                                      :props {:overflow-scroll "both"}}])
+        data-update (thrown-data #(compile-ops file' [{:op "update_shape" :page-id pid :id board-id
+                                                       :props {:overflow-scroll "sideways"}}]))]
+    (t/is (= :vertical (:overflow-scroll (shape-of file' board-id))))
+    (t/is (= :validation (:type data-create)))
+    (t/is (= :both (:overflow-scroll (shape-of file'' board-id))))
+    (t/is (= :validation (:type data-update)))))
+
 (t/deftest create-ellipse-is-circle
   (let [file   (thf/sample-file :file1)
         pid    (page-id-of file)

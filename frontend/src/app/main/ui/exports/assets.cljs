@@ -13,12 +13,15 @@
    [app.common.data.macros :as dm]
    [app.common.types.color :as clr]
    [app.main.data.exports.assets :as de]
+   [app.main.data.fonts-missing :as fonts-missing]
    [app.main.data.modal :as modal]
+   [app.main.fonts :as fonts]
    [app.main.refs :as refs]
    [app.main.store :as st]
    [app.main.ui.ds.buttons.button :refer [button*]]
    [app.main.ui.ds.buttons.icon-button :refer [icon-button*]]
    [app.main.ui.ds.foundations.assets.icon :as i :refer [icon*]]
+   [app.main.ui.ds.notifications.context-notification :refer [context-notification*]]
    [app.main.ui.workspace.shapes :refer [shape-wrapper]]
    [app.util.dom :as dom]
    [app.util.i18n :as i18n :refer  [tr c]]
@@ -37,6 +40,26 @@
         all-exports     (deref exports)
         all-checked?    (every? :enabled all-exports)
         all-unchecked?  (every? (complement :enabled) all-exports)
+
+        vstate          (mf/deref refs/viewer-data)
+        ws-objects      (mf/deref refs/workspace-page-objects)
+        fonts           (mf/deref fonts/fontsdb)
+
+        enabled-ids     (mf/with-memo [all-exports]
+                          (into [] (comp (filter :enabled) (map :object-id)) all-exports))
+
+        ;; The modal is also opened from the viewer, where the workspace page
+        ;; is not loaded. There, use the viewer page of the exports; then add
+        ;; the shapes the exports carry for ids the page does not hold.
+        objects         (mf/with-memo [origin vstate ws-objects all-exports]
+                          (let [page-id (:page-id (first all-exports))
+                                base    (or (when (= origin "viewer")
+                                              (get-in vstate [:pages page-id :objects]))
+                                            ws-objects)]
+                            (fonts-missing/objects-with-exports base all-exports)))
+
+        missing         (mf/with-memo [objects enabled-ids fonts]
+                          (fonts-missing/get-missing-fonts objects enabled-ids fonts/installed?))
 
         enabled-exports (into []
                               (comp (filter :enabled)
@@ -152,6 +175,12 @@
 
        (when (> (count all-exports) 0)
          [:div {:class (stl/css :modal-footer)}
+          (when (seq missing)
+            [:> context-notification* {:type :context
+                                       :appearance "neutral"
+                                       :level :warning}
+             (tr "dashboard.export-shapes.missing-fonts"
+                 (fonts-missing/families-label missing))])
           [:div {:class (stl/css :action-buttons)}
            [:> button* {:variant "secondary"
                         :on-click cancel-fn}
