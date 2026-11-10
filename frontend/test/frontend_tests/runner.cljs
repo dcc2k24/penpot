@@ -9,6 +9,7 @@
    [frontend-tests.code-gen-style-test]
    [frontend-tests.composable-tests.comp.sync-test]
    [frontend-tests.copy-as-svg-test]
+   [frontend-tests.data.changes-test]
    [frontend-tests.data.comments-filters-test]
    [frontend-tests.data.dashboard-test]
    [frontend-tests.data.event-test]
@@ -167,6 +168,7 @@
    [frontend-tests.util-text-editor-test]
    [frontend-tests.util-theme-test]
    [frontend-tests.util-webapi-test]
+   [frontend-tests.util-worker-test]
    [frontend-tests.util-zip-test]
    [frontend-tests.util.code-gen-markup-svg-wasm-test]
    [frontend-tests.util.dom.dnd-test]
@@ -191,6 +193,7 @@
    'frontend-tests.code-gen-style-test
    'frontend-tests.composable-tests.comp.sync-test
    'frontend-tests.copy-as-svg-test
+   'frontend-tests.data.changes-test
    'frontend-tests.data.comments-filters-test
    'frontend-tests.data.dashboard-test
    'frontend-tests.data.event-test
@@ -352,6 +355,7 @@
    'frontend-tests.util-text-editor-test
    'frontend-tests.util-theme-test
    'frontend-tests.util-webapi-test
+   'frontend-tests.util-worker-test
    'frontend-tests.util.code-gen-markup-svg-wasm-test
    'frontend-tests.util.dom.dnd-test
    'frontend-tests.util-zip-test

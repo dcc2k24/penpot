@@ -5,7 +5,8 @@
 ;; Copyright (c) KALEIDOS SUBSIDIARY SL
 
 (ns app.util.worker
-  "A lightweight layer on top of webworkers api."
+  "A lightweight layer on top of webworkers api. Each request waits for
+  its own reply, found by the sender id."
   (:require
    [app.common.uuid :as uuid]
    [app.util.object :as obj]
@@ -13,7 +14,26 @@
    [beicon.v2.core :as rx]))
 
 (declare handle-response)
-(defrecord Worker [instance stream])
+(defrecord Worker [instance pending])
+
+(defn- get-replies
+  "Returns an observable of the replies to the request `sender-id`.
+  Subscribing adds the subscriber to the waiting set for that id in
+  `pending`. Unsubscribing removes it, and removes the id once no
+  subscriber waits for it."
+  [^js pending sender-id]
+  (let [id (str sender-id)]
+    (rx/create
+     (fn [subscriber]
+       (let [subs (or (.get pending id)
+                      (let [subs (js/Set.)]
+                        (.set pending id subs)
+                        subs))]
+         (.add subs subscriber)
+         (fn []
+           (.delete subs subscriber)
+           (when (zero? (.-size subs))
+             (.delete pending id))))))))
 
 (defn- send-message!
   ([worker message]
@@ -35,8 +55,7 @@
      (if (some? instance)
        (do (.postMessage instance data transfer)
            (if (not ignore-response?)
-             (->> (:stream worker)
-                  (rx/filter #(= (:reply-to %) sender-id))
+             (->> (get-replies (:pending worker) sender-id)
                   (take-messages)
                   (rx/filter (complement :dropped))
                   (rx/map handle-response))
@@ -87,18 +106,21 @@
      :transfer transfer})))
 
 (defn init
-  "Return a initialized webworker instance."
+  "Return a initialized webworker instance. Replies go to the waiting
+  subscribers of their request; a reply nobody waits for is dropped."
   [path on-error]
   (let [instance (js/Worker. path)
-        bus      (rx/subject)
-        worker   (Worker. instance (rx/to-observable bus))
+        pending  (js/Map.)
+        worker   (Worker. instance pending)
 
         handle-message
         (fn [event]
           (let [message (wm/decode (.-data event))]
             (if (:error message)
               (on-error (:error message))
-              (rx/push! bus message))))
+              (when-let [subs (.get ^js pending (str (:reply-to message)))]
+                (doseq [subscriber (js/Array.from subs)]
+                  (rx/push! subscriber message))))))
 
         handle-error
         (fn [event]

@@ -48,13 +48,13 @@
     (assoc :page-id (or id (:id page)))))
 
 (defn- update-indexes
-  "Given a commit, send the changes to the worker for updating the
-  indexes."
-  [commit attr]
+  "Given a vector of changes, send them to the worker for updating the
+  indexes. Sends one request per page."
+  [changes]
   (ptk/reify ::update-indexes
     ptk/WatchEvent
     (watch [_ _ _]
-      (let [changes (->> (get commit attr)
+      (let [changes (->> changes
                          (map fix-page-id)
                          (filter :page-id)
                          (group-by :page-id))]
@@ -80,6 +80,19 @@
   (->> (concat (map (d/getf (:index persistence)) (:queue persistence))
                (:buffer persistence))
        (not-empty)))
+
+(defn- get-rebase-changes
+  "Returns the changes the worker index must apply when `commit` is
+  rebased over `pending`. The index must see the same sequence that the
+  file data sees, so the result is: the undo changes of the pending
+  commits, latest commit first; then the redo changes of `commit`; then
+  the redo changes of the pending commits in commit order. With no
+  pending commits it returns the redo changes of `commit`."
+  [commit pending]
+  (-> []
+      (into (mapcat :undo-changes) (reverse pending))
+      (into (:redo-changes commit))
+      (into (mapcat :redo-changes) pending)))
 
 (def ^:private xf:map-page-id
   ;; Component-only changes have no :page-id; keep drops those nils so
@@ -234,14 +247,7 @@
                         (get-pending-commits state))]
           (rx/concat
            (rx/of (apply-changes-localy commit pending))
-           (if pending
-             (rx/concat
-              (->> (rx/from (reverse pending))
-                   (rx/map (fn [commit] (update-indexes commit :undo-changes))))
-              (rx/of (update-indexes commit :redo-changes))
-              (->> (rx/from pending)
-                   (rx/map (fn [commit] (update-indexes commit :redo-changes)))))
-             (rx/of (update-indexes commit :redo-changes)))))))))
+           (rx/of (update-indexes (get-rebase-changes commit pending)))))))))
 
 (defn- resolve-file-revn
   [state file-id]
