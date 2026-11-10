@@ -138,6 +138,64 @@ const cases: [string, string, Record<string, unknown>, string, Record<string, un
         { fileId: FILE, setId: SET, format: "dtcg" },
     ],
     [
+        "export_subtree",
+        "export_subtree",
+        { fileId: FILE, pageId: PAGE, rootId: SHAPE, limit: 50 },
+        "get-mcp-subtree",
+        { fileId: FILE, pageId: PAGE, rootId: SHAPE, limit: 50, maxBytes: 80_000 },
+    ],
+    [
+        "get_interactions",
+        "get_interactions",
+        { fileId: FILE, pageId: PAGE, limit: 25 },
+        "get-mcp-interactions",
+        { fileId: FILE, pageId: PAGE, limit: 25 },
+    ],
+    [
+        "find_connectors",
+        "find_connectors",
+        { fileId: FILE, pageId: PAGE, maxDistance: 120, limit: 40 },
+        "find-mcp-connectors",
+        { fileId: FILE, pageId: PAGE, maxDistance: 120, limit: 40 },
+    ],
+    [
+        "list_fonts",
+        "list_fonts",
+        { fileId: FILE, pageId: PAGE, rootIds: [SHAPE] },
+        "get-mcp-fonts",
+        { fileId: FILE, pageId: PAGE, rootIds: [SHAPE] },
+    ],
+    [
+        "lint_page",
+        "lint_page",
+        {
+            fileId: FILE,
+            pageId: PAGE,
+            depth: 2,
+            boardNameRegex: "^Screen",
+            minShapes: 5,
+            rules: ["empty-board", "off-board-control"],
+            limit: 100,
+        },
+        "get-mcp-page-lint",
+        {
+            fileId: FILE,
+            pageId: PAGE,
+            depth: 2,
+            boardNameRegex: "^Screen",
+            minShapes: 5,
+            rules: ["empty-board", "off-board-control"],
+            limit: 100,
+        },
+    ],
+    [
+        "find_similar_boards",
+        "find_similar_boards",
+        { fileId: FILE, pageId: PAGE, depth: 3, boardNameRegex: "^Card", threshold: 0.75, minShapes: 4, limit: 20 },
+        "find-mcp-similar-boards",
+        { fileId: FILE, pageId: PAGE, depth: 3, boardNameRegex: "^Card", threshold: 0.75, minShapes: 4, limit: 20 },
+    ],
+    [
         "apply_operations",
         "apply_operations",
         { fileId: FILE, operations: [createRect], dryRun: true, baseRevn: 7 },
@@ -532,12 +590,23 @@ test("read tools are marked read-only, and the file and version managers are mar
         "find_shapes",
         "get_library",
         "get_tokens",
+        "get_interactions",
+        "find_connectors",
+        "list_fonts",
+        "lint_page",
+        "find_similar_boards",
         "describe_operations",
     ];
     for (const name of readOnly) {
         const found = tools.find((candidate) => candidate.getToolName() === name);
         assert.ok(found, `${name} is registered`);
         assert.deepEqual(found.annotations(), { readOnlyHint: true, destructiveHint: false }, name);
+    }
+    const writesOnly = ["export_subtree"];
+    for (const name of writesOnly) {
+        const found = tools.find((candidate) => candidate.getToolName() === name);
+        assert.ok(found, `${name} is registered`);
+        assert.deepEqual(found.annotations(), { readOnlyHint: false, destructiveHint: false }, name);
     }
     for (const name of ["manage_files", "manage_versions"]) {
         const found = tools.find((candidate) => candidate.getToolName() === name);
@@ -546,11 +615,11 @@ test("read tools are marked read-only, and the file and version managers are mar
     }
 });
 
-test("the tool set holds twenty-two backend tools with unique names", () => {
+test("the tool set holds twenty-eight backend tools with unique names", () => {
     const { tools } = harness();
     const names = tools.map((tool) => tool.getToolName());
-    assert.equal(names.length, 22);
-    assert.equal(new Set(names).size, 22);
+    assert.equal(names.length, 28);
+    assert.equal(new Set(names).size, 28);
     assert.ok(names.includes("describe_operations"));
     assert.ok(names.includes("execute_code"));
     assert.ok(names.includes("apply_operations"));

@@ -6,7 +6,12 @@ import type { BackendServices } from "../../backend/BackendServices";
 import { TokenDigest } from "../../backend/TokenDigest";
 import { AwaitRewriter } from "../../sandbox/AwaitRewriter";
 import { CallSlots, SlotHolder } from "../../sandbox/CallSlots";
-import { SandboxHost, type SandboxSummary, type SandboxWriteOptions } from "../../sandbox/SandboxHost";
+import {
+    SandboxHost,
+    type PartialScope,
+    type SandboxSummary,
+    type SandboxWriteOptions,
+} from "../../sandbox/SandboxHost";
 import {
     HOST_PRIMITIVE_NAMES,
     RUNTIME_DISCARDED_MESSAGE,
@@ -40,7 +45,28 @@ export class ExecuteCodeBackendArgs {
         ),
         pageId: BackendIds.uuid()
             .optional()
-            .describe("Id of the page that becomes penpot.currentPage. Default: the first page of the file."),
+            .describe(
+                "Id of the page that becomes penpot.currentPage. Default: the first page of the file. " +
+                    "With rootIds, the page that holds the roots."
+            ),
+        rootIds: z
+            .array(BackendIds.uuid())
+            .min(1)
+            .max(20)
+            .optional()
+            .describe(
+                "Ids of 1 to 20 shapes of pageId (boards or groups) to load instead of the whole page. Each one loads " +
+                    "with its subtree. The ancestors up to the page root load too, marked ancestorOnly: children lists them, " +
+                    "so a walk from the root reaches the loaded shapes, while findShapes and the other searches skip them, and " +
+                    "an ancestor cannot be moved, removed or reordered. Shapes outside the roots are not in the model: findShapes and " +
+                    "penpot.root see only the loaded shapes. A parent with children that were not loaded refuses the " +
+                    "operations that depend on its child order: insertChild with an index, setParentIndex, bringToFront, " +
+                    "sendToBack, bringForward and sendBackward of its children, parentIndex of its children, and remove " +
+                    "and ungroup of the parent itself. appendChild with no index works. A reference to a shape outside " +
+                    "the roots reads as a placeholder with its id and loaded false; any other read of it throws. " +
+                    "Needs pageId. Pass rootIds for a page too large to load whole (PENPOT_MCP_SANDBOX_PAGE_MB), or to " +
+                    "work on a few boards. Other pages load whole. The reply carries a partial-page warning."
+            ),
         snapshot: WriteOptions.schema.snapshot.describe(
             "Whether the first write of the script takes a snapshot. Unset: the backend decides, as for " +
                 "apply_operations. true: the first write takes one, so one restore undoes the whole script. " +
@@ -77,6 +103,8 @@ export class ExecuteCodeBackendArgs {
     fileId!: string;
 
     pageId?: string;
+
+    rootIds?: string[];
 
     snapshot?: boolean;
 
@@ -213,6 +241,12 @@ export class ExecuteCodeBackendTool extends BackendTool<ExecuteCodeBackendArgs> 
             "create, and the 5000-operation limit counts the operations after that. Reads after writes see the " +
             "pending changes. The return value comes back as JSON. Console output comes back in the console array. " +
             "storage keeps its data for the MCP access token, across files, and drops it after 30 minutes idle. " +
+            "With rootIds and pageId, only the subtrees of those shapes load (at most 20 roots), so a page too large " +
+            "to load whole can still be read in part; the reply then carries a partial-page warning. A partial page " +
+            "refuses the operations that need every child of a parent that is not fully loaded, with one clear error " +
+            "and nothing sent, and a reference to a shape outside the roots reads as a placeholder; a placeholder returned as a result is its id and loaded false. " +
+            "Each flush reloads the page by walking every root again, which takes one rate-limit token. swapComponent on a " +
+            "root gives a new id that the model does not learn, so pass the parent of the instance as the root when swapping components. " +
             "Limits per call: 5000 operations, 20 pages (16 MB of page data by default; PENPOT_MCP_SANDBOX_PAGE_MB), 1000 host calls, " +
             "20 exports and media uploads, 120 s wall-clock time, 3 s CPU time, 128 MB memory. " +
             "One script runs at a time for each token, and two more may wait; at most 20 scripts run at once across " +
@@ -226,6 +260,16 @@ export class ExecuteCodeBackendTool extends BackendTool<ExecuteCodeBackendArgs> 
     }
 
     protected async executeBackend(args: ExecuteCodeBackendArgs, userToken: string): Promise<ToolResponse> {
+        if (args.rootIds !== undefined && args.pageId === undefined) {
+            throw new Error("execute_code: rootIds needs pageId, the page that holds the roots");
+        }
+        const scope =
+            args.rootIds === undefined
+                ? undefined
+                : SandboxHost.partialScope(args.fileId, args.pageId ?? "", args.rootIds);
+        if (scope !== undefined) {
+            await this.checkPage(scope.fileId, scope.pageId, userToken);
+        }
         const sessions = this.services.sandboxes;
         const key = TokenDigest.sha256Hex(userToken);
         // the token's turn comes first, so that one token cannot hold every global slot.
@@ -234,7 +278,7 @@ export class ExecuteCodeBackendTool extends BackendTool<ExecuteCodeBackendArgs> 
             const slot = new SlotHolder(this.slots);
             await this.admit(() => slot.take());
             try {
-                return await this.runWithRetry(args, userToken, key, slot);
+                return await this.runWithRetry(args, userToken, key, slot, scope);
             } finally {
                 // a runtime whose memory grew past the recycle size is dropped, so the memory goes back to the process.
                 sessions.recycleIfSpent(key);
@@ -243,6 +287,26 @@ export class ExecuteCodeBackendTool extends BackendTool<ExecuteCodeBackendArgs> 
         } finally {
             // waits for the save of the storage, so that the next call on another adapter reads the new copy.
             await releaseTurn();
+        }
+    }
+
+    /**
+     * Refuses a partial call whose page the file does not hold, before anything is loaded.
+     *
+     * @param fileId - file of the call
+     * @param pageId - page that the roots belong to
+     * @param userToken - MCP token of the call
+     * @throws Error when the file has no page with that id
+     */
+    private async checkPage(fileId: string, pageId: string, userToken: string): Promise<void> {
+        const outline = await this.services.backend.callCommand<{ pages?: Array<{ id?: unknown }> }>(
+            userToken,
+            "get-mcp-file-outline",
+            { fileId }
+        );
+        const pages = Array.isArray(outline?.pages) ? outline.pages : [];
+        if (!pages.some((page) => page.id === pageId)) {
+            throw new Error(`pageId ${pageId} is not a page of file ${fileId}`);
         }
     }
 
@@ -275,13 +339,14 @@ export class ExecuteCodeBackendTool extends BackendTool<ExecuteCodeBackendArgs> 
         args: ExecuteCodeBackendArgs,
         userToken: string,
         key: string,
-        slot: SlotHolder
+        slot: SlotHolder,
+        scope: PartialScope | undefined
     ): Promise<ToolResponse> {
         const scriptId = args.requestId ?? randomUUID();
         for (let attempt = 1; ; attempt += 1) {
             const runtime = await this.services.sandboxes.acquire(key);
             const settings = this.services.sandboxes.settings;
-            const host = new SandboxHost(this.services, userToken, settings.maxHostCalls, settings.maxPageBytes);
+            const host = new SandboxHost(this.services, userToken, settings.maxHostCalls, settings.maxPageBytes, scope);
             const state: CallState = {
                 started: false,
                 scriptId,

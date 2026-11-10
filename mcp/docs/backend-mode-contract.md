@@ -55,13 +55,13 @@ has `::rpc/token-type "mcp"`.
 | Scope | How reached | Commands |
 |---|---|---|
 | `mcp:read` | opt-in | `get-teams`, `get-projects`, `get-project-files`, `get-team-shared-files`, `get-team-recent-files`, `get-team-deleted-files`, `search-files`, `get-file-snapshots`, `get-comment-threads`, `get-comments` |
-| `mcp:read` | MCP only | `mcp-whoami`, `get-mcp-file-outline`, `get-mcp-page-tree`, `get-mcp-shapes`, `find-mcp-shapes`, `get-mcp-library`, `get-mcp-tokens`, `create-mcp-render-session`, `send-mcp-feedback` |
+| `mcp:read` | MCP only | `mcp-whoami`, `get-mcp-file-outline`, `get-mcp-page-tree`, `get-mcp-shapes`, `find-mcp-shapes`, `get-mcp-library`, `get-mcp-tokens`, `create-mcp-render-session`, `send-mcp-feedback`, `get-mcp-subtree`, `get-mcp-interactions`, `find-mcp-connectors`, `get-mcp-fonts`, `get-mcp-page-lint`, `find-mcp-similar-boards` |
 | `mcp:write` | opt-in | `upload-file-media-object`, `create-file-media-object-from-url`, `create-comment-thread`, `update-comment-thread` (resolve or reopen), `create-comment`, `update-comment-thread-position`, `create-file-snapshot`, `update-file-snapshot`, `lock-file-snapshot`, `unlock-file-snapshot` |
 | `mcp:write` | MCP only | `mcp-apply-changes`, `mcp-apply-operations`, `mcp-import-svg`. Their scope is `mcp:read` when `dryRun` is true, else `mcp:write`. |
 | `mcp:manage` | opt-in | `create-team`, `update-team`, `create-project`, `rename-project`, `update-project-pin`, `create-file`, `rename-file`, `set-file-shared`, `duplicate-file`, `duplicate-project`, `move-files`, `move-project`, `link-file-to-library`, `unlink-file-from-library`, `restore-deleted-team-files`, `import-binfile` |
 | `mcp:delete` | opt-in | `delete-project`, `delete-file`, `restore-file-snapshot`, `delete-file-snapshot`, `delete-comment-thread`, `delete-comment` |
 
-That is 54 commands: 42 opt-in and 12 MCP only.
+That is 60 commands: 42 opt-in and 18 MCP only.
 
 Not reachable by MCP tokens: `update-file` (the editor save), `update-comment`, `get-comment-thread`,
 `update-comment-thread-status`, `update-comment-thread-frame`, `get-file-info`, `get-file-stats`,
@@ -172,14 +172,21 @@ Params `{file-id}`. Result:
 {id, name, revn, vern, version, features: [..], projectId, teamId, isShared, modifiedAt,
  pages: [{id, name, index, shapeCount, rootChildCount}],
  libraries: [{id, name}],
+ warnings: [{kind: "font-unresolved", fontId, family, reason, pageId, runs}],
+ warningsComplete: bool, warningsTruncated: bool,
  components: n, deletedComponents: n, colors: n, typographies: n, media: n,
  tokens: {sets: n, themes: n, tokens: n, activeThemes: [..], activeSets: [..]} | null,
  pointerMap: bool}
 ```
 
 - `shapeCount` is the shape count of the page, the root excluded.
-- Page summaries are cached in an LRU keyed by the page pointer id (or by file, vern, page and revn for a plain
-  page). The cache holds up to 4096 entries for 10 minutes.
+- `warnings` is a list, empty when no font is unresolved. It holds one entry for each page and each unresolved font on
+  that page: pages in order, fonts by runs. At most 50 entries come back, and `warningsTruncated` is true when more
+  exist. The warnings cover the pages that one call reads within one second. A page of more than 5,000 shapes is covered
+  only when its font usage is already cached, which a `get-mcp-fonts` read does. `warningsComplete` is false when some
+  pages are not covered, so the list may be short. `reason` is one of the font reasons of section 2.8d. The `pages`
+  entries do not change. Font usage has its own cache per page (10 minutes), so a second outline call reads further
+  pages.
 
 ### 2.4 `get-mcp-page-tree` (read)
 
@@ -280,6 +287,236 @@ not accepted.
 - Result: `{sets: [{id, name, active, tokenCount}], themes: [{id, group, name, sets, active}], activeThemes,
   activeSets, tokens: [{setId, id, name, type, value, description}]}`, or `dtcg` in place of `tokens`.
 
+### 2.8a `get-mcp-subtree` (read)
+
+Params `{file-id, page-id, root-id?, cursor? (string, at most 4096), limit? (int 1 to 5000, default 500),
+max-bytes? (int 1000 to 1000000, default 1000000)}`. `root-id` defaults to the page root (`uuid/zero`).
+
+The walk is depth-first and pre-order, with the children in stored `:shapes` order (bottom first). The root is the
+first shape, except the page root, which is skipped. The children of the page root then have depth 0. A shape that is
+reached a second time, by a cycle in a corrupt child list or by a second parent, is listed once, at its first place, so
+a cycle cannot loop the walk. A child id with no shape on the page is skipped, and not counted in `total`.
+
+The walk of a root on one page version is cached for 10 minutes, so the windows of one export walk the page once. The
+cache holds 400,000 entries in all. The version is part of the key, so a changed page walks again.
+
+Each shape carries:
+
+- every stored attribute except `thumbnail`, so `content`, `position-data`, `points`, `selrect`, `transform`,
+  `transform-inverse`, `fills`, `strokes`, `shadow`, `blur`, `interactions`, `shapes`, `parent-id` and `frame-id`
+  come too. A path's or boolean's `content` is its SVG path string in page space (absolute `M`, `L`, `C` and `Z`
+  commands). A text's `content` is its tree of paragraphs;
+- the defaults of section 2.5, and the box of section 2.5 (`x`, `y`, `width`, `height`);
+- `characters` for a text shape;
+- `depth` (0 for the first level of the walk) and `index` (its place in the whole walk, from 0);
+- `world-matrix` `{a, b, c, d, e, f}` when the shape has a `selrect`: its `transform` applied about the centre of
+  the `selrect`.
+
+Result `{revn, pageId, rootId, total, shapes, truncated, nextCursor?}`. `total` counts the whole walk.
+
+Caps: a window holds at most `limit` shapes. It stops before the shape that would take its encoded size past
+`max-bytes`. It always holds one shape at least. When shapes remain, `truncated` is true and `nextCursor` is set.
+
+Cursor: opaque. It encodes `[page-id version index root-id 0]`, where `version` is the page version (section 2.4).
+A cursor of another page or root is `mcp-invalid-cursor`. A cursor whose version is not the page's is
+`mcp-stale-cursor`. A cursor past the end is `mcp-invalid-cursor`. A root the page does not hold is
+`shape-not-found` (HTTP 404).
+
+Audit props: `file-id`, `page-ids`, `revn` and `token-id`. The command runs through `run-tool`.
+
+### 2.8b `get-mcp-interactions` (read)
+
+Params `{file-id, page-id, limit? (int 1 to 5000, default 1000)}`.
+
+Result `{revn, pageId, flows, shapes, totalInteractions, totalShapes, truncated}`:
+
+- `flows`: each flow of the page as `{id, name, startingFrame, startingFrameName}`. Flows are sorted by name, then id.
+  `startingFrameName` is left out when the starting frame is not on the page.
+- `shapes`: every shape with at least one interaction, in walk order (stored order, pre-order), as
+  `{id, name, type, frameId, path, interactions}`. `path` is the one of section 2.6. The walk skips a repeated shape
+  and a missing one, as section 2.8a does.
+- Each interaction is the stored map, plus `destinationName` when its `destination` is a shape on the page. A point
+  such as `overlay-position` (on an `open-overlay` or `toggle-overlay` action) comes as `overlayPosition: {x, y}`, in
+  page coordinates.
+- `totalInteractions` and `totalShapes` count the whole page.
+
+Caps: at most `limit` shapes, and at most the response budget of about 1,000,000 encoded bytes. `truncated` is true
+when either one cut the list.
+
+### 2.8c `find-mcp-connectors` (read)
+
+Params `{file-id, page-id, max-distance? (number 0 to 2000, default 64), limit? (int 1 to 2000, default 500),
+within-id? (uuid)}`. `within-id` limits the scan to the shapes under that shape; the shape itself is not a candidate.
+A `within-id` that the page does not hold is `shape-not-found`.
+
+It finds the arrows and lines that run between two boards. Candidates are the visible `path` and `bool` shapes, the
+shallowest first, in walk order within a level. A candidate is skipped when it is hidden, when a hidden ancestor
+hides it, when it is a child of a boolean (a boolean draws its children as one shape), or when `within-id` is set and
+it is not under that shape.
+
+Boards are the visible frames, measured by the true bounding box of their points, so a rotated board counts as it is
+drawn. The page root is not a board.
+
+Ends of a candidate: for an open path with a stroke (no close command), its first and last content points. Otherwise
+the two ends of the outline, found by three farthest-point passes over the content points: the point farthest from the
+centroid, the point farthest from that, and the point farthest from the second. The last two points are the ends. This
+is exact for convex outlines such as lines and arrows, and an approximation for other shapes. Above 400 content points,
+every k-th point is used.
+
+Snap: each end snaps to the nearest board within `max-distance`. The distance is 0 inside a board. Boards that are
+ancestors of the candidate are left out, and so are boards that hold both ends. Boards within 1 px of the nearest are
+tied. Of those, the outermost board wins (the one that is an ancestor of the others). If none is, the board with the
+largest area wins. A candidate whose two ends both lie inside its nearest ancestor frame is skipped when that frame is
+not an ancestor of any board: it is a line inside one board.
+
+A candidate is a connector when its two ends snap to two different boards.
+
+Direction:
+
+- `cap`: exactly one end has an arrow cap on a stroke (`line-arrow` or `triangle-arrow`). Caps count on open paths only.
+  That end is `to`.
+- `shape`: the outline is clearly wider at one end. The points within 20 % of the length from each end are measured
+  by their greatest distance from the line through the two ends. The wider end is `to` when it is at least 1.5 times
+  the other and more than 2 px.
+- `none`: `from` is the end further left, or on the same x, the one further up.
+
+Result `{revn, pageId, scanned, connectors, truncated}`. `scanned` counts the candidates looked at. Each connector is
+`{id, name, type, direction, length, from, to}`. `length` is the straight distance between the two ends, not the length
+of the path. `from` and `to` are `{boardId, boardName, distance, x, y}`, where `distance` is the distance of that end
+to its board.
+
+Caps: the scan, with the building of the boards and the candidates, stops after 5 seconds. `truncated` is true when
+the scan stops early, or when more than `limit` connectors are found; the reply then holds `limit` connectors.
+
+### 2.8d `get-mcp-fonts` (read)
+
+Params `{file-id, page-id?, root-ids? (vector of uuid, 1 to 200; needs page-id)}`.
+
+The font of a text run is the `font-id` of its text leaf, `sourcesanspro` when the leaf names none. A leaf with no
+characters is not a run. The variant of a run is its stored `font-variant-id`, else its style and weight.
+
+Source of a font: `builtin` (a bundled family), `google` (an id that starts with `gfont-`), `custom` (an id that
+starts with `custom-`), or `unknown`.
+
+Resolution and `reason`. A font that does not resolve has `resolved` false and one of these reasons:
+
+- `google-fonts-disabled`: the `google-fonts-provider` flag is off.
+- `not-in-google-catalog`: the id is not in the catalogue that ships as `common/resources/fonts/gfonts.2025.11.28.json`.
+- `custom-font-not-in-team`: the team of the file has no live font variant with that id.
+- `unknown-font-id`: any other id. The editor draws it with the default font.
+
+Resolution is read on every call and is not cached, because it depends on the flags and on the team's fonts.
+
+A font that resolves can still have a run whose face the catalogue does not list. That variant has `resolved` false
+and reason `variant-not-found`. The variants of a font that does not resolve carry the reason of the font.
+
+Runs of one face are merged. A run names its face by its variant id, else by weight and style, and the runs of one face
+form one variant entry under the catalogue's own variant id (for example `regular`).
+
+Result `{revn, fonts, unresolved, truncated}`. Each font is `{fontId, family, source, resolved, reason?, runs, shapes,
+pages, variants}`. `shapes` counts the text shapes that use the font. `pages` lists `{pageId, runs}`. Each variant is
+`{variantId, weight, style, runs, resolved, reason?, url?}`. `unresolved` counts every font that does not resolve, also
+those past the reply limit. Fonts sort by runs, descending, then by `fontId`. A reply holds at most 500 fonts.
+
+`truncated` is true when the read was not complete, when the file has more than 500 fonts, or when the reply reached the
+response budget. The fonts that were cut are not listed.
+
+`url`, when there is one:
+
+- a Google variant: the TTF URL of the catalogue;
+- a custom variant: `<public-uri>/assets/by-id/<file-id>` of its TTF file, else of its OTF, WOFF2 or WOFF1 file;
+- a bundled font: none.
+
+Caps: the font usage of each whole page is cached for 10 minutes, keyed by the page. Without `page-id` every page is
+read, in order, under a 5 second budget. The first page is always read. Past the budget no more pages are read, the
+read is not complete, and `truncated` is true. A read with `root-ids` is not cached. `root-ids` limits the report to the
+text under those shapes on the page. A root the page does not hold is `shape-not-found`.
+
+### 2.8e `get-mcp-page-lint` (read)
+
+Params `{file-id, page-id, depth? (int 1 to 5, default 1), board-name-regex? (string, at most 200), min-shapes? (int
+0 to 1000, default 3), rules? (vector of 1 to 8 rule names; default all six), limit? (int 1 to 2000, default 500)}`.
+
+Boards are the visible frames at most `depth` levels below the page root. Depth 1 is the direct children of the page
+root. A frame nested in a board is a board when it is within `depth`. `board-name-regex` keeps the boards whose name
+matches it. An invalid expression is `mcp-invalid-regex`, with a hint that names `board-name-regex`. A pattern too deep
+for the names is `mcp-invalid-pattern`.
+
+Boxes are the true bounding boxes of the points of a shape, so a rotated shape is measured as it is drawn. A shape with
+no points uses its stored box.
+
+Visible descendants of a board are its descendants that are not hidden and have no hidden ancestor below the board.
+A control is a component instance head with at least one visible text descendant.
+
+Rules:
+
+- `empty-board`: the board has fewer visible descendants than `min-shapes`. A board that is, or lies inside, a
+  component instance is skipped. Detail `{shapeCount, minShapes}`.
+- `instance-only-board`: the board's only visible child is a component instance head. A board that is, or lies
+  inside, a component instance is skipped. Detail `{componentId, shapeName}`.
+- `invisible-control`: a control has area and nothing of it is visible at rest. Detail `{visibleFraction,
+  clippedBy}`.
+- `clipped-control`: a control keeps more than 0 % and less than 99.9 % of its area at rest. Detail `{visibleFraction,
+  clippedBy}`. `visibleFraction` has 0 to 1 and three decimals. `clippedBy` is the id of the clipping frame that keeps
+  the least of the control.
+- `scroll-hidden-control`: the control is hidden at rest, and a scroll container brings it into view. Detail
+  `{scrolledBy, visibleFraction}`, where `scrolledBy` is the id of the scroll container and `visibleFraction` is the
+  share at rest.
+- `off-board-control`: a control whose box is not wholly inside the board. Detail `{overflow: {left, top, right,
+  bottom}}`, in px, 0 where it is inside.
+
+The model of the rest and the scroll rules:
+
+- At rest, the clipping frames of a control are the frames between it and the board, the board included, that do not
+  have `show-content` true. The visible share is the area of the control left inside all of them. Nothing scrolls yet.
+- A control that is hidden at rest is checked for reachability. The nearest scroll container (`overflow-scroll` on a
+  frame, with an axis) above it is the one that brings the control into view. The control takes the scroll container's
+  extent on each axis that it scrolls. On the other axis, the control must fit inside the container. The result is then
+  clipped by the container and by the clipping frames above it, and it is reachable when some area is left. A
+  reachable control gives `scroll-hidden-control`. Otherwise the rest rule applies.
+- `off-board-control` applies only when no other rule applies.
+
+Each control gets at most one finding, under its innermost selected board: a selected board between the control and
+the board reports it, so the outer board does not. With `rules` given, the first asked rule that applies is reported,
+in the order `invisible-control`, `clipped-control`, `scroll-hidden-control`, `off-board-control`.
+
+Result `{revn, pageId, boards, findings, counts, truncated}`. `boards` counts the boards checked. Each finding is
+`{rule, boardId, boardName, shapeId?, shapeName?, path?, detail}`. The board findings carry no shape keys. Findings come
+in board order, then walk order. `counts` holds one total for each asked rule, over all findings of the scan, also when
+`limit` cuts the list.
+
+Caps: the scan stops after 5 seconds. `findings` holds at most `limit` entries. `truncated` is true when the scan stops
+early, or when the list is cut.
+
+### 2.8f `find-mcp-similar-boards` (read)
+
+Params `{file-id, page-id, depth? (int 1 to 5, default 1), board-name-regex? (string, at most 200), threshold?
+(number 0.5 to 1, default 0.9), min-shapes? (int 1 to 1000, default 3), limit? (int 1 to 500, default 100)}`.
+
+The boards are those of section 2.8e. Boards with fewer visible descendants than `min-shapes` are left out.
+
+A token is the type of a visible descendant, its component id (none when it has none), and, for a text, its characters
+with whitespace runs collapsed and trimmed. A board's signature is the multiset of its tokens. Positions and names are
+not part of it.
+
+Groups:
+
+- Boards with equal signatures are exact copies. Their group has `similarity` 1 and `exact` true.
+- Distinct signatures are linked when their Jaccard index is at least `threshold`. The index is the sum of the smaller
+  counts over the sum of the larger ones. Links join groups, so a group can span a chain of links. A joined group has
+  `exact` false, and its `similarity` is the lowest index among its linked pairs.
+
+Pruning: the distinct signatures are sorted by size. A pair is not compared when the smaller size over the larger one is
+already below `threshold`, because its index cannot reach it. The deadline is checked every 256 compared pairs.
+
+Result `{revn, pageId, boards, compared, groups, truncated}`. `boards` counts the boards compared. `compared` counts the
+pairs whose index was computed. Each group is `{similarity, exact, boards: [{id, name, path, shapeCount}]}`. Only groups
+of two or more boards come back. They sort by board count, largest first, then by similarity. At most `limit` groups
+come back.
+
+Caps: at most 1000 boards are compared. More set `truncated`. The scan stops after 5 seconds, which also sets
+`truncated`. `truncated` is also set when more groups exist than `limit`.
+
 ### 2.9 `create-mcp-render-session` (read)
 
 Params `{file-id}`. Checks read permission on the file. Mints a session row for the profile with a 10-minute
@@ -294,17 +531,24 @@ the owner's own calls.
 
 | Limiter | Scope | Limit |
 |---|---|---|
-| rlimit `:mcp-read` | reads: `mcp-whoami`, `get-mcp-*`, `find-mcp-shapes`, `create-mcp-render-session` | 1200 calls per bucket, refill 600 per minute (`1200/600/1m`) |
-| rlimit `:mcp-write` | `mcp-apply-changes`, `mcp-apply-operations`, `mcp-import-svg` | 120 calls per bucket, refill 60 per minute (`120/60/1m`) |
+| rlimit `:mcp-read` | reads: `mcp-whoami`, `get-mcp-file-outline`, `get-mcp-page-tree`, `get-mcp-shapes`, `find-mcp-shapes`, `get-mcp-library`, `get-mcp-tokens`, `create-mcp-render-session`, and the six reads of sections 2.8a to 2.8f | 1200 calls per bucket, refill 600 per minute (`1200/600/1m`) |
+| rlimit `:mcp-write` | `mcp-apply-changes`, `mcp-apply-operations`, `mcp-import-svg` | 600 calls per bucket, refill 300 per minute (`600/300/1m`) |
 | rlimit `:access-token` | `update-mcp-token-scopes` | 60 per bucket, refill 30 per minute |
 | climit `:mcp-read/by-profile` | reads | 4 permits, queue 20, timeout 30 s |
 | climit `:mcp-read/global` | reads | 8 permits, queue 64, timeout 30 s |
-| climit `:mcp-find/by-file` | `find-mcp-shapes` | 2 permits per file, queue 10, timeout 30 s |
+| climit `:mcp-find/by-file` | `find-mcp-shapes`, `find-mcp-connectors` (2.8c), `get-mcp-fonts` (2.8d), `get-mcp-page-lint` (2.8e), `find-mcp-similar-boards` (2.8f) | 2 permits per file, queue 10, timeout 30 s |
 | climit `:mcp-apply/by-profile` | writes | 1 permit, queue 5, timeout 60 s |
 | climit `:mcp-apply/global` | writes | 6 permits, queue 50, timeout 60 s |
 | climit `:mcp-update-file/by-profile` | writes: its own permit, so an agent write does not hold the owner's file-save permit | 1 permit, queue 5, timeout 60 s |
+| climit `:mcp-apply/by-team` | writes, per team of the file | 4 permits, queue 50, timeout 60 s |
 
-The write limiters are taken in the order `mcp-apply/by-profile`, `mcp-apply/global`, `mcp-update-file/by-profile`.
+`get-mcp-subtree` (2.8a) and `get-mcp-interactions` (2.8b) take the two read limiters and no per-file limiter.
+
+The six reads of sections 2.8a to 2.8f use the `:mcp-read` bucket, like the other reads. Every command in a set also
+keeps the file's `:default` entry (`200000/h`).
+
+The write limiters are taken in the order `mcp-apply/by-profile`, `mcp-apply/global`, `mcp-update-file/by-profile`,
+`mcp-apply/by-team`.
 
 ### 2.11 Write rules (shared by the three write commands)
 
@@ -632,6 +876,14 @@ hint names the op that sets the key (`schema.cljc`, `structural-prop-hints`):
 `layout-gap*`, `layout-padding*` and `layout-item-*` keys are refused in `props` on purpose. Use `set_flex_layout`,
 `set_grid_layout` or `set_layout_child` for them. `hide-in-viewer` is allowed on every type.
 
+`overflow-scroll` (JSON `overflowScroll`) is a board prop. Its values are `none`, `horizontal`, `vertical` and `both`,
+and an absent value means `none`. `create_board` takes it in `props`, and so does `update_shape` on a board. Any other
+value answers a validation error, `mcp-invalid-operation`, before anything is written (test
+`create-board-and-update-overflow-scroll-test`). It marks a clipping board as a scroll container for prototypes and
+code export. The viewer does not scroll it yet. The reads return it. The plugin API has `board.overflowScroll`, and
+`execute_code` reads and writes it. The `scroll-hidden-control` rule of `lint_page` (section 2.8e) uses it: a control
+that is hidden only along the axis the board scrolls is not clipped.
+
 ### 3.6 Parent refusals
 
 Any op that takes a parent (`create_*`, `instantiate_component`, `move_shapes`, `reorder`, `clone_shape` with a
@@ -665,9 +917,14 @@ tools are off.
 `high_level_overview`, `penpot_api_info` and `submit_feedback` are shared by all modes.
 
 Backend tools: `whoami`, `list_teams`, `list_projects`, `list_files`, `get_file_outline`, `get_page_tree`,
-`get_shapes`, `find_shapes`, `get_library`, `get_tokens`, `apply_operations`, `apply_raw_changes`,
+`get_shapes`, `find_shapes`, `export_subtree`, `get_interactions`, `find_connectors`, `list_fonts`, `lint_page`,
+`find_similar_boards`, `get_library`, `get_tokens`, `apply_operations`, `apply_raw_changes`,
 `batch_create_shapes`, `manage_files`, `manage_versions`, `comments`, `import_image`, `import_svg`,
 `import_archive`, `export_shape`, `execute_code`, `describe_operations`.
+
+`penpot_api_info` takes a type name or a topic. The topic `Geometry` gives the rules of the box, the transform, the
+text, the gradients, the strokes and the children of a shape. The same text is the "Geometry semantics" section of
+`packages/server/data/backend_instructions.md`.
 
 `describe_operations {ops}` takes a list of operation names and returns their parameters as JSON Schema, with the rules
 that span operations. The adapter points to it when an operation is rejected.
@@ -691,6 +948,12 @@ the `get_shapes`, `get_page_tree` and `find_shapes` results and keeps `frame` fo
 | `get_page_tree {fileId, pageId, rootId?, depth?, fields?, limit?, cursor?}` | `get-mcp-page-tree`. `limit` defaults to 100 (1 to 5000). Layout children come in visual order. |
 | `get_shapes {fileId, pageId, ids, fields?, includeChildren?}` | `get-mcp-shapes`. Without `fields` the tool sends: `id name type parentId x y width height hidden shapes`. |
 | `find_shapes {...}` | `find-mcp-shapes`. `limit` defaults to 100 (1 to 1000). Type `ellipse` or `board` is sent as `circle` or `frame`. Matches show `ellipse` and `frame`. |
+| `export_subtree {fileId, pageId, rootId?, cursor?, limit?, filePath?, overwrite?}` | `get-mcp-subtree` (section 2.8a). Inline: one window. `limit` is 1 to 5000, default 100. Without `filePath` the window fills 80 % of the response cap. With `filePath`, every window is read into one file (below). Shape types show as the other tools show them (`ellipse`, `frame`). A path's or boolean's `content` is an SVG path string in page space. A text's `content` is its tree of paragraphs. |
+| `get_interactions {fileId, pageId, limit?}` | `get-mcp-interactions` (section 2.8b). `limit` is 1 to 5000, default 1000. Shape types show as in `get_shapes`. |
+| `find_connectors {fileId, pageId, maxDistance?, withinId?, limit?}` | `find-mcp-connectors` (section 2.8c). `maxDistance` is 0 to 2000, default 64. `withinId` limits the scan to the shapes under one shape, and it must be on the page. `limit` is 1 to 2000, default 500. |
+| `list_fonts {fileId, pageId?, rootIds?}` | `get-mcp-fonts` (section 2.8d). `rootIds` is 1 to 200 shape ids and needs `pageId`. Without `pageId` every page is read. At most 500 fonts come back. |
+| `lint_page {fileId, pageId, depth?, boardNameRegex?, minShapes?, rules?, limit?}` | `get-mcp-page-lint` (section 2.8e). `minShapes` is 0 to 1000, default 3. `rules` takes 1 to 8 of six names: `empty-board`, `instance-only-board`, `clipped-control`, `invisible-control`, `scroll-hidden-control` and `off-board-control`. `limit` is 1 to 2000, default 500. |
+| `find_similar_boards {fileId, pageId, depth?, boardNameRegex?, threshold?, minShapes?, limit?}` | `find-mcp-similar-boards` (section 2.8f). `threshold` is 0.5 to 1, default 0.9. `minShapes` is 1 to 1000, default 3. `limit` is 1 to 500, default 100. The reply has `compared`, the number of pairs compared. |
 | `get_library {fileId, kinds?}` | `get-mcp-library` |
 | `get_tokens {fileId, setId?, format?}` | `get-mcp-tokens` with `fileId`, `setId` (one set; left out for every set) and `format` (`tokens`, the default, or `dtcg`). |
 | `apply_operations {fileId, operations, ...}` | `mcp-apply-operations`. Operation `op` names and camelCase params pass through. The adapter validates each op with zod and reports the `index` and `op` of the first invalid one. |
@@ -702,8 +965,16 @@ the `get_shapes`, `get_page_tree` and `find_shapes` results and keeps `frame` fo
 | `import_image {fileId, base64? url? filePath?, mimeType?, name?, pageId?, parentId?, x?, y?, width?, height?, createShape?}` | multipart `upload-file-media-object` or `create-file-media-object-from-url`, then a `create_image` op |
 | `import_svg {fileId, pageId, svg, parentId?, x?, y?}` | `mcp-import-svg` |
 | `import_archive {projectId, base64? filePath? url?, name?}` | multipart `import-binfile` (the SSE reply is read to the end) |
-| `export_shape {fileId, pageId, shapeId or "page", format, scale?, mode, filePath?, overwrite?}` | section 4.5 |
-| `execute_code {code, fileId, pageId?, snapshot?, baseRevn?, failOnConflict?, allowSplit?, requestId?}` | section 4.4 |
+| `export_shape {fileId, pageId, shapeId or "page" or shapeIds, format, scale?, mode, renderer?, refresh?, filePath?, outputDir?, overwrite?}` | section 4.5 |
+| `execute_code {code, fileId, pageId?, rootIds?, snapshot?, baseRevn?, failOnConflict?, allowSplit?, requestId?}` | section 4.4 |
+
+`export_subtree` with `filePath` reads every window (5000 shapes each) and streams one JSON document to the file:
+`{"fileId", "pageId", "rootId", "revn", "total", "shapes": [...]}`. The shapes are in walk order, with the attributes
+of section 2.8a in camelCase. The path must lie inside the export directory (section 4.5), end in `.json`, and not
+replace a file unless `overwrite` is true. `cursor` is refused with `filePath`. The reply is `{path, shapes, bytes,
+revn, windows}`, and the tool reports progress after each window. When the page changes during the walk, the walk
+starts again once from the beginning. A second stale cursor fails with a message that the page keeps changing. A
+failed walk removes the partial file and the folders the call created. In multi-user mode a `filePath` is refused.
 
 ### 4.3 Replies, writes and errors
 
@@ -712,6 +983,13 @@ the `get_shapes`, `get_page_tree` and `find_shapes` results and keeps `frame` fo
   `truncated`, keeps the first items of each array (the same count for every array), and names the arrays it cut.
   Its `nextCursor`, if any, is dropped, because it would skip the cut items. The note tells the caller to repeat the
   call with a smaller limit.
+- An inline `export_subtree` reply holds whole shapes, as many as fit the cap. A window too large is cut to fewer shapes,
+  and nextCursor continues from the first shape not sent. A single shape too large for the cap comes back trimmed.
+  Its largest attributes are replaced by `{omitted: true, bytes}`, in this order: `content`, `positionData` and
+  `shapes` first; then the other strings and arrays above 2000 bytes, largest first; then the rest, largest first.
+  `id` and `type` are never cut. The reply then carries `oversize: [{id, bytes, omitted: [names]}]` with the size of
+  the full shape, and a `note` that says to read the shape in a file with `filePath`, or one attribute with
+  `get_shapes` and `fields`.
 - Every write sends a `requestId`. The caller may name it. Otherwise the adapter makes a UUID for the call. A retry
   of the same write must reuse the `requestId`. The same id with another payload is a new write on the backend. A repeat that the backend already applied returns `alreadyApplied:
   true` and a note that nothing changed. The idempotency window is set by the backend (section 2.11).
@@ -744,6 +1022,34 @@ Limits (defaults, all set by `PENPOT_MCP_SANDBOX_*`, section 4.6):
 - `storage` (the script's own data) is kept per MCP token, across files. It holds JSON values only: a cycle or a
   function is lost on save. Its saved JSON is capped at 8 MB. A larger save keeps the last copy that fit and adds a
   note to the reply.
+
+Partial loads (`rootIds` with `pageId`):
+
+- `rootIds` names 1 to 20 shapes of the page, not the page root. The host fixes the roots for the call, so script code
+  cannot change them. Each root loads with its subtree, and a deep subtree loads past depth 20.
+- Every ancestor of a root loads too, up to the page root. An ancestor loaded only to reach a root is a stub: its
+  `ancestorOnly` is true, and its child list is partial (`childrenPartial` true). The page root is partial too, when it
+  loads with stubs. `children` returns the stubs, so a walk from the root reaches the loaded shapes. `findShapes` and
+  `penpotUtils.findShapes` skip stubs in their results.
+- Shapes outside the roots are not in the model. `penpot.root` lists the loaded shapes only.
+- The call fails before anything loads when `pageId` is not a page of the file: the error reads `pageId <id> is not a page of file <id>`. A root that is not a shape of
+  that page fails the call, and the error names the root.
+- A root that the script removes is dropped at the next refresh. Each flush reloads the page by walking every root
+  again, which takes one rate-limit token. The first load of a page takes one token for each root.
+- A parent whose child list did not load in full, and a stub, refuse the operations that need every child: an insert at
+  an index, a z-order move of a child (`setParentIndex`, `bringToFront`, `sendToBack`, `bringForward`,
+  `sendBackward`), the `parentIndex` read of a child, and `remove`, `ungroup` and `flatten` of the shape. A stub cannot
+  be moved either. `penpotUtils.addFlexLayout` checks the same rule before it writes anything. The error reads:
+  `<operation> needs every child of <parent>, and rootIds did not load them all. Add that shape's id to rootIds, or run
+  without rootIds.` An append on top with no index stays allowed.
+- A reference to a shape outside the roots is a placeholder. As JSON it is `{id, loaded: false}`. Any other read of it
+  throws `shape <id> is not loaded: rootIds loads only the given subtrees`.
+- `swapComponent` on a root gives the root a new id that the model does not learn, and the old root is dropped at the next
+  refresh. Pass the parent of the instance as the root when swapping components.
+- The reply carries a warning `{code: "partial-page", pageId, rootIds, shapes, ancestors}`. `shapes` counts the loaded
+  shapes, and `ancestors` lists the ancestor-only ids. A whole load can add two warnings: `shapes-below-depth-limit`,
+  for shapes nested deeper than 20 levels that are not in the model, and `shapes-missing`, for shapes that the backend
+  reported missing.
 
 Flushes:
 
@@ -780,6 +1086,9 @@ The sandbox facade maps the layout setters to backend ops: `layoutItem*` setters
 - Formats: `png`, `jpeg`, `webp` return an image of at most 8 MB, and at most 16 million pixels (the box times the
   scale). `svg` and `pdf` return text (pdf as base64 inside JSON), at most 256 kB (256 000 bytes). Larger output
   needs `filePath`.
+- An `svg` export of a shape that holds a text created or changed through the MCP fails with an exporter timeout until
+  the file is opened in the workspace, because such a text has no `positionData`. This failure is not retried. The error
+  then says to export `png` or to open the file once and retry.
 - `filePath` writes the file inside the export root, `PENPOT_MCP_EXPORT_DIR`, which defaults to `penpot-exports` in the
   home directory. A file is not replaced unless `overwrite` is true. The path must end in the format's extension.
 - `shapeId: "page"` exports the first 10 root shapes of the page, in page order, one call of the exporter per shape.
@@ -788,6 +1097,50 @@ The sandbox facade maps the layout setters to backend ops: `layoutItem*` setters
 - Concurrency: each token gets one render at a time. The whole process runs at most 4 renders against the backend at a
   time (`PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS`; 0 means no limit). A render waits at most 60 s. With Redis, the renders of all adapters share `PENPOT_MCP_EXPORT_TOTAL_PERMITS` permits, and callers that wait for one are served in arrival order.
 - The render session cookie is taken from `create-mcp-render-session` (section 2.9).
+- `shapeIds` (1 to 200 ids, not with `shapeId`) exports several shapes in one call. The ids are lower-cased. They go to the
+  exporter in chunks of `PENPOT_MCP_EXPORT_BATCH_SIZE` (section 4.6). Each chunk is one exporter request under one render
+  permit. The exporter answers a ZIP for a chunk of two or more shapes. The adapter reads it, checks every entry against
+  its CRC-32, and maps each entry back to its shape id. Its size cap is the cap of one file for each shape of the chunk,
+  plus 1 MB for the archive headers. A chunk of one shape is a plain file. `shapeId: "page"` uses the same path for its
+  first 10 root shapes.
+- Each render is cached as soon as its bytes arrive, before it is written or reported. It stays for 15 minutes, whatever
+  its fonts. The key is the file id, the file revision, the page id, the shape id, the format, the scale and the renderer.
+  A render is not cached when the file revision is unknown. `refresh: true` renders the shape again and replaces its
+  cached render.
+- The font check is separate. After the renders, the tool asks `get-mcp-fonts` for the shapes that it served, with a
+  wait of 3 s at most. The check only makes the notice. A JSON reply (with `outputDir`) gets `warnings`, one
+  `{kind: "font-unresolved", fontId, family, reason, runs}` for each unresolved font. An inline reply gets a text item.
+  The notice names each font and says to run `list_fonts`. It also says that the renders are kept for up to 15 minutes,
+  so pass `refresh: true` after the font is fixed. A late or failed check adds nothing.
+- Failure policy of a batch:
+  - A busy exporter (HTTP 429, or a wait for a permit that runs past its limit) and a cancelled call end the call. The
+    shapes not reached fail with the stop text. There is no fallback.
+  - A chunk that runs past its render deadline, an answer too large for its cap, and a ZIP that does not map back to the
+    shapes switch the rest of the call to one shape per request.
+  - Any other failure of a batch (a 5xx, or another error) renders the chunk one shape per request. Only when every
+    shape of the chunk then renders, the exporter is recorded as refusing batches for 10 minutes. The record is kept per
+    exporter client in the process, and no batch goes to that exporter in that time.
+  - A breaker stops a failure that keeps coming back. When every shape of a chunk fails with the same class of error
+    (authentication, HTTP 401 or 403; network, an unreachable exporter or a render deadline; or a 5xx), and the first
+    request of the next chunk fails with that class again, the call stops. The shapes not yet rendered fail with that
+    error.
+- A single render that answers 5xx is tried once more after 500 ms. A 4xx answer is not retried.
+- The call budget is 10 minutes. Past it, the call starts no more renders, and the shapes left are not rendered.
+- Inline replies: an image too large on its own is not returned (the reply says so and names `outputDir` or
+  `filePath`). An image that does not fit the 8 MB total left is not returned. When less than 256 kB of the total is
+  left, the total is full: the shapes after it are listed as not rendered, with the text "the inline total is full; pass
+  outputDir to save every shape, or ask for fewer shapes". An svg or pdf above 256 kB is not returned.
+- With `outputDir`, each file is written through a temporary file, then renamed when `overwrite` is true. Without
+  `overwrite`, an existing file is refused. The reply is JSON: `{rendered, cached, failed: [{shapeId, error}], files:
+  [{shapeId, path, bytes}], notRendered: [{shapeId, reason}]}`, plus `warnings` when a font does not resolve.
+- Stop texts. A stop of a call with `outputDir` adds "call again with overwrite: true", since the files already written
+  are refused without it. The other stop texts read:
+  - "export is busy, retry later; call again; the shapes already rendered come from the cache." (a busy exporter)
+  - "the call was cancelled; call again; the shapes already rendered come from the cache."
+  - "the call ran out of time; call again; the shapes already rendered come from the cache." (the 10 minute budget)
+  - "an earlier shape failed, so the shapes after it were not rendered." (`shapeId: "page"` only, which stops at the
+    first failure)
+  A shape that fails alone keeps its own error, and a breaker stop uses the error of the failure.
 
 ### 4.6 Adapter settings
 
@@ -813,6 +1166,8 @@ variable.
 | `PENPOT_MCP_IMPORT_DIR` | `~/penpot-imports` | Import root for `filePath` arguments |
 | `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` | `0` in bridge mode, `4` in backend mode | Renders at once in one process against the backend; 0 means no limit |
 | `PENPOT_MCP_EXPORT_TOTAL_PERMITS` | `4` | Renders at once across all adapters that share `PENPOT_MCP_REDIS_URI`. Needs Redis. |
+| `PENPOT_MCP_EXPORT_BATCH_SIZE` | `10` | Shapes that one exporter request renders in a `shapeIds` batch, 1 to 50 (section 4.5). |
+| `PENPOT_MCP_EXPORT_CACHE_MB` | `64` | Size of the in-memory cache of rendered shapes in each adapter process, in MB, 0 to 4096. `0` turns it off (section 4.5). |
 | `PENPOT_MCP_SANDBOX_TIMEOUT_S` | `3` | Guest CPU time of one `execute_code` call |
 | `PENPOT_MCP_SANDBOX_WALL_S` | `120` | Wall-clock limit of one call |
 | `PENPOT_MCP_SANDBOX_IDLE_MIN` | `30` | Idle minutes before a session sandbox is evicted |
@@ -839,10 +1194,13 @@ variable.
 
 - `GET /healthz` answers that the adapter is up.
 - `GET /readyz` answers whether the backend can serve calls. It exists when a backend is configured.
-- `GET /metrics` serves the adapter's Prometheus metrics: tool call counts and timings, and the sandbox counters. It
-  answers without a token only to a client on this machine. The adapter must bind a loopback host, and the request
-  must carry no forwarding header (`X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP` or `Forwarded`). Any other
-  request needs a valid token.
+- `GET /metrics` serves the adapter's Prometheus metrics: tool call counts and timings, the sandbox counters, and the
+  export counters. `penpot_mcp_export_busy_total{gate}` counts the exports refused as busy, by the `token`, `process` or
+  `shared` gate. The gauge `penpot_mcp_export_permits_held{gate}` shows the permits that this process holds, for the
+  `process` and `shared` gates. Summed over the adapters, the `shared` gauge against `PENPOT_MCP_EXPORT_TOTAL_PERMITS`
+  shows how full the render cap is. The endpoint answers without a token only to a client on this machine. The adapter
+  must bind a loopback host, and the request must carry no forwarding header (`X-Forwarded-For`, `X-Forwarded-Host`,
+  `X-Real-IP` or `Forwarded`). Any other request needs a valid token.
 - Package: the root package (`mcp/package.json`) ships `pnpm-lock.dist.yaml`. The `prepack` script copies it from
   `pnpm-lock.yaml`, and `postpack` removes it. Its `files` list leaves out the test files (`*.test.ts`), the backend
   test helpers and the integration scripts.
@@ -921,6 +1279,8 @@ variable.
 - Additions do not bump the version. New fields in a reply, new ops, new optional params and new error codes are
   compatible additions. Round 2 added such items and kept the version at 1. Round 2 also renamed a failure field
   (`last-committed-revn` to `revn-before-call`); the adapter does not read that field, so no bump was made.
+  Round 4 is the same kind of change: six read commands, two adapter settings, a `warnings` field in the outline and
+  new optional arguments. These are additions, so `contractVersion` stays at 1.
 - Whether a change of a command's behaviour, without a change of shape, needs a bump is not defined in code. Round 2
   changed behaviour (the 50-batch limit, the replay key, the lock codes) without a bump.
 
@@ -1019,6 +1379,51 @@ Compatible additions and fixes. `contractVersion` stays at 1.
   token transport: `Bearer` from the agent to the adapter, `Token` from the adapter to the backend.
 - `get_tokens` takes `setId` and `format` (section 4.2). The server build has two entries (section 4.7).
 
+### Round 4 (Avalonia test run)
+
+Compatible additions. `contractVersion` stays at 1.
+
+- Six read commands, all `mcp:read` and MCP-only: `get-mcp-subtree` (section 2.8a), `get-mcp-interactions` (2.8b),
+  `find-mcp-connectors` (2.8c), `get-mcp-fonts` (2.8d), `get-mcp-page-lint` (2.8e) and `find-mcp-similar-boards`
+  (2.8f). Their adapter tools are `export_subtree`, `get_interactions`, `find_connectors`, `list_fonts`, `lint_page`
+  and `find_similar_boards` (section 4.2).
+- `get-mcp-file-outline` adds `warnings`, one `font-unresolved` entry for each unresolved font on each page (section 2.3).
+- `execute_code` takes `rootIds`, which loads only the subtrees of those shapes, and it reports a `partial-page`
+  warning (section 4.4).
+- `export_shape` takes `shapeIds`, `outputDir`, `renderer` and `refresh`. Exports run in batches, retry a 5xx once, keep
+  a render cache, and report unresolved fonts (section 4.5). A `shapeId: "page"` export uses the same batch path.
+- `export_subtree` writes a whole subtree to a JSON file in windows, and trims a single oversize shape in an inline
+  reply (sections 4.2 and 4.3).
+- Two adapter settings: `PENPOT_MCP_EXPORT_BATCH_SIZE` and `PENPOT_MCP_EXPORT_CACHE_MB` (section 4.6).
+- The six reads of sections 2.8a to 2.8f use the `:mcp-read` bucket of `rlimit.edn`, like the other reads.
+- Board attribute `overflow-scroll` (JSON `overflowScroll`): `none`, `horizontal`, `vertical` or `both`; absent means
+  `none`. It is a board prop of `create_board` and `update_shape` (section 3.5). The reads return it, the plugin API
+  and `execute_code` read and write it, and `lint_page` uses it for `scroll-hidden-control`. The viewer does not act on it.
+- Section 2.10 now documents the `:mcp-apply/by-team` limit and the `find` limiter of the four scan commands. It also
+  corrects the figure of the `:mcp-write` bucket, which `rlimit.edn` has always set to `600/300/1m`.
+- Connectors: `find-mcp-connectors` takes `within-id`. Boards use the true bounding box of their points. Candidates
+  are taken shallowest first, and boolean children, hidden shapes and shapes under a hidden ancestor are skipped. The
+  cap rule applies to open paths only. The ends of a closed outline come from three farthest-point passes. `length` is
+  the straight distance between the ends. A line inside one board is skipped.
+- Interactions: flows sort by name, then id. `overlayPosition` comes as `{x, y}`.
+- Fonts and the outline: font usage has its own cache per page. The outline computes its warnings under a one-second
+  budget, and it does not scan a page of more than 5,000 shapes unless that usage is cached. The outline adds
+  `warningsComplete` and `warningsTruncated` (at most 50 warnings). `get-mcp-fonts` returns at most 500 fonts and stays
+  within the reply budget. Runs of one face merge under the font's own variant id, and an empty text leaf is not a run.
+  Resolution is read on every call.
+- Lint: boxes are the true bounding boxes of the points. The scroll rule works from the model in section 2.8e. A control
+  is reported once, under its innermost selected board. With `rules`, the first asked rule that applies is reported.
+  `counts` are totals over all findings.
+- Similar boards: size-ratio pruning, a deadline check every 256 compared pairs, and the result field `compared`.
+- Execute code: partial loads keep the ancestors as stubs, and the refusals of section 4.4 cover ungroup, flatten and
+  `addFlexLayout`. A root removed by the script is dropped at the next refresh. A deep subtree loads past depth 20.
+- Export: the cache key includes the page id, and a render is cached as soon as it arrives, whatever its fonts. The font
+  check is separate and only makes the notice. Batch ZIPs have their own size cap and CRC-checked entries. The
+  exporter refusal is recorded only when every shape of its chunk then renders. A breaker stops a failure that keeps
+  coming back. Ids are lower-cased. Writes go through a temporary file.
+- Metrics: the gauge `penpot_mcp_export_permits_held{gate}` is new, and the busy counter is described in section 4.7.
+- Board attribute `overflow-scroll` (`overflowScroll`), described in section 3.5.
+
 ## 8. Audit matrix
 
 This section says what each MCP command writes to the audit log, and whether the request id is in it. Read it with
@@ -1036,7 +1441,7 @@ section 5.4 of `docs/technical-guide/mcp-production.md`. Every statement points 
   is on and the command marks `::webhooks/event? true` (`loggers/audit.clj`, `process-event`).
 - A refusal before the command runs writes no event. It writes a log line `mcp refused` with the reason, the command,
   the token fingerprint and the request id, and it counts in `penpot_mcp_refusals_total` (`rpc.clj`, `note-refusal!`).
-- The `mcp-tool` log line and the tool timing and error metrics come only from the eight read tools that call
+- The `mcp-tool` log line and the tool timing and error metrics come only from the fourteen read commands that call
   `run-tool` and from the three write commands (`rpc/commands/mcp.clj`, `mcp_write.clj`).
 
 ### 8.2 The commands
@@ -1046,6 +1451,7 @@ section 5.4 of `docs/technical-guide/mcp-production.md`. Every statement points 
 | Command | Scope | Event name on success | Props | Request id | Webhook | Notes |
 |---|---|---|---|---|---|---|
 | `mcp-whoami`, `get-mcp-file-outline`, `get-mcp-page-tree`, `get-mcp-shapes`, `find-mcp-shapes`, `get-mcp-library`, `get-mcp-tokens`, `create-mcp-render-session` | read | The command name | `tool`, `file-id`, `page-ids`, `change-count` (0), `change-types` ({}), `revn-before`, `revn-after`, `token-id`, `duration-ms`, `request-id` (from `audit-props` in `mcp.clj`). Nil values are dropped. | Context and props | No | Through `run-tool`: one `mcp-tool` line and timing metrics. A failed call has the line and the error metric, and no event. |
+| `get-mcp-subtree`, `get-mcp-interactions`, `find-mcp-connectors`, `get-mcp-fonts`, `get-mcp-page-lint`, `find-mcp-similar-boards` | read | The command name | As the row above: `tool`, `file-id`, `page-ids`, `change-count` (0), `change-types` ({}), `revn-before`, `revn-after`, `token-id`, `duration-ms`, `request-id`. Nil values are dropped. | Context and props | No | Through `run-tool`, so each has an `mcp-tool` line and timing metrics. Round 4 additions (section 7). |
 | `get-teams`, `get-projects`, `get-project-files`, `search-files`, `get-team-shared-files`, `get-team-recent-files`, `get-team-deleted-files`, `get-file-snapshots`, `get-comment-threads`, `get-comments` | read | The command name | The params without qualified keys, for example `team-id`, `project-id`, `file-id` | Context only | No | Not through `run-tool`: no `mcp-tool` line and no tool metric. **Gap G3.** |
 | `send-mcp-feedback` | read (bridge) | `send-mcp-feedback` | None. The command sets empty props (`feedback.clj`). | Context | No | The subject and the text are not logged, by design. |
 | `mcp-apply-changes`, `mcp-apply-operations`, `mcp-import-svg`, committed | write | `update-file` | `tool`, `file-id`, `id`, `name`, `features`, `project-id`, `team-id`, `page-ids`, `change-count`, `change-types`, `revn-before`, `revn-after`, `revn`, `modified-at`, `snapshot-id` (when a snapshot was taken), `token-id`, `request-id`, `duration-ms` | Props and context | Yes, batched per file for two minutes | The name is the same as an editor save. Filter on `props.tool`. **Gap G4.** |

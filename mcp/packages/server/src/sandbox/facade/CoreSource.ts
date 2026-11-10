@@ -131,6 +131,8 @@ export const CORE_SOURCE: string = String.raw`
     this.pageId = pageId;
     this.revn = null;
     this.records = new Map();
+    // true for a page that a partial load holds: only the roots, their ancestors and what they need
+    this.partial = false;
   }
 
   PageModel.prototype.get = function (id) {
@@ -174,14 +176,17 @@ export const CORE_SOURCE: string = String.raw`
         return;
       }
       seen.add(record.id);
-      out.push(record);
+      // an ancestor loaded only to reach a root is not listed; its children are still visited
+      if (record.ancestorOnly !== true) {
+        out.push(record);
+      }
       for (const childId of Array.isArray(record.shapes) ? record.shapes : []) {
         visit(childId);
       }
     };
     visit(ROOT_ID);
     for (const record of this.records.values()) {
-      if (!seen.has(record.id)) {
+      if (!seen.has(record.id) && record.ancestorOnly !== true) {
         out.push(record);
       }
     }
@@ -200,6 +205,7 @@ export const CORE_SOURCE: string = String.raw`
     }
     const data = JSON.parse(__host.loadPage(model.fileId, model.pageId));
     model.revn = data.revn;
+    model.partial = data.partial === true;
     model.records = new Map();
     for (const shape of Array.isArray(data.shapes) ? data.shapes : []) {
       model.records.set(shape.id, shape);

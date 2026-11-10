@@ -26,6 +26,14 @@ export class BackendSettings {
     public static readonly DEFAULT_EXPORT_TOTAL_PERMITS = 4;
     /** Largest number of sockets kept open to one origin, for the backend and the exporter. */
     public static readonly CONNECTIONS_PER_ORIGIN = 32;
+    /** Default number of shapes that one exporter request renders in a batch. */
+    public static readonly DEFAULT_EXPORT_BATCH_SIZE = 10;
+    /** Largest batch size that PENPOT_MCP_EXPORT_BATCH_SIZE accepts. */
+    public static readonly MAX_EXPORT_BATCH_SIZE = 50;
+    /** Default size, in megabytes, of the in-memory cache of rendered shapes. */
+    public static readonly DEFAULT_EXPORT_CACHE_MB = 64;
+    /** Largest cache size, in megabytes, that PENPOT_MCP_EXPORT_CACHE_MB accepts. */
+    public static readonly MAX_EXPORT_CACHE_MB = 4096;
 
     /**
      * Creates settings from explicit values.
@@ -40,6 +48,8 @@ export class BackendSettings {
      * @param redisUri - Redis URI of the shared rate limit, or undefined to limit within this process only
      * @param tokenCacheSeconds - time a successful token check is reused, in seconds
      * @param exportTotalPermits - renders at once across all adapters that share the Redis of the rate limit
+     * @param exportBatchSize - shapes that one exporter request renders, from 1 to 50
+     * @param exportCacheMb - size of the in-memory cache of rendered shapes, in megabytes; 0 turns it off
      */
     constructor(
         public readonly timeoutSeconds: number = BackendSettings.DEFAULT_TIMEOUT_SECONDS,
@@ -51,7 +61,9 @@ export class BackendSettings {
         public readonly assetsUri: string | undefined = undefined,
         public readonly redisUri: string | undefined = undefined,
         public readonly tokenCacheSeconds: number = BackendSettings.DEFAULT_TOKEN_CACHE_SECONDS,
-        public readonly exportTotalPermits: number = BackendSettings.DEFAULT_EXPORT_TOTAL_PERMITS
+        public readonly exportTotalPermits: number = BackendSettings.DEFAULT_EXPORT_TOTAL_PERMITS,
+        public readonly exportBatchSize: number = BackendSettings.DEFAULT_EXPORT_BATCH_SIZE,
+        public readonly exportCacheMb: number = BackendSettings.DEFAULT_EXPORT_CACHE_MB
     ) {}
 
     /**
@@ -96,8 +108,72 @@ export class BackendSettings {
                 env,
                 "PENPOT_MCP_EXPORT_TOTAL_PERMITS",
                 BackendSettings.DEFAULT_EXPORT_TOTAL_PERMITS
-            )
+            ),
+            BackendSettings.readExportBatchSize(env),
+            BackendSettings.readExportCacheMb(env)
         );
+    }
+
+    /**
+     * Reads the number of shapes that one exporter request renders, from 1 to 50.
+     *
+     * @param env - environment to read
+     * @returns the batch size; the default of 10 when the variable is unset or blank
+     * @throws Error naming the variable when the value is not a whole number from 1 to 50
+     */
+    public static readExportBatchSize(env: Record<string, string | undefined>): number {
+        return BackendSettings.wholeNumberInRange(
+            env,
+            "PENPOT_MCP_EXPORT_BATCH_SIZE",
+            BackendSettings.DEFAULT_EXPORT_BATCH_SIZE,
+            1,
+            BackendSettings.MAX_EXPORT_BATCH_SIZE
+        );
+    }
+
+    /**
+     * Reads the size of the in-memory cache of rendered shapes, in megabytes, from 0 to 4096. Zero turns it off.
+     *
+     * @param env - environment to read
+     * @returns the cache size in megabytes; the default of 64 when the variable is unset or blank
+     * @throws Error naming the variable when the value is not a whole number from 0 to 4096
+     */
+    public static readExportCacheMb(env: Record<string, string | undefined>): number {
+        return BackendSettings.wholeNumberInRange(
+            env,
+            "PENPOT_MCP_EXPORT_CACHE_MB",
+            BackendSettings.DEFAULT_EXPORT_CACHE_MB,
+            0,
+            BackendSettings.MAX_EXPORT_CACHE_MB
+        );
+    }
+
+    /**
+     * Reads a whole number within a range, falling back to a default when the variable is unset or blank.
+     *
+     * @param env - environment to read
+     * @param name - variable name
+     * @param fallback - value used when the variable is unset or blank
+     * @param min - smallest accepted value
+     * @param max - largest accepted value
+     * @throws Error naming the variable when the value is not a whole number within the range
+     */
+    private static wholeNumberInRange(
+        env: Record<string, string | undefined>,
+        name: string,
+        fallback: number,
+        min: number,
+        max: number
+    ): number {
+        const raw = env[name]?.trim();
+        if (raw === undefined || raw === "") {
+            return fallback;
+        }
+        const value = Number(raw);
+        if (!Number.isInteger(value) || value < min || value > max) {
+            throw new Error(`${name} must be a whole number from ${min} to ${max} (got "${raw}").`);
+        }
+        return value;
     }
 
     /**

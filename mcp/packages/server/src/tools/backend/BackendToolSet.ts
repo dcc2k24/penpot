@@ -11,6 +11,12 @@ import { GetShapesTool } from "./GetShapesTool";
 import { FindShapesTool } from "./FindShapesTool";
 import { GetLibraryTool } from "./GetLibraryTool";
 import { GetTokensTool } from "./GetTokensTool";
+import { ExportSubtreeTool } from "./ExportSubtreeTool";
+import { GetInteractionsTool } from "./GetInteractionsTool";
+import { FindConnectorsTool } from "./FindConnectorsTool";
+import { ListFontsTool } from "./ListFontsTool";
+import { LintPageTool } from "./LintPageTool";
+import { FindSimilarBoardsTool } from "./FindSimilarBoardsTool";
 import { DescribeOperationsTool } from "./DescribeOperationsTool";
 import { ApplyOperationsTool } from "./ApplyOperationsTool";
 import { BatchCreateShapesTool } from "./BatchCreateShapesTool";
@@ -44,6 +50,12 @@ export class BackendToolSet {
             new FindShapesTool(mcpServer, services),
             new GetLibraryTool(mcpServer, services),
             new GetTokensTool(mcpServer, services),
+            new ExportSubtreeTool(mcpServer, services),
+            new GetInteractionsTool(mcpServer, services),
+            new FindConnectorsTool(mcpServer, services),
+            new ListFontsTool(mcpServer, services),
+            new LintPageTool(mcpServer, services),
+            new FindSimilarBoardsTool(mcpServer, services),
             new DescribeOperationsTool(mcpServer, services),
             new ApplyOperationsTool(mcpServer, services),
             new BatchCreateShapesTool(mcpServer, services),

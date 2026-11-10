@@ -55,15 +55,29 @@ export class ApiType {
     }
 
     /**
+     * Returns the names of all members, in document order.
+     */
+    getMemberNames(): string[] {
+        return Object.values(this.members).flatMap((memberEntries) => Object.keys(memberEntries));
+    }
+
+    /**
      * Returns the description of the member with the given name.
      *
      * The member type doesn't matter for the search, as member names are unique
-     * across all member types within a single API type.
+     * across all member types within a single API type. An exact match wins; otherwise
+     * the name is matched without regard to letter case.
      */
     getMember(memberName: string): string | null {
         for (const memberEntries of Object.values(this.members)) {
-            if (memberName in memberEntries) {
+            if (Object.prototype.hasOwnProperty.call(memberEntries, memberName)) {
                 return memberEntries[memberName];
+            }
+        }
+        const wanted = memberName.toLowerCase();
+        for (const name of this.getMemberNames()) {
+            if (name.toLowerCase() === wanted) {
+                return this.getMember(name);
             }
         }
         return null;
@@ -74,23 +88,30 @@ export class ApiType {
  * Loads and manages API documentation from YAML files.
  *
  * This class provides case-insensitive access to API type documentation
- * loaded from the data/api_types.yml file.
+ * loaded from the data/api_types.yml file, and to topics loaded from the
+ * data/api_topics.yml file. A topic explains a subject that is not an API type,
+ * such as the geometry of shapes.
  */
 export class ApiDocs {
     private readonly apiTypes: Map<string, ApiType> = new Map();
+    private readonly topics: Map<string, ApiType> = new Map();
 
     /**
-     * Creates a new ApiDocs instance and loads the API types from the YAML file.
+     * Creates a new ApiDocs instance and loads the API types and the topics from the YAML files.
      */
     constructor() {
-        this.loadApiTypes();
+        this.loadEntries("api_types.yml", this.apiTypes);
+        this.loadEntries("api_topics.yml", this.topics);
     }
 
     /**
-     * Loads API types from the data/api_types.yml file.
+     * Loads entries from a YAML file in the data directory into the given map.
+     *
+     * @param fileName - name of the file in the data directory
+     * @param target - map that receives the entries, keyed by lower-case name
      */
-    private loadApiTypes(): void {
-        const yamlPath = path.join(process.cwd(), "data", "api_types.yml");
+    private loadEntries(fileName: string, target: Map<string, ApiType>): void {
+        const yamlPath = path.join(process.cwd(), "data", fileName);
         const yamlContent = fs.readFileSync(yamlPath, "utf8");
         const data = yaml.load(yamlContent) as Record<string, any>;
 
@@ -101,7 +122,7 @@ export class ApiDocs {
             const apiType = new ApiType(typeName, overview, members);
 
             // store with lower-case key for case-insensitive retrieval
-            this.apiTypes.set(typeName.toLowerCase(), apiType);
+            target.set(typeName.toLowerCase(), apiType);
         }
     }
 
@@ -110,6 +131,20 @@ export class ApiDocs {
      */
     getType(typeName: string): ApiType | null {
         return this.apiTypes.get(typeName.toLowerCase()) || null;
+    }
+
+    /**
+     * Retrieves a topic by name (case-insensitive).
+     */
+    getTopic(topicName: string): ApiType | null {
+        return this.topics.get(topicName.toLowerCase()) || null;
+    }
+
+    /**
+     * Returns all topic names.
+     */
+    getTopicNames(): string[] {
+        return Array.from(this.topics.values()).map((topic) => topic.getName());
     }
 
     /**

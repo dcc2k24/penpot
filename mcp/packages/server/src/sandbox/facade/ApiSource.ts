@@ -378,16 +378,75 @@ export const API_SOURCE: string = String.raw`
     return makeShape(pageId, id);
   }
 
+  // the children that the page holds, in order; an ancestor loaded only to reach a root is not one of them
   function childShapes(ref, record) {
     const ids = Array.isArray(record.shapes) ? record.shapes : [];
+    const model = modelOf(ref.pageId);
     const out = [];
     for (const id of ids) {
-      const child = shapeOrNull(ref.pageId, id);
+      const child = model.get(id);
+      // an ancestor stub is listed too, so that a walk from the root reaches the loaded shapes below it
       if (child) {
-        out.push(child);
+        out.push(makeShape(ref.pageId, id));
       }
     }
     return out;
+  }
+
+  // the record of a shape that the page holds already; a shape created in this call has none to check, and reading the page
+  // for it would flush the queue early
+  function settledRecordOf(ref) {
+    return isHandle(core.resolve(ref.id)) ? undefined : recordOf(ref);
+  }
+
+  // refuses an operation that needs every child of a parent, when a partial page loaded the parent without all of them
+  function requireAllChildren(parentRecord, operation) {
+    if (parentRecord && (parentRecord.partialChildren === true || parentRecord.ancestorOnly === true)) {
+      throw new Error(operation + " needs every child of " + (parentRecord.name || parentRecord.id) + ", and rootIds did not load them all. Add that shape's id to rootIds, or run without rootIds.");
+    }
+  }
+
+  // refuses an operation on a shape that is loaded only to reach a root: its subtree is not loaded, so the operation
+  // would carry or drop shapes the script cannot see
+  function requireNotStub(record, operation) {
+    if (record && record.ancestorOnly === true) {
+      throw new Error(operation + " needs every child of " + (record.name || record.id) + ", and rootIds did not load them all. Add that shape's id to rootIds, or run without rootIds.");
+    }
+  }
+
+  // a placeholder for a shape that a reference names and that a partial page does not hold: only id and loaded read,
+  // and as JSON it is its id and loaded false
+  function placeholderOf(id) {
+    const refuse = function () {
+      throw new Error("shape " + core.resolve(id) + " is not loaded: rootIds loads only the given subtrees");
+    };
+    return new Proxy({}, {
+      get: function (target, key) {
+        if (key === "toJSON") {
+          return function () {
+            return { id: core.resolve(id), loaded: false };
+          };
+        }
+        if (key === "id") {
+          return id;
+        }
+        if (key === "loaded") {
+          return false;
+        }
+        return refuse();
+      },
+      set: refuse,
+      deleteProperty: refuse
+    });
+  }
+
+  // the shape that a reference names: a proxy when the page holds it, a placeholder when a partial page does not
+  function referenceOf(pageId, id) {
+    const shape = shapeOrNull(pageId, id);
+    if (shape || id === undefined || id === null) {
+      return shape;
+    }
+    return modelOf(pageId).partial === true ? placeholderOf(id) : null;
   }
 
   function bindMethod(ref, name) {
@@ -560,7 +619,12 @@ export const API_SOURCE: string = String.raw`
       case "parent":
         return shapeOrNull(ref.pageId, record.parentId);
       case "parentIndex":
+        requireAllChildren(modelOf(ref.pageId).get(record.parentId), "parentIndex");
         return indexInParent(ref, record);
+      case "childrenPartial":
+        return record.partialChildren === true;
+      case "ancestorOnly":
+        return record.ancestorOnly === true;
       case "children":
         return childShapes(ref, record);
       case "tokens":
@@ -730,6 +794,7 @@ export const API_SOURCE: string = String.raw`
     }
     const shapes = Array.isArray(record.shapes) ? record.shapes : [];
     return {
+      ...(record.partialChildren === true ? { childrenPartial: true } : {}),
       id: core.resolve(ref.id),
       name: record.name,
       type: PROP.types[record.type] || record.type,
@@ -766,12 +831,18 @@ export const API_SOURCE: string = String.raw`
   }
 
   function removeShape(ref) {
+    requireAllChildren(settledRecordOf(ref), "remove");
+    requireNotStub(settledRecordOf(ref), "remove");
     core.enqueue({ op: "delete_shapes", pageId: ref.pageId, ids: [ref.id] });
   }
 
   // an index of undefined appends the child at the end, which is the front of the parent.
   function moveInto(parentRef, child, index) {
+    if (index !== undefined) {
+      requireAllChildren(settledRecordOf(parentRef), "insertChild");
+    }
     const childRef = requireShape(child, "child");
+    requireNotStub(settledRecordOf(childRef), "insertChild");
     const op = { op: "move_shapes", pageId: parentRef.pageId, ids: [childRef.id], parentId: parentRef.id };
     if (index !== undefined) {
       op.index = requireIndex(index, "index");
@@ -781,6 +852,8 @@ export const API_SOURCE: string = String.raw`
 
   function setParentIndex(ref, index) {
     const record = requireRecord(ref);
+    requireAllChildren(modelOf(ref.pageId).get(record.parentId), "setParentIndex");
+    requireNotStub(record, "setParentIndex");
     core.enqueue({
       op: "move_shapes",
       pageId: ref.pageId,
@@ -792,8 +865,10 @@ export const API_SOURCE: string = String.raw`
 
   // moves the shape inside its parent. The pick function gets the child ids and the index of the shape, and returns
   // the new full order, or null when nothing moves.
-  function restackShape(ref, pick) {
+  function restackShape(ref, pick, operation) {
     const record = requireRecord(ref);
+    requireAllChildren(modelOf(ref.pageId).get(record.parentId), operation);
+    requireNotStub(record, operation);
     const parent = modelOf(ref.pageId).get(record.parentId);
     if (!parent || !Array.isArray(parent.shapes)) {
       return;
@@ -1552,19 +1627,19 @@ export const API_SOURCE: string = String.raw`
       setParentIndex(ref, index);
     },
     bringToFront: function (ref) {
-      restackShape(ref, toFront);
+      restackShape(ref, toFront, "bringToFront");
     },
     sendToBack: function (ref) {
-      restackShape(ref, toBack);
+      restackShape(ref, toBack, "sendToBack");
     },
     bringToBack: function (ref) {
-      restackShape(ref, toBack);
+      restackShape(ref, toBack, "bringToBack");
     },
     bringForward: function (ref) {
-      restackShape(ref, oneForward);
+      restackShape(ref, oneForward, "bringForward");
     },
     sendBackward: function (ref) {
-      restackShape(ref, oneBackward);
+      restackShape(ref, oneBackward, "sendBackward");
     },
     addFlexLayout: function (ref, options) {
       layoutOp(ref, "set_flex_layout", options);
@@ -1583,6 +1658,8 @@ export const API_SOURCE: string = String.raw`
     detach: function (ref) {
       core.enqueue({ op: "detach", pageId: ref.pageId, ids: [ref.id] });
     },
+    // a shape that is itself a root gets a new id from the swap, which the model does not learn: the old root is
+    // dropped at the next refresh. Pass the parent of the instance as the root when swapping components.
     swapComponent: function (ref, component) {
       core.enqueue({ op: "swap_component", pageId: ref.pageId, id: ref.id, componentId: componentIdOf(component) });
     },
@@ -1653,7 +1730,7 @@ export const API_SOURCE: string = String.raw`
       if (!record || !hasComponent(record) || typeof record.shapeRef !== "string") {
         return null;
       }
-      return shapeOrNull(ref.pageId, record.shapeRef);
+      return referenceOf(ref.pageId, record.shapeRef);
     },
     componentRoot: function (ref) {
       return nearestShape(ref, isRootRecord);
@@ -1754,6 +1831,7 @@ export const API_SOURCE: string = String.raw`
   function ungroupShapes(...groups) {
     for (const group of groups) {
       const ref = requireShape(group, "group");
+      requireAllChildren(settledRecordOf(ref), "ungroup");
       core.enqueue({ op: "ungroup", pageId: ref.pageId, id: ref.id });
     }
   }
@@ -1762,6 +1840,9 @@ export const API_SOURCE: string = String.raw`
   // input shapes are returned.
   function flattenShapes(shapes) {
     const refs = shapeRefs(shapes, "shapes");
+    for (const ref of refs) {
+      requireAllChildren(settledRecordOf(ref), "flatten");
+    }
     if (refs.length === 0) {
       return [];
     }
@@ -2032,7 +2113,7 @@ export const API_SOURCE: string = String.raw`
         if (info.mainInstanceId === undefined || info.mainInstanceId === null || !page) {
           return null;
         }
-        return shapeOrNull(page, info.mainInstanceId);
+        return referenceOf(page, info.mainInstanceId);
       },
       instance: function (x, y) {
         return instantiateComponent(id, x, y);
@@ -2418,10 +2499,10 @@ export const API_SOURCE: string = String.raw`
   function interactionView(ref, raw, index) {
     const action = withoutUndefined({
       type: actionNameOf(raw.actionType),
-      destination: raw.destination ? shapeOrNull(ref.pageId, raw.destination) : undefined,
+      destination: raw.destination ? referenceOf(ref.pageId, raw.destination) : undefined,
       url: raw.url,
       preserveScrollPosition: raw.preserveScroll,
-      relativeTo: raw.positionRelativeTo ? shapeOrNull(ref.pageId, raw.positionRelativeTo) : undefined,
+      relativeTo: raw.positionRelativeTo ? referenceOf(ref.pageId, raw.positionRelativeTo) : undefined,
       position: raw.overlayPosType,
       manualPositionLocation: raw.overlayPosition,
       closeClickOutside: raw.closeClickOutside,

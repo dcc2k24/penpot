@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { BackendServices } from "../backend/BackendServices";
 import { ExportConcurrency } from "../utils/ExportConcurrency";
 import { ExporterError, type ExportFormat, type RenderedFile } from "../backend/ExporterClient";
+import { BackendRpcError } from "../backend/BackendRpcError";
 import { TokenDigest } from "../backend/TokenDigest";
 import { OperationValidator } from "../tools/backend/operations/OperationValidator";
 import { ApplyTokenValues, TokenCatalogue } from "./ApplyTokenValues";
@@ -11,6 +12,8 @@ import { SandboxSettings } from "./SandboxSettings";
 /** A node of the page tree returned by `get-mcp-page-tree`. */
 interface TreeNode {
     id: string;
+    /** Number of children the node has in the page, whether or not the reply carries them. */
+    childCount?: number;
     children?: TreeNode[];
 }
 
@@ -27,6 +30,66 @@ interface ShapesResult {
     revn: number;
     shapes: Array<{ id: string } & Record<string, unknown>>;
     missing?: string[];
+    truncated?: boolean;
+}
+
+/** The roots of one call on one page: the file, the page, and the roots in the order given. */
+export interface PartialScope {
+    /** File that holds the page. */
+    fileId: string;
+    /** The page that loads partly. Every other page loads whole. */
+    pageId: string;
+    /** Shape ids of the page that load, with their subtrees and what they need. */
+    rootIds: string[];
+}
+
+/** What a partial page keeps from one of its loads to the next, within one call. */
+interface PartialState {
+    /** Roots that the call still loads. A refresh drops a root that the backend no longer holds. */
+    liveRoots: string[];
+    /** Ids that the last load held, or undefined before the first load. */
+    held: Set<string> | undefined;
+    /** Ids that the last load held as ancestors only. */
+    ancestorIds: Set<string>;
+    /** Shapes and ancestors of the last load, for the partial-page warning. */
+    summary: { shapes: number; ancestors: string[] } | undefined;
+}
+
+/** Thrown when the backend does not hold a root that a partial load names. */
+class MissingRootError extends Error {
+    /**
+     * Creates the error.
+     *
+     * @param message - text that names the root
+     */
+    constructor(message: string) {
+        super(message);
+        this.name = "MissingRootError";
+    }
+}
+
+/** A shape that a page load holds, as the backend returned it and as the JSON text the guest receives. */
+interface FetchedShape {
+    /** The shape as the backend returned it; its child list is cut to the loaded shapes before the text is taken. */
+    shape: { id: string } & Record<string, unknown>;
+    /** The JSON text of the shape. */
+    text: string;
+}
+
+/** The shapes that a page load hands to the guest, and the counts that its warnings report. */
+interface LoadedParts {
+    /** JSON text of each shape, in the order the guest receives them. */
+    pieces: string[];
+    /** Shapes that the load covers: every id of a whole-page tree, or every shape of a partial load. */
+    count: number;
+    /** Ids of the page tree that the backend did not return. */
+    missing: number;
+}
+
+/** The revn of the reads of one page load. The first answer sets it, and every later answer must match it. */
+interface LoadRead {
+    /** The revn that the reads agreed on, or undefined before the first answer. */
+    revn: number | undefined;
 }
 
 /** The result of a write command that reports the revn and the created ids. */
@@ -157,6 +220,10 @@ export class SandboxHost implements SandboxHostCalls {
         "shapes",
         "componentId",
     ];
+    /** Most roots that one partial page takes. */
+    private static readonly MAX_ROOTS = 20;
+    /** Id of the page root, which the backend names with the nil uuid. It is loaded with every page. */
+    private static readonly PAGE_ROOT_ID = "00000000-0000-0000-0000-000000000000";
     /** Formats that the exporter renders. */
     private static readonly EXPORT_FORMATS: ReadonlySet<string> = new Set(["png", "svg", "jpeg", "webp", "pdf"]);
 
@@ -172,6 +239,12 @@ export class SandboxHost implements SandboxHostCalls {
         "get-comment-threads",
         "get-team-deleted-files",
         "get-team-shared-files",
+        "get-mcp-subtree",
+        "get-mcp-interactions",
+        "find-mcp-connectors",
+        "get-mcp-fonts",
+        "get-mcp-page-lint",
+        "find-mcp-similar-boards",
     ]);
 
     /** Commands the sandbox may write through `rpc`, serialised per file. */
@@ -230,6 +303,12 @@ export class SandboxHost implements SandboxHostCalls {
     private conflictBaseRevn: number | undefined;
     /** Fills the values of `apply_token` operations from the token catalogue. */
     private readonly tokenValues = new ApplyTokenValues("execute_code", "");
+    /** The roots of the call, when the call has them. */
+    private readonly scope: PartialScope | undefined;
+    /** The partial state of the scoped page, from its first load. */
+    private readonly partial: PartialState | undefined;
+    /** Ids that the imports of this call answered as their root and as shapes. */
+    private readonly importedIds = new Set<string>();
 
     /**
      * Creates a host bound to one MCP token.
@@ -237,14 +316,27 @@ export class SandboxHost implements SandboxHostCalls {
      * @param services - backend, write queue and other shared services
      * @param userToken - MCP token the sandbox acts with, already validated by the caller
      * @param maxHostCalls - most primitive calls one script may make
+     * @param maxPageBytes - cap of the page data of one call, in bytes
+     * @param scope - the roots of the call, or undefined when every page loads whole
      */
     constructor(
         private readonly services: BackendServices,
         private readonly userToken: string,
         private readonly maxHostCalls: number = 1000,
-        private readonly maxPageBytes: number = SandboxSettings.DEFAULT_MAX_PAGE_MB * 1024 * 1024
+        private readonly maxPageBytes: number = SandboxSettings.DEFAULT_MAX_PAGE_MB * 1024 * 1024,
+        scope?: PartialScope
     ) {
         this.tokenDigest = TokenDigest.sha256Hex(userToken);
+        this.scope = scope;
+        this.partial =
+            scope === undefined
+                ? undefined
+                : {
+                      liveRoots: [...scope.rootIds],
+                      held: undefined,
+                      ancestorIds: new Set<string>(),
+                      summary: undefined,
+                  };
     }
 
     /**
@@ -332,12 +424,23 @@ export class SandboxHost implements SandboxHostCalls {
      * Returns the totals of the current call, for the tool response.
      */
     public summary(): SandboxSummary {
+        const warnings: unknown[] = [...this.warnings];
+        if (this.scope !== undefined && this.partial?.summary !== undefined) {
+            // the warning is worded at the end of the call, so that its count is the final one
+            warnings.push({
+                code: "partial-page",
+                pageId: this.scope.pageId,
+                rootIds: [...this.scope.rootIds],
+                shapes: this.partial.summary.shapes,
+                ancestors: [...this.partial.summary.ancestors],
+            });
+        }
         return {
             opsApplied: this.opsApplied,
             flushes: this.flushes,
             chunks: this.chunks,
             revn: this.lastRevn,
-            warnings: [...this.warnings],
+            warnings,
             createdIds: { ...this.createdIds },
         };
     }
@@ -356,20 +459,42 @@ export class SandboxHost implements SandboxHostCalls {
     }
 
     /**
-     * Reads every shape of one page and returns them as JSON text.
+     * Checks the roots of a partial page, and removes the repeats.
      *
-     * Walks the page tree up to 20 levels, then fetches the shapes in batches of 200 ids and keeps the order of the
-     * tree. Every page of the tree and every batch must report the same revn. A page that is loaded again in the
-     * same call replaces its earlier copy and does not count twice against the page cap.
+     * @param fileId - file that holds the page
+     * @param pageId - the page whose roots these are
+     * @param rootIds - shape ids the call names as roots, in the order given
+     * @returns the scope of the call
+     * @throws Error when there are not 1 to 20 distinct roots, or the page root is named
+     */
+    public static partialScope(fileId: string, pageId: string, rootIds: readonly string[]): PartialScope {
+        const unique = [...new Set(rootIds)];
+        if (unique.includes(SandboxHost.PAGE_ROOT_ID)) {
+            throw new Error(
+                "execute_code: rootIds cannot name the page root; leave rootIds out to load the whole page"
+            );
+        }
+        if (unique.length < 1 || unique.length > SandboxHost.MAX_ROOTS) {
+            throw new Error(
+                `execute_code takes 1 to ${SandboxHost.MAX_ROOTS} rootIds; this call gives ${unique.length}`
+            );
+        }
+        return { fileId, pageId, rootIds: unique };
+    }
+
+    /**
+     * Reads the shapes of one page and returns them as JSON text.
      *
-     * The result carries warnings for shapes that the model cannot hold: those below the depth limit, and ids that
-     * the backend reports as missing.
+     * A page that is not the scoped page of the call loads whole: the page tree is walked up to 20 levels, then the
+     * shapes are fetched in batches of 200 ids and keep the order of the tree. The scoped page loads its roots (see
+     * {@link loadPartial}). Every page of the tree and every batch must report the same revn. A page that is loaded
+     * again in the same call replaces its earlier copy and does not count twice against the page cap.
      *
      * @param fileId - file that holds the page
      * @param pageId - page to read
-     * @returns JSON text of `{ revn, pageId, fileId, shapes }`
-     * @throws Error when the call already loaded 20 distinct pages, the file changed while it was read, or the
-     *   pages would exceed 16 MB of page data
+     * @returns JSON text of `{ revn, pageId, fileId, shapes }`, with `partial: true` for the scoped page
+     * @throws Error when the call already loaded 20 distinct pages, the first load misses a root, the file changed
+     *   while it was read, or the loaded shapes would exceed the page cap
      */
     public async loadPage(fileId: string, pageId: string): Promise<string> {
         this.countPrimitive(false);
@@ -378,11 +503,273 @@ export class SandboxHost implements SandboxHostCalls {
         if (isNew && this.pageBytes.size >= SandboxHost.MAX_PAGE_LOADS) {
             throw new Error("execute_code loads at most 20 pages per script");
         }
-        await this.admitPrimitive();
+        const partial = this.partialFor(fileId, pageId);
+        // a first partial load takes one rate-limit token per root; every other load takes one token
+        await this.admitCalls(partial !== undefined && isNew ? partial.liveRoots.length : 1);
 
-        const ids = new Set<string>();
+        const read: LoadRead = { revn: undefined };
         const deepest = { dropped: false };
-        let revn: number | undefined;
+        const parts =
+            partial === undefined
+                ? await this.loadWhole(fileId, pageId, read, deepest)
+                : await this.loadPartial(fileId, pageId, partial, read);
+        const text =
+            '{"revn":' +
+            String(read.revn ?? null) +
+            ',"pageId":' +
+            JSON.stringify(pageId) +
+            ',"fileId":' +
+            JSON.stringify(fileId) +
+            ',"shapes":[' +
+            parts.pieces.join(",") +
+            "]" +
+            (partial === undefined ? "" : ',"partial":true') +
+            "}";
+        const bytes = Buffer.byteLength(text, "utf8");
+        if (bytes > this.maxPageBytes) {
+            throw this.pageTooLarge(pageId, parts.count, bytes, partial !== undefined);
+        }
+        const others = this.loadedBytes() - (this.pageBytes.get(key) ?? 0);
+        if (others + bytes > this.maxPageBytes) {
+            throw new Error(this.pagesTooLarge());
+        }
+        this.pageBytes.set(key, bytes);
+        if (isNew) {
+            this.noteDroppedShapes(fileId, pageId, deepest.dropped, parts.missing);
+        }
+        this.lastRevn = read.revn ?? null;
+        return text;
+    }
+
+    /**
+     * Returns the partial state of the call when the page is the scoped page of the call.
+     *
+     * @param fileId - file of the page
+     * @param pageId - page to read
+     * @returns the partial state, or undefined for a page that loads whole
+     */
+    private partialFor(fileId: string, pageId: string): PartialState | undefined {
+        const scope = this.scope;
+        if (this.partial === undefined || scope === undefined || scope.fileId !== fileId || scope.pageId !== pageId) {
+            return undefined;
+        }
+        return this.partial;
+    }
+
+    /**
+     * Reads the whole page: its tree, then the shapes of the tree in tree order.
+     *
+     * @param fileId - file that holds the page
+     * @param pageId - page to read
+     * @param read - receives the revn of the reads
+     * @param deepest - receives `dropped` when a node below the depth limit has children
+     * @returns the JSON text of each shape that the backend returned, in tree order
+     * @throws Error when the page is too large to hold
+     */
+    private async loadWhole(
+        fileId: string,
+        pageId: string,
+        read: LoadRead,
+        deepest: { dropped: boolean }
+    ): Promise<LoadedParts> {
+        const ids = new Set<string>();
+        await this.readTree(fileId, pageId, undefined, ids, deepest, read);
+        // each shape is serialised once; the page text is then joined from those pieces.
+        const allIds = [...ids];
+        const fetched = new Map<string, FetchedShape>();
+        await this.fetchShapes(fileId, pageId, allIds, read, fetched, (done, bytes) =>
+            this.checkEstimate(pageId, allIds.length, done, bytes, false)
+        );
+        // keep the tree order; ids that the backend did not return are skipped and reported.
+        const pieces = allIds.flatMap((id) => {
+            const held = fetched.get(id);
+            return held === undefined ? [] : [held.text];
+        });
+        return { pieces, count: allIds.length, missing: allIds.length - pieces.length };
+    }
+
+    /**
+     * Reads the part of the scoped page that the roots name, and the shapes that the call needs to see the page as it
+     * is now.
+     *
+     * The subtree of each root is read in the order of the roots, and a root inside another root adds nothing new. A
+     * node at the depth limit that has children the reply does not carry starts another tree call of its own, so a
+     * deep subtree loads whole. On a refresh, a root that the backend no longer holds is dropped from the call. Then
+     * come the shapes that this call created or imported, with the children they hold; the shapes that the last load
+     * held and that no root holds now, which the backend answers as present or deleted; and the ancestors of all of
+     * these, up to the page root, which is always loaded. An ancestor that is not under a root is marked
+     * `ancestorOnly`, and a shape whose child list is cut to the loaded ids is marked `partialChildren`, with the real
+     * count in `childCount`.
+     *
+     * The result is in document order: the page root, the ancestors, the subtrees in the order of the roots, the
+     * created shapes, then the shapes the last load held.
+     *
+     * @param fileId - file that holds the page
+     * @param pageId - page to read
+     * @param state - the partial state of the call; its roots and totals are updated
+     * @param read - receives the revn of the reads
+     * @returns the JSON text of each loaded shape, in document order
+     * @throws Error when the first load misses a root, or the page is too large to hold
+     */
+    private async loadPartial(
+        fileId: string,
+        pageId: string,
+        state: PartialState,
+        read: LoadRead
+    ): Promise<LoadedParts> {
+        const refresh = state.held !== undefined;
+        const given = new Set(state.liveRoots);
+        const dropped = new Set<string>();
+        const tree: string[] = [];
+        const inTree = new Set<string>();
+        const walked = new Set<string>();
+        const pending = [...state.liveRoots];
+        while (pending.length > 0) {
+            const rootId = pending.shift() as string;
+            if (walked.has(rootId)) {
+                continue;
+            }
+            walked.add(rootId);
+            const ids = new Set<string>();
+            const walk: { dropped: boolean; cut: string[] } = { dropped: false, cut: [] };
+            try {
+                await this.readTree(fileId, pageId, rootId, ids, walk, read);
+            } catch (error) {
+                if (refresh && given.has(rootId) && error instanceof MissingRootError) {
+                    dropped.add(rootId);
+                    continue;
+                }
+                throw error;
+            }
+            for (const id of ids) {
+                if (!inTree.has(id)) {
+                    inTree.add(id);
+                    tree.push(id);
+                }
+            }
+            pending.push(...walk.cut);
+        }
+        if (dropped.size > 0) {
+            state.liveRoots = state.liveRoots.filter((id) => !dropped.has(id));
+        }
+
+        const fetched = new Map<string, FetchedShape>();
+        await this.fetchShapes(fileId, pageId, tree, read, fetched, (done, bytes) =>
+            this.checkEstimate(pageId, tree.length, done, bytes, true)
+        );
+        const heldInTree = tree.filter((id) => fetched.has(id)).length;
+        for (const rootId of state.liveRoots) {
+            if (!fetched.has(rootId)) {
+                throw new Error(`execute_code: root shape ${rootId} is not a shape of page ${pageId}`);
+            }
+        }
+
+        // the shapes that this call created or imported, and the children that they hold
+        const created: string[] = [];
+        let pendingCreated = this.createdShapeIds().filter((id) => !fetched.has(id));
+        while (pendingCreated.length > 0) {
+            const stored = await this.fetchShapes(fileId, pageId, pendingCreated, read, fetched);
+            created.push(...stored);
+            const next = new Set<string>();
+            for (const id of stored) {
+                for (const child of SandboxHost.childIdsOf(fetched.get(id)?.shape)) {
+                    if (!fetched.has(child)) {
+                        next.add(child);
+                    }
+                }
+            }
+            pendingCreated = [...next];
+        }
+
+        // the shapes the last load held that no root holds now: moved out of the roots, or deleted (then missing)
+        const moved: string[] = [];
+        const movedAncestors: string[] = [];
+        if (state.held !== undefined) {
+            const held = state.held;
+            const candidates = [...held].filter((id) => !fetched.has(id) && id !== SandboxHost.PAGE_ROOT_ID);
+            for (const id of await this.fetchShapes(fileId, pageId, candidates, read, fetched)) {
+                (state.ancestorIds.has(id) ? movedAncestors : moved).push(id);
+            }
+        }
+
+        // the ancestors of everything loaded, up to the page root, which is always loaded
+        const ancestors: string[] = [];
+        let wanted = SandboxHost.missingParents(SandboxHost.shapesOf([...fetched.keys()], fetched), fetched);
+        wanted.add(SandboxHost.PAGE_ROOT_ID);
+        while (wanted.size > 0) {
+            const stored = await this.fetchShapes(
+                fileId,
+                pageId,
+                [...wanted].filter((id) => !fetched.has(id)),
+                read,
+                fetched
+            );
+            ancestors.push(...stored);
+            wanted = SandboxHost.missingParents(SandboxHost.shapesOf(stored, fetched), fetched);
+        }
+
+        const ancestorOnly = new Set([...ancestors, ...movedAncestors].filter((id) => id !== SandboxHost.PAGE_ROOT_ID));
+        const order = [...new Set([SandboxHost.PAGE_ROOT_ID, ...ancestorOnly, ...tree, ...created, ...moved])].filter(
+            (id) => fetched.has(id)
+        );
+        const loaded = new Set(order);
+        const pieces: string[] = [];
+        for (const id of order) {
+            const held = fetched.get(id);
+            if (held === undefined) {
+                continue;
+            }
+            const shape = held.shape;
+            if (ancestorOnly.has(id)) {
+                shape.ancestorOnly = true;
+            }
+            // an ancestor is partial by definition: its subtree was not loaded whole, even when no child id is cut
+            const stub = ancestorOnly.has(id) || id === SandboxHost.PAGE_ROOT_ID;
+            if (Array.isArray(shape.shapes)) {
+                const children: unknown[] = shape.shapes;
+                const kept = children.filter(
+                    (child): child is string => typeof child === "string" && loaded.has(child)
+                );
+                if (stub || kept.length < children.length) {
+                    shape.partialChildren = true;
+                    shape.childCount = children.length;
+                    shape.shapes = kept;
+                }
+            }
+            held.text = JSON.stringify(shape);
+            pieces.push(held.text);
+        }
+
+        state.held = new Set(order);
+        state.ancestorIds = ancestorOnly;
+        state.summary = {
+            shapes: order.filter((id) => id !== SandboxHost.PAGE_ROOT_ID && !ancestorOnly.has(id)).length,
+            ancestors: [...ancestorOnly],
+        };
+        return { pieces, count: order.length, missing: tree.length - heldInTree };
+    }
+
+    /**
+     * Adds the ids of one page tree, from a root or from the page root, to a set, and records the revn of the reads.
+     * Each page of the tree is read with its cursor.
+     *
+     * @param fileId - file that holds the page
+     * @param pageId - page to read
+     * @param rootId - root of the tree, or undefined for the page root
+     * @param ids - receives the ids in document order, without repeats
+     * @param walk - receives `dropped` for a node cut at the limit of a whole walk, and `cut` for the nodes that a
+     *   partial walk must continue from
+     * @param read - the revn of the reads, checked against each answer
+     * @throws Error when the file changed between the pages, or a truncated page has no cursor
+     */
+    private async readTree(
+        fileId: string,
+        pageId: string,
+        rootId: string | undefined,
+        ids: Set<string>,
+        walk: { dropped: boolean; cut?: string[] },
+        read: LoadRead
+    ): Promise<void> {
         let cursor: string | undefined;
         do {
             const params: Record<string, unknown> = {
@@ -391,81 +778,181 @@ export class SandboxHost implements SandboxHostCalls {
                 depth: SandboxHost.TREE_DEPTH,
                 limit: SandboxHost.TREE_LIMIT,
             };
+            if (rootId !== undefined) {
+                params.rootId = rootId;
+            }
             if (cursor !== undefined) {
                 params.cursor = cursor;
             }
-            const page = await this.services.backend.callCommand<PageTreeResult>(
-                this.userToken,
-                "get-mcp-page-tree",
-                params
-            );
-            revn = this.checkRevn(revn, page.revn);
-            this.collectIds(page.root, ids, 1, deepest);
+            const page = await this.callTree(pageId, rootId, params);
+            read.revn = this.checkRevn(read.revn, page.revn);
+            this.collectIds(page.root, ids, 1, walk);
             if (page.truncated && page.nextCursor === undefined) {
                 throw new Error("get-mcp-page-tree reported a truncated page without a cursor");
             }
             cursor = page.truncated ? page.nextCursor : undefined;
         } while (cursor !== undefined);
+    }
 
-        // each shape is serialised once; the page text is then joined from those pieces.
-        const allIds = [...ids];
-        const shapeJson = new Map<string, string>();
-        const others = this.loadedBytes() - (this.pageBytes.get(key) ?? 0);
-        let shapeBytes = 0;
-        for (let start = 0; start < allIds.length; start += SandboxHost.SHAPE_BATCH_SIZE) {
-            const batch = allIds.slice(start, start + SandboxHost.SHAPE_BATCH_SIZE);
-            const result = await this.services.backend.callCommand<ShapesResult>(this.userToken, "get-mcp-shapes", {
-                fileId,
-                pageId,
-                ids: batch,
-                includeChildren: false,
-            });
-            revn = this.checkRevn(revn, result.revn);
-            for (const shape of result.shapes) {
-                const text = JSON.stringify(shape);
-                shapeJson.set(shape.id, text);
-                shapeBytes += Buffer.byteLength(text, "utf8");
+    /**
+     * Calls `get-mcp-page-tree`, and marks an answer that a root is missing from the page.
+     *
+     * @param pageId - page that the tree is read from
+     * @param rootId - root of the tree, or undefined for the page root
+     * @param params - parameters of the call
+     * @returns the page of the tree
+     * @throws MissingRootError that names the root when the page does not hold it; any other backend error as it is
+     */
+    private async callTree(
+        pageId: string,
+        rootId: string | undefined,
+        params: Record<string, unknown>
+    ): Promise<PageTreeResult> {
+        try {
+            return await this.services.backend.callCommand<PageTreeResult>(this.userToken, "get-mcp-page-tree", params);
+        } catch (error) {
+            if (rootId !== undefined && error instanceof BackendRpcError && error.code === "shape-not-found") {
+                throw new MissingRootError(`execute_code: root shape ${rootId} is not a shape of page ${pageId}`);
             }
-            // The shapes read so far give the size of the page. A page that is clearly too large stops here, before
-            // its other shapes are fetched and serialised.
-            const read = Math.min(start + SandboxHost.SHAPE_BATCH_SIZE, allIds.length);
-            const estimate = Math.round((shapeBytes / read) * allIds.length);
-            if (read < allIds.length && estimate > this.maxPageBytes) {
-                throw this.pageTooLarge(pageId, allIds.length, estimate, true);
-            }
+            throw error;
         }
+    }
 
-        // keep the tree order; ids that the backend did not return are skipped and reported.
-        const pieces: string[] = [];
-        for (const id of allIds) {
-            const text = shapeJson.get(id);
-            if (text !== undefined) {
-                pieces.push(text);
+    /**
+     * Fetches shapes by id, in batches, and stores each one with its JSON text. A reply that the backend cut short is
+     * asked again for the ids it neither answered nor listed as missing.
+     *
+     * @param fileId - file that holds the page
+     * @param pageId - page to read
+     * @param ids - ids to fetch, in the order to fetch them
+     * @param read - the revn of the reads, checked against each answer
+     * @param into - receives the shapes by id; a shape fetched again replaces its earlier copy
+     * @param onBatch - runs after each batch with the number of ids read so far and the bytes of the texts stored
+     * @returns the ids that were not in `into` before this call and were returned by the backend
+     * @throws Error when a cut reply answers none of the ids it was asked for
+     */
+    private async fetchShapes(
+        fileId: string,
+        pageId: string,
+        ids: string[],
+        read: LoadRead,
+        into: Map<string, FetchedShape>,
+        onBatch?: (done: number, bytes: number) => void
+    ): Promise<string[]> {
+        const stored: string[] = [];
+        let bytes = 0;
+        for (let start = 0; start < ids.length; start += SandboxHost.SHAPE_BATCH_SIZE) {
+            const batch = ids.slice(start, start + SandboxHost.SHAPE_BATCH_SIZE);
+            let pending = batch;
+            while (pending.length > 0) {
+                const result = await this.services.backend.callCommand<ShapesResult>(this.userToken, "get-mcp-shapes", {
+                    fileId,
+                    pageId,
+                    ids: pending,
+                    includeChildren: false,
+                });
+                read.revn = this.checkRevn(read.revn, result.revn);
+                const answered = new Set<string>();
+                for (const shape of result.shapes) {
+                    const text = JSON.stringify(shape);
+                    bytes += Buffer.byteLength(text, "utf8");
+                    answered.add(shape.id);
+                    if (!into.has(shape.id)) {
+                        stored.push(shape.id);
+                    }
+                    into.set(shape.id, { shape, text });
+                }
+                const listed = new Set(result.missing ?? []);
+                const unanswered = pending.filter((id) => !answered.has(id) && !listed.has(id));
+                const again = result.truncated === true ? unanswered : [];
+                if (again.length > 0 && again.length === pending.length) {
+                    throw new Error("get-mcp-shapes answered none of the shapes asked for, so the load cannot finish");
+                }
+                pending = again;
+            }
+            onBatch?.(start + batch.length, bytes);
+        }
+        return stored;
+    }
+
+    /**
+     * Stops a whole-page or partial load whose first batches show that its shapes are clearly above the cap.
+     *
+     * @param pageId - the page
+     * @param total - shapes the load will fetch
+     * @param done - shapes fetched so far
+     * @param bytes - bytes of the shapes fetched so far
+     * @param partial - whether the load is partial, which changes the advice of the error
+     * @throws Error when the estimate of the load is above the cap and shapes remain to be fetched
+     */
+    private checkEstimate(pageId: string, total: number, done: number, bytes: number, partial: boolean): void {
+        const estimate = Math.round((bytes / done) * total);
+        if (done < total && estimate > this.maxPageBytes) {
+            throw this.pageTooLarge(pageId, total, estimate, partial);
+        }
+    }
+
+    /**
+     * Returns the ids of the shapes that this call created or imported, which a partial load fetches by id.
+     *
+     * @returns the distinct ids
+     */
+    private createdShapeIds(): string[] {
+        return [...new Set([...Object.values(this.createdIds), ...this.importedIds])];
+    }
+
+    /**
+     * Returns the child ids that a shape lists.
+     *
+     * @param shape - the shape, or undefined
+     * @returns the child ids in stored order; empty when the shape lists none
+     */
+    private static childIdsOf(shape: Record<string, unknown> | undefined): string[] {
+        const children = shape?.shapes;
+        return Array.isArray(children) ? children.filter((child): child is string => typeof child === "string") : [];
+    }
+
+    /**
+     * Returns the parent id of a shape as the backend gives it.
+     *
+     * @param shape - the shape
+     * @returns the parent id, or undefined when the shape has none
+     */
+    private static parentIdOf(shape: Record<string, unknown>): string | undefined {
+        const parent = shape.parentId;
+        return typeof parent === "string" ? parent : undefined;
+    }
+
+    /**
+     * Returns the shapes that the given ids name, when they are loaded.
+     *
+     * @param ids - ids of shapes
+     * @param fetched - the loaded shapes by id
+     * @returns the shapes that are loaded, in the order of `ids`
+     */
+    private static shapesOf(ids: string[], fetched: Map<string, FetchedShape>): Record<string, unknown>[] {
+        return ids.flatMap((id) => {
+            const held = fetched.get(id);
+            return held === undefined ? [] : [held.shape];
+        });
+    }
+
+    /**
+     * Returns the parents of the given shapes that are not loaded, other than the page root.
+     *
+     * @param shapes - shapes whose parents are wanted
+     * @param fetched - the loaded shapes by id
+     * @returns the ids of the parents that still have to be fetched
+     */
+    private static missingParents(shapes: Record<string, unknown>[], fetched: Map<string, FetchedShape>): Set<string> {
+        const missing = new Set<string>();
+        for (const shape of shapes) {
+            const parent = SandboxHost.parentIdOf(shape);
+            if (parent !== undefined && parent !== SandboxHost.PAGE_ROOT_ID && !fetched.has(parent)) {
+                missing.add(parent);
             }
         }
-        const text =
-            '{"revn":' +
-            String(revn ?? null) +
-            ',"pageId":' +
-            JSON.stringify(pageId) +
-            ',"fileId":' +
-            JSON.stringify(fileId) +
-            ',"shapes":[' +
-            pieces.join(",") +
-            "]}";
-        const bytes = Buffer.byteLength(text, "utf8");
-        if (bytes > this.maxPageBytes) {
-            throw this.pageTooLarge(pageId, allIds.length, bytes, false);
-        }
-        if (others + bytes > this.maxPageBytes) {
-            throw new Error(this.pagesTooLarge());
-        }
-        this.pageBytes.set(key, bytes);
-        if (isNew) {
-            this.noteDroppedShapes(fileId, pageId, deepest.dropped, allIds.length - pieces.length);
-        }
-        this.lastRevn = revn ?? null;
-        return text;
+        return missing;
     }
 
     /**
@@ -846,6 +1333,7 @@ export class SandboxHost implements SandboxHostCalls {
         if (params.dryRun !== true) {
             this.flushes += 1;
             this.recordAnswer(0, SandboxHost.isRecord(result) ? result : {});
+            this.noteImported(result);
         }
         return JSON.stringify(result);
     }
@@ -1170,21 +1658,32 @@ export class SandboxHost implements SandboxHostCalls {
     /**
      * Adds the id of a tree node and of every node below it, in document order, without repeats.
      *
-     * The root is at depth 1. A node below the depth limit that still has children marks the page as cut short.
+     * A node that has no children in the reply, though its `childCount` says it has some, is cut. A whole walk
+     * notes such a node at the depth limit as dropped. A partial walk records it in `cut`, so that it continues from it.
      *
      * @param node - the node to walk
      * @param ids - ids collected so far, in document order
      * @param depth - depth of the node, from 1
-     * @param state - receives `dropped` when a node below the depth limit has children
+     * @param walk - receives `dropped` or `cut`, as described above
      */
-    private collectIds(node: TreeNode, ids: Set<string>, depth: number, state: { dropped: boolean }): void {
+    private collectIds(
+        node: TreeNode,
+        ids: Set<string>,
+        depth: number,
+        walk: { dropped: boolean; cut?: string[] }
+    ): void {
         ids.add(node.id);
         const children = node.children ?? [];
-        if (depth >= SandboxHost.TREE_DEPTH && children.length > 0) {
-            state.dropped = true;
+        if (walk.cut !== undefined) {
+            // a partial walk goes on from a node whose children the reply does not carry
+            if (children.length === 0 && (node.childCount ?? 0) > 0) {
+                walk.cut.push(node.id);
+            }
+        } else if (depth >= SandboxHost.TREE_DEPTH && (children.length > 0 || (node.childCount ?? 0) > 0)) {
+            walk.dropped = true;
         }
         for (const child of children) {
-            this.collectIds(child, ids, depth + 1, state);
+            this.collectIds(child, ids, depth + 1, walk);
         }
     }
 
@@ -1217,20 +1716,44 @@ export class SandboxHost implements SandboxHostCalls {
     }
 
     /**
-     * Words the error of one page that is above the cap.
+     * Notes the ids that an import answered, so that a partial load fetches them as created shapes.
+     *
+     * @param result - the answer of the import
+     */
+    private noteImported(result: unknown): void {
+        if (!SandboxHost.isRecord(result)) {
+            return;
+        }
+        if (typeof result.rootId === "string") {
+            this.importedIds.add(result.rootId);
+        }
+        if (Array.isArray(result.shapeIds)) {
+            for (const id of result.shapeIds) {
+                if (typeof id === "string") {
+                    this.importedIds.add(id);
+                }
+            }
+        }
+    }
+
+    /**
+     * Words the error of one page, or of the shapes of one load, that is above the cap.
      *
      * @param pageId - the page
-     * @param shapes - shapes in the page
-     * @param bytes - size of the page as JSON, or the estimate of it
-     * @param estimated - whether the size is an estimate from the shapes read so far
-     * @returns the error, which names the page, its size and shape count, and the way out
+     * @param shapes - shapes that the load holds, or that a whole load would hold
+     * @param bytes - size of the loaded shapes as JSON, or the estimate of it
+     * @param partial - whether the load is partial; then the advice is to pass fewer or smaller rootIds
+     * @returns the error, which names the page, its size and shape count, the limit and the way out
      */
-    private pageTooLarge(pageId: string, shapes: number, bytes: number, estimated: boolean): Error {
+    private pageTooLarge(pageId: string, shapes: number, bytes: number, partial: boolean): Error {
         const megabytes = (bytes / (1024 * 1024)).toFixed(1);
+        const limit = Number((this.maxPageBytes / (1024 * 1024)).toFixed(1));
+        const advice = partial
+            ? "Pass fewer or smaller rootIds, or use export_subtree, get_shapes and find_shapes for reads."
+            : "Pass rootIds to load only the boards the script needs, or use export_subtree, get_shapes and find_shapes for reads.";
         return new Error(
-            `page ${pageId} has ${shapes} shapes (${estimated ? "about " : ""}${megabytes} MB); ` +
-                "execute_code loads a whole page; use apply_operations and get_shapes/find_shapes for a page this " +
-                "large, or raise PENPOT_MCP_SANDBOX_PAGE_MB"
+            `page ${pageId} has ${shapes} shapes (about ${megabytes} MB); the limit is ${limit} MB ` +
+                `(PENPOT_MCP_SANDBOX_PAGE_MB). ${advice}`
         );
     }
 

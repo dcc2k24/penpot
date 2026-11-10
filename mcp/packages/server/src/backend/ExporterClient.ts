@@ -4,6 +4,7 @@ import { withDispatcher } from "./ConnectionPools";
 import { CappedBody } from "./CappedBody";
 import { Transit } from "./Transit";
 import { CallContext } from "./CallContext";
+import { ZipLimitError, ZipReader, type ZipEntry } from "../utils/ZipReader";
 
 /** Format that the exporter can render a shape to. */
 export type ExportFormat = "png" | "svg" | "jpeg" | "webp" | "pdf";
@@ -26,6 +27,74 @@ export interface ExportShapeRequest {
     name: string;
 }
 
+/** Renderer of an export: the browser renderer of the exporter, or its headless renderer, the one the workspace uses. */
+export type ExportRenderer = "browser" | "wasm";
+
+/** Options of an export call. */
+export interface ExportOptions {
+    /** Renderer of the export: `browser` (the default) or `wasm`. Older exporters ignore `wasm`. */
+    renderer?: ExportRenderer;
+}
+
+/** Raised when the exporter answers a batch with a ZIP whose entries do not match the requested shapes. */
+export class ExportBatchError extends Error {
+    /**
+     * Creates the error.
+     *
+     * @param message - what did not match, without any secret
+     */
+    constructor(message: string) {
+        super(message);
+        this.name = "ExportBatchError";
+    }
+}
+
+/** How long, in milliseconds, an exporter that refused a batch is kept to one shape per request. */
+export const BATCH_REFUSAL_MS = 10 * 60_000;
+
+/**
+ * Remembers, per exporter client, until when it refuses batches. A refusal is a 5xx answer to a batch, or a ZIP
+ * that cannot be mapped back to the shapes. Until the time passes, the callers send one shape per request.
+ *
+ * The state lives with the exporter object, so every tool of the process shares it, and a new exporter starts with
+ * no refusal. The clock is passed in, so that tests can move it.
+ */
+export class BatchRefusals {
+    /** Time, in milliseconds, until which each exporter refuses batches. */
+    private static readonly until = new WeakMap<object, number>();
+
+    /**
+     * Records that an exporter refused a batch now.
+     *
+     * @param exporter - the exporter that refused
+     * @param now - the current time in milliseconds
+     */
+    public static refuse(exporter: object, now: number): void {
+        BatchRefusals.until.set(exporter, now + BATCH_REFUSAL_MS);
+    }
+
+    /**
+     * Tells whether an exporter is still kept to one shape per request.
+     *
+     * @param exporter - the exporter to ask about
+     * @param now - the current time in milliseconds
+     * @returns true until the refusal period has passed
+     */
+    public static refusesBatches(exporter: object, now: number): boolean {
+        const until = BatchRefusals.until.get(exporter);
+        return until !== undefined && now < until;
+    }
+
+    /**
+     * Drops the refusal of an exporter at once, so that batches are tried again.
+     *
+     * @param exporter - the exporter whose refusal ends
+     */
+    public static forget(exporter: object): void {
+        BatchRefusals.until.delete(exporter);
+    }
+}
+
 /** Bytes of a rendered file with the media type reported for them. */
 export interface RenderedFile {
     /** Raw bytes of the file. */
@@ -41,11 +110,29 @@ export interface ExporterClient {
      *
      * @param renderToken - render session token that authorizes the export
      * @param request - shape, file and format to render
+     * @param options - the renderer; undefined means the browser renderer
      * @returns the rendered bytes and their media type
      * @throws ExporterError when the exporter answers with an error status
      * @throws Error when the exporter does not respond or its answer has no asset uri
      */
-    exportShape(renderToken: string, request: ExportShapeRequest): Promise<RenderedFile>;
+    exportShape(renderToken: string, request: ExportShapeRequest, options?: ExportOptions): Promise<RenderedFile>;
+
+    /**
+     * Renders several shapes in one exporter request. One request is answered with a plain file; two or more with
+     * a ZIP, whose entries are named after the `name` of each request, which the caller sets to the shape id.
+     *
+     * @param renderToken - render session token that authorizes the export
+     * @param requests - the shapes to render, with the same file; each `name` must be unique
+     * @param options - the renderer; undefined means the browser renderer
+     * @returns the rendered file of each request, keyed by its `name`
+     * @throws ExporterError when the exporter answers with an error status; a 5xx answer means a batch is refused
+     * @throws ExportBatchError when the ZIP does not hold exactly the requested shapes
+     */
+    exportShapes(
+        renderToken: string,
+        requests: ExportShapeRequest[],
+        options?: ExportOptions
+    ): Promise<Map<string, RenderedFile>>;
 
     /**
      * Downloads one stored asset from the backend.
@@ -57,7 +144,33 @@ export interface ExporterClient {
      * @throws ExporterError when the backend refuses the session or lacks the asset
      * @throws Error when the asset identifier is not a UUID
      */
-    downloadAsset(renderToken: string, assetId: string, baseUri?: URL): Promise<RenderedFile>;
+    downloadAsset(renderToken: string, assetId: string, baseUri?: URL, maxBytes?: number): Promise<RenderedFile>;
+}
+
+/** Raised when the exporter or the backend does not answer at all: a connection failure or a refused request. */
+export class ExporterUnreachableError extends Error {
+    /**
+     * Creates the error.
+     *
+     * @param message - what did not answer, without any secret
+     */
+    constructor(message: string) {
+        super(message);
+        this.name = "ExporterUnreachableError";
+    }
+}
+
+/** Raised when an answer or a download is larger than the cap that applies to it. */
+export class ExportTooLargeError extends Error {
+    /**
+     * Creates the error.
+     *
+     * @param message - what is too large, and the cap it passed
+     */
+    constructor(message: string) {
+        super(message);
+        this.name = "ExportTooLargeError";
+    }
 }
 
 /** Error raised when the exporter or the backend answers a render request with an error status. */
@@ -70,7 +183,9 @@ export class ExporterError extends Error {
      */
     constructor(
         public readonly status: number,
-        message: string
+        message: string,
+        /** `export` for the answer of the exporter, `asset` for the download of the rendered file. */
+        public readonly source: "export" | "asset" = "export"
     ) {
         super(message);
         this.name = "ExporterError";
@@ -92,6 +207,27 @@ export class HttpExporterClient implements ExporterClient {
     private static readonly UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     /** Media type that stands for an unknown type. */
     private static readonly OCTET_STREAM = "application/octet-stream";
+
+    /** Media type of each format that the exporter renders. */
+    private static readonly MIME_TYPES: Record<ExportFormat, string> = {
+        png: "image/png",
+        jpeg: "image/jpeg",
+        webp: "image/webp",
+        svg: "image/svg+xml",
+        pdf: "application/pdf",
+    };
+
+    /** Extra bytes that a batch answer may take on top of one cap per export, for its headers: one megabyte. */
+    private static readonly BATCH_HEADER_BYTES = 1024 * 1024;
+
+    /** File name extensions that the entries of a batch ZIP carry, per format. */
+    private static readonly EXTENSIONS: Record<ExportFormat, readonly string[]> = {
+        png: ["png"],
+        jpeg: ["jpg", "jpeg"],
+        webp: ["webp"],
+        svg: ["svg"],
+        pdf: ["pdf"],
+    };
 
     /** Hint that every no-file answer carries, so that the operator knows which variable to change. */
     private static readonly PUBLIC_URI_HINT =
@@ -152,27 +288,103 @@ export class HttpExporterClient implements ExporterClient {
      *
      * @param renderToken - render session token, sent as the auth-token cookie
      * @param request - shape, file and format to render
+     * @param options - the renderer; undefined means the browser renderer
      * @returns the rendered bytes and their media type
      * @throws ExporterError for the 400, 401, 404 and 429 statuses and for any other error status
      * @throws Error when the exporter does not respond or its answer has no asset uri
      */
-    public async exportShape(renderToken: string, request: ExportShapeRequest): Promise<RenderedFile> {
+    public async exportShape(
+        renderToken: string,
+        request: ExportShapeRequest,
+        options?: ExportOptions
+    ): Promise<RenderedFile> {
+        return this.postExport(renderToken, [request], options);
+    }
+
+    /**
+     * Renders several shapes in one exporter request, and maps the answer back to the shapes.
+     *
+     * One request is a plain file. Two or more are answered with one ZIP, which is read and matched by name: each
+     * entry must be `<name>.<extension>` for one of the requests, and each request must have exactly one entry.
+     *
+     * @param renderToken - render session token, sent as the auth-token cookie
+     * @param requests - the shapes to render; each `name` must be unique and is the id of its shape
+     * @param options - the renderer; undefined means the browser renderer
+     * @returns the rendered file of each request, keyed by its name
+     * @throws ExporterError for an error status of the exporter, or of the backend asset download
+     * @throws ExportBatchError when the ZIP does not hold exactly the requested shapes or cannot be read
+     * @throws Error when the exporter does not respond or its answer has no asset uri
+     */
+    public async exportShapes(
+        renderToken: string,
+        requests: ExportShapeRequest[],
+        options?: ExportOptions
+    ): Promise<Map<string, RenderedFile>> {
+        if (requests.length === 0) {
+            return new Map();
+        }
+        if (requests.length === 1) {
+            const rendered = await this.postExport(renderToken, requests, options);
+            return new Map([[requests[0].name, rendered]]);
+        }
+        const cap = this.batchCapBytes(requests.length);
+        const rendered = await this.postExport(renderToken, requests, options, cap);
+        let entries: ZipEntry[];
+        try {
+            entries = ZipReader.read(rendered.bytes, cap);
+        } catch (error) {
+            if (error instanceof ZipLimitError) {
+                throw new ExportTooLargeError(`The exporter batch is too large: ${error.message}`);
+            }
+            throw new ExportBatchError(
+                `The exporter batch is not a readable ZIP (${HttpExporterClient.messageOf(error)}).`
+            );
+        }
+        return HttpExporterClient.mapBatchEntries(entries, requests);
+    }
+
+    /**
+     * Returns the cap of a batch answer: one file's cap for each export of the batch, plus one megabyte for the
+     * archive headers.
+     *
+     * @param count - the number of exports in the batch
+     * @returns the cap in bytes, for the ZIP body and for its uncompressed entries
+     */
+    private batchCapBytes(count: number): number {
+        return this.maxResponseBytes * count + HttpExporterClient.BATCH_HEADER_BYTES;
+    }
+
+    /**
+     * Posts one export request with one or more shapes, and downloads the file that the answer names.
+     *
+     * @param renderToken - render session token, sent as the auth-token cookie
+     * @param requests - the shapes to render, at least one
+     * @param options - the renderer; undefined means the browser renderer
+     * @returns the rendered resource: one file, or a ZIP for two or more shapes
+     * @throws ExporterError for an error status of the exporter
+     * @throws Error when the exporter does not respond or its answer has no asset uri
+     */
+    private async postExport(
+        renderToken: string,
+        requests: ExportShapeRequest[],
+        options: ExportOptions = {},
+        maxBytes?: number
+    ): Promise<RenderedFile> {
+        const first = requests[0];
         const body = Transit.encode({
             cmd: Transit.keyword("export-shapes"),
-            "profile-id": Transit.uuid(request.profileId),
+            "profile-id": Transit.uuid(first.profileId),
             wait: true,
-            "is-wasm": false,
-            exports: [
-                {
-                    "file-id": Transit.uuid(request.fileId),
-                    "page-id": Transit.uuid(request.pageId),
-                    "object-id": Transit.uuid(request.objectId),
-                    type: Transit.keyword(request.format),
-                    suffix: "",
-                    scale: request.scale,
-                    name: request.name,
-                },
-            ],
+            "is-wasm": options.renderer === "wasm",
+            exports: requests.map((request) => ({
+                "file-id": Transit.uuid(request.fileId),
+                "page-id": Transit.uuid(request.pageId),
+                "object-id": Transit.uuid(request.objectId),
+                type: Transit.keyword(request.format),
+                suffix: "",
+                scale: request.scale,
+                name: request.name,
+            })),
         });
         let response: Response;
         try {
@@ -193,7 +405,7 @@ export class HttpExporterClient implements ExporterClient {
                 )
             );
         } catch (error) {
-            throw new Error(
+            throw new ExporterUnreachableError(
                 `The exporter did not respond (${HttpExporterClient.reasonOf(error)}). Check PENPOT_MCP_EXPORTER_URI.`
             );
         }
@@ -207,7 +419,48 @@ export class HttpExporterClient implements ExporterClient {
                 `The exporter answered without a file (${noFileCause}). ${HttpExporterClient.PUBLIC_URI_HINT}`
             );
         }
-        return this.downloadRendered(renderToken, text);
+        return this.downloadRendered(renderToken, text, maxBytes);
+    }
+
+    /**
+     * Matches the entries of a batch ZIP to the requested shapes by name, and checks that each shape has one entry.
+     *
+     * @param entries - the entries of the ZIP
+     * @param requests - the requested shapes, whose names are the shape ids
+     * @returns the file of each shape, keyed by its name, with the media type of its format
+     * @throws ExportBatchError when an entry matches no shape, a shape has two entries, or a shape has none
+     */
+    private static mapBatchEntries(entries: ZipEntry[], requests: ExportShapeRequest[]): Map<string, RenderedFile> {
+        const formatById = new Map(requests.map((request) => [request.name, request.format]));
+        const files = new Map<string, RenderedFile>();
+        for (const entry of entries) {
+            const dot = entry.name.lastIndexOf(".");
+            const id = dot < 0 ? entry.name : entry.name.slice(0, dot);
+            const extension = dot < 0 ? "" : entry.name.slice(dot + 1).toLowerCase();
+            const format = formatById.get(id);
+            const expected = format === undefined ? undefined : HttpExporterClient.EXTENSIONS[format];
+            if (format === undefined || expected === undefined || !expected.includes(extension) || files.has(id)) {
+                throw new ExportBatchError(
+                    `The exporter batch has an entry "${entry.name}" that matches no requested shape once.`
+                );
+            }
+            files.set(id, { bytes: entry.data, mimeType: HttpExporterClient.MIME_TYPES[format] });
+        }
+        for (const id of formatById.keys()) {
+            if (!files.has(id)) {
+                throw new ExportBatchError(`The exporter batch has no entry for shape ${id}.`);
+            }
+        }
+        return files;
+    }
+
+    /**
+     * Returns the text of an error, or its text form when it is not an error.
+     *
+     * @param error - the caught value
+     */
+    private static messageOf(error: unknown): string {
+        return error instanceof Error ? error.message : String(error);
     }
 
     /**
@@ -220,7 +473,12 @@ export class HttpExporterClient implements ExporterClient {
      * characters of the response body, and the status is 401 for 401 and 403 answers
      * @throws Error when the asset identifier is not a UUID or the backend does not respond
      */
-    public async downloadAsset(renderToken: string, assetId: string, baseUri?: URL): Promise<RenderedFile> {
+    public async downloadAsset(
+        renderToken: string,
+        assetId: string,
+        baseUri?: URL,
+        maxBytes?: number
+    ): Promise<RenderedFile> {
         if (!HttpExporterClient.UUID_PATTERN.test(assetId)) {
             throw new Error("The asset id must be a UUID.");
         }
@@ -229,7 +487,7 @@ export class HttpExporterClient implements ExporterClient {
         if (!response.ok) {
             throw HttpExporterClient.assetFailure(response.status, await HttpExporterClient.snippetOf(response));
         }
-        const bytes = await this.readCapped(response, "asset");
+        const bytes = await this.readCapped(response, "asset", maxBytes);
         const noFileCause = HttpExporterClient.noFileCause(response, bytes.length === 0);
         if (noFileCause !== undefined) {
             throw new Error(
@@ -298,7 +556,8 @@ export class HttpExporterClient implements ExporterClient {
             throw new ExporterError(
                 first.status,
                 `The asset answer redirected to another origin (${next.origin}), which the server does not follow. ` +
-                    "Set PENPOT_MCP_ASSETS_URI to the public URI that serves the assets."
+                    "Set PENPOT_MCP_ASSETS_URI to the public URI that serves the assets.",
+                "asset"
             );
         }
         return this.sendAsset(next.href, renderToken);
@@ -327,7 +586,7 @@ export class HttpExporterClient implements ExporterClient {
                 )
             );
         } catch (error) {
-            throw new Error(
+            throw new ExporterUnreachableError(
                 `The backend did not respond (${HttpExporterClient.reasonOf(error)}) while downloading the asset.`
             );
         }
@@ -340,13 +599,18 @@ export class HttpExporterClient implements ExporterClient {
      * @param what - the kind of body, named in the error
      * @throws Error naming the cap and its environment variable when the body is over the cap
      */
-    private readCapped(response: Response, what: string): Promise<Uint8Array> {
+    private readCapped(
+        response: Response,
+        what: string,
+        maxBytes: number = this.maxResponseBytes
+    ): Promise<Uint8Array> {
+        const megabytes = Math.round((maxBytes / (1024 * 1024)) * 100) / 100;
         return CappedBody.bytes(
             response,
-            this.maxResponseBytes,
+            maxBytes,
             () =>
-                new Error(
-                    `The ${what} exceeds ${this.maxResponseMb} MB (PENPOT_MCP_BACKEND_MAX_RESPONSE_MB); ` +
+                new ExportTooLargeError(
+                    `The ${what} exceeds ${megabytes} MB (PENPOT_MCP_BACKEND_MAX_RESPONSE_MB); ` +
                         "the export was not completed."
                 )
         );
@@ -380,7 +644,7 @@ export class HttpExporterClient implements ExporterClient {
      * @returns the rendered bytes, with the resource media type when the download reports none
      * @throws Error when the answer is not transit or its uri names no asset
      */
-    private async downloadRendered(renderToken: string, answerText: string): Promise<RenderedFile> {
+    private async downloadRendered(renderToken: string, answerText: string, maxBytes?: number): Promise<RenderedFile> {
         let decoded: unknown;
         try {
             decoded = Transit.decode(answerText);
@@ -393,7 +657,7 @@ export class HttpExporterClient implements ExporterClient {
         if (assetId === undefined) {
             throw new Error("the exporter answer has no asset uri");
         }
-        const rendered = await this.downloadAsset(renderToken, assetId, this.assetBaseFor(uri));
+        const rendered = await this.downloadAsset(renderToken, assetId, this.assetBaseFor(uri), maxBytes);
         const mtype = answer?.mtype;
         const resourceType = typeof mtype === "string" ? mtype : HttpExporterClient.OCTET_STREAM;
         return {
@@ -447,14 +711,14 @@ export class HttpExporterClient implements ExporterClient {
     private static assetFailure(status: number, snippet: string): ExporterError {
         if (status === 401 || status === 403) {
             const reason = "The render session cannot read this asset";
-            return new ExporterError(401, HttpExporterClient.withDetail(reason, status, snippet));
+            return new ExporterError(401, HttpExporterClient.withDetail(reason, status, snippet), "asset");
         }
         if (status === 404) {
             const reason = "The asset was not found or is not visible to the render session";
-            return new ExporterError(404, HttpExporterClient.withDetail(reason, status, snippet));
+            return new ExporterError(404, HttpExporterClient.withDetail(reason, status, snippet), "asset");
         }
         const reason = "The backend failed to return the asset";
-        return new ExporterError(status, HttpExporterClient.withDetail(reason, status, snippet));
+        return new ExporterError(status, HttpExporterClient.withDetail(reason, status, snippet), "asset");
     }
 
     /**

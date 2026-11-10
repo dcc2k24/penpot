@@ -1,5 +1,6 @@
 import * as path from "path";
 import * as fs from "fs";
+import { randomBytes } from "crypto";
 
 export class FileUtils {
     /**
@@ -30,6 +31,36 @@ export class FileUtils {
     public static writeBinaryFile(filePath: string, bytes: Uint8Array, options: FileWriteOptions = {}): void {
         this.createParentDirectories(filePath);
         fs.writeFileSync(filePath, Buffer.from(bytes), { flag: FileUtils.flagOf(options) });
+    }
+
+    /**
+     * Writes bytes so that an existing file is replaced, not written through: the bytes go to a temporary name in the
+     * same folder, which is then renamed onto the target. A hard link or a file that another program has open at the
+     * target name keeps its old content. The temporary file is removed when the write fails.
+     *
+     * With `overwrite` false the write fails, as {@link writeBinaryFile} does, when a file exists.
+     *
+     * @param filePath - The absolute path to the file where data should be written
+     * @param bytes - The binary data to write to the file
+     * @param options - whether an existing file may be replaced; replaced by default
+     * @throws Error when the write or the rename fails; the temporary file is removed then
+     */
+    public static writeBinaryFileReplacing(filePath: string, bytes: Uint8Array, options: FileWriteOptions = {}): void {
+        if (options.overwrite === false) {
+            FileUtils.writeBinaryFile(filePath, bytes, options);
+            return;
+        }
+        this.createParentDirectories(filePath);
+        const temporary = path.join(
+            path.dirname(filePath),
+            `.${path.basename(filePath)}.${randomBytes(6).toString("hex")}.tmp`
+        );
+        try {
+            fs.writeFileSync(temporary, Buffer.from(bytes), { flag: "wx" });
+            fs.renameSync(temporary, filePath);
+        } finally {
+            fs.rmSync(temporary, { force: true });
+        }
     }
 
     /**

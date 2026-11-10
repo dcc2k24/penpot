@@ -1,3 +1,4 @@
+import { BackendRpcError } from "../../backend/BackendRpcError";
 import type { RecordedCall } from "../../backend/testing/FakePenpotBackend";
 import type { PenpotMcpServer } from "../../PenpotMcpServer";
 import type { ToolResponse } from "../../ToolResponse";
@@ -107,14 +108,15 @@ export function pageRecords(shapes: FakeShape[]): Map<string, Record<string, unk
  * Builds the page tree of the fake page from the records: each node lists its children.
  *
  * @param shapes - shapes of the page
+ * @param start - id of the node that the tree starts from, the page root by default
  * @returns the root node
  */
-export function pageTree(shapes: FakeShape[]): { id: string; children: unknown[] } {
+export function pageTree(shapes: FakeShape[], start: string = ROOT): { id: string; children: unknown[] } {
     const build = (id: string): { id: string; children: unknown[] } => ({
         id,
         children: shapes.filter((shape) => (shape.parentId ?? ROOT) === id).map((shape) => build(shape.id)),
     });
-    return build(ROOT);
+    return build(start);
 }
 
 /**
@@ -205,12 +207,18 @@ export function harness(options: HarnessOptions = {}): Harness {
                 { id: PAGE_TWO, name: "Page 2", index: 1 },
             ],
         })
-        .respond("get-mcp-page-tree", () => ({
-            revn,
-            pageId: PAGE,
-            root: pageTree(shapes),
-            truncated: false,
-        }))
+        .respond("get-mcp-page-tree", (params: object) => {
+            // a tree from a root that the page does not hold fails as the backend does
+            const rootId = (params as { rootId?: string }).rootId ?? ROOT;
+            if (rootId !== ROOT && !shapes.some((shape) => shape.id === rootId)) {
+                throw new BackendRpcError(400, "get-mcp-page-tree", {
+                    type: "not-found",
+                    code: "shape-not-found",
+                    hint: "root shape not found in page",
+                });
+            }
+            return { revn, pageId: PAGE, root: pageTree(shapes, rootId), truncated: false };
+        })
         .respond("get-mcp-shapes", (params: object) => {
             const ids = (params as { ids: string[] }).ids;
             const records = pageRecords(shapes);
@@ -303,4 +311,197 @@ export function disposeHarnesses(): void {
     for (const services of allServices) {
         services.sandboxes.dispose();
     }
+}
+
+/** A record of the order-keeping fake page: its parent, and its children in the order the backend keeps them. */
+export interface OrderedRecord {
+    id: string;
+    type: string;
+    name: string;
+    parentId: string;
+    shapes: string[];
+    [key: string]: unknown;
+}
+
+/** Options of {@link orderedPage}. */
+export interface OrderedPageOptions {
+    /** Most shapes one `get-mcp-shapes` reply carries. The rest are left out and the reply is marked truncated. */
+    shapeReplyLimit?: number;
+}
+
+/** The answers of an order-keeping fake page, and the records it holds. */
+export interface OrderedPage {
+    /** Answers of the page commands, to pass to `harness({ responses })`. */
+    responses: Record<string, CannedResponse>;
+    /** The records of the page by id; the page root is {@link ROOT}. */
+    records: Map<string, OrderedRecord>;
+}
+
+/**
+ * Builds an order-keeping fake of one page. Unlike the default fake, it keeps the child order of every shape and
+ * applies creates, updates, deletes, moves and reorders as the backend does: a reorder must name every child exactly
+ * once, and a move with no index appends. Tree reads honour `rootId` and `depth`, and report `childCount` for a node
+ * whose children they do not carry. Shape reads can be cut short with `shapeReplyLimit`.
+ *
+ * @param shapes - the shapes of the page; a parent may come after its children
+ * @param options - the limits of the reads
+ * @returns the answers and the records
+ */
+export function orderedPage(shapes: FakeShape[], options: OrderedPageOptions = {}): OrderedPage {
+    const records = new Map<string, OrderedRecord>();
+    records.set(ROOT, { id: ROOT, type: "frame", name: "Root", parentId: ROOT, shapes: [] });
+    for (const shape of shapes) {
+        records.set(shape.id, { ...shape, parentId: shape.parentId ?? ROOT, shapes: [] });
+    }
+    for (const shape of shapes) {
+        records.get(shape.parentId ?? ROOT)?.shapes.push(shape.id);
+    }
+    let revn = 1;
+    let counter = 0;
+
+    const parentOf = (id: string): OrderedRecord | undefined => {
+        const record = records.get(id);
+        return record === undefined ? undefined : records.get(record.parentId);
+    };
+    const detach = (id: string): void => {
+        const parent = parentOf(id);
+        if (parent !== undefined) {
+            parent.shapes = parent.shapes.filter((child) => child !== id);
+        }
+    };
+    const removeTree = (id: string): void => {
+        const record = records.get(id);
+        if (record === undefined) {
+            return;
+        }
+        for (const child of [...record.shapes]) {
+            removeTree(child);
+        }
+        detach(id);
+        records.delete(id);
+    };
+    const tree = (params: object): unknown => {
+        const { rootId = ROOT, depth = 20 } = params as { rootId?: string; depth?: number };
+        if (!records.has(rootId)) {
+            throw new BackendRpcError(400, "get-mcp-page-tree", {
+                type: "not-found",
+                code: "shape-not-found",
+                hint: "root shape not found in page",
+            });
+        }
+        const build = (id: string, level: number): unknown => {
+            const record = records.get(id) as OrderedRecord;
+            return {
+                id,
+                childCount: record.shapes.length,
+                children: level < depth ? record.shapes.map((child) => build(child, level + 1)) : [],
+            };
+        };
+        return { revn, pageId: PAGE, root: build(rootId, 1), truncated: false };
+    };
+    const shapesOf = (params: object): unknown => {
+        const ids = (params as { ids: string[] }).ids;
+        const present = ids.filter((id) => records.has(id));
+        const kept = options.shapeReplyLimit === undefined ? present : present.slice(0, options.shapeReplyLimit);
+        return {
+            revn,
+            shapes: kept.map((id) => JSON.parse(JSON.stringify(records.get(id)))),
+            missing: ids.filter((id) => !records.has(id)),
+            truncated: kept.length < present.length,
+        };
+    };
+    const apply = (params: object): unknown => {
+        const operations = (params as { operations: Array<Record<string, any>> }).operations;
+        const createdIds: Record<string, string> = {};
+        const resolve = (value: any): any =>
+            typeof value === "string" && createdIds[value] !== undefined ? createdIds[value] : value;
+        for (const operation of operations) {
+            if (["create_board", "create_rect", "create_ellipse", "create_text"].includes(operation.op)) {
+                counter += 1;
+                const id = `5e6f7a80-0000-4000-8000-${String(counter).padStart(12, "0")}`;
+                createdIds[operation.id] = id;
+                const parentId: string = resolve(operation.parentId) ?? ROOT;
+                const type =
+                    operation.op === "create_board" ? "frame" : operation.op === "create_text" ? "text" : "rect";
+                records.set(id, {
+                    id,
+                    type,
+                    name: typeof operation.name === "string" ? operation.name : type,
+                    parentId,
+                    shapes: [],
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 10,
+                });
+                records.get(parentId)?.shapes.push(id);
+            } else if (operation.op === "update_shape") {
+                const record = records.get(resolve(operation.id));
+                if (record !== undefined) {
+                    Object.assign(record, operation.props);
+                }
+            } else if (operation.op === "delete_shapes") {
+                for (const id of operation.ids) {
+                    removeTree(resolve(id));
+                }
+            } else if (operation.op === "move_shapes") {
+                const target = records.get(resolve(operation.parentId));
+                if (target === undefined) {
+                    throw new BackendRpcError(400, "mcp-apply-operations", {
+                        type: "not-found",
+                        code: "shape-not-found",
+                    });
+                }
+                const ids: string[] = operation.ids.map(resolve);
+                for (const id of ids) {
+                    detach(id);
+                    const record = records.get(id);
+                    if (record !== undefined) {
+                        record.parentId = target.id;
+                    }
+                }
+                const at =
+                    typeof operation.index === "number" && operation.index <= target.shapes.length
+                        ? operation.index
+                        : target.shapes.length;
+                target.shapes.splice(at, 0, ...ids);
+            } else if (operation.op === "reorder") {
+                const target = records.get(resolve(operation.parentId));
+                const ids: string[] = operation.ids.map(resolve);
+                if (
+                    target === undefined ||
+                    ids.length !== target.shapes.length ||
+                    new Set(ids).size !== ids.length ||
+                    !ids.every((id) => target.shapes.includes(id))
+                ) {
+                    throw new BackendRpcError(400, "mcp-apply-operations", {
+                        type: "validation",
+                        code: "mcp-invalid-operation",
+                        hint: "reorder needs every child of the parent exactly once",
+                    });
+                }
+                target.shapes = ids;
+            }
+        }
+        revn += 1;
+        return { revn, createdIds, warnings: [], changeCount: operations.length };
+    };
+    const importSvg = (params: object): unknown => {
+        void params;
+        counter += 1;
+        const id = `5e6f7a80-0000-4000-8000-${String(counter).padStart(12, "0")}`;
+        records.set(id, { id, type: "frame", name: "Svg", parentId: ROOT, shapes: [] });
+        records.get(ROOT)?.shapes.push(id);
+        revn += 1;
+        return { revn, rootId: id, shapeIds: [id] };
+    };
+    return {
+        responses: {
+            "get-mcp-page-tree": tree,
+            "get-mcp-shapes": shapesOf,
+            "mcp-apply-operations": apply,
+            "mcp-import-svg": importSvg,
+        },
+        records,
+    };
 }

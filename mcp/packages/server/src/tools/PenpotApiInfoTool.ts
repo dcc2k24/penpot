@@ -52,33 +52,50 @@ export class PenpotApiInfoTool extends Tool<PenpotApiInfoArgs> {
 
     public getToolDescription(): string {
         return (
-            "Retrieves Penpot API documentation for types and their members." +
+            "Retrieves Penpot API documentation for types and their members. " +
+            "The type can also be a topic that explains a subject, such as 'Geometry' (what the box, transform, " +
+            "text, gradient and stroke values of a shape mean). " +
             "Be sure to read the 'Penpot High-Level Overview' first."
         );
     }
 
     protected async executeCore(args: PenpotApiInfoArgs): Promise<ToolResponse> {
         const apiType = this.apiDocs.getType(args.type);
+        const topic = apiType ? null : this.apiDocs.getTopic(args.type);
+        const entry = apiType ?? topic;
 
-        if (!apiType) {
-            throw new Error(`API type "${args.type}" not found`);
+        if (!entry) {
+            throw new Error(
+                `API type "${args.type}" not found. Valid names are the topics (${this.apiDocs.getTopicNames().join(", ")}) ` +
+                    `and the API types (${this.apiDocs.getTypeNames().join(", ")}).`
+            );
         }
 
         if (args.member) {
             // return specific member documentation
-            const memberDoc = apiType.getMember(args.member);
+            const memberDoc = entry.getMember(args.member);
             if (!memberDoc) {
-                throw new Error(`Member "${args.member}" not found in type "${args.type}"`);
+                throw new Error(
+                    `Member "${args.member}" not found in type "${args.type}". ` +
+                        `Valid members: ${entry.getMemberNames().join(", ")}.`
+                );
             }
             return new TextResponse(memberDoc);
         } else {
             // return full text or overview based on length
-            const fullText = apiType.getFullText();
+            const fullText = entry.getFullText();
             if (fullText.length <= PenpotApiInfoTool.MAX_FULL_TEXT_CHARS) {
                 return new TextResponse(fullText);
+            } else if (topic) {
+                return new TextResponse(
+                    topic.getOverviewText() +
+                        `\n\nMembers: ${topic.getMemberNames().join(", ")}. ` +
+                        "Member details not provided (too long). " +
+                        "Call this tool with a member name for more information."
+                );
             } else {
                 return new TextResponse(
-                    apiType.getOverviewText() +
+                    entry.getOverviewText() +
                         "\n\nMember details not provided (too long). " +
                         "Call this tool with a member name for more information."
                 );

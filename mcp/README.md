@@ -301,6 +301,8 @@ The Penpot MCP server can be configured using environment variables.
 | `PENPOT_MCP_TOOL_TIMEOUT_S`                      | Timeout, in seconds, for tool calls dispatched to the Penpot plugin                                                                                                                                                                                                         | `120`          |
 | `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS`  | Maximum number of export shape requests that run at once in one process. In backend mode the backend export tools default to 4.                                                                                                                                                                                                    | `0` (no limit) in bridge mode, `4` in backend mode |
 | `PENPOT_MCP_EXPORT_TOTAL_PERMITS` | Most renders that run at once across all adapters that share `PENPOT_MCP_REDIS_URI`. Each permit lasts at most 65 s. Without Redis, each process uses its own cap. | `4` |
+| `PENPOT_MCP_EXPORT_BATCH_SIZE` | Most shapes that one exporter request renders in a `shapeIds` batch, from 1 to 50. | `10` |
+| `PENPOT_MCP_EXPORT_CACHE_MB` | Size, in MB, of the render cache in each process, from 0 to 4096. `0` turns it off. | `64` |
 | `PENPOT_MCP_AUTH_URI` | Public base URL of the MCP authorization service, e.g. `https://penpot.example/api/mcp/oauth`. Set to enable OAuth; requires `--multi-user`. Use HTTPS (HTTP is allowed on loopback for development), without credentials, query parameters, or a fragment. | (unset; OAuth disabled) |
 | `PENPOT_MCP_REDIS_URI`                           | Redis connection URI (for example `redis://host:6379`). In multi-user mode it routes plugin tasks between instances (see above). In backend and both mode it shares the rate limit and the sandbox `storage` across adapters; when Redis does not answer, the adapter uses its own in-process rate limit and skips the storage copy. Requires Redis 5 or later. | (unset)        |
 | `PENPOT_MCP_TOKEN_CACHE_S` | Seconds that a successful token check is reused before the backend is asked again. A revoked token keeps working on each adapter for up to this long after the revocation. Lowering it costs one `mcp-whoami` call per token per interval on each adapter. | `60` |
@@ -403,13 +405,17 @@ The backend tools follow one discovery flow, with explicit ids at every step:
 `whoami` → `list_teams` → `list_projects` → `list_files` → `get_file_outline` → `get_page_tree` → `get_shapes`.
 Writes go through `apply_operations` (typed operations, `$tmp:` handles for shapes created in the same call) or
 `apply_raw_changes`. Every write accepts `dryRun`, `snapshot`, `baseRevn` and `failOnConflict`.
+Whole subtrees, prototypes, fonts and page checks have their own reads: `export_subtree`, `get_interactions`,
+`find_connectors`, `list_fonts`, `lint_page` and `find_similar_boards`. `execute_code` takes `rootIds` (1 to 20 shape
+ids) to load only those boards when a page is too large to load whole.
 The `high_level_overview` tool returns the backend instructions in this mode; the file is
 `packages/server/data/backend_instructions.md`.
 
 Each MCP token is validated against the backend (`mcp-whoami`, cached for 60 seconds) and limited to
 `PENPOT_MCP_RATE_LIMIT_RPS` requests per second. Writes by one token to one file run one after another in each server process.
 Request bodies are capped at `PENPOT_MCP_MAX_BODY_MB`, and backend responses at `PENPOT_MCP_BACKEND_MAX_RESPONSE_MB`.
-Exports wait for a slot: at most `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` run at once in one process (4 by default in backend mode). With Redis, at most `PENPOT_MCP_EXPORT_TOTAL_PERMITS` (4 by default) run at once across all adapters. With Redis, callers that wait for the shared cap are served in arrival order. The counter `penpot_mcp_export_busy_total{gate}` counts the refusals.
+Exports wait for a slot: at most `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` run at once in one process (4 by default in backend mode). With Redis, at most `PENPOT_MCP_EXPORT_TOTAL_PERMITS` (4 by default) run at once across all adapters. With Redis, callers that wait for the shared cap are served in arrival order. The counter `penpot_mcp_export_busy_total{gate}` counts the refusals, and the gauge `penpot_mcp_export_permits_held{gate}` counts the permits this process holds. The gauge `penpot_mcp_export_permits_held{gate}` shows the permits each process holds.
+`export_shape` takes `shapeIds` (up to 200 ids), renders them in batches of `PENPOT_MCP_EXPORT_BATCH_SIZE` (10 by default), and keeps each render for 15 minutes in a cache of `PENPOT_MCP_EXPORT_CACHE_MB` (64 MB by default).
 A failed tool call returns `isError: true` with the failure text.
 Each tool call writes one log line with the tool name, the token fingerprint, the duration and the outcome.
 A token needs the scopes of the tools it calls: `mcp:read` for reads, `mcp:write` for design changes,

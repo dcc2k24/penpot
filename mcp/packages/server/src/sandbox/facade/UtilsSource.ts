@@ -51,6 +51,9 @@ export const UTILS_SOURCE: string = String.raw`
     }
 
     const result = { id: shape.id, name: shape.name, type: shape.type };
+    if (shape.childrenPartial === true) {
+      result.childrenPartial = true;
+    }
 
     // add layout information if present
     const flex = tryRead(function () {
@@ -113,7 +116,8 @@ export const UTILS_SOURCE: string = String.raw`
       const kids = shape.children;
       if (kids) {
         for (const child of kids) {
-          if (predicate(child)) {
+          // a stub is walked through, but not returned: it is loaded only to reach a root
+          if (!child.ancestorOnly && predicate(child)) {
             result.push(child);
           }
           walk(child);
@@ -139,7 +143,7 @@ export const UTILS_SOURCE: string = String.raw`
       if (!shape) {
         return null;
       }
-      if (predicate(shape)) {
+      if (!shape.ancestorOnly && predicate(shape)) {
         return shape;
       }
       const kids = shape.children;
@@ -244,6 +248,10 @@ export const UTILS_SOURCE: string = String.raw`
   // "row" and by y for "column", then each one moves to index 0 in that order. the facade does not return the layout
   // object, so this helper returns nothing.
   function addFlexLayout(container, dir) {
+    // every check runs before the first write, so a refusal leaves the board as it was
+    if (container.childrenPartial === true || (container.children || []).some((child) => child.ancestorOnly)) {
+      throw new Error("addFlexLayout needs every child of " + (container.name || container.id) + ", and rootIds did not load them all. Add that shape's id to rootIds, or run without rootIds.");
+    }
     const children = container.children || [];
     const sortedChildren = children.slice().sort(function (a, b) {
       return dir === "row" ? a.x - b.x : a.y - b.y;
@@ -264,7 +272,7 @@ export const UTILS_SOURCE: string = String.raw`
     const results = [];
 
     const traverse = function (shape, currentDepth) {
-      const result = evaluator(root, shape);
+      const result = shape.ancestorOnly ? null : evaluator(root, shape);
       if (result !== null && result !== undefined) {
         results.push({ shape: shape, result: result });
       }

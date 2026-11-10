@@ -1005,6 +1005,8 @@ mode means the `backend` or `both` value of `PENPOT_MCP_MODE`. Bridge mode means
 | `PENPOT_MCP_MAX_TOOL_RESPONSE_KB` | `100` | Largest JSON answer of one backend tool, in kilobytes (1 to 10000). Longer answers are cut. Backend mode. |
 | `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` | `0` (no limit), or `4` in backend mode | Most export shape requests that run at once. Zero means no limit. |
 | `PENPOT_MCP_EXPORT_TOTAL_PERMITS` | `4` | Most renders that run at once across all adapters that share `PENPOT_MCP_REDIS_URI`. Each permit lasts at most 65 s. Without Redis, each process uses its own cap. |
+| `PENPOT_MCP_EXPORT_BATCH_SIZE` | `10` | Most shapes that one exporter request renders in a `shapeIds` batch, from 1 to 50. Backend mode. |
+| `PENPOT_MCP_EXPORT_CACHE_MB` | `64` | Size, in MB, of the render cache in each adapter process, from 0 to 4096. `0` turns the cache off. Backend mode. |
 | `PENPOT_MCP_SANDBOX_TIMEOUT_S` | `3` | CPU time, in seconds, that one `execute_code` call may use. Backend mode. |
 | `PENPOT_MCP_SANDBOX_WALL_S` | `120` | Wall-clock limit, in seconds, of one `execute_code` call. Backend mode. |
 | `PENPOT_MCP_SANDBOX_IDLE_MIN` | `30` | Minutes without a call after which a session's sandbox is dropped. Backend mode. |

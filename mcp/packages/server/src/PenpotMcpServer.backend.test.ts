@@ -137,6 +137,12 @@ test("backend mode serves backend tools, opens no plugin bridge and lists no bri
         "submit_feedback",
         "high_level_overview",
         "execute_code",
+        "export_subtree",
+        "get_interactions",
+        "find_connectors",
+        "list_fonts",
+        "lint_page",
+        "find_similar_boards",
     ]) {
         assert.ok(names.includes(expected), `${expected} is listed`);
     }

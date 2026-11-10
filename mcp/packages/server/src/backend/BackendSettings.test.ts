@@ -213,3 +213,45 @@ for (const value of ["soon", "0", "-2", "1.5"]) {
         );
     });
 }
+
+test("the export batch size defaults to 10 and the render cache to 64 MB", () => {
+    const settings = BackendSettings.fromEnvironment({});
+    assert.equal(settings.exportBatchSize, 10);
+    assert.equal(settings.exportCacheMb, 64);
+    assert.equal(BackendSettings.readExportBatchSize({}), 10);
+    assert.equal(BackendSettings.readExportCacheMb({}), 64);
+});
+
+test("PENPOT_MCP_EXPORT_BATCH_SIZE and PENPOT_MCP_EXPORT_CACHE_MB are read from the environment", () => {
+    const settings = BackendSettings.fromEnvironment({
+        PENPOT_MCP_EXPORT_BATCH_SIZE: " 50 ",
+        PENPOT_MCP_EXPORT_CACHE_MB: "4096",
+    });
+    assert.equal(settings.exportBatchSize, 50);
+    assert.equal(settings.exportCacheMb, 4096);
+    assert.equal(BackendSettings.readExportBatchSize({ PENPOT_MCP_EXPORT_BATCH_SIZE: "1" }), 1);
+});
+
+test("PENPOT_MCP_EXPORT_CACHE_MB of 0 is accepted and turns the cache off", () => {
+    assert.equal(BackendSettings.readExportCacheMb({ PENPOT_MCP_EXPORT_CACHE_MB: "0" }), 0);
+});
+
+test("a blank export batch size or cache size falls back to the default", () => {
+    assert.equal(BackendSettings.readExportBatchSize({ PENPOT_MCP_EXPORT_BATCH_SIZE: "  " }), 10);
+    assert.equal(BackendSettings.readExportCacheMb({ PENPOT_MCP_EXPORT_CACHE_MB: "" }), 64);
+});
+
+for (const [name, value] of [
+    ["PENPOT_MCP_EXPORT_BATCH_SIZE", "0"],
+    ["PENPOT_MCP_EXPORT_BATCH_SIZE", "51"],
+    ["PENPOT_MCP_EXPORT_BATCH_SIZE", "2.5"],
+    ["PENPOT_MCP_EXPORT_BATCH_SIZE", "many"],
+    ["PENPOT_MCP_EXPORT_CACHE_MB", "-1"],
+    ["PENPOT_MCP_EXPORT_CACHE_MB", "4097"],
+    ["PENPOT_MCP_EXPORT_CACHE_MB", "0.5"],
+    ["PENPOT_MCP_EXPORT_CACHE_MB", "big"],
+]) {
+    test(`${name}=${value} is a startup error that names the variable`, () => {
+        assert.throws(() => BackendSettings.fromEnvironment({ [name]: value }), new RegExp(name));
+    });
+}

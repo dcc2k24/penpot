@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ExporterError, HttpExporterClient, type ExportShapeRequest } from "./ExporterClient";
+import {
+    BATCH_REFUSAL_MS,
+    BatchRefusals,
+    ExportBatchError,
+    ExporterError,
+    ExportTooLargeError,
+    HttpExporterClient,
+    type ExportShapeRequest,
+} from "./ExporterClient";
 import { Transit } from "./Transit";
+import { ZipReader } from "../utils/ZipReader";
 import { CallContext } from "./CallContext";
 
 const EXPORTER = "http://exporter.example/";
@@ -564,4 +573,227 @@ test("an asset download stops at once when the call of the tool is abandoned", a
     setTimeout(() => controller.abort(), 10);
     await assert.rejects(call);
     assert.equal(seen[0].aborted, true);
+});
+
+/** Builds a stored (method 0) ZIP archive of the given entries, as the exporter answers a batch. */
+function storedZip(entries: Array<{ name: string; data: Uint8Array }>): Uint8Array {
+    const locals: Buffer[] = [];
+    const centrals: Buffer[] = [];
+    let offset = 0;
+    for (const entry of entries) {
+        const name = Buffer.from(entry.name, "utf8");
+        const data = Buffer.from(entry.data);
+        const crc = ZipReader.crc32(data);
+        const local = Buffer.alloc(30);
+        local.writeUInt32LE(0x04034b50, 0);
+        local.writeUInt16LE(20, 4);
+        local.writeUInt32LE(crc, 14);
+        local.writeUInt32LE(data.length, 18);
+        local.writeUInt32LE(data.length, 22);
+        local.writeUInt16LE(name.length, 26);
+        const body = Buffer.concat([local, name, data]);
+        locals.push(body);
+        const central = Buffer.alloc(46);
+        central.writeUInt32LE(0x02014b50, 0);
+        central.writeUInt16LE(20, 4);
+        central.writeUInt16LE(20, 6);
+        central.writeUInt32LE(crc, 16);
+        central.writeUInt32LE(data.length, 20);
+        central.writeUInt32LE(data.length, 24);
+        central.writeUInt16LE(name.length, 28);
+        central.writeUInt32LE(offset, 42);
+        centrals.push(Buffer.concat([central, name]));
+        offset += body.length;
+    }
+    const centralBytes = Buffer.concat(centrals);
+    const end = Buffer.alloc(22);
+    end.writeUInt32LE(0x06054b50, 0);
+    end.writeUInt16LE(entries.length, 8);
+    end.writeUInt16LE(entries.length, 10);
+    end.writeUInt32LE(centralBytes.length, 12);
+    end.writeUInt32LE(offset, 16);
+    return new Uint8Array(Buffer.concat([...locals, centralBytes, end]));
+}
+
+/** Shape ids of the batch tests. */
+const SHAPE_A = "1b2c3d4e-0000-4000-8000-0000000000a1";
+const SHAPE_B = "1b2c3d4e-0000-4000-8000-0000000000a2";
+const SHAPE_C = "1b2c3d4e-0000-4000-8000-0000000000a3";
+
+/**
+ * Builds the export request of one shape of the batch tests, named by the shape id as a batch names it.
+ *
+ * @param id - the shape id
+ */
+function requestFor(id: string): ExportShapeRequest {
+    return { ...REQUEST, objectId: id, name: id };
+}
+
+/**
+ * Builds a route that answers the batch export call with a transit answer that names a ZIP, and the download of that
+ * ZIP with the given bytes.
+ *
+ * @param zip - the bytes of the ZIP that the download returns
+ * @returns the route
+ */
+function batchRoute(zip: Uint8Array): Route {
+    return (call) => {
+        if (call.init.method === "POST") {
+            return new Response(exportAnswer("application/zip"), {
+                status: 200,
+                headers: { "content-type": "application/transit+json" },
+            });
+        }
+        return new Response(zip, { status: 200, headers: { "content-type": "application/zip" } });
+    };
+}
+
+test("exportShapes sends every shape in one request, each named by its shape id, with is-wasm from the renderer", async () => {
+    const zip = storedZip([
+        { name: `${SHAPE_A}.png`, data: PNG_BYTES },
+        { name: `${SHAPE_B}.png`, data: PNG_BYTES },
+        { name: `${SHAPE_C}.png`, data: PNG_BYTES },
+    ]);
+    const { client, calls } = clientOn(batchRoute(zip));
+    const requests = [requestFor(SHAPE_A), requestFor(SHAPE_B), requestFor(SHAPE_C)];
+    await client.exportShapes(RENDER_TOKEN, requests, { renderer: "wasm" });
+    const body = exportBodyOf(calls[0]);
+    assert.equal(body.cmd, "export-shapes");
+    assert.equal(body["is-wasm"], true);
+    assert.deepEqual(
+        body.exports.map((entry) => entry.name),
+        [SHAPE_A, SHAPE_B, SHAPE_C]
+    );
+    assert.deepEqual(
+        body.exports.map((entry) => entry["object-id"]),
+        [SHAPE_A, SHAPE_B, SHAPE_C]
+    );
+    await client.exportShapes(RENDER_TOKEN, requests);
+    assert.equal(exportBodyOf(calls[2])["is-wasm"], false, "the browser renderer is the default");
+});
+
+test("exportShapes maps the entries of the ZIP back to the shape ids and gives each file its bytes", async () => {
+    const bytesA = new Uint8Array([1, 2, 3]);
+    const bytesB = new Uint8Array([4, 5, 6, 7]);
+    const zip = storedZip([
+        { name: `${SHAPE_B}.png`, data: bytesB },
+        { name: `${SHAPE_A}.png`, data: bytesA },
+    ]);
+    const { client } = clientOn(batchRoute(zip));
+    const files = await client.exportShapes(RENDER_TOKEN, [requestFor(SHAPE_A), requestFor(SHAPE_B)]);
+    assert.deepEqual(Buffer.from(files.get(SHAPE_A)?.bytes ?? []), Buffer.from(bytesA));
+    assert.deepEqual(Buffer.from(files.get(SHAPE_B)?.bytes ?? []), Buffer.from(bytesB));
+    assert.equal(files.get(SHAPE_A)?.mimeType, "image/png");
+    assert.equal(files.size, 2);
+});
+
+test("exportShapes fails the whole chunk with ExportBatchError when an entry names no requested shape", async () => {
+    const zip = storedZip([
+        { name: `${SHAPE_A}.png`, data: PNG_BYTES },
+        { name: "stranger.png", data: PNG_BYTES },
+    ]);
+    const { client } = clientOn(batchRoute(zip));
+    await assert.rejects(
+        client.exportShapes(RENDER_TOKEN, [requestFor(SHAPE_A), requestFor(SHAPE_B)]),
+        (error: unknown) => error instanceof ExportBatchError && /stranger\.png/.test(error.message)
+    );
+});
+
+test("exportShapes fails the whole chunk with ExportBatchError when a requested shape has no entry", async () => {
+    const zip = storedZip([{ name: `${SHAPE_A}.png`, data: PNG_BYTES }]);
+    const { client } = clientOn(batchRoute(zip));
+    await assert.rejects(
+        client.exportShapes(RENDER_TOKEN, [requestFor(SHAPE_A), requestFor(SHAPE_B)]),
+        (error: unknown) => error instanceof ExportBatchError && error.message.includes(SHAPE_B)
+    );
+});
+
+test("exportShapes fails the chunk with ExportBatchError when the answer is not a readable ZIP", async () => {
+    const { client } = clientOn(batchRoute(new Uint8Array([80, 75, 1, 2, 3])));
+    await assert.rejects(
+        client.exportShapes(RENDER_TOKEN, [requestFor(SHAPE_A), requestFor(SHAPE_B)]),
+        (error: unknown) => error instanceof ExportBatchError
+    );
+});
+
+test("exportShapes with one request posts a plain file, keyed by the request name", async () => {
+    const { client, calls } = clientOn(exporterRoute);
+    const files = await client.exportShapes(RENDER_TOKEN, [requestFor(SHAPE_A)]);
+    assert.equal(calls.length, 2, "one export call and one download, with no ZIP");
+    assert.equal(exportBodyOf(calls[0]).exports.length, 1);
+    assert.deepEqual(files.get(SHAPE_A)?.bytes, PNG_BYTES);
+});
+
+test("exportShape passes the renderer to the request", async () => {
+    const { client, calls } = clientOn(exporterRoute);
+    await client.exportShape(RENDER_TOKEN, REQUEST, { renderer: "wasm" });
+    assert.equal(exportBodyOf(calls[0])["is-wasm"], true);
+});
+
+test("a refusal of batches lasts ten minutes for one exporter, and only that exporter", () => {
+    const exporter = {};
+    const other = {};
+    BatchRefusals.refuse(exporter, 1_000);
+    assert.equal(BatchRefusals.refusesBatches(exporter, 1_000), true);
+    assert.equal(BatchRefusals.refusesBatches(exporter, 1_000 + BATCH_REFUSAL_MS - 1), true);
+    assert.equal(BatchRefusals.refusesBatches(exporter, 1_000 + BATCH_REFUSAL_MS), false);
+    assert.equal(BatchRefusals.refusesBatches(other, 1_000), false);
+    BatchRefusals.refuse(exporter, 5_000);
+    BatchRefusals.forget(exporter);
+    assert.equal(BatchRefusals.refusesBatches(exporter, 5_000), false);
+});
+
+test("a batch of ten 1 MB boards is read within its own cap, not the cap of one file", async () => {
+    const data = new Uint8Array(1024 * 1024).fill(3);
+    const ids = Array.from(
+        { length: 10 },
+        (_, index) => `1b2c3d4e-0000-4000-8000-0000000001${String(index).padStart(2, "0")}`
+    );
+    const zip = storedZip(ids.map((id) => ({ name: `${id}.png`, data })));
+    const { client } = clientOn(batchRoute(zip));
+    const files = await client.exportShapes(RENDER_TOKEN, ids.map(requestFor));
+    assert.equal(files.size, 10);
+});
+
+test("a batch answer over its cap is an ExportTooLargeError, which is not a refusal of batches", async () => {
+    const data = new Uint8Array(2 * 1024 * 1024).fill(4);
+    const zip = storedZip([
+        { name: `${SHAPE_A}.png`, data },
+        { name: `${SHAPE_B}.png`, data },
+    ]);
+    const { fetchImpl } = recordingFetch(batchRoute(zip));
+    const client = new HttpExporterClient(EXPORTER, BACKEND, 120, fetchImpl, 1);
+    await assert.rejects(
+        client.exportShapes(RENDER_TOKEN, [requestFor(SHAPE_A), requestFor(SHAPE_B)]),
+        (error: unknown) => error instanceof ExportTooLargeError
+    );
+});
+
+test("an entry whose extension is not the one of its format names no shape", async () => {
+    const zip = storedZip([
+        { name: `${SHAPE_A}.exe`, data: PNG_BYTES },
+        { name: `${SHAPE_B}.png`, data: PNG_BYTES },
+    ]);
+    const { client } = clientOn(batchRoute(zip));
+    await assert.rejects(
+        client.exportShapes(RENDER_TOKEN, [requestFor(SHAPE_A), requestFor(SHAPE_B)]),
+        (error: unknown) => error instanceof ExportBatchError
+    );
+});
+
+test("a failed download of the batch ZIP is an ExporterError from the asset stage", async () => {
+    const { fetchImpl } = recordingFetch((call) => {
+        if (call.init.method === "POST") {
+            return new Response(exportAnswer("application/zip"), {
+                status: 200,
+                headers: { "content-type": "application/transit+json" },
+            });
+        }
+        return new Response("boom", { status: 503 });
+    });
+    const client = new HttpExporterClient(EXPORTER, BACKEND, 120, fetchImpl);
+    await assert.rejects(
+        client.exportShapes(RENDER_TOKEN, [requestFor(SHAPE_A), requestFor(SHAPE_B)]),
+        (error: unknown) => error instanceof ExporterError && error.status === 503 && error.source === "asset"
+    );
 });

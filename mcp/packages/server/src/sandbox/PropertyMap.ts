@@ -92,9 +92,12 @@ export class PropertyMap {
 
         // board and group properties.
         clipContent: { attr: "showContent", access: "read-write", kind: "attr", invert: true },
+        overflowScroll: { attr: "overflowScroll", access: "read-write", kind: "attr" },
         showInViewMode: { attr: "hideInViewer", access: "read-write", kind: "attr", invert: true },
         guides: { attr: "grids", access: "read-write", kind: "attr" },
         children: { attr: "shapes", access: "read", kind: "derived" },
+        childrenPartial: { attr: "partialChildren", access: "read", kind: "derived" },
+        ancestorOnly: { attr: "ancestorOnly", access: "read", kind: "derived" },
         flex: { attr: "layout", access: "read", kind: "derived" },
         grid: { attr: "layout", access: "read", kind: "derived" },
 

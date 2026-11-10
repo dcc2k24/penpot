@@ -6,6 +6,7 @@ import { BackendSettings } from "./BackendSettings";
 import { BackendTokenValidator } from "./BackendTokenValidator";
 import type { ExporterClient } from "./ExporterClient";
 import { FileWriteQueue } from "./FileWriteQueue";
+import { RENDER_CACHE_TTL_MS, RenderCache } from "./RenderCache";
 import { RenderSessionCache } from "./RenderSessionCache";
 import type { RateLimiter } from "./RateLimiter";
 import { RedisRateLimiter } from "./RedisRateLimiter";
@@ -111,6 +112,10 @@ export class BackendServices {
     private readonly storageReach: ReachabilityStorageStore | undefined;
     public readonly writeQueue: FileWriteQueue;
     public readonly renderSessions: RenderSessionCache;
+    /** In-memory cache of rendered shapes, shared by all export calls of this process. */
+    public readonly renderCache: RenderCache;
+    /** Shapes that one exporter request renders, from the settings. */
+    public readonly exportBatchSize: number;
     public readonly sandboxes: SandboxSessions;
     /** Shared export permits, or undefined when the renders are capped per process only. */
     public readonly exportPermits: RedisExportPermits | undefined;
@@ -165,6 +170,8 @@ export class BackendServices {
         }
         this.writeQueue = new FileWriteQueue();
         this.renderSessions = new RenderSessionCache(backend, now);
+        this.renderCache = new RenderCache(settings.exportCacheMb * 1024 * 1024, RENDER_CACHE_TTL_MS, now);
+        this.exportBatchSize = settings.exportBatchSize;
         // the settings decide the worker mode; the runtime reads the environment only when they are not given
         const sandboxSettings = SandboxSettings.fromEnvironment(process.env);
         // Redis keeps the storage across adapters; the memory store is the fallback for a single adapter

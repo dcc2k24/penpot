@@ -1,0 +1,127 @@
+# Topics: explanations that are not API types. penpot_api_info reads them by name, in any letter case.
+# The text of every topic paragraph is the text of the "Geometry semantics" section in
+# data/backend_instructions.md. src/ApiDocs.test.ts checks both directions. Edit both files together,
+# or regenerate the members from the section.
+Geometry:
+  overview: |-
+
+    These rules say what the numbers of a shape mean. Read them before you place shapes in another program. Positions are in
+    page coordinates unless a rule says otherwise. Penpot draws shapes with two renderers. The SVG renderer makes the
+    exporter's default render. The wasm renderer draws the workspace. Where they differ, the rule says so.
+  members:
+    Parts:
+      box: |-
+        `x` and `y` are the top-left corner of the box around the shape's `points`. `width` and `height` are the size of its
+        `selrect`, before rotation. `rotation` is reported apart.
+
+        The `x`, `y`, `width` and `height` in the replies of `get_shapes` and `export_subtree` are this box. The stored values of
+        a rotated shape, or of a path or boolean whose content changed, can be stale.
+
+        `points` lists the four corners of the shape's rectangle in page space. Take the corners of the unrotated, unflipped
+        rectangle in the order top-left, top-right, bottom-right, bottom-left, and transform each one. A flipped shape therefore
+        has its first point at a corner that is not its visual top-left.
+
+        `selrect` is the unrotated rectangle. It has the same centre as the points, and its width and height are the lengths of
+        the sides.
+      transform: |-
+        `transform` maps the `selrect` to the `points`. It works about the centre of the shape. `transformInverse` is its inverse.
+        A shape that is neither rotated nor flipped has the identity for both. A flipped shape has a mirror in `transform`.
+
+        To draw a shape, draw its unrotated rectangle through `translate(centre) · transform · translate(-centre)`.
+        `export_subtree` gives this product as `worldMatrix` for each shape, with the values `a` to `f` in SVG order. A shape
+        without `selrect` has no `worldMatrix`.
+
+        The `content` of a path or a boolean is a string of absolute SVG commands `M`, `L`, `C` and `Z`, for example
+        `M10.0,20.0L110.0,20.0C...Z`. Its points are in page space with `transform` already applied. Do not apply `transform` to
+        it again. The `content` of a text is a tree of paragraphs and runs.
+      text: |-
+        Each entry of `positionData` is one laid-out run of text. It has `x`, `y`, `width`, `height`, `text`, `direction`, `fills`
+        and the font properties.
+
+        `x` and `y` are in page coordinates, before the shape's rotation. The rotation is in the shape's `transform`.
+
+        `y` is the bottom of the run's box. It is the ideographic baseline, the descent line. It is not the alphabetic baseline.
+
+        Draw each run with `dominant-baseline: ideographic` at `x` and `y`. Set `textLength` to `width` with
+        `lengthAdjust: spacingAndGlyphs`, so that glyphs and spacing stretch to exactly `width`. Use `white-space: pre`. A run
+        with `direction` `rtl` is anchored at `x + width`.
+
+        Example: a run has `x` 100, `y` 74, `width` 120 and `height` 24. Its box runs from y 50 to y 74. Put the glyph bottoms on
+        y 74 and fit the run to 120 px. If you put the alphabetic baseline on y 74, the text sits lower by its descent.
+
+        A text without `positionData` has no run positions. Its box is an estimate only when its grow type is also
+        `auto-width` or `auto-height`. See "Text sizes". A text created or changed through the MCP has no `positionData`
+        until the file is opened in the workspace. An svg export of a shape that holds such a text fails with an
+        exporter timeout, while png works.
+      gradients: |-
+        `startX`, `startY`, `endX` and `endY` are fractions of the shape's `selrect`, measured in its unrotated frame. A value can
+        lie outside 0 to 1. They are not pixels, and they are not a direction in page space.
+
+        Example: a box of 200 by 100, with start (0, 0) and end (1, 1). The line runs from corner to corner. In pixels it goes from
+        (0, 0) to (200, 100), so its angle is about 26.6 degrees, not 45.
+
+        The two renderers differ on a box that is not square. The wasm renderer turns both points into pixels and draws the colour
+        bands perpendicular to the line. The SVG renderer works in the unit square and stretches the result with the box, so its
+        bands are skewed. At the corner (200, 0), t is 0.5 in the SVG renderer and 0.8 in the wasm renderer. Here t is 0 at start
+        and 1 at end.
+
+        - Linear: the gradient runs from start to end.
+        - Radial: the centre is the start point. `width` is a ratio. Across the axis, the radius is `width` times the radius along
+          it. For a vertical axis in a W by H box, both renderers give a radius of |end - start| × H along the axis and
+          |end - start| × width × W across it. For other axes the renderers differ.
+        - A stroke gradient on a path, in the SVG renderer, gets the shape's transform, applied about the centre of the path's
+          bounding box.
+        - A text fill gradient, in the SVG renderer, uses the fractions of the shape's `selrect`. The gradient is anchored at each
+          run's own box, so it restarts at each run.
+      strokes: |-
+        `strokeAlignment` is `center`, `inner` or `outer`. A stroke that stores no alignment is drawn as `center`. An `inner`
+        stroke lies wholly inside the outline of the shape, and an `outer` stroke lies wholly outside it. On an open path, both are
+        drawn as `center`.
+
+        Rectangles and boards can store a width for each side on an entry of `strokes`: `strokeWidthTop`, `strokeWidthRight`,
+        `strokeWidthBottom` and `strokeWidthLeft`. A side without a value takes `strokeWidth`. Both renderers draw each side with
+        its own width, as the band between an outer and an inner rounded rectangle. With `inner` alignment the outer edge is the
+        box, so the band lies inside it. With `outer` the inner edge is the box, so the band lies outside it. With `center` each
+        edge moves half a side width. Corner radii grow with the outer edge and shrink with the inner edge. When two radii on one
+        side add up to more than that side, all radii scale down by one factor, as SVG and Skia do. The SVG renderer does not fit
+        a whole number of dashes into each side, and it does not mitre several per-side strokes that share a box, as the
+        workspace renderer does.
+      children: |-
+        `shapes` lists a shape's children in stored order. Outside a layout, the last id is on top.
+
+        In a flex or grid layout, the stacking depends on the layout:
+
+        - Flex `row` or `column`: the first id in `shapes` is on top, in both renderers.
+        - Flex `row-reverse` or `column-reverse`: the last id is on top, in both renderers.
+        - Grid: the wasm renderer draws the last id on top. The SVG renderer draws the first id on top.
+
+        In both renderers, a child with a higher layout item z-index is drawn above the others. `get_page_tree` lists a layout's
+        children in visual order, which is the reverse of `shapes`. So the first id in `shapes` is listed last. See "Child order in
+        layouts".
+
+        A board clips its content unless `showContent` is true. The clip follows the board's corner radii.
+
+        A board can also carry `overflowScroll`: `none`, `horizontal`, `vertical` or `both`. Absent means `none`. It marks a
+        clipping board as a scroll container on the axes it names, for prototypes and code export: content past the board's edge
+        on those axes is meant to be reached by scrolling. The viewer does not act on it yet.
+      generator: |-
+        To place shapes in another program, read a board with `export_subtree`, with `rootId` set to the board's id.
+
+        1. Read every window. Pass `nextCursor` as `cursor` while `truncated` is true.
+        2. Place each shape with its `worldMatrix`. A path and a boolean are the exception. Their `content` is already in page
+           space, so draw it without `transform` and without `worldMatrix`. Use `points` for their box.
+        3. Paint each shape with its `fills`. For each stroke, use `strokeAlignment` and the side widths.
+        4. Draw each text from its `positionData`, as set out under Text.
+        5. Stack children as set out under Stacking and clipping.
+      more: |-
+        - A boolean's children appear in the walk, but the boolean draws only its own path.
+        - A hidden shape appears in the walk and is not drawn.
+        - In a masked group, the first id in `shapes` is the mask.
+        - `fills[0]` is on top of the other fills, in both renderers. In the SVG renderer `strokes[0]` is on top of the other strokes, and hidden strokes are not drawn.
+        - Corner radii are `r1` top-left, `r2` top-right, `r3` bottom-right and `r4` bottom-left.
+        - The blur of a drop shadow or an inner shadow has standard deviation `blur / 2`. A layer blur uses `value` as its standard deviation. These are the SVG renderer's values.
+        - Opacity and blend mode of a group apply to the group with all its children.
+        - An image fill with `keepAspectRatio` covers the box and is centred, so the parts outside are cut away. Without it, the image is stretched to the box.
+        - In `positionData`, `fontSize`, `letterSpacing` and the other font values are strings, such as `"14px"`.
+        - `text` in `positionData` is not case-transformed. Apply `textTransform` yourself.
+        - `x1`, `y1`, `x2` and `y2` in a run come from the browser's layout. They do not move with the shape, so ignore them.

@@ -289,7 +289,7 @@ numbers. Each rule has a runbook note in the file. The first step is below.
 | `PenpotMcpRateLimitFallback` | An adapter used the in-process limiter for 5 min | See the Redis alert. While the fallback runs, the limit is about N times too generous. |
 | `PenpotMcpBackendPoolSaturated` | Calls wait for a Postgres connection for 5 min | Compare `hikaricp_active_connections` with `hikaricp_max_connections`. Look for slow queries. |
 | `PenpotMcpClimitRejected` | The backend refuses MCP calls at its concurrency limit | Raise the limit only if the pool and the write latency look healthy. Otherwise lower the agents per backend. |
-| `PenpotMcpExportCapFull` | Exports refused as busy by the process or the shared cap for 10 min (`penpot_mcp_export_busy_total{gate="process"}` or `{gate="shared"}`) | Check the exporter CPU and the export duration. If the exporter has room, raise `PENPOT_MCP_EXPORT_TOTAL_PERMITS` and `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS`. If not, add exporter capacity or lower the export load. `gate="token"` is one client and is not part of this alert. |
+| `PenpotMcpExportCapFull` | More than one export a minute refused as busy by the process or the shared cap, summed over all adapters, for 10 min (`sum(rate(penpot_mcp_export_busy_total{gate=~"process|shared"}[5m])) * 60 > 1`). One stray refusal does not fire it. `gate="token"` is one client and is not part of this alert. | Check the exporter CPU and the export duration. Compare `sum(penpot_mcp_export_permits_held{gate="shared"})` with `PENPOT_MCP_EXPORT_TOTAL_PERMITS`. If the exporter has room, raise `PENPOT_MCP_EXPORT_TOTAL_PERMITS` and `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS`. If not, add exporter capacity or lower the export load. |
 | `PenpotMcpAdapterMemoryHigh` | Adapter resident memory above 1.5 GB for 10 min | Compare `nodejs_heap_used_bytes` with `penpot_mcp_sandbox_workers`. A flat heap and rising RSS is a native leak. A rising heap is a cache or sandbox leak. |
 | `PenpotMcpAdapterEventLoopLag` | Event loop lag p99 above 200 ms for 5 min | Look for large JSON bodies, or a sandbox that runs on the server thread. |
 
@@ -301,8 +301,8 @@ One thing to know before you use the rules:
 ### 5.2 Dashboard
 
 `mcp/deploy/grafana-mcp-dashboard.json` is provisioned by `mcp/deploy/compose.monitoring.yaml`. It shows the
-tool p95, refusals by reason (with the export refusals by gate), errors by code, Postgres pool use and waiting threads, Redis state, the fallback count
-and the concurrency rejections.
+tool p95, refusals by reason (with the export refusals by gate), errors by code, Postgres pool use and waiting threads, Redis state, the fallback count,
+the concurrency rejections and the panel "Shared export permits held", which sums `penpot_mcp_export_permits_held{gate="shared"}` over the adapters against `PENPOT_MCP_EXPORT_TOTAL_PERMITS`.
 
 Prometheus scrapes the adapters with an MCP token. `/metrics` answers without a token only when the adapter binds a loopback address, the client is on the same
 machine, and the request has no forwarding header (contract 4.7). The balancer adds
@@ -362,19 +362,21 @@ There are two layers of limits. The adapter limits each token. The backend limit
 | Client tokens per profile | 20 (`mcp-client-limit`) | `mcp-client-limit` (restriction). An OAuth approval answers `access_denied`. | Revoke a client token |
 | Sandbox | CPU 3 s, wall 120 s, 1000 host calls, 20 calls at once per process (`PENPOT_MCP_SANDBOX_MAX_CONCURRENT`), 16 MB of page data, 8 MB of `storage` | Interrupted, refused or capped, with a message that names the limit | Split the work. Use `storage` for state that must survive a call. |
 | Export renders | One per token. Four per process. With Redis, four across all adapters on it (`PENPOT_MCP_EXPORT_TOTAL_PERMITS`). | A call waits up to 30 s for a slot. With Redis, waiting calls get slots in arrival order. Then it answers `export is busy, retry later`. A render over 60 s fails. | Retry the export later |
-| Export batch | 200 shapes per call (`shapeIds`). The ids go to the exporter in chunks of `PENPOT_MCP_EXPORT_BATCH_SIZE` (default 10, from 1 to 50), one render permit for each chunk. | A shape that fails is listed under `failed` and does not stop the others. | Export the failed shapes again |
-| Export call budget | 10 minutes per call. Past it, the call starts no more renders. | The shapes left are listed as not rendered: `the call ran out of time; call again, the shapes already rendered are cached.` | Call again. The rendered shapes come from the cache. |
+| Export batch | 200 shapes per call (`shapeIds`). The ids go to the exporter in chunks of `PENPOT_MCP_EXPORT_BATCH_SIZE` (default 10, from 1 to 50), one render permit for each chunk. | A shape that fails is listed under `failed` and does not stop the others. A failure that keeps coming back, the same error class on the first request of two chunks in a row, stops the call. | Export the failed shapes again |
+| Export call budget | 10 minutes per call. Past it, the call starts no more renders. | The shapes left are listed as not rendered: `the call ran out of time; call again; the shapes already rendered come from the cache.` | Call again. The rendered shapes come from the cache. |
 | Export batch refusal | An exporter that answers a batch with a 5xx, or a ZIP that does not map back to the shapes, gets one shape per request for 10 minutes in that process. This applies when the single renders of that chunk all succeed. | None. The call goes on one shape at a time. | None |
 | Export retry | A single render that answers 5xx is tried once more after 500 ms. A 4xx answer is not retried. | The shape's error, for example the exporter's 4xx text | Fix the call, or retry later |
-| Export cache | `PENPOT_MCP_EXPORT_CACHE_MB` (64 MB by default) for each adapter process, 15 minutes for each render. A render is not kept when a font of it did not resolve, or when the font check failed or ran past 3 s. | None. A cached shape is not rendered again. | `refresh: true` renders it again. |
+| Export cache | `PENPOT_MCP_EXPORT_CACHE_MB` (64 MB by default) for each adapter process, 15 minutes for each render. Each render is kept as soon as it arrives, whatever its fonts. The key includes the page. A render is not kept when the file revision is unknown. | None. A cached shape is not rendered again. | `refresh: true` renders it again. |
 
 Export answers name the cause in text. These are the texts a client may see:
 
-- `export is busy, retry later; shapes already rendered are cached.` The render slots are full and the call stops.
-- `the call was cancelled; shapes already rendered are cached.` The client went away.
-- `the inline total reached the 8 MB limit; pass outputDir to save every shape, or ask for fewer shapes.` Images that do not fit inline are listed as not returned.
+- `export is busy, retry later; call again; the shapes already rendered come from the cache.` The render slots are full and the call stops. A call with `outputDir` says `call again with overwrite: true` as well.
+- `the call was cancelled; call again; the shapes already rendered come from the cache.` The client went away.
+- `the call ran out of time; call again; the shapes already rendered come from the cache.` The 10 minute budget is spent.
+- `the inline total is full; pass outputDir to save every shape, or ask for fewer shapes.` Less than 256 kB of the 8 MB inline total is left, so the shapes after it are listed as not rendered.
+- `too large for an inline reply on their own, not returned` An image over 8 MB is skipped. Pass `outputDir` or `filePath`.
 - `an earlier shape failed, so the shapes after it were not rendered.` Only a `shapeId: "page"` export stops at a failed shape.
-- `Font warning: these fonts did not resolve, so the render used a fallback font: ...` The reply names each font with its reason. Run `list_fonts` to see it.
+- `Font warning: these fonts did not resolve, so the render used a fallback font: ... These renders are kept for up to 15 minutes; after the font is fixed, pass refresh: true to render again.` The reply names each font with its reason, in `warnings` (with `outputDir`) or as a text item. The check runs within 3 s and only adds this notice. Run `list_fonts` to see the font.
 
 The concurrency limits answer HTTP 429 with a body whose `type` is `concurrency-limit` and whose `code` is
 `capacity-limit-reached`. The body names the `limit` (for example `mcp-apply/by-team`) and the `reason`
@@ -565,6 +567,7 @@ Watch for one hour after each step:
 - `penpot_mcp_redis_up` and `penpot_mcp_rate_limit_fallback_total`. Both should stay flat.
 - `penpot_mcp_refusals_total` by reason. A rise means a client is trying what it should not.
 - `penpot_mcp_export_busy_total` by gate. `process` and `shared` rises mean the render cap is full.
+- `penpot_mcp_export_permits_held` by gate. The `shared` sum over the adapters, against `PENPOT_MCP_EXPORT_TOTAL_PERMITS`, shows how full the cap is.
 - `penpot_mcp_errors_total` by code. Watch `mcp-file-busy` and `mcp-lock-timeout` most closely.
 - `penpot_mcp_tool_duration_seconds` p95 for the write tools.
 - `hikaricp_pending_threads` and `penpot_rpc_climit_rejected_total`.
