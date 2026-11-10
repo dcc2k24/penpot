@@ -35,6 +35,9 @@ export class PermitGate {
     /** Permits not held by any caller. */
     private available: number;
 
+    /** Permits the gate was created with. */
+    private readonly permits: number;
+
     /** Callers that wait for a permit, in arrival order. */
     private readonly waiting: PermitWaiter[] = [];
 
@@ -51,12 +54,18 @@ export class PermitGate {
         if (permits < 1) {
             throw new Error(`A permit gate needs at least 1 permit; got ${permits}.`);
         }
+        this.permits = permits;
         this.available = permits;
     }
 
     /** Returns the number of callers that wait for a permit. */
     public get waitingCount(): number {
         return this.waiting.length;
+    }
+
+    /** Returns the number of permits held by callers. */
+    public get heldCount(): number {
+        return this.permits - this.available;
     }
 
     /**

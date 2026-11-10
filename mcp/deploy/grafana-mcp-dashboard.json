@@ -1269,6 +1269,65 @@
           "range": true
         }
       ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Shared export permits held",
+      "description": "Shared export permits held, summed over the adapters, against the cap PENPOT_MCP_EXPORT_TOTAL_PERMITS (4 by default).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 81,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(penpot_mcp_export_permits_held{gate=\"shared\"})",
+          "legendFormat": "shared permits held",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (penpot_mcp_export_permits_held{gate=\"process\"})",
+          "legendFormat": "process permits, {{instance}}",
+          "range": true
+        }
+      ]
     }
   ]
 }

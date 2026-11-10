@@ -3,8 +3,26 @@ import { BusyError, PermitGate } from "./PermitGate";
 import { Semaphore } from "./Semaphore";
 import type { SharedExportPermits } from "./RedisExportPermits";
 
+/**
+ * Raised as the abort reason of a render that runs past its timeout. The message names the timeout; the class is
+ * what callers test for.
+ */
+export class RenderDeadlineError extends Error {
+    /**
+     * Creates the error.
+     *
+     * @param timeoutMs - the timeout that ran out, in milliseconds
+     */
+    constructor(timeoutMs: number) {
+        super(`The export did not finish within ${timeoutMs / 1000} seconds.`);
+    }
+}
+
 /** The gates a backend export passes, in order: the token gate, the process gate and the shared permit. */
 export type ExportGate = "token" | "process" | "shared";
+
+/** The gates whose permits a process holds and can report: the process gate and the shared permit. */
+export type HeldGate = Exclude<ExportGate, "token">;
 
 /** Options of one backend export: how long the whole call may take, and how long it may wait for a slot. */
 export interface BackendPermitOptions {
@@ -107,6 +125,19 @@ export class ExportConcurrency {
         return { ...ExportConcurrency.busy };
     }
 
+    /**
+     * Returns the export permits this process holds at the moment, one count per gate. A gate with no limit holds
+     * no permits, so its count is 0.
+     *
+     * @returns the permits held under the process gate and the shared permit
+     */
+    public static heldCounts(): Readonly<Record<HeldGate, number>> {
+        return {
+            process: ExportConcurrency.backendGate?.heldCount ?? 0,
+            shared: ExportConcurrency.sharedPermits?.heldCount ?? 0,
+        };
+    }
+
     /** Per-token gates that hold at least one call, keyed by token digest. Dropped again when idle. */
     private static readonly tokenGates = new Map<string, { gate: PermitGate; holders: number }>();
 
@@ -134,7 +165,7 @@ export class ExportConcurrency {
         const entry = ExportConcurrency.holdTokenGate(tokenDigest);
         const controller = new AbortController();
         const timer = setTimeout(() => {
-            controller.abort(new Error(`The export did not finish within ${timeoutMs / 1000} seconds.`));
+            controller.abort(new RenderDeadlineError(timeoutMs));
         }, timeoutMs);
         try {
             return await ExportConcurrency.runGated(entry.gate, task, { waitMs, signal: controller.signal });

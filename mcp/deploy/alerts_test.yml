@@ -1,0 +1,47 @@
+# Unit test of PenpotMcpExportCapFull: the F2-20 rate fires it, one stray refusal does not.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 30s
+
+tests:
+  # F2-20 figures: 8 refusals in 189 s over two adapters, about 2.5 a minute in all, kept up for 20 minutes.
+  # Per adapter: 4406 at 0.6 a minute, 4407 at 1.9 a minute (per minute values: 0.0106/s and 0.0317/s).
+  - interval: 30s
+    input_series:
+      - series: 'penpot_mcp_export_busy_total{gate="shared", instance="4406", job="penpot-mcp"}'
+        values: '0+0.317x40'
+      - series: 'penpot_mcp_export_busy_total{gate="shared", instance="4407", job="penpot-mcp"}'
+        values: '0+0.952x40'
+      - series: 'penpot_mcp_export_busy_total{gate="process", instance="4406", job="penpot-mcp"}'
+        values: '0x40'
+      - series: 'penpot_mcp_export_busy_total{gate="token", instance="4406", job="penpot-mcp"}'
+        values: '0+5x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PenpotMcpExportCapFull
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Exports are refused as busy at 2.538 a minute because the render cap is full"
+              description: "Exports waited 30 s for a render slot and were refused as busy at more than one a minute, summed over all adapters, for 10 minutes. The F2-20 load run, with ten exporters on four shared permits, refused 2.5 a minute. One stray refusal does not fire this rule."
+              runbook: "Check the exporter CPU and the export duration first. If the exporter has spare CPU, raise PENPOT_MCP_EXPORT_TOTAL_PERMITS, and PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS if it is lower. If not, add exporter capacity or lower the export load. sum(penpot_mcp_export_permits_held{gate=\"shared\"}) against PENPOT_MCP_EXPORT_TOTAL_PERMITS shows how full the cap is. Refusals with gate=\"token\" come from one client that asks for renders in parallel; they are not part of this alert."
+  # one stray refusal: the counter steps once and stays there
+  - interval: 30s
+    input_series:
+      - series: 'penpot_mcp_export_busy_total{gate="shared", instance="4406", job="penpot-mcp"}'
+        values: '0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PenpotMcpExportCapFull
+        exp_alerts: []
+  # token-gate refusals alone, however many, never fire it
+  - interval: 30s
+    input_series:
+      - series: 'penpot_mcp_export_busy_total{gate="token", instance="4406", job="penpot-mcp"}'
+        values: '0+10x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PenpotMcpExportCapFull
+        exp_alerts: []

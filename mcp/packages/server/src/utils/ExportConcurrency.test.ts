@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ExportConcurrency } from "./ExportConcurrency";
+import { ExportConcurrency, RenderDeadlineError } from "./ExportConcurrency";
 import { BusyError } from "./PermitGate";
 
 test("the backend export gate allows four concurrent exports by default", () => {
@@ -62,6 +62,17 @@ test("a render that runs past the timeout fails, and frees its token for the nex
         /did not finish within 0\.02 seconds/
     );
     assert.equal(await ExportConcurrency.withBackendPermit("token-slow", async () => "next"), "next");
+});
+
+test("a render past its timeout rejects with a RenderDeadlineError that keeps the message", async () => {
+    const error = await ExportConcurrency.withBackendPermit("digest-deadline", () => new Promise(() => undefined), {
+        timeoutMs: 20,
+    }).then(
+        () => assert.fail("the render should not finish"),
+        (reason: unknown) => reason
+    );
+    assert.ok(error instanceof RenderDeadlineError);
+    assert.equal((error as Error).message, "The export did not finish within 0.02 seconds.");
 });
 
 test("at the deadline the signal of the render is aborted, so the render can stop", async () => {
@@ -136,6 +147,28 @@ test("the timeout covers the wait for a slot as well as the render", async () =>
     await holder.done;
 });
 
+test("heldCounts reads the process permits that this process holds", async () => {
+    assert.deepEqual(ExportConcurrency.heldCounts(), { process: 0, shared: 0 });
+    const holder = holdRender("token-held");
+    await holder.started;
+    assert.equal(ExportConcurrency.heldCounts().process, 1);
+    holder.release();
+    await holder.done;
+    assert.equal(ExportConcurrency.heldCounts().process, 0);
+});
+
+test("heldCounts reads the shared permits through the shared permits set", () => {
+    ExportConcurrency.setSharedPermits({
+        heldCount: 3,
+        acquire: async () => async () => undefined,
+    });
+    try {
+        assert.equal(ExportConcurrency.heldCounts().shared, 3);
+    } finally {
+        ExportConcurrency.setSharedPermits(undefined);
+    }
+});
+
 test("the render timeout is 60 seconds", () => {
     assert.equal(ExportConcurrency.RENDER_TIMEOUT_MS, 60_000);
 });
@@ -143,6 +176,7 @@ test("the render timeout is 60 seconds", () => {
 test("the shared permit is taken after the process permit, and given back when the render fails", async () => {
     const events: string[] = [];
     ExportConcurrency.setSharedPermits({
+        heldCount: 0,
         acquire: async (wait) => {
             events.push(`take within ${wait.waitMs <= ExportConcurrency.PERMIT_WAIT_MS ? "budget" : "too long"}`);
             return async () => {
@@ -167,6 +201,7 @@ test("the shared permit is taken after the process permit, and given back when t
 test("a refused shared permit gives the busy error and frees the token and process slots", async () => {
     let refuse = true;
     ExportConcurrency.setSharedPermits({
+        heldCount: 0,
         acquire: async () => {
             if (refuse) {
                 throw new BusyError("export", 20);
@@ -201,6 +236,7 @@ test("a busy refusal is counted under the gate that refused it", async () => {
     assert.equal(afterToken.shared - before.shared, 0);
 
     ExportConcurrency.setSharedPermits({
+        heldCount: 0,
         acquire: async () => {
             throw new BusyError("export", 10);
         },

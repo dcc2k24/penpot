@@ -2,7 +2,7 @@
 # Every rule has a runbook annotation: the first thing to do when it fires. The thresholds are starting points for
 # a deployment that has not been measured yet; tune them from the soak and capacity numbers.
 #
-# Checked with: promtool check rules alerts.yml
+# Checked with: promtool check rules alerts.yml, and promtool test rules alerts_test.yml
 
 groups:
   - name: penpot-mcp-availability
@@ -142,15 +142,16 @@ groups:
           summary: "Backend rejects MCP calls at its concurrency limit {{ $labels.name }} ({{ $labels.reason }})"
           runbook: "Raise the limit only after the pool and the write latency look healthy; otherwise lower the agents per backend."
 
+      # The sum runs over all instances: the render cap is shared, so a busy adapter must not hide behind a quiet one.
       - alert: PenpotMcpExportCapFull
-        expr: sum by (instance) (increase(penpot_mcp_export_busy_total{gate=~"process|shared"}[10m])) > 0
+        expr: sum(rate(penpot_mcp_export_busy_total{gate=~"process|shared"}[5m])) * 60 > 1
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Adapter {{ $labels.instance }} refuses exports because the render cap is full"
-          description: "Exports waited 30 s for a render slot and were refused as busy. The export load is above what the render cap lets through."
-          runbook: "Check the exporter CPU and the export duration first. If the exporter has room, raise PENPOT_MCP_EXPORT_TOTAL_PERMITS and the per-process cap PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS. If not, add exporter capacity or lower the export load. Refusals with gate=\"token\" come from one client that asks for renders in parallel; they are not part of this alert."
+          summary: "Exports are refused as busy at {{ $value | humanize }} a minute because the render cap is full"
+          description: "Exports waited 30 s for a render slot and were refused as busy at more than one a minute, summed over all adapters, for 10 minutes. The F2-20 load run, with ten exporters on four shared permits, refused 2.5 a minute. One stray refusal does not fire this rule."
+          runbook: "Check the exporter CPU and the export duration first. If the exporter has spare CPU, raise PENPOT_MCP_EXPORT_TOTAL_PERMITS, and PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS if it is lower. If not, add exporter capacity or lower the export load. sum(penpot_mcp_export_permits_held{gate=\"shared\"}) against PENPOT_MCP_EXPORT_TOTAL_PERMITS shows how full the cap is. Refusals with gate=\"token\" come from one client that asks for renders in parallel; they are not part of this alert."
 
   - name: penpot-mcp-adapter-process
     rules:

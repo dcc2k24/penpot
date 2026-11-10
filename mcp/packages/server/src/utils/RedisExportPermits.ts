@@ -114,6 +114,8 @@ export interface SharedExportPermits {
      * @throws Error with the busy text when the cap is still full at the end of the budget, or the signal's reason
      */
     acquire(wait: PermitWait): Promise<() => Promise<void>>;
+    /** Number of shared permits this process holds at the moment. */
+    readonly heldCount: number;
 }
 
 /** Options of {@link RedisExportPermits}. */
@@ -179,6 +181,8 @@ export class RedisExportPermits implements SharedExportPermits {
     private failing = false;
     /** True while gives-back fail, so their warning is logged once per outage. */
     private releaseFailing = false;
+    /** Number of shared permits held by this process at the moment. */
+    private held = 0;
 
     /**
      * Creates the shared permits.
@@ -222,14 +226,19 @@ export class RedisExportPermits implements SharedExportPermits {
         return !this.failing;
     }
 
+    /** Number of shared permits this process holds at the moment. */
+    public get heldCount(): number {
+        return this.held;
+    }
+
     /**
      * Takes a shared permit, polling Redis until one is free or the wait budget is spent.
      *
      * One member id serves every take of this call, so the caller keeps its place in the queue between polls.
      *
      * @param wait - the wait budget, and the signal that ends the wait
-     * @returns a function that gives the permit back; it never throws. It does nothing when the call went on
-     *   without a shared permit because Redis failed.
+     * @returns a function that gives the permit back; it never throws, and a second call does nothing. It does
+     *   nothing when the call went on without a shared permit because Redis failed.
      * @throws BusyError when the cap is still full at the end of the budget, or the signal's reason
      */
     public async acquire(wait: PermitWait): Promise<() => Promise<void>> {
@@ -255,7 +264,14 @@ export class RedisExportPermits implements SharedExportPermits {
             }
             this.failing = false;
             if (taken) {
-                return () => this.free(member);
+                this.held += 1;
+                let released = false;
+                return async () => {
+                    if (!released) {
+                        released = true;
+                        await this.free(member);
+                    }
+                };
             }
             const remainingMs = deadline - Date.now();
             if (remainingMs <= 0) {
@@ -275,10 +291,12 @@ export class RedisExportPermits implements SharedExportPermits {
 
     /**
      * Gives a permit back. A failure is logged once per outage and ignored, since the lease frees the permit.
+     * The count of held permits drops at once, whether or not Redis removes the permit.
      *
      * @param member - the id the permit was taken with
      */
     private async free(member: string): Promise<void> {
+        this.held -= 1;
         try {
             await this.store.free(this.key, member);
             this.releaseFailing = false;

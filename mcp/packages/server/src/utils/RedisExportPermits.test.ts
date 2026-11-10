@@ -154,6 +154,33 @@ test("a permit given back frees the slot for a waiting caller", async () => {
     assert.equal(store.held, 0);
 });
 
+test("heldCount follows the shared permits that this process holds", async () => {
+    const permits = new RedisExportPermits(new FakeStore(() => 0), 1, 60_000, { warn: () => undefined });
+    assert.equal(permits.heldCount, 0);
+    const release = await permits.acquire({ waitMs: 1_000 });
+    assert.equal(permits.heldCount, 1);
+    await release();
+    assert.equal(permits.heldCount, 0);
+    await release();
+    assert.equal(permits.heldCount, 0);
+});
+
+test("heldCount ignores a take that falls back, and drops after a give-back that fails", async () => {
+    const store = new FakeStore(() => 0);
+    const permits = new RedisExportPermits(store, 1, 60_000, { warn: () => undefined });
+    store.takeError = new Error("down");
+    const fallback = await permits.acquire({ waitMs: 1_000 });
+    assert.equal(permits.heldCount, 0);
+    await fallback();
+    assert.equal(permits.heldCount, 0);
+    store.takeError = undefined;
+    const release = await permits.acquire({ waitMs: 1_000 });
+    assert.equal(permits.heldCount, 1);
+    store.freeError = new Error("down");
+    await release();
+    assert.equal(permits.heldCount, 0);
+});
+
 test("two adapters sharing one store never hold more than the limit at once", async () => {
     let now = 0;
     const store = new FakeStore(() => now);
@@ -385,6 +412,73 @@ test("a leave that throws is ignored", async () => {
     const release = await permits.acquire({ waitMs: 1_000 });
     await assert.rejects(permits.acquire({ waitMs: 30 }), /export is busy/);
     await release();
+});
+
+test("a waiting caller that stopped asking loses its place, and the next caller is served", async () => {
+    let now = 0;
+    const store = new FakeStore(() => now);
+    const permits = new RedisExportPermits(store, 1, 60_000);
+    const release = await permits.acquire({ waitMs: 1_000 });
+    const reason = new Error("the caller went away");
+    const controller = new AbortController();
+    const waitingB = permits.acquire({ waitMs: 10_000, signal: controller.signal });
+    await settle();
+    assert.equal(store.waiters.size, 1);
+    // the leave fails, so B keeps its place in the queue after it has gone
+    store.leaveError = new Error("down");
+    controller.abort(reason);
+    await assert.rejects(waitingB, (error: unknown) => error === reason);
+    store.leaveError = undefined;
+    assert.equal(store.waiters.size, 1);
+    now += 3_001;
+    const waitingC = permits.acquire({ waitMs: 10_000 });
+    await settle();
+    await release();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("the next caller was not served within 2 seconds")), 2_000);
+    });
+    let releaseC: () => Promise<void>;
+    try {
+        releaseC = await Promise.race([waitingC, timeout]);
+    } finally {
+        clearTimeout(timer);
+    }
+    assert.equal(store.waiters.size, 0);
+    assert.equal(store.held, 1);
+    await releaseC();
+    assert.equal(store.held, 0);
+});
+
+test("an aborted waiter does not block the callers behind it", async () => {
+    let now = 0;
+    const store = new FakeStore(() => now);
+    const permits = new RedisExportPermits(store, 1, 60_000);
+    const release = await permits.acquire({ waitMs: 1_000 });
+    const reason = new Error("the caller went away");
+    const controller = new AbortController();
+    const waitingB = permits.acquire({ waitMs: 10_000, signal: controller.signal });
+    await settle();
+    now += 40;
+    const waitingC = permits.acquire({ waitMs: 10_000 });
+    await settle();
+    assert.equal(store.waiters.size, 2);
+    controller.abort(reason);
+    await assert.rejects(waitingB, (error: unknown) => error === reason);
+    assert.equal(store.waiters.size, 1);
+    await release();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("the next caller was not served within 2 seconds")), 2_000);
+    });
+    let releaseC: () => Promise<void>;
+    try {
+        releaseC = await Promise.race([waitingC, timeout]);
+    } finally {
+        clearTimeout(timer);
+    }
+    await releaseC();
+    assert.equal(store.held, 0);
 });
 
 test("the Redis store grants permits in arrival order", { skip: skipWithoutRedis }, async () => {

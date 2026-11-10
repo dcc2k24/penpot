@@ -297,6 +297,10 @@ test("metrics show the Redis gauge when Redis is configured", async () => {
     assert.match(text, /^penpot_mcp_export_busy_total\{gate="token"\} \d+$/m);
     assert.match(text, /^penpot_mcp_export_busy_total\{gate="process"\} \d+$/m);
     assert.match(text, /^penpot_mcp_export_busy_total\{gate="shared"\} \d+$/m);
+    // the permits this adapter holds, by gate: nothing runs in this test, so both read 0
+    assert.match(text, /^# TYPE penpot_mcp_export_permits_held gauge$/m);
+    assert.match(text, /^penpot_mcp_export_permits_held\{gate="process"\} 0$/m);
+    assert.match(text, /^penpot_mcp_export_permits_held\{gate="shared"\} 0$/m);
     assert.match(text, /^# TYPE penpot_mcp_redis_client_up gauge$/m);
     assert.match(text, /^penpot_mcp_redis_client_up\{client="rate-limiter"\} 0$/m);
     assert.match(text, /^penpot_mcp_redis_client_up\{client="storage"\} 1$/m);

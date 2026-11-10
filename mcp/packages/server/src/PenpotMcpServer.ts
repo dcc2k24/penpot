@@ -995,6 +995,16 @@ export class PenpotMcpServer {
                     value: ExportConcurrency.busyCounts()[gate],
                 })),
             },
+            // how full the cap is on this adapter: the permits it holds, by gate
+            {
+                name: "penpot_mcp_export_permits_held",
+                help: "Export permits held by this process, by gate.",
+                type: "gauge",
+                samples: (["process", "shared"] as const).map((gate) => ({
+                    labels: { gate },
+                    value: ExportConcurrency.heldCounts()[gate],
+                })),
+            },
             // only with Redis configured; without it the families are left out
             ...this.redisFamilies(),
         ]);

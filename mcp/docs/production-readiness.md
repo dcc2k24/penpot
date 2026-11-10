@@ -199,9 +199,10 @@ with `PENPOT_MCP_EXPORT_TOTAL_PERMITS=4`, nginx in front, and Prometheus with `d
   p50 5.5 s, p95 6.9 s, max 7.5 s.
 - The 30 s wait: 8 calls ended with "export is busy, retry later", seven after 30 s and one after 24.7 s (what was
   left of its 30 s after the process gate). 6 more calls took 30 to 35 s: a wait of 23 s or more, then the render.
-  With 5.5 s renders on four slots, callers served in arrival order would wait about 8 s. The shared permit has no
-  queue: each waiter asks Redis again every 20 to 250 ms (2,579 refused requests in the run) and the first to ask
-  after a release gets the permit. That is the likely cause of the long waits; this run did not isolate it.
+  With the renders of this run on four slots, callers served in arrival order would have waited p50 12.3 s and at most
+  19.0 s (replayed from the recording; see "After F2-20"). The shared permit has no queue: each waiter asks Redis
+  again every 20 to 250 ms (2,579 refused requests in the run) and the first to ask after a release gets the permit.
+  That is the likely cause of the long waits; this run did not isolate it.
 - Permit count, sampled every 250 ms (852 samples): 4 in 702 samples, 3 in 14, 2 in 1, 1 in 6, and 0 in 129 (before
   the first take and after the last release). Never above 4. Four permits were held for 183 of the 188 s between the
   first take and the last release. The set was empty at the last release and stayed empty.
@@ -229,17 +230,36 @@ with `PENPOT_MCP_EXPORT_TOTAL_PERMITS=4`, nginx in front, and Prometheus with `d
 - The shared export permit now serves waiting callers in arrival order. A refused caller joins a queue in Redis,
   beside the permit set. A caller that has not asked for 3 s loses its place, so a crashed adapter cannot block the
   queue. Arrival order holds once every adapter is upgraded.
-- The likely cause of the long waits in the F2-20 run: a caller fresh from the process gate asked Redis right after
-  a release, and so beat callers that had waited longer.
+- The cause, measured on the F2-20 recording (`wait-analysis.txt` in its result folder, written by
+  `scripts/round2/permit-wait-analysis.mjs`; each call rebuilt from the adapter logs and the Redis MONITOR log, with
+  the per-process gate replayed as the FIFO it is): the long waits were
+  spent at Redis, not at the process gate. Of the 14 calls that waited 20 s or more, 12 waited under 0.1 s at the
+  process gate; the other two waited 4.3 and 5.3 s there and 25 s at Redis. Each of the 14 was passed by 11 to 22
+  callers that reached Redis after it, from both adapters: of the 371 overtakes in the run, 160 were by a caller on
+  the same adapter and 211 by one on the other. 120 of the 133 grants went to a caller that passed an earlier one.
+  Half the grants went to a caller within 3 ms of its leaving the process gate: a finished render frees its process
+  slot and its shared permit at the same instant, and the caller the process gate lets through polls before the
+  callers that were already waiting. The process gate kept order (p50 wait 2.4 s, max 10.4 s) and refused no call, so
+  `ExportConcurrency.ts` was left as it is apart from the busy counter.
+- The same analysis on the re-run below: 5 overtakes in 100 grants, all between callers that reached Redis within the
+  same few milliseconds, against 371 in 133. The wait at Redis was p50 7.6 s, max 9.5 s. The process-gate wait was p50
+  3.3 s, max 13.7 s; the one call over 20 s (21.0 s) spent 13.0 s of it at its adapter's process gate. Trade-off left
+  open: the process cap (4) equals the shared cap, so a caller held at one adapter's process gate loses its place to a
+  later caller that reaches Redis from the other adapter. Setting `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` above
+  `PENPOT_MCP_EXPORT_TOTAL_PERMITS` would let callers queue in Redis sooner, at the cost of more polling; not measured.
 - `penpot_mcp_export_busy_total{gate}` counts exports refused as busy, by the gate that refused them (`token`,
-  `process` or `shared`). The alert `PenpotMcpExportCapFull` fires on the `process` and `shared` gates.
+  `process` or `shared`). The alert `PenpotMcpExportCapFull` fires when the `process` and `shared` gates refuse more
+  than one export a minute, summed over all adapters, for 10 minutes. The F2-20 rate, 2.5 a minute, is above the
+  threshold; one stray refusal is not. The gauge `penpot_mcp_export_permits_held{gate}` shows the permits each
+  adapter holds, so the sum of `gate="shared"` against `PENPOT_MCP_EXPORT_TOTAL_PERMITS` shows how full the cap is.
 - The permit report script reads the three-key take, so the waiter keys do not count as takes or releases.
 - Re-measure (2026-11-10, the same C8 run on the new code; record in
   `mcp/packages/loadtest/results/2026-11-10-fair-permits-c8/`): 100 exports, none refused as busy, against 8 of 141
   on 2026-11-09. Call time p50 17.8 s, p95 24.3 s, max 28.6 s; no call took 30 s or more, against 14. Renders were
   slower on this day (permit held p50 7.7 s against 5.5 s; another test run shared the machine), which is why
   fewer exports ran; the four permits were held for 182 of 197 s. The wait for the shared permit, from the first
-  ask to the take, was p50 7.6 s and at most 9.5 s: about one render. No waiter key was left in Redis.
+  ask to the take, was p50 7.6 s and at most 9.5 s: about one render. No waiter key was left in Redis. The tail is
+  gone: no call was refused and no call took 30 s or more; the longest wait for the shared permit was about one render.
 - The counter, live: an overload run (24 exporters, 75 s) ended 6 of 76 calls as busy, and
   `penpot_mcp_export_busy_total{gate="shared"}` read 4 on one adapter and 2 on the other.
 - Not checked: an older adapter and a new one on the same Redis, and the alert firing in Prometheus (the rule

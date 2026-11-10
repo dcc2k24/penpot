@@ -73,6 +73,20 @@ test("a signal that has already fired refuses the call without queueing it", asy
     assert.equal(gate.waitingCount, 0);
 });
 
+test("heldCount counts the permits held, and a hand-over keeps the count at the cap", async () => {
+    const gate = new PermitGate("export", 1);
+    assert.equal(gate.heldCount, 0);
+    await gate.acquire({ waitMs: 1_000 });
+    assert.equal(gate.heldCount, 1);
+    const waiting = gate.acquire({ waitMs: 1_000 });
+    await settle();
+    gate.release();
+    await waiting;
+    assert.equal(gate.heldCount, 1);
+    gate.release();
+    assert.equal(gate.heldCount, 0);
+});
+
 test("a gate needs at least one permit", () => {
     assert.throws(() => new PermitGate("export", 0), /at least 1 permit/);
 });
