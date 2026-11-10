@@ -208,7 +208,7 @@
    (check-profile-state! (or (request-profile params)
                              (profile/get-profile cfg profile-id)))))
 
-(defn- check-access!
+(defn check-access!
   [cfg params profile-id file-id]
   (check-profile! cfg profile-id params)
   (files/check-read-permissions! cfg profile-id file-id))
@@ -257,7 +257,7 @@
     (or (feat.fdata/load-pointer cfg file-id (pmap/get-id ptr)) {})
     ptr))
 
-(defn- load-file-data
+(defn load-file-data
   "The file read from the database. The pages stay pointer
   maps and `get-page-data` loads one at a time. The pointer maps of the
   file-level collections named in `ks` are loaded too. A file that needs
@@ -274,7 +274,7 @@
                         data
                         ks))))))
 
-(defn- load-file-for-page
+(defn load-file-for-page
   "`load-file-data` for a read of `page-id`. A cached root that lacks the
   page is stale: a root of another file or revision answered for this key.
   The entry is dropped and the file is read again, so the page is found
@@ -323,7 +323,7 @@
     [:pointer (pmap/get-id page)]
     [file-id page-id revn]))
 
-(defn- get-page-data
+(defn get-page-data
   "The page `page-id` of a file `data` at revision `revn`, from
   `page-cache` when its key is cached."
   [cfg file-id revn data page-id]
@@ -335,7 +335,7 @@
     (cache/get page-cache (page-cache-key file-id page-id revn page)
                (fn [_] (load-page cfg file-id data page-id)))))
 
-(defn- page-version
+(defn page-version
   "The version a page-tree cursor binds to: the pointer id of a pointer
   map page, else the file revn. A write to another page leaves a pointer
   id alone."
@@ -349,7 +349,7 @@
   [shape]
   (if (some? (:position-data shape)) "exact" "approximate"))
 
-(defn- shape-characters
+(defn shape-characters
   [shape]
   (if (some? (:content shape))
     (txt/content->text (:content shape))
@@ -363,7 +363,7 @@
        (contains? #{:auto-width :auto-height} (:grow-type shape))
        (nil? (:position-data shape))))
 
-(defn- shape-box
+(defn shape-box
   "`shape` with the box the plugin API reports. `:x` and `:y` are the
   top-left corner of the rectangle around its points; `:width` and
   `:height` are the size of its selrect, before rotation. The stored
@@ -404,7 +404,7 @@
              shape
              defaults))
 
-(defn- with-defaults
+(defn with-defaults
   "`shape` with the defaults Penpot assumes for `hidden`, `blocked`,
   `opacity`, the alignment of its strokes and, on a layout board or
   child, its layout sizing."
@@ -418,7 +418,7 @@
     (fill-missing {:layout-item-h-sizing default-layout-item-sizing
                    :layout-item-v-sizing default-layout-item-sizing})))
 
-(defn- shape-children
+(defn shape-children
   "The children of `shape` in the order the tree shows them. With `visual?`
   the children of a flex or grid layout come in visual order, the reverse of
   the stored `:shapes`, since a layout keeps its children reversed. Every
@@ -431,7 +431,7 @@
       (vec (reverse children))
       children)))
 
-(defn- page-preorder
+(defn page-preorder
   "Pre-order `[level id]` entries of the subtree at `start-id`, down to
   `max-level` levels (the start shape is level 1). Missing shapes are
   skipped. With `visual?` the children of layouts come in visual order (see
@@ -633,7 +633,7 @@
   [:id :name :type :x :y :width :height :parent-id :frame-id :hidden
    :blocked :component-id :main-instance :component-root :shape-ref])
 
-(defn- pick-named
+(defn pick-named
   "The attributes `fields` of `shape`, each one present. An attribute the
   shape lacks comes back as nil, so a caller that names a field always
   gets a key for it. Defaults are filled before this runs."
@@ -669,12 +669,12 @@
                   [(tree-node shape pick children) j]))))]
     (first (build 0))))
 
-(defn- encode-cursor
+(defn encode-cursor
   [value]
   (let [^String text (t/encode-str value)]
     (.encodeToString (Base64/getEncoder) (.getBytes text "UTF-8"))))
 
-(defn- parse-cursor
+(defn parse-cursor
   "The `[page-id version index root-id depth]` a cursor carries, or nil
   when it is not one. `version` is a pointer id (uuid) or a revn (int)."
   [^String cursor]
@@ -770,12 +770,12 @@
    [:limit {:optional true} [::sm/int {:min 1 :max 5000}]]
    [:cursor {:optional true} [:string {:max 4096}]]])
 
-(def ^:private response-byte-budget
+(def response-byte-budget
   "Encoded bytes that the shapes or the tree nodes of one reply may take:
   about 1 MB. A reply above it is cut short and flagged `truncated`."
   1000000)
 
-(defn- encoded-size
+(defn encoded-size
   "Encoded size of `value` in characters of its transit text. It stands in
   for the bytes of the reply: transit text is ASCII for most shapes, and a
   rough count is enough for a budget. Costs one encode per value."
@@ -875,7 +875,7 @@
 
 ;; --- SHAPES
 
-(defn- shape-out
+(defn shape-out
   "The map of `shape` that `get-mcp-shapes` returns: the box the plugin
   API reports, the defaults Penpot assumes, no thumbnail. Without
   `fields` the heavy attributes are left out too; `fields` names the
@@ -895,7 +895,7 @@
         (assoc :text-size-approximate true))
       out)))
 
-(defn- within-budget
+(defn within-budget
   "The shapes of `items`, mapped by `f`, in order, up to `budget` encoded
   bytes. The first one is always kept, so a call makes progress. Returns
   `[kept truncated?]`."
@@ -978,7 +978,7 @@
   "Time a search may spend across pages: five seconds."
   5000000000)
 
-(defn- compile-regex
+(defn compile-regex
   [pattern]
   (when (some? pattern)
     (try
@@ -1046,11 +1046,11 @@
            (or (nil? wanted)
                (boolean (some wanted (shape-colors data shape))))))))
 
-(def ^:private max-ancestor-steps
+(def max-ancestor-steps
   "Most ancestors `shape-path` walks up; a deeper path stops here."
   1000)
 
-(defn- shape-path
+(defn shape-path
   "Names of the shape's ancestors, top down, and its own name, joined
   with \" / \". The page root is not part of the path."
   [objects shape]

@@ -19,6 +19,15 @@
    [clojure.set :as set]
    [clojure.test :as t]))
 
+(def ^:private mcp-command-files
+  "The source files that declare MCP commands."
+  ["src/app/rpc/commands/mcp.clj"
+   "src/app/rpc/commands/mcp_fonts.clj"
+   "src/app/rpc/commands/mcp_lint.clj"
+   "src/app/rpc/commands/mcp_prototype.clj"
+   "src/app/rpc/commands/mcp_subtree.clj"
+   "src/app/rpc/commands/mcp_write.clj"])
+
 (defn- declared-climit-ids
   "The climit ids that the command metadata of `path` declares. Each
   `::climit/id` form runs up to the next metadata key."
@@ -32,8 +41,7 @@
 
 (t/deftest every-declared-mcp-climit-id-has-an-entry
   (let [limits (edn/read-string (slurp "resources/climit.edn"))
-        ids    (concat (declared-climit-ids "src/app/rpc/commands/mcp.clj")
-                       (declared-climit-ids "src/app/rpc/commands/mcp_write.clj"))]
+        ids    (mapcat declared-climit-ids mcp-command-files)]
     (t/is (seq ids) "the scan finds the MCP ids")
     (doseq [id ids]
       (t/is (contains? limits id)
@@ -134,7 +142,11 @@
   (let [listed (set main/mcp-error-codes)
         raised (set/union
                 (mcp-codes-raised-from "src/app/rpc/commands/mcp.clj" "(defn run-tool")
-                (mcp-codes-raised-from "src/app/rpc/commands/mcp_write.clj" "(ns "))]
+                (mcp-codes-raised-from "src/app/rpc/commands/mcp_write.clj" "(ns ")
+                (mcp-codes-raised-from "src/app/rpc/commands/mcp_fonts.clj" "(ns ")
+                (mcp-codes-raised-from "src/app/rpc/commands/mcp_lint.clj" "(ns ")
+                (mcp-codes-raised-from "src/app/rpc/commands/mcp_prototype.clj" "(ns ")
+                (mcp-codes-raised-from "src/app/rpc/commands/mcp_subtree.clj" "(ns "))]
     (t/is (contains? raised "mcp-invalid-change"))
     (doseq [code raised]
       (t/is (contains? listed code) (str code " is raised but not in mcp-error-codes")))))

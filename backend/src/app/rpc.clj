@@ -588,6 +588,10 @@
           'app.rpc.commands.ldap
           'app.rpc.commands.management
           'app.rpc.commands.mcp
+          'app.rpc.commands.mcp-fonts
+          'app.rpc.commands.mcp-lint
+          'app.rpc.commands.mcp-prototype
+          'app.rpc.commands.mcp-subtree
           'app.rpc.commands.mcp-write
           'app.rpc.commands.media
           'app.rpc.commands.nitrate
