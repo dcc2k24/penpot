@@ -7,6 +7,10 @@
 //   node scripts/round2/export-permit-report.mjs --help
 //
 // Writes <dir>/permit-report.json and <dir>/permit-report.txt, and prints the text.
+//
+// The permit waits (monitor.waitDistribution) run from the first attempt of a member to its take. They are only
+// meaningful for adapters that keep one member id per caller across its polls. An adapter that uses a fresh id per
+// attempt gives a wait of 0 for every take, and attempts count one granted per take.
 
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -206,7 +210,9 @@ export function distribution(values) {
  * the attempts and the first and last times. Other lines are not counted in the first and last times either.
  *
  * A take is a ZADD on the key (score = expiry in ms, member). A release is a ZREM on the key. An attempt is an
- * EVAL or EVALSHA whose arguments include the key; its member is the argument after the key.
+ * EVAL or EVALSHA whose KEYS include the key. The arguments are [command, sha, numkeys, ...keys, ...argv], so the
+ * member is the first ARGV, at index 3 + numkeys. The take script also gets the waiter keys, so the member is not
+ * the argument after the key. The one-key script of older adapters fits the same layout.
  *
  * @param {string} text - the log text, one tab separated line per event
  * @param {string} key - the permit key
@@ -254,7 +260,13 @@ export function parseMonitorLog(text, key) {
         } else if (command === "zrem" && args[1] === key) {
             releases.push({ member: String(args[2]), atMs });
         } else if (command === "evalsha" || command === "eval") {
-            attempts.push({ member: String(args[args.indexOf(key) + 1]), atMs });
+            const numKeys = Number(args[2]);
+            if (!Number.isInteger(numKeys) || numKeys < 1 || 3 + numKeys >= args.length) {
+                continue;
+            }
+            if (args.slice(3, 3 + numKeys).includes(key)) {
+                attempts.push({ member: String(args[3 + numKeys]), atMs });
+            }
         }
     }
     return { takes, releases, attempts, firstMs, lastMs, skipped };
@@ -387,15 +399,44 @@ export function concurrency(holds, lastMs) {
 }
 
 /**
- * Counts the attempts that got a permit. An attempt is granted when its member was taken.
+ * Counts the attempts that got a permit. A caller keeps one member id across its polls, so a member that was
+ * taken counts as ONE granted attempt, however many attempts it made. granted is the number of distinct taken
+ * members that appear in the attempts, and refusedPolls is the other attempts. An adapter that uses a fresh member
+ * id for each attempt gives one granted attempt per take, as before.
  *
  * @param {{takes: Array<{member: string}>, attempts: Array<{member: string}>}} parsed - the parsed log
  * @returns {{attempts: number, granted: number, refusedPolls: number}} the counts
  */
 export function attemptStats(parsed) {
     const taken = new Set(parsed.takes.map((take) => take.member));
-    const granted = parsed.attempts.filter((attempt) => taken.has(attempt.member)).length;
+    const grantedMembers = new Set(
+        parsed.attempts.map((attempt) => attempt.member).filter((member) => taken.has(member))
+    );
+    const granted = grantedMembers.size;
     return { attempts: parsed.attempts.length, granted, refusedPolls: parsed.attempts.length - granted };
+}
+
+/**
+ * Gives the wait for the shared permit of each take, in the order of the takes. The wait runs from the first
+ * attempt of the member to its take, in milliseconds. It is 0 when the first attempt is the take, or when the
+ * member has no attempt in the log. The wait is only meaningful for adapters that keep one member id per caller:
+ * an adapter that uses a fresh id per attempt gives 0 for every take.
+ *
+ * @param {{takes: Array<{member: string, atMs: number}>, attempts: Array<{member: string, atMs: number}>}} parsed - the parsed log
+ * @returns {number[]} one wait per take, in milliseconds
+ */
+export function permitWaits(parsed) {
+    const firstAttempt = new Map();
+    for (const attempt of parsed.attempts) {
+        const known = firstAttempt.get(attempt.member);
+        if (known === undefined || attempt.atMs < known) {
+            firstAttempt.set(attempt.member, attempt.atMs);
+        }
+    }
+    return parsed.takes.map((take) => {
+        const first = firstAttempt.get(take.member);
+        return first === undefined ? 0 : Math.max(0, take.atMs - first);
+    });
 }
 
 /**
@@ -943,6 +984,7 @@ export function formatReport(report) {
         `  holds ${monitor.holdsSummary.count}, still held at the end ${monitor.holdsSummary.heldAtEnd}, ` +
             `outlived the lease ${monitor.holdsSummary.exceededLease}`,
         `  hold time: ${holdDistText(monitor.holdsSummary.holdDistribution)}`,
+        `  wait for the permit: ${holdDistText(monitor.waitDistribution)}`,
         `  max concurrent permits ${monitor.concurrency.max} (cap ${cap})`,
         `  time at each level: ${levels || "none"}`,
         "",
@@ -1049,6 +1091,7 @@ export async function main(argv) {
         firstMs: monitorEvents.firstMs,
         lastMs: monitorEvents.lastMs,
         holdsSummary: { count: holds.length, ...holdsSummary },
+        waitDistribution: distribution(permitWaits(monitorEvents)),
         concurrency: concurrency(holds, monitorEvents.lastMs),
         holds,
     };

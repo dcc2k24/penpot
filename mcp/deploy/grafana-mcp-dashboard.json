@@ -511,6 +511,16 @@
           "expr": "sum by (reason) (rate(penpot_mcp_refusals_total[5m]))",
           "legendFormat": "{{reason}}",
           "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (gate) (rate(penpot_mcp_export_busy_total[5m]))",
+          "legendFormat": "export busy, {{gate}}",
+          "range": true
         }
       ]
     },

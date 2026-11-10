@@ -142,6 +142,16 @@ groups:
           summary: "Backend rejects MCP calls at its concurrency limit {{ $labels.name }} ({{ $labels.reason }})"
           runbook: "Raise the limit only after the pool and the write latency look healthy; otherwise lower the agents per backend."
 
+      - alert: PenpotMcpExportCapFull
+        expr: sum by (instance) (increase(penpot_mcp_export_busy_total{gate=~"process|shared"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Adapter {{ $labels.instance }} refuses exports because the render cap is full"
+          description: "Exports waited 30 s for a render slot and were refused as busy. The export load is above what the render cap lets through."
+          runbook: "Check the exporter CPU and the export duration first. If the exporter has room, raise PENPOT_MCP_EXPORT_TOTAL_PERMITS and the per-process cap PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS. If not, add exporter capacity or lower the export load. Refusals with gate=\"token\" come from one client that asks for renders in parallel; they are not part of this alert."
+
   - name: penpot-mcp-adapter-process
     rules:
       - alert: PenpotMcpAdapterMemoryHigh

@@ -14,6 +14,7 @@ import {
     parseMonitorLog,
     percentile,
     permitHolds,
+    permitWaits,
     summarizeAdapter,
     summarizeMetrics,
     summarizeSamples,
@@ -89,6 +90,82 @@ test("parseMonitorLog reads takes, releases and attempts and skips broken lines"
     assert.equal(parsed.firstMs, 1762676862100);
     assert.equal(parsed.lastMs, 1762676863500);
     assert.deepEqual(attemptStats(parsed), { attempts: 2, granted: 1, refusedPolls: 1 });
+});
+
+test("parseMonitorLog reads the member of a three-key take and ignores the waiter keys", () => {
+    const WAITERS = "{penpot.mcp.export.permits}:waiters";
+    const SEEN = "{penpot.mcp.export.permits}:seen";
+    const text = [
+        monitorLine("1762676870.000000", ["zadd", WAITERS, "1762676870000", "w1"]),
+        monitorLine("1762676870.100000", ["zadd", SEEN, "1762676870100", "w1"]),
+        monitorLine("1762676870.200000", [
+            "evalsha",
+            "sha1",
+            "3",
+            KEY,
+            WAITERS,
+            SEEN,
+            "m5",
+            "4",
+            String(LEASE_MS),
+            "3000",
+        ]),
+        monitorLine("1762676870.300000", ["zadd", KEY, "1762676935300", "m5"]),
+        monitorLine("1762676871.000000", ["zrem", WAITERS, "w1"]),
+        monitorLine("1762676871.100000", ["zrem", SEEN, "w1"]),
+        monitorLine("1762676872.000000", ["zrem", KEY, "m5"]),
+    ].join("\n");
+    const parsed = parseMonitorLog(text, KEY);
+    assert.deepEqual(parsed.attempts, [{ member: "m5", atMs: 1762676870200 }]);
+    assert.deepEqual(parsed.takes, [{ member: "m5", atMs: 1762676870300, expiresAtMs: 1762676935300 }]);
+    assert.deepEqual(parsed.releases, [{ member: "m5", atMs: 1762676872000 }]);
+    assert.equal(parsed.skipped, 0);
+});
+
+test("parseMonitorLog does not count an eval whose permit key is only an argument", () => {
+    const WAITERS = "{penpot.mcp.export.permits}:waiters";
+    const text = monitorLine("1762676880.000000", ["evalsha", "sha1", "1", WAITERS, KEY, "4", String(LEASE_MS)]);
+    const parsed = parseMonitorLog(text, KEY);
+    assert.deepEqual(parsed.attempts, []);
+});
+
+test("parseMonitorLog reads takes, releases and attempts of the one-key script", () => {
+    const text = [
+        monitorLine("1762676890.000000", ["evalsha", "sha1", "1", KEY, "m6", "4", String(LEASE_MS)]),
+        monitorLine("1762676890.100000", ["zadd", KEY, "1762676955100", "m6"]),
+    ].join("\n");
+    const parsed = parseMonitorLog(text, KEY);
+    assert.deepEqual(parsed.attempts, [{ member: "m6", atMs: 1762676890000 }]);
+    assert.deepEqual(parsed.takes, [{ member: "m6", atMs: 1762676890100, expiresAtMs: 1762676955100 }]);
+});
+
+test("attemptStats counts one granted attempt for a taken member that polled several times", () => {
+    const parsed = {
+        takes: [{ member: "one", atMs: 4000 }],
+        attempts: [
+            { member: "one", atMs: 1000 },
+            { member: "one", atMs: 2000 },
+            { member: "one", atMs: 3000 },
+            { member: "one", atMs: 4000 },
+        ],
+    };
+    assert.deepEqual(attemptStats(parsed), { attempts: 4, granted: 1, refusedPolls: 3 });
+});
+
+test("permitWaits gives the wait from the first attempt of each member to its take", () => {
+    const parsed = {
+        takes: [
+            { member: "quick", atMs: 5000 },
+            { member: "slow", atMs: 13500 },
+        ],
+        attempts: [
+            { member: "quick", atMs: 5000 },
+            { member: "slow", atMs: 10000 },
+            { member: "slow", atMs: 11000 },
+            { member: "slow", atMs: 12000 },
+        ],
+    };
+    assert.deepEqual(permitWaits(parsed), [0, 3500]);
 });
 
 test("permitHolds: a release in time is a normal hold", () => {
