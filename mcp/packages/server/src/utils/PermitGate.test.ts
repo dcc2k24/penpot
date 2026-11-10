@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { PermitGate } from "./PermitGate";
+import { BusyError, PermitGate } from "./PermitGate";
 
 /** Lets pending callbacks and timers run. */
 function settle(): Promise<void> {
@@ -34,6 +34,19 @@ test("a caller that waits longer than the wait is refused as busy, and leaves th
     gate.release();
     // nothing is held by the refused caller, so the permit is free again
     await gate.acquire({ waitMs: 1_000 });
+    gate.release();
+});
+
+test("a caller refused as busy gets a BusyError whose text starts with Error: export is busy", async () => {
+    const gate = new PermitGate("export", 1);
+    await gate.acquire({ waitMs: 1_000 });
+    const refused = await gate.acquire({ waitMs: 20 }).then(
+        () => undefined,
+        (error: unknown) => error
+    );
+    assert.ok(refused instanceof BusyError);
+    assert.equal(refused.message, "export is busy, retry later: no slot was free for 0.02 seconds.");
+    assert.ok(String(refused).startsWith("Error: export is busy"));
     gate.release();
 });
 

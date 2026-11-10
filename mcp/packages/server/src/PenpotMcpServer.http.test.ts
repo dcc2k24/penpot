@@ -292,6 +292,11 @@ test("metrics show the Redis gauge when Redis is configured", async () => {
     // the export permits have their own counter and one gauge per configured client
     assert.match(text, /^# TYPE penpot_mcp_export_permit_fallback_total counter$/m);
     assert.match(text, /^penpot_mcp_export_permit_fallback_total 0$/m);
+    // exports refused as busy, by the gate that refused them: one series per gate, present from the start
+    assert.match(text, /^# TYPE penpot_mcp_export_busy_total counter$/m);
+    assert.match(text, /^penpot_mcp_export_busy_total\{gate="token"\} \d+$/m);
+    assert.match(text, /^penpot_mcp_export_busy_total\{gate="process"\} \d+$/m);
+    assert.match(text, /^penpot_mcp_export_busy_total\{gate="shared"\} \d+$/m);
     assert.match(text, /^# TYPE penpot_mcp_redis_client_up gauge$/m);
     assert.match(text, /^penpot_mcp_redis_client_up\{client="rate-limiter"\} 0$/m);
     assert.match(text, /^penpot_mcp_redis_client_up\{client="storage"\} 1$/m);

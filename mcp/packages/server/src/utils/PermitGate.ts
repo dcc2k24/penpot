@@ -1,3 +1,16 @@
+/** Error of a caller that waited for a permit until its wait budget ran out. */
+export class BusyError extends Error {
+    /**
+     * Creates the error. The message starts with the name, so `String(error)` reads `Error: <name> is busy`.
+     *
+     * @param name - the word that starts the text, such as `export`
+     * @param waitMs - the wait budget that ran out, in milliseconds
+     */
+    public constructor(name: string, waitMs: number) {
+        super(`${name} is busy, retry later: no slot was free for ${waitMs / 1000} seconds.`);
+    }
+}
+
 /** A caller that waits for a permit, with the way to grant it a turn. */
 interface PermitWaiter {
     /** Hands the caller its permit, and stops its wait timer. */
@@ -104,8 +117,7 @@ export class PermitGate {
             const timer = setTimeout(() => {
                 stop();
                 leave();
-                const seconds = wait.waitMs / 1000;
-                reject(new Error(`${this.name} is busy, retry later: no slot was free for ${seconds} seconds.`));
+                reject(new BusyError(this.name, wait.waitMs));
             }, wait.waitMs);
             wait.signal?.addEventListener("abort", onAbort, { once: true });
             this.waiting.push(waiter);

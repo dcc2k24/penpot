@@ -51,6 +51,7 @@ import { BodyLimit } from "./utils/BodyLimit";
 import { JSON_RPC_INVALID_REQUEST, failureOf, jsonRpcErrorBody, type RequestFailure } from "./utils/RequestErrors";
 import { jsonNestingDepth } from "./utils/JsonDepth";
 import { ExportDirectory } from "./utils/ExportDirectory";
+import { ExportConcurrency } from "./utils/ExportConcurrency";
 import type { BackendServices } from "./backend/BackendServices";
 import type { ToolCallRecord, ToolAnnotations } from "./Tool";
 import type { ProgressReporter } from "./backend/CallContext";
@@ -984,6 +985,16 @@ export class PenpotMcpServer {
                 "Export renders that went on without the shared permit because Redis failed.",
                 this.backendServices?.exportPermits?.fallbackCount ?? 0
             ),
+            // a full cap shows here: an export refused as busy, by the gate that refused it
+            {
+                name: "penpot_mcp_export_busy_total",
+                help: "Exports refused as busy, by the gate that refused them.",
+                type: "counter",
+                samples: (["token", "process", "shared"] as const).map((gate) => ({
+                    labels: { gate },
+                    value: ExportConcurrency.busyCounts()[gate],
+                })),
+            },
             // only with Redis configured; without it the families are left out
             ...this.redisFamilies(),
         ]);

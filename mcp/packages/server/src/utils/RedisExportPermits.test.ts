@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import Redis from "ioredis";
 import { PermitGate, type PermitWait } from "./PermitGate";
-import { ExportPermitStore, RedisExportPermits, RedisExportPermitStore } from "./RedisExportPermits";
+import { ExportPermitStore, RedisExportPermits, RedisExportPermitStore, waiterKeysOf } from "./RedisExportPermits";
 
 /** Redis URI of the test server, or undefined when the tests run without Redis. */
 const testRedisUri = process.env.PENPOT_MCP_TEST_REDIS_URI?.trim() || undefined;
@@ -17,15 +17,27 @@ function requireRedisUri(): string {
     return testRedisUri;
 }
 
+/** A waiting caller in the fake store: the times of its first and its last take. */
+interface FakeWaiter {
+    /** Time of the first take, which sets the place in the queue. */
+    since: number;
+    /** Time of the last take. */
+    seen: number;
+}
+
 /**
  * In-memory store that mimics the Lua script: expired members are removed by their score against an injected
- * clock, and a take counts against the limit. A test can make its takes or gives-back throw.
+ * clock, waiting callers keep their place in arrival order, and a take counts against the limit. A caller that has
+ * not asked for the stale time loses its place. A test can make its takes, gives-back or leaves throw.
  */
 class FakeStore implements ExportPermitStore {
     /** Held permits, by member id, with the time at which each expires. */
     readonly members = new Map<string, number>();
+    /** Waiting callers, by member id. */
+    readonly waiters = new Map<string, FakeWaiter>();
     takeError: Error | undefined;
     freeError: Error | undefined;
+    leaveError: Error | undefined;
 
     constructor(private readonly clock: () => number) {}
 
@@ -35,13 +47,26 @@ class FakeStore implements ExportPermitStore {
         return this.members.size;
     }
 
-    async take(_key: string, member: string, limit: number, leaseMs: number): Promise<boolean> {
+    async take(_key: string, member: string, limit: number, leaseMs: number, staleMs: number): Promise<boolean> {
         if (this.takeError !== undefined) {
             throw this.takeError;
         }
         this.removeExpired();
-        if (this.members.size < limit) {
-            this.members.set(member, this.clock() + leaseMs);
+        const now = this.clock();
+        for (const [waiter, place] of this.waiters) {
+            if (place.seen <= now - staleMs) {
+                this.waiters.delete(waiter);
+            }
+        }
+        const place = this.waiters.get(member);
+        if (place === undefined) {
+            this.waiters.set(member, { since: now, seen: now });
+        } else {
+            place.seen = now;
+        }
+        if (this.members.size < limit && this.rankOf(member) < limit - this.members.size) {
+            this.waiters.delete(member);
+            this.members.set(member, now + leaseMs);
             return true;
         }
         return false;
@@ -52,6 +77,24 @@ class FakeStore implements ExportPermitStore {
             throw this.freeError;
         }
         this.members.delete(member);
+    }
+
+    async leave(_key: string, member: string): Promise<void> {
+        if (this.leaveError !== undefined) {
+            throw this.leaveError;
+        }
+        this.waiters.delete(member);
+    }
+
+    /** Place of a waiting caller: by the time of its first take, then by member id. */
+    private rankOf(member: string): number {
+        const ordered = [...this.waiters].sort(([a, placeA], [b, placeB]) => {
+            if (placeA.since !== placeB.since) {
+                return placeA.since - placeB.since;
+            }
+            return a < b ? -1 : a > b ? 1 : 0;
+        });
+        return ordered.findIndex(([waiter]) => waiter === member);
     }
 
     private removeExpired(): void {
@@ -78,6 +121,17 @@ async function busyTextOfPermitGate(waitMs: number): Promise<string> {
         return "";
     } catch (error) {
         return error instanceof Error ? error.message : String(error);
+    }
+}
+
+/** Deletes the permit set of a test key and its waiter sets, so that a test leaves nothing behind. */
+async function deleteTestKeys(key: string): Promise<void> {
+    const direct = new Redis(requireRedisUri());
+    try {
+        const waiters = waiterKeysOf(key);
+        await direct.del(key, waiters.waiters, waiters.seen);
+    } finally {
+        await direct.quit();
     }
 }
 
@@ -222,13 +276,15 @@ test("the Redis permit store takes and frees permits of one key", { skip: skipWi
     const direct = new Redis(uri);
     try {
         const one = randomUUID();
-        assert.equal(await first.take(key, one, 1, 60_000), true);
-        assert.equal(await second.take(key, randomUUID(), 1, 60_000), false);
+        // the waiting caller keeps its member id between takes, so it keeps its place in the queue
+        const two = randomUUID();
+        assert.equal(await first.take(key, one, 1, 60_000, 3_000), true);
+        assert.equal(await second.take(key, two, 1, 60_000, 3_000), false);
         await first.free(key, one);
-        assert.equal(await second.take(key, randomUUID(), 1, 60_000), true);
+        assert.equal(await second.take(key, two, 1, 60_000, 3_000), true);
         assert.ok((await direct.pttl(key)) > 0);
     } finally {
-        await direct.del(key);
+        await deleteTestKeys(key);
         await first.close();
         await second.close();
         await direct.quit();
@@ -253,4 +309,159 @@ test("available is false while takes fail, and true again after one take succeed
     const release = await permits.acquire({ waitMs: 1000, signal: undefined } as PermitWait);
     assert.equal(permits.available, true);
     await release();
+});
+
+test("a caller that arrives later does not overtake a waiting caller", async () => {
+    let now = 0;
+    const store = new FakeStore(() => now);
+    const permits = new RedisExportPermits(store, 1, 60_000);
+    const releaseA = await permits.acquire({ waitMs: 1_000 });
+    const waitingB = permits.acquire({ waitMs: 5_000 });
+    await settle();
+    now += 40;
+    let cGranted = false;
+    const waitingC = permits.acquire({ waitMs: 5_000 }).then((release) => {
+        cGranted = true;
+        return release;
+    });
+    await settle();
+    await releaseA();
+    const releaseB = await waitingB;
+    await settle();
+    assert.equal(cGranted, false);
+    await releaseB();
+    const releaseC = await waitingC;
+    assert.equal(cGranted, true);
+    await releaseC();
+    assert.equal(store.held, 0);
+});
+
+test("one acquire keeps one member id across its takes", async () => {
+    let now = 0;
+    const store = new FakeStore(() => now);
+    const takes: string[] = [];
+    const takeOf = store.take.bind(store);
+    store.take = (key, member, limit, leaseMs, staleMs) => {
+        takes.push(member);
+        return takeOf(key, member, limit, leaseMs, staleMs);
+    };
+    const permits = new RedisExportPermits(store, 1, 60_000);
+    const release = await permits.acquire({ waitMs: 1_000 });
+    takes.length = 0;
+    await assert.rejects(permits.acquire({ waitMs: 100 }), /export is busy/);
+    assert.ok(takes.length > 1);
+    assert.equal(new Set(takes).size, 1);
+    await release();
+});
+
+test("a caller whose wait budget ends leaves the queue", async () => {
+    const store = new FakeStore(() => 0);
+    const permits = new RedisExportPermits(store, 1, 60_000);
+    const release = await permits.acquire({ waitMs: 1_000 });
+    await assert.rejects(permits.acquire({ waitMs: 30 }), /export is busy/);
+    assert.equal(store.waiters.size, 0);
+    await release();
+});
+
+test("a caller whose signal fires leaves the queue", async () => {
+    const store = new FakeStore(() => 0);
+    const permits = new RedisExportPermits(store, 1, 60_000);
+    const release = await permits.acquire({ waitMs: 1_000 });
+    const reason = new Error("the caller went away");
+    const controller = new AbortController();
+    const waiting = permits.acquire({ waitMs: 1_000, signal: controller.signal });
+    await settle();
+    assert.equal(store.waiters.size, 1);
+    controller.abort(reason);
+    await assert.rejects(waiting, (error: unknown) => error === reason);
+    assert.equal(store.waiters.size, 0);
+    await release();
+});
+
+test("a leave that throws is ignored", async () => {
+    const store = new FakeStore(() => 0);
+    store.leaveError = new Error("down");
+    const permits = new RedisExportPermits(store, 1, 60_000);
+    const release = await permits.acquire({ waitMs: 1_000 });
+    await assert.rejects(permits.acquire({ waitMs: 30 }), /export is busy/);
+    await release();
+});
+
+test("the Redis store grants permits in arrival order", { skip: skipWithoutRedis }, async () => {
+    const key = `penpot.mcp.test.${randomUUID()}`;
+    const store = new RedisExportPermitStore(requireRedisUri());
+    const [m1, m2, m3] = [randomUUID(), randomUUID(), randomUUID()];
+    try {
+        assert.equal(await store.take(key, m1, 1, 60_000, 3_000), true);
+        assert.equal(await store.take(key, m2, 1, 60_000, 3_000), false);
+        await settle();
+        assert.equal(await store.take(key, m3, 1, 60_000, 3_000), false);
+        await store.free(key, m1);
+        assert.equal(await store.take(key, m3, 1, 60_000, 3_000), false);
+        assert.equal(await store.take(key, m2, 1, 60_000, 3_000), true);
+        await store.free(key, m2);
+        assert.equal(await store.take(key, m3, 1, 60_000, 3_000), true);
+        await store.free(key, m3);
+    } finally {
+        await deleteTestKeys(key);
+        await store.close();
+    }
+});
+
+test("the Redis store drops a waiting caller that stopped asking", { skip: skipWithoutRedis }, async () => {
+    const key = `penpot.mcp.test.${randomUUID()}`;
+    const store = new RedisExportPermitStore(requireRedisUri());
+    const [m1, m2, m3] = [randomUUID(), randomUUID(), randomUUID()];
+    try {
+        assert.equal(await store.take(key, m1, 1, 60_000, 100), true);
+        assert.equal(await store.take(key, m2, 1, 60_000, 100), false);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        await store.free(key, m1);
+        assert.equal(await store.take(key, m3, 1, 60_000, 100), true);
+        await store.free(key, m3);
+    } finally {
+        await deleteTestKeys(key);
+        await store.close();
+    }
+});
+
+test("the Redis store forgets a caller that leaves", { skip: skipWithoutRedis }, async () => {
+    const key = `penpot.mcp.test.${randomUUID()}`;
+    const store = new RedisExportPermitStore(requireRedisUri());
+    const [m1, m2, m3] = [randomUUID(), randomUUID(), randomUUID()];
+    try {
+        assert.equal(await store.take(key, m1, 1, 60_000, 3_000), true);
+        assert.equal(await store.take(key, m2, 1, 60_000, 3_000), false);
+        await store.leave(key, m2);
+        await store.free(key, m1);
+        assert.equal(await store.take(key, m3, 1, 60_000, 3_000), true);
+        await store.free(key, m3);
+    } finally {
+        await deleteTestKeys(key);
+        await store.close();
+    }
+});
+
+test("two free permits go to the first two waiting callers", { skip: skipWithoutRedis }, async () => {
+    const key = `penpot.mcp.test.${randomUUID()}`;
+    const store = new RedisExportPermitStore(requireRedisUri());
+    const [m1, m2, m3, m4, m5] = [randomUUID(), randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+    try {
+        assert.equal(await store.take(key, m1, 2, 60_000, 3_000), true);
+        assert.equal(await store.take(key, m2, 2, 60_000, 3_000), true);
+        assert.equal(await store.take(key, m3, 2, 60_000, 3_000), false);
+        await settle();
+        assert.equal(await store.take(key, m4, 2, 60_000, 3_000), false);
+        await settle();
+        assert.equal(await store.take(key, m5, 2, 60_000, 3_000), false);
+        await store.free(key, m1);
+        await store.free(key, m2);
+        assert.equal(await store.take(key, m5, 2, 60_000, 3_000), false);
+        assert.equal(await store.take(key, m3, 2, 60_000, 3_000), true);
+        assert.equal(await store.take(key, m4, 2, 60_000, 3_000), true);
+        assert.equal(await store.take(key, m5, 2, 60_000, 3_000), false);
+    } finally {
+        await deleteTestKeys(key);
+        await store.close();
+    }
 });

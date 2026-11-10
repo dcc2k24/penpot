@@ -1,7 +1,10 @@
 import { createLogger } from "../logger";
-import { PermitGate } from "./PermitGate";
+import { BusyError, PermitGate } from "./PermitGate";
 import { Semaphore } from "./Semaphore";
 import type { SharedExportPermits } from "./RedisExportPermits";
+
+/** The gates a backend export passes, in order: the token gate, the process gate and the shared permit. */
+export type ExportGate = "token" | "process" | "shared";
 
 /** Options of one backend export: how long the whole call may take, and how long it may wait for a slot. */
 export interface BackendPermitOptions {
@@ -83,6 +86,9 @@ export class ExportConcurrency {
         );
     }
 
+    /** Number of busy refusals of each gate since the process started. */
+    private static readonly busy: Record<ExportGate, number> = { token: 0, process: 0, shared: 0 };
+
     /**
      * Sets the shared permits that every backend render takes after its process permit.
      *
@@ -90,6 +96,15 @@ export class ExportConcurrency {
      */
     public static setSharedPermits(permits: SharedExportPermits | undefined): void {
         ExportConcurrency.sharedPermits = permits;
+    }
+
+    /**
+     * Returns a copy of the busy refusal counts, one per gate, since the process started.
+     *
+     * @returns the number of exports refused as busy by each gate
+     */
+    public static busyCounts(): Readonly<Record<ExportGate, number>> {
+        return { ...ExportConcurrency.busy };
     }
 
     /** Per-token gates that hold at least one call, keyed by token digest. Dropped again when idle. */
@@ -176,13 +191,13 @@ export class ExportConcurrency {
     ): Promise<T> {
         const startedAt = Date.now();
         const run = () => Promise.race([task(wait.signal), ExportConcurrency.abortedAsRejection(wait.signal)]);
-        await tokenGate.acquire(wait);
+        await ExportConcurrency.countBusy("token", () => tokenGate.acquire(wait));
         try {
             const processGate = ExportConcurrency.backendGate;
             if (processGate === undefined) {
                 return await ExportConcurrency.runShared(run, wait, startedAt);
             }
-            await processGate.acquire(wait);
+            await ExportConcurrency.countBusy("process", () => processGate.acquire(wait));
             try {
                 return await ExportConcurrency.runShared(run, wait, startedAt);
             } finally {
@@ -210,12 +225,32 @@ export class ExportConcurrency {
             return run();
         }
         const remainingMs = Math.max(0, wait.waitMs - (Date.now() - startedAt));
-        const release = await shared.acquire({ waitMs: remainingMs, signal: wait.signal });
+        const release = await ExportConcurrency.countBusy("shared", () =>
+            shared.acquire({ waitMs: remainingMs, signal: wait.signal })
+        );
         try {
             return await run();
         } finally {
             await release();
         }
+    }
+
+    /**
+     * Runs one gate acquire and counts it when the gate refuses the call as busy. Any other rejection, such as the
+     * deadline signal's reason, passes through without a count.
+     *
+     * @param gate - the gate that the acquire belongs to
+     * @param acquire - the acquire to run
+     * @returns the value of the acquire
+     * @throws the rejection of the acquire, unchanged
+     */
+    private static countBusy<T>(gate: ExportGate, acquire: () => Promise<T>): Promise<T> {
+        return acquire().catch((error: unknown) => {
+            if (error instanceof BusyError) {
+                ExportConcurrency.busy[gate] += 1;
+            }
+            throw error;
+        });
     }
 
     /**

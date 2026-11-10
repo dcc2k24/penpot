@@ -1,40 +1,78 @@
 import { randomUUID } from "node:crypto";
 import Redis from "ioredis";
 import { createLogger } from "../logger";
-import type { PermitWait } from "./PermitGate";
+import { BusyError, type PermitWait } from "./PermitGate";
 import { ExportConcurrency } from "./ExportConcurrency";
 
 /**
- * Takes one permit of a sorted set, as one step.
+ * Takes one permit of a sorted set, as one step, in arrival order.
  *
- * KEYS[1]: the permit key. ARGV[1]: the member id. ARGV[2]: the limit. ARGV[3]: the lease in milliseconds.
- * Permits are scored by their expiry time. The clock is the Redis TIME, not the clock of the adapter, so adapters
- * with skewed clocks agree on which permits have expired. Returns 1 when the permit was taken, 0 when the set is full.
+ * KEYS[1]: the permit set. Scored by expiry, in the same format as before, so an older adapter on the same Redis
+ * still respects the cap. KEYS[2]: the waiting callers, scored by the Redis time of their first take, so that
+ * arrival order decides who gets a free permit; equal times order by member id. KEYS[3]: the same callers, scored
+ * by the Redis time of their last take. A caller that has not asked for `stale` milliseconds is dropped, so a caller
+ * that vanished cannot hold the head of the queue. A caller gets a permit only when its rank among the waiting
+ * callers is below the number of free permits.
+ *
+ * ARGV[1]: the member id. ARGV[2]: the limit. ARGV[3]: the lease in milliseconds. ARGV[4]: the stale time in
+ * milliseconds. The clock is the Redis TIME, not the clock of the adapter, so adapters with skewed clocks agree on
+ * which permits have expired. Returns 1 when the permit was taken, 0 when the caller must wait.
  */
 const TAKE_SCRIPT = `local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local member = ARGV[1]
 local limit = tonumber(ARGV[2])
 local lease = tonumber(ARGV[3])
+local stale = tonumber(ARGV[4])
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
-if redis.call('ZCARD', KEYS[1]) < limit then
-  redis.call('ZADD', KEYS[1], now + lease, ARGV[1])
+local gone = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', now - stale)
+for _, m in ipairs(gone) do
+  redis.call('ZREM', KEYS[2], m)
+  redis.call('ZREM', KEYS[3], m)
+end
+if not redis.call('ZSCORE', KEYS[2], member) then
+  redis.call('ZADD', KEYS[2], now, member)
+end
+redis.call('ZADD', KEYS[3], now, member)
+local free = limit - redis.call('ZCARD', KEYS[1])
+if free > 0 and redis.call('ZRANK', KEYS[2], member) < free then
+  redis.call('ZREM', KEYS[2], member)
+  redis.call('ZREM', KEYS[3], member)
+  redis.call('ZADD', KEYS[1], now + lease, member)
   redis.call('PEXPIRE', KEYS[1], lease + 1000)
   return 1
 end
+redis.call('PEXPIRE', KEYS[2], stale + 1000)
+redis.call('PEXPIRE', KEYS[3], stale + 1000)
 return 0`;
+
+/**
+ * The keys of the waiting callers of a permit set.
+ *
+ * The braces are a Redis Cluster hash tag whose text equals the permit key, so the permit set and both waiter sets
+ * land in one cluster slot.
+ *
+ * @param key - the key of the permit set
+ * @returns the key of the waiting callers by arrival, and the key of their last takes
+ */
+export function waiterKeysOf(key: string): { waiters: string; seen: string } {
+    return { waiters: `{${key}}:waiters`, seen: `{${key}}:seen` };
+}
 
 /** The Redis calls that the permits need, behind an interface so that tests can use an in-memory fake. */
 export interface ExportPermitStore {
     /**
-     * Takes a permit of the key when fewer than the limit are held.
+     * Takes a permit of the key when fewer than the limit are held and this caller is among the first waiting
+     * callers. A refused caller is kept as waiting, in arrival order, as long as it asks again within `staleMs`.
      *
      * @param key - the key of the permit set
-     * @param member - a unique id of this permit
+     * @param member - a unique id of this caller, the same for every take of one acquire
      * @param limit - permits that may be held at once
      * @param leaseMs - how long the permit stays held unless it is given back, in milliseconds
-     * @returns true when the permit was taken, false when the set is full
+     * @param staleMs - how long a waiting caller may go without asking before it loses its place, in milliseconds
+     * @returns true when the permit was taken, false when the caller must wait
      */
-    take(key: string, member: string, limit: number, leaseMs: number): Promise<boolean>;
+    take(key: string, member: string, limit: number, leaseMs: number, staleMs: number): Promise<boolean>;
     /**
      * Gives a permit back.
      *
@@ -42,11 +80,26 @@ export interface ExportPermitStore {
      * @param member - the id the permit was taken with
      */
     free(key: string, member: string): Promise<void>;
+    /**
+     * Removes a waiting caller, so that it no longer holds its place in the queue.
+     *
+     * @param key - the key of the permit set
+     * @param member - the id of the waiting caller
+     */
+    leave(key: string, member: string): Promise<void>;
 }
 
 /** The Redis client with the take script registered as a command. */
 type PermitClient = Redis & {
-    exportPermitTake(key: string, member: string, limit: string, leaseMs: string): Promise<unknown>;
+    exportPermitTake(
+        permitKey: string,
+        waitersKey: string,
+        seenKey: string,
+        member: string,
+        limit: string,
+        leaseMs: string,
+        staleMs: string
+    ): Promise<unknown>;
 };
 
 /**
@@ -75,11 +128,6 @@ export interface RedisExportPermitsOptions {
 
 const logger = createLogger("RedisExportPermits");
 
-/** Busy text of a wait that runs out. It is the text that PermitGate gives for the export gate. */
-function busyError(waitMs: number): Error {
-    return new Error(`export is busy, retry later: no slot was free for ${waitMs / 1000} seconds.`);
-}
-
 /** Resolves after the given time, or rejects with the signal's reason when the signal fires first. */
 function pause(ms: number, signal: AbortSignal | undefined): Promise<void> {
     return new Promise<void>((resolve, reject) => {
@@ -104,7 +152,9 @@ function pause(ms: number, signal: AbortSignal | undefined): Promise<void> {
  * Caps the renders across all adapters that share one Redis.
  *
  * Each permit is a member of one sorted set, scored by its expiry, so a crashed adapter frees its permits when
- * they expire. A caller that finds the set full polls with a short backoff until the wait budget ends.
+ * they expire. A caller that finds the set full waits in arrival order: it polls with a short backoff until the
+ * wait budget ends, and the first waiting callers get a freed permit. An older adapter on the same Redis takes a free
+ * permit without queuing, so the cap holds but the order does not until every adapter is upgraded.
  *
  * When Redis cannot answer, the shared permit is neither granted nor refused: the call goes on with the
  * in-process permits only. A busy refusal happens only when Redis answers and the cap is still full.
@@ -114,10 +164,12 @@ export class RedisExportPermits implements SharedExportPermits {
     public static readonly DEFAULT_KEY = "penpot.mcp.export.permits";
     /** First pause between two takes, in milliseconds. */
     private static readonly FIRST_PAUSE_MS = 20;
-    /** Longest pause between two takes, in milliseconds. */
-    private static readonly MAX_PAUSE_MS = 250;
+    /** Longest pause between two takes, in milliseconds. Short, so that waiting callers ask often enough. */
+    private static readonly MAX_PAUSE_MS = 100;
     /** Random extra pause, up to this many milliseconds, so waiting callers do not poll in step. */
     private static readonly JITTER_MS = 10;
+    /** A waiting caller that has not asked for this long loses its place, in milliseconds. */
+    private static readonly WAITER_STALE_MS = 3_000;
 
     private readonly key: string;
     private readonly warn: (error: unknown, message: string) => void;
@@ -173,22 +225,30 @@ export class RedisExportPermits implements SharedExportPermits {
     /**
      * Takes a shared permit, polling Redis until one is free or the wait budget is spent.
      *
+     * One member id serves every take of this call, so the caller keeps its place in the queue between polls.
+     *
      * @param wait - the wait budget, and the signal that ends the wait
      * @returns a function that gives the permit back; it never throws. It does nothing when the call went on
      *   without a shared permit because Redis failed.
-     * @throws Error with the busy text when the cap is still full at the end of the budget, or the signal's reason
+     * @throws BusyError when the cap is still full at the end of the budget, or the signal's reason
      */
     public async acquire(wait: PermitWait): Promise<() => Promise<void>> {
         if (wait.signal?.aborted === true) {
             throw wait.signal.reason;
         }
+        const member = randomUUID();
         const deadline = Date.now() + wait.waitMs;
         let pauseMs = RedisExportPermits.FIRST_PAUSE_MS;
         for (;;) {
-            const member = randomUUID();
             let taken: boolean;
             try {
-                taken = await this.store.take(this.key, member, this.limit, this.leaseMs);
+                taken = await this.store.take(
+                    this.key,
+                    member,
+                    this.limit,
+                    this.leaseMs,
+                    RedisExportPermits.WAITER_STALE_MS
+                );
             } catch (error) {
                 this.recordFailure(error);
                 return async () => undefined;
@@ -199,10 +259,16 @@ export class RedisExportPermits implements SharedExportPermits {
             }
             const remainingMs = deadline - Date.now();
             if (remainingMs <= 0) {
-                throw busyError(wait.waitMs);
+                await this.leave(member);
+                throw new BusyError("export", wait.waitMs);
             }
             const jitterMs = Math.floor(Math.random() * RedisExportPermits.JITTER_MS);
-            await pause(Math.min(pauseMs + jitterMs, remainingMs), wait.signal);
+            try {
+                await pause(Math.min(pauseMs + jitterMs, remainingMs), wait.signal);
+            } catch (error) {
+                await this.leave(member);
+                throw error;
+            }
             pauseMs = Math.min(pauseMs * 2, RedisExportPermits.MAX_PAUSE_MS);
         }
     }
@@ -221,6 +287,20 @@ export class RedisExportPermits implements SharedExportPermits {
                 this.releaseFailing = true;
                 this.warn(error, "Could not give back a shared export permit; its lease will free it");
             }
+        }
+    }
+
+    /**
+     * Removes a waiting caller from the queue. A failure is ignored, since a caller that stops asking loses its
+     * place by itself.
+     *
+     * @param member - the id of the waiting caller
+     */
+    private async leave(member: string): Promise<void> {
+        try {
+            await this.store.leave(this.key, member);
+        } catch {
+            // the stale rule drops the caller, so a failed leave needs no other action
         }
     }
 
@@ -262,7 +342,7 @@ export class RedisExportPermitStore implements ExportPermitStore {
             connectTimeout: 2000,
             commandTimeout: 2000,
         }) as PermitClient;
-        this.client.defineCommand("exportPermitTake", { numberOfKeys: 1, lua: TAKE_SCRIPT });
+        this.client.defineCommand("exportPermitTake", { numberOfKeys: 3, lua: TAKE_SCRIPT });
         // failed commands report the error to their caller, so the connection error needs no listener of its own
         this.client.on("error", () => undefined);
         // the first take waits for the first connection attempt, since queuing is off and would fail it
@@ -276,14 +356,24 @@ export class RedisExportPermitStore implements ExportPermitStore {
      * Takes a permit with the Lua script.
      *
      * @param key - the key of the permit set
-     * @param member - a unique id of this permit
+     * @param member - a unique id of this caller
      * @param limit - permits that may be held at once
      * @param leaseMs - lease in milliseconds
+     * @param staleMs - time without a take after which a waiting caller loses its place, in milliseconds
      * @returns true when the permit was taken
      */
-    public async take(key: string, member: string, limit: number, leaseMs: number): Promise<boolean> {
+    public async take(key: string, member: string, limit: number, leaseMs: number, staleMs: number): Promise<boolean> {
         await this.firstAttempt;
-        const reply = await this.client.exportPermitTake(key, member, String(limit), String(leaseMs));
+        const waiters = waiterKeysOf(key);
+        const reply = await this.client.exportPermitTake(
+            key,
+            waiters.waiters,
+            waiters.seen,
+            member,
+            String(limit),
+            String(leaseMs),
+            String(staleMs)
+        );
         return reply === 1;
     }
 
@@ -295,6 +385,17 @@ export class RedisExportPermitStore implements ExportPermitStore {
      */
     public async free(key: string, member: string): Promise<void> {
         await this.client.zrem(key, member);
+    }
+
+    /**
+     * Removes a waiting caller from both waiter sets.
+     *
+     * @param key - the key of the permit set
+     * @param member - the id of the waiting caller
+     */
+    public async leave(key: string, member: string): Promise<void> {
+        const waiters = waiterKeysOf(key);
+        await this.client.multi().zrem(waiters.waiters, member).zrem(waiters.seen, member).exec();
     }
 
     /** Closes the Redis connection. Call it when the store is no longer used. */

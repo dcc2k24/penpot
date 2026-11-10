@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { ExportConcurrency } from "./ExportConcurrency";
+import { BusyError } from "./PermitGate";
 
 test("the backend export gate allows four concurrent exports by default", () => {
     assert.equal(ExportConcurrency.readBackendMaximum({}), 4);
@@ -168,7 +169,7 @@ test("a refused shared permit gives the busy error and frees the token and proce
     ExportConcurrency.setSharedPermits({
         acquire: async () => {
             if (refuse) {
-                throw new Error("export is busy, retry later: no slot was free for 0.02 seconds.");
+                throw new BusyError("export", 20);
             }
             return async () => undefined;
         },
@@ -183,6 +184,47 @@ test("a refused shared permit gives the busy error and frees the token and proce
     } finally {
         ExportConcurrency.setSharedPermits(undefined);
     }
+});
+
+test("a busy refusal is counted under the gate that refused it", async () => {
+    const before = ExportConcurrency.busyCounts();
+    const holder = holdRender("token-counted");
+    await holder.started;
+    await assert.rejects(
+        ExportConcurrency.withBackendPermit("token-counted", async () => "late", { waitMs: 10 }),
+        /export is busy/
+    );
+    holder.release();
+    await holder.done;
+    const afterToken = ExportConcurrency.busyCounts();
+    assert.equal(afterToken.token - before.token, 1);
+    assert.equal(afterToken.shared - before.shared, 0);
+
+    ExportConcurrency.setSharedPermits({
+        acquire: async () => {
+            throw new BusyError("export", 10);
+        },
+    });
+    try {
+        await assert.rejects(
+            ExportConcurrency.withBackendPermit("token-counted-shared", async () => "never"),
+            /export is busy/
+        );
+    } finally {
+        ExportConcurrency.setSharedPermits(undefined);
+    }
+    const afterShared = ExportConcurrency.busyCounts();
+    assert.equal(afterShared.shared - afterToken.shared, 1);
+    assert.equal(afterShared.token - afterToken.token, 0);
+
+    await assert.rejects(
+        ExportConcurrency.withBackendPermit("token-counted-deadline", () => new Promise<never>(() => undefined), {
+            timeoutMs: 20,
+        }),
+        /did not finish within/
+    );
+    const afterDeadline = ExportConcurrency.busyCounts();
+    assert.deepEqual(afterDeadline, afterShared);
 });
 
 test("the shared permit lease covers the render timeout with a margin of 5 seconds", () => {
