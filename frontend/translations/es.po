@@ -559,6 +559,12 @@ msgstr ""
 msgid "dashboard.export-shapes.how-to-link"
 msgstr "Información sobre cómo configurar exportaciones en Penpot."
 
+#: src/app/main/ui/exports/assets.cljs:171
+msgid "dashboard.export-shapes.missing-fonts"
+msgstr ""
+"Algunos textos usan fuentes que no están disponibles (%s). La exportación "
+"los dibujará con una fuente alternativa."
+
 #: src/app/main/ui/exports/assets.cljs:178
 msgid "dashboard.export-shapes.no-elements"
 msgstr "No hay elementos con configuraciones de exportación."
@@ -7553,6 +7559,12 @@ msgstr "Inicio de flujo"
 msgid "workspace.options.flows.flow-starts"
 msgstr "Inicios de flujo"
 
+#: src/app/main/ui/workspace/sidebar/options/menus/text.cljs:553
+msgid "workspace.options.font-missing-warning"
+msgstr ""
+"Fuente no encontrada: %s. Este texto se dibuja con una fuente alternativa, "
+"aquí y en las exportaciones."
+
 #: src/app/main/ui/workspace/sidebar/options/menus/text.cljs:526
 msgid "workspace.options.font-not-available"
 msgstr ""
@@ -7986,6 +7998,32 @@ msgstr "No hay tamaños predefinidos coincidentes"
 #: src/app/main/ui/workspace/sidebar/options/menus/layer.cljs:240, src/app/main/ui/workspace/sidebar/options/menus/layer.cljs:297
 msgid "workspace.options.opacity"
 msgstr "Opacidad"
+
+#: src/app/main/ui/workspace/sidebar/options/menus/measures.cljs:783
+msgid "workspace.options.overflow-scroll"
+msgstr "Desplazamiento"
+
+#: src/app/main/ui/workspace/sidebar/options/menus/measures.cljs:349
+msgid "workspace.options.overflow-scroll.both"
+msgstr "Ambas direcciones"
+
+#: src/app/main/ui/workspace/sidebar/options/menus/measures.cljs:348
+msgid "workspace.options.overflow-scroll.horizontal"
+msgstr "Horizontal"
+
+#: src/app/main/ui/workspace/sidebar/options/menus/measures.cljs:346
+msgid "workspace.options.overflow-scroll.none"
+msgstr "Sin desplazamiento"
+
+#: src/app/main/ui/workspace/sidebar/options/menus/measures.cljs:784
+msgid "workspace.options.overflow-scroll.tooltip"
+msgstr ""
+"Marca este tablero como contenedor con desplazamiento para prototipos y "
+"exportación de código. El visor todavía no lo desplaza."
+
+#: src/app/main/ui/workspace/sidebar/options/menus/measures.cljs:347
+msgid "workspace.options.overflow-scroll.vertical"
+msgstr "Vertical"
 
 #: src/app/main/ui/workspace/sidebar/options/page.cljs:99, src/app/main/ui/workspace/sidebar/options/page.cljs:106
 msgid "workspace.options.pixel-grid-color"
@@ -8876,6 +8914,10 @@ msgstr "Componentes"
 #: src/app/main/ui/workspace/sidebar/layers.cljs:585
 msgid "workspace.sidebar.layers.filter"
 msgstr "Filtrar"
+
+#: src/app/main/ui/workspace/sidebar/layer_item.cljs:79
+msgid "workspace.sidebar.layers.font-missing"
+msgstr "Fuente no encontrada: %s"
 
 #: src/app/main/ui/workspace/sidebar/layers.cljs:649, src/app/main/ui/workspace/sidebar/layers.cljs:680
 msgid "workspace.sidebar.layers.frames"

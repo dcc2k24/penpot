@@ -40,6 +40,26 @@
          (filter #(some? (:font-id %)))
          (remove #(installed? (:font-id %))))))
 
+(defn shape-missing-fonts
+  "Returns a vector of {:font-id :font-family} for the fonts of the text
+  `shape` that are not installed, one entry per font id, sorted by family
+  then font id. Only the content of `shape` itself is read. A shape that
+  is not a text yields [] and `installed?` is never called. Leaves without
+  a font id use the default font and are never reported."
+  [shape installed?]
+  (if (= :text (:type shape))
+    (->> (missing-leaves installed? shape)
+         (reduce (fn [acc {:keys [font-id font-family]}]
+                   (if (contains? acc font-id)
+                     acc
+                     (assoc acc font-id {:font-id     font-id
+                                         :font-family (or font-family font-id)})))
+                 {})
+         (vals)
+         (sort-by (juxt :font-family :font-id) compare)
+         (vec))
+    []))
+
 (defn objects-with-exports
   "Returns `objects` with the shapes carried by `exports` added for the
   ids that `objects` does not hold. Page objects win over a carried shape

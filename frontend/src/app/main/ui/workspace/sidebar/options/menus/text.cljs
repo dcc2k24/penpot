@@ -316,8 +316,10 @@
         font            (get fonts font-id)
 
         objects         (mf/deref refs/workspace-page-objects)
-        missing         (mf/with-memo [objects ids fonts]
-                          (fonts-missing/get-missing-fonts objects ids fonts/installed?))
+        fonts-fetched?  (mf/deref refs/team-fonts-fetched?)
+        missing         (mf/with-memo [objects ids fonts fonts-fetched?]
+                          (when fonts-fetched?
+                            (fonts-missing/get-missing-fonts objects ids fonts/installed?)))
 
         token-dropdown-open* (mf/use-state false)
         token-dropdown-open? (deref token-dropdown-open*)

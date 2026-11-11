@@ -16,8 +16,10 @@
    [app.common.types.container :as ctn]
    [app.common.types.shape.layout :as ctl]
    [app.common.uuid :as uuid]
+   [app.main.data.fonts-missing :as fonts-missing]
    [app.main.data.workspace :as dw]
    [app.main.data.workspace.collapse :as dwc]
+   [app.main.fonts :as fonts]
    [app.main.refs :as refs]
    [app.main.store :as st]
    [app.main.ui.context :as ctx]
@@ -59,6 +61,31 @@
          (when (seq enter)
            (apply st/emit! (map dw/highlight-shape enter))))))))
 
+(mf/defc missing-font-badge*
+  "Warning mark for a text layer whose font is not installed. It reads
+  the font database itself, so only text rows subscribe to it. It shows
+  nothing until the team fonts have been fetched, so a row never flashes
+  a badge for a team font that has not arrived yet."
+  {::mf/wrap [mf/memo]}
+  [{:keys [content]}]
+  (let [fonts          (mf/deref fonts/fontsdb)
+        fonts-fetched? (mf/deref refs/team-fonts-fetched?)
+        missing        (mf/with-memo [content fonts fonts-fetched?]
+                         (when fonts-fetched?
+                           (fonts-missing/shape-missing-fonts
+                            {:type :text :content content}
+                            #(contains? fonts %))))]
+    (when (seq missing)
+      (let [label (tr "workspace.sidebar.layers.font-missing"
+                      (fonts-missing/families-label missing))]
+        [:span {:class (stl/css :missing-font)
+                :role "img"
+                :title label
+                :aria-label label}
+         [:> icon* {:icon-id i/msg-warning
+                    :size "s"
+                    :aria-hidden true}]]))))
+
 (mf/defc layer-item-inner*
   [{:keys [item depth parent-size name-ref children ref style rename-id
            ;; Flags
@@ -89,7 +116,34 @@
         variant-properties    (-> (ctkl/get-component data component-id)
                                   (get :variant-properties))
 
-        icon-shape            (usi/get-shape-icon item)]
+        icon-shape            (usi/get-shape-icon item)
+        text?                 (cfh/text-shape? item)
+
+        ;; Built with mf/html: a hiccup vector bound to a local is not
+        ;; compiled and would reach React as data.
+        name-node
+        (mf/html
+         [:> layer-name* {:ref name-ref
+                          :rename-id rename-id
+                          :shape-id id
+                          :shape-name name
+                          :is-shape-touched touched?
+                          :disabled-double-click is-read-only
+                          :on-start-edit on-disable-drag
+                          :on-stop-edit on-enable-drag
+                          :depth depth
+                          :is-blocked blocked?
+                          :parent-size parent-size
+                          :is-selected is-selected
+                          :type-comp (or is-component-tree is-variant-container?)
+                          :type-frame (cfh/frame-shape? item)
+                          :variant-id variant-id
+                          :variant-name variant-name
+                          :variant-properties variant-properties
+                          :variant-error variant-error
+                          :component-id component-id
+                          :is-hidden hidden?
+                          :on-tab-press on-tab-press}])]
 
     [:*
      [:div {:id id
@@ -156,27 +210,11 @@
              [:div {:class (stl/css :absolute)}])
            [:> icon* {:icon-id icon-shape :size "s" :data-testid (str "icon-" icon-shape)}]]])
 
-       [:> layer-name* {:ref name-ref
-                        :rename-id rename-id
-                        :shape-id id
-                        :shape-name name
-                        :is-shape-touched touched?
-                        :disabled-double-click is-read-only
-                        :on-start-edit on-disable-drag
-                        :on-stop-edit on-enable-drag
-                        :depth depth
-                        :is-blocked blocked?
-                        :parent-size parent-size
-                        :is-selected is-selected
-                        :type-comp (or is-component-tree is-variant-container?)
-                        :type-frame (cfh/frame-shape? item)
-                        :variant-id variant-id
-                        :variant-name variant-name
-                        :variant-properties variant-properties
-                        :variant-error variant-error
-                        :component-id component-id
-                        :is-hidden hidden?
-                        :on-tab-press on-tab-press}]]
+       (if ^boolean text?
+         [:div {:class (stl/css :name-cell)}
+          name-node
+          [:> missing-font-badge* {:content (:content item)}]]
+         name-node)]
       (when (not ^boolean is-read-only)
         [:div {:class (stl/css-case
                        :element-actions true

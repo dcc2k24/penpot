@@ -90,7 +90,7 @@
 .element-list-body {
   align-items: center;
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   column-gap: var(--sp-xs);
   block-size: $sz-32;
   inline-size: calc(100% - (var(--depth) * var(--layer-indentation-size)));
@@ -117,6 +117,22 @@
   .layer-row:hover & {
     display: flex;
   }
+}
+
+// Holds the name and the missing-font badge of a text row in one grid
+// cell, so the badge keeps its place however many nodes the name renders.
+.name-cell {
+  display: flex;
+  align-items: center;
+  min-inline-size: 0;
+  block-size: 100%;
+}
+
+.missing-font {
+  display: flex;
+  flex: none;
+  align-items: center;
+  color: var(--color-accent-warning);
 }
 
 .button-content {

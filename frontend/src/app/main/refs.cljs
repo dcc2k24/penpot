@@ -309,6 +309,12 @@
                  (dm/get-in state [:recent-fonts file-id])))
              st/state))
 
+(def team-fonts-fetched?
+  "True once the team fonts of the current team are in the state, that is
+  once `fonts-fetched` has run. Before that, a font that belongs to the team
+  is not in the font database yet and must not be reported as missing."
+  (l/derived #(some? (:fonts %)) st/state))
+
 (def workspace-file-typography
   (l/derived :typographies workspace-data))
 

@@ -7928,7 +7928,9 @@ msgstr "No scrolling"
 
 #: src/app/main/ui/workspace/sidebar/options/menus/measures.cljs:784
 msgid "workspace.options.overflow-scroll.tooltip"
-msgstr "Marks this board as a scroll container for prototypes and code export. The viewer does not scroll it yet."
+msgstr ""
+"Marks this board as a scroll container for prototypes and code export. The "
+"viewer does not scroll it yet."
 
 #: src/app/main/ui/workspace/sidebar/options/menus/measures.cljs:347
 msgid "workspace.options.overflow-scroll.vertical"
@@ -8819,6 +8821,10 @@ msgstr "Components"
 #: src/app/main/ui/workspace/sidebar/layers.cljs:585
 msgid "workspace.sidebar.layers.filter"
 msgstr "Filter"
+
+#: src/app/main/ui/workspace/sidebar/layer_item.cljs:79
+msgid "workspace.sidebar.layers.font-missing"
+msgstr "Missing font: %s"
 
 #: src/app/main/ui/workspace/sidebar/layers.cljs:649, src/app/main/ui/workspace/sidebar/layers.cljs:680
 msgid "workspace.sidebar.layers.frames"

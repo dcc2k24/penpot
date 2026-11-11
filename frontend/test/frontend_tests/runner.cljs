@@ -16,7 +16,7 @@
    [frontend-tests.data.exports-assets-test]
    [frontend-tests.data.exports-files-test]
    [frontend-tests.data.fix-deleted-fonts-test]
-  [frontend-tests.data.fonts-missing-test]
+   [frontend-tests.data.fonts-missing-test]
    [frontend-tests.data.imports-test]
    [frontend-tests.data.jobs-test]
    [frontend-tests.data.modal-test]
@@ -142,6 +142,7 @@
    [frontend-tests.ui.inspect-geometry-test]
    [frontend-tests.ui.inspect-stroke-tokens-test]
    [frontend-tests.ui.jobs-progress-test]
+   [frontend-tests.ui.layer-missing-font-test]
    [frontend-tests.ui.layout-container-multiple-test]
    [frontend-tests.ui.mcp-authorize-test]
    [frontend-tests.ui.measurements-test]
@@ -151,7 +152,7 @@
    [frontend-tests.ui.settings-password-schema-test]
    [frontend-tests.ui.settings-shortcuts-test]
    [frontend-tests.ui.shape-filters-test]
-  [frontend-tests.ui.shapes-per-side-stroke-test]
+   [frontend-tests.ui.shapes-per-side-stroke-test]
    [frontend-tests.ui.shortcuts-labels-test]
    [frontend-tests.ui.sidebar-scroll-test]
    [frontend-tests.ui.sortable-auto-scroll-test]
@@ -329,6 +330,7 @@
    'frontend-tests.ui.inspect-geometry-test
    'frontend-tests.ui.inspect-stroke-tokens-test
    'frontend-tests.ui.jobs-progress-test
+   'frontend-tests.ui.layer-missing-font-test
    'frontend-tests.ui.layout-container-multiple-test
    'frontend-tests.ui.measurements-test
    'frontend-tests.ui.measures-menu-props-test

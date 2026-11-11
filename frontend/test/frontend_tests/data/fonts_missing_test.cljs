@@ -112,3 +112,38 @@
   (t/is (= "Alpha, Zeta"
            (fonts-missing/families-label [{:font-family "Alpha"}
                                           {:font-family "Zeta"}]))))
+
+(t/deftest shape-missing-fonts-reports-a-missing-font
+  (let [shape (text-shape (uuid/next) [(leaf "Hi" "gfont-access-sans" "Access Sans")])]
+    (t/is (= [{:font-id "gfont-access-sans" :font-family "Access Sans"}]
+             (fonts-missing/shape-missing-fonts shape installed?)))))
+
+(t/deftest shape-missing-fonts-ignores-installed-fonts
+  (let [shape (text-shape (uuid/next) [(leaf "Hi" "sourcesanspro" "Source Sans Pro")])]
+    (t/is (= [] (fonts-missing/shape-missing-fonts shape installed?)))))
+
+(t/deftest shape-missing-fonts-reports-a-mixed-family-once
+  (let [shape (text-shape (uuid/next)
+                          [(leaf "Hi" "sourcesanspro" "Source Sans Pro")
+                           (leaf " a" "gfont-x" "Gamma X")
+                           (leaf " b" "gfont-x" "Gamma X")
+                           (leaf " c" "gfont-alpha" "Alpha")])]
+    (t/is (= [{:font-id "gfont-alpha" :font-family "Alpha"}
+              {:font-id "gfont-x" :font-family "Gamma X"}]
+             (fonts-missing/shape-missing-fonts shape installed?)))))
+
+(t/deftest shape-missing-fonts-leaves-without-font-id-use-the-default
+  (let [shape (text-shape (uuid/next) [{:text "Hi" :font-family "Fallback"}])]
+    (t/is (= [] (fonts-missing/shape-missing-fonts shape installed?)))))
+
+(t/deftest shape-missing-fonts-skips-non-text-shapes
+  (let [calls (atom 0)
+        count-installed? (fn [_] (swap! calls inc) false)
+        board {:id (uuid/next) :type :frame :shapes []}
+        ;; A non-text shape never carries content, but even if it did the
+        ;; check must not run.
+        odd   (assoc board :content (:content (text-shape (uuid/next) [(leaf "Hi" "gfont-x" "X")])))]
+    (t/is (= [] (fonts-missing/shape-missing-fonts board count-installed?)))
+    (t/is (= [] (fonts-missing/shape-missing-fonts odd count-installed?)))
+    (t/is (= [] (fonts-missing/shape-missing-fonts nil count-installed?)))
+    (t/is (zero? @calls))))
