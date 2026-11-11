@@ -96,7 +96,13 @@ test("loadPage pages the tree with the cursor and fetches the shapes in tree ord
 
     const treeCalls = backend.callsTo("get-mcp-page-tree");
     assert.equal(treeCalls.length, 2);
-    assert.deepEqual(treeCalls[0]?.params, { fileId: FILE, pageId: PAGE, depth: 20, limit: 5000 });
+    assert.deepEqual(treeCalls[0]?.params, {
+        fileId: FILE,
+        pageId: PAGE,
+        depth: 20,
+        limit: 5000,
+        estimateSize: true,
+    });
     assert.deepEqual(treeCalls[1]?.params, { fileId: FILE, pageId: PAGE, depth: 20, limit: 5000, cursor: "cursor-2" });
     const shapeCalls = backend.callsTo("get-mcp-shapes");
     assert.equal(shapeCalls.length, 1);
@@ -1188,6 +1194,8 @@ interface PageEntry {
     id: string;
     parentId: string;
     name?: string;
+    /** Makes the entry a board with this layout: its children are stored in the reverse of their visual order. */
+    layout?: "flex" | "grid";
 }
 
 /** The id of the page root, which the backend names with the nil uuid. */
@@ -1213,27 +1221,39 @@ const PAGE_REVN = 9;
 /**
  * Answers the page commands for a flat list of shapes, as the backend does. The tree starts at the root that the call
  * names, or at the page root, and stops at `depth` levels: a node below the last level lists no children and reports
- * its `childCount`. A root the page does not hold fails with `shape-not-found`. A shape reply carries the stored child
- * list of each shape, and can be cut short with `shapeReplyLimit`. The list `entries` is read at each call, so a test
- * can change the page between two loads.
+ * its `childCount`. The children of a board with a layout come in the reverse of their stored order, as the tree
+ * command of the backend does (`shape-children` in `backend/src/app/rpc/commands/mcp.clj`). A root the page does not
+ * hold fails with `shape-not-found`. A shape reply carries the stored child list of each shape, and can be cut short
+ * with `shapeReplyLimit`. The list `entries` is read at each call, so a test can change the page between two loads.
+ *
+ * The shape reply mirrors `get-mcp-shapes` of the backend, whose order the backend test
+ * `shapes-with-children-come-in-stored-order-children-first` pins: with `includeChildren` the descendants of each requested shape
+ * follow it, in stored child order, all the children of a shape before the descendants of its first child
+ * (`get-children-ids` in `common/src/app/common/files/helpers.cljc`); with `includeAncestors` the ancestors of the
+ * requested shapes up to the page root come first, top down, each once (`get-ancestor-ids` in `mcp.clj`).
  *
  * @param entries - the shapes of the page, in stored order
- * @param options - the limit of a shape reply
+ * @param options - the limit of a shape reply, and the size estimate that the first tree window reports
  * @returns the answers of the commands
  */
 function partialPage(
     entries: PageEntry[],
-    options: { shapeReplyLimit?: number } = {}
+    options: { shapeReplyLimit?: number; estimate?: { totalShapes: number; estimatedBytes: number } } = {}
 ): { tree: (params: object) => unknown; shapes: (params: object) => unknown; importSvg: () => unknown } {
     const childrenOf = (id: string): string[] =>
         entries.filter((entry) => entry.parentId === id).map((entry) => entry.id);
+    const visualChildrenOf = (id: string): string[] => {
+        const children = childrenOf(id);
+        return entries.find((entry) => entry.id === id)?.layout === undefined ? children : children.reverse();
+    };
     const recordsOf = (): Map<string, Record<string, unknown>> => {
         const records = new Map<string, Record<string, unknown>>();
         records.set(PAGE_ROOT, { id: PAGE_ROOT, name: "Root", shapes: childrenOf(PAGE_ROOT), x: 0, y: 0 });
         for (const entry of entries) {
             records.set(entry.id, {
                 id: entry.id,
-                type: "rect",
+                type: entry.layout === undefined ? "rect" : "frame",
+                ...(entry.layout === undefined ? {} : { layout: entry.layout }),
                 name: entry.name ?? entry.id,
                 parentId: entry.parentId,
                 shapes: childrenOf(entry.id),
@@ -1247,7 +1267,15 @@ function partialPage(
     };
     return {
         tree: (params: object) => {
-            const { rootId = PAGE_ROOT, depth = 20 } = params as { rootId?: string; depth?: number };
+            const {
+                rootId = PAGE_ROOT,
+                depth = 20,
+                estimateSize = false,
+            } = params as {
+                rootId?: string;
+                depth?: number;
+                estimateSize?: boolean;
+            };
             if (!recordsOf().has(rootId)) {
                 throw new BackendRpcError(400, "get-mcp-page-tree", {
                     type: "not-found",
@@ -1258,14 +1286,50 @@ function partialPage(
             const build = (id: string, level: number): { id: string; childCount: number; children: unknown[] } => ({
                 id,
                 childCount: childrenOf(id).length,
-                children: level < depth ? childrenOf(id).map((child) => build(child, level + 1)) : [],
+                children: level < depth ? visualChildrenOf(id).map((child) => build(child, level + 1)) : [],
             });
-            return { revn: PAGE_REVN, pageId: PAGE, root: build(rootId, 1), truncated: false };
+            return {
+                revn: PAGE_REVN,
+                pageId: PAGE,
+                root: build(rootId, 1),
+                truncated: false,
+                ...(estimateSize ? (options.estimate ?? {}) : {}),
+            };
         },
         shapes: (params: object) => {
-            const ids = (params as { ids: string[] }).ids;
+            const {
+                ids,
+                includeChildren = false,
+                includeAncestors = false,
+            } = params as {
+                ids: string[];
+                includeChildren?: boolean;
+                includeAncestors?: boolean;
+            };
             const records = recordsOf();
-            const present = ids.filter((id) => records.has(id));
+            const found = [...new Set(ids)].filter((id) => records.has(id));
+            const below = (id: string): string[] => {
+                const kids = childrenOf(id);
+                return [...kids, ...kids.flatMap(below)];
+            };
+            const chosen = includeChildren ? [...new Set(found.flatMap((id) => [id, ...below(id)]))] : found;
+            const seen = new Set(chosen);
+            const ancestors: string[] = [];
+            if (includeAncestors) {
+                for (const id of found) {
+                    const chain: string[] = [];
+                    let parent = records.get(id)?.parentId as string | undefined;
+                    while (parent !== undefined && records.has(parent) && !seen.has(parent)) {
+                        chain.unshift(parent);
+                        parent = records.get(parent)?.parentId as string | undefined;
+                    }
+                    for (const link of chain) {
+                        seen.add(link);
+                        ancestors.push(link);
+                    }
+                }
+            }
+            const present = [...ancestors, ...chosen];
             const kept = options.shapeReplyLimit === undefined ? present : present.slice(0, options.shapeReplyLimit);
             return {
                 revn: PAGE_REVN,
@@ -1338,9 +1402,10 @@ test("a partial load of one root reads its subtree and its ancestors, and marks 
 
     assert.equal(loaded.partial, true);
     assert.deepEqual(idsOf(loaded), [PAGE_ROOT, "board", "c2", "c2a"]);
+    assert.equal(backend.callsTo("get-mcp-page-tree").length, 0, "a partial load makes no tree call");
     assert.deepEqual(
-        backend.callsTo("get-mcp-page-tree").map((call) => call.params),
-        [{ fileId: FILE, pageId: PAGE, depth: 20, limit: 5000, rootId: "c2" }]
+        backend.callsTo("get-mcp-shapes").map((call) => call.params),
+        [{ fileId: FILE, pageId: PAGE, ids: ["c2"], includeChildren: true, includeAncestors: true }]
     );
     const requested = backend.callsTo("get-mcp-shapes").flatMap((call) => (call.params as { ids: string[] }).ids);
     for (const id of requested) {
@@ -1370,7 +1435,8 @@ test("two roots, one inside the other, load each shape once, with the roots in t
 
     const loaded = JSON.parse(await host.loadPage(FILE, PAGE));
 
-    assert.equal(backend.callsTo("get-mcp-page-tree").length, 2);
+    assert.equal(backend.callsTo("get-mcp-page-tree").length, 0, "a partial load makes no tree call");
+    assert.equal(backend.callsTo("get-mcp-shapes").length, 1);
     assert.deepEqual(idsOf(loaded), [PAGE_ROOT, "board", "c1", "c2", "c2a"]);
     const requested = backend.callsTo("get-mcp-shapes").flatMap((call) => (call.params as { ids: string[] }).ids);
     assert.equal(new Set(requested).size, requested.length, "a shape was asked for twice");
@@ -1411,9 +1477,10 @@ test("a root that is itself above the cap fails with the limit and the way out",
     }
     const { host } = scopedHost(backendOf(partialPage(entries)), ["big"], 512 * 1024);
 
+    // the count is of the shapes received: the 301 under the root and the page root, which came as its ancestor
     await assert.rejects(host.loadPage(FILE, PAGE), {
         message:
-            /^page .* has 301 shapes \(about [0-9.]+ MB\); the limit is 0\.5 MB \(PENPOT_MCP_SANDBOX_PAGE_MB\)\. Pass fewer or smaller rootIds, or use export_subtree, get_shapes and find_shapes for reads\.$/,
+            /^page .* has 302 shapes \(about [0-9.]+ MB\); the limit is 0\.5 MB \(PENPOT_MCP_SANDBOX_PAGE_MB\)\. Pass fewer or smaller rootIds, or use export_subtree, get_shapes and find_shapes for reads\.$/,
     });
 });
 
@@ -1447,7 +1514,7 @@ test("a shape reply that is cut short is asked again, so both roots load", async
     assert.deepEqual(idsOf(loaded), [PAGE_ROOT, "board", "c1", "c2", "c2a"]);
 });
 
-test("a chain 25 deep below a root loads completely, by a second tree call from the cut node", async () => {
+test("a chain 25 deep below a root loads completely, in one shape call and no tree call", async () => {
     const entries: PageEntry[] = [{ id: "top", parentId: PAGE_ROOT }];
     let parent = "top";
     for (let level = 0; level < 24; level += 1) {
@@ -1461,11 +1528,78 @@ test("a chain 25 deep below a root loads completely, by a second tree call from 
 
     assert.equal(loaded.shapes.length, 26);
     assert.equal(loaded.shapes[loaded.shapes.length - 1].id, "d23");
-    assert.equal(backend.callsTo("get-mcp-page-tree").length, 2);
+    assert.equal(backend.callsTo("get-mcp-page-tree").length, 0, "a partial load makes no tree call");
+    assert.equal(backend.callsTo("get-mcp-shapes").length, 1);
     assert.deepEqual(
         (host.summary().warnings as Array<{ code: string }>).map((warning) => warning.code),
         ["partial-page"]
     );
+});
+
+/**
+ * Builds a page of one root with many sections, each with one large leaf, and a first reply that is cut short.
+ *
+ * @param sections - number of sections under the root `R`
+ * @returns the answers of the shape command, with the first call cut to 50 shapes, and the shapes
+ */
+function wideSections(sections: number): { shapes: (params: object) => unknown; count: number } {
+    const entries: PageEntry[] = [{ id: "R", parentId: PAGE_ROOT }];
+    for (let index = 0; index < sections; index += 1) {
+        entries.push({ id: `g${index}`, parentId: "R" });
+        entries.push({ id: `l${index}`, parentId: `g${index}`, name: "x".repeat(8192) });
+    }
+    const page = partialPage(entries);
+    return {
+        count: entries.length,
+        shapes: (params: object) => {
+            const reply = page.shapes(params) as { shapes: unknown[]; truncated: boolean };
+            const first = (params as { includeAncestors?: boolean }).includeAncestors === true;
+            return first ? { ...reply, shapes: reply.shapes.slice(0, 50), truncated: true } : reply;
+        },
+    };
+}
+
+test("a partial load stops at the reply that passes the cap, and starts no further call", async () => {
+    const wide = wideSections(1200);
+    const backend = new FakePenpotBackend().respond("get-mcp-shapes", wide.shapes);
+    const { host } = scopedHost(backend, ["R"], 2 * 1024 * 1024);
+
+    await assert.rejects(host.loadPage(FILE, PAGE), {
+        message:
+            /^page .* shapes \(about [0-9.]+ MB\); the limit is 2 MB \(PENPOT_MCP_SANDBOX_PAGE_MB\)\. Pass fewer or smaller rootIds/,
+    });
+
+    // the round after the first would make 6 calls of 200 ids; a reply of 1.6 MB twice passes the cap
+    assert.ok(backend.callsTo("get-mcp-shapes").length <= 4, `calls ${backend.callsTo("get-mcp-shapes").length}`);
+    assert.equal(backend.callsTo("get-mcp-page-tree").length, 0);
+});
+
+test("a backend error in the middle of a round fails the load with that error and starts no further call", async () => {
+    const wide = wideSections(1200);
+    let seen = 0;
+    const backend = new FakePenpotBackend().respond("get-mcp-shapes", (params: object) => {
+        seen += 1;
+        if (seen === 3) {
+            throw new Error("backend broke on the third call");
+        }
+        return wide.shapes(params);
+    });
+    const { host } = scopedHost(backend, ["R"]);
+
+    await assert.rejects(host.loadPage(FILE, PAGE), { message: "backend broke on the third call" });
+
+    assert.ok(backend.callsTo("get-mcp-shapes").length <= 4, `calls ${backend.callsTo("get-mcp-shapes").length}`);
+});
+
+test("a partial load that fits makes the same calls as before", async () => {
+    const wide = wideSections(1200);
+    const backend = new FakePenpotBackend().respond("get-mcp-shapes", wide.shapes);
+    const { host } = scopedHost(backend, ["R"]);
+
+    const loaded = JSON.parse(await host.loadPage(FILE, PAGE));
+
+    assert.equal(loaded.shapes.length, wide.count + 1, "every shape and the page root");
+    assert.equal(backend.callsTo("get-mcp-shapes").length, 7, "1 call for the roots and 6 of 200 ids");
 });
 
 test("a refresh drops a root that the backend no longer holds, and goes on", async () => {
@@ -1552,4 +1686,289 @@ test("an ancestor whose only loaded child is another ancestor is still partial",
     assert.equal(byId.get("S")?.partialChildren, true, "a stub must always be partial");
     assert.equal(byId.get("T")?.partialChildren, true);
     assert.equal(byId.get(PAGE_ROOT)?.partialChildren, true, "the page root is partial under rootIds");
+});
+
+/** A fake backend that holds each call for a few milliseconds and records the most calls that ran at once. */
+class TrackingBackend extends FakePenpotBackend {
+    /** Calls that have started and not finished. */
+    public inFlight = 0;
+    /** Most calls that ran at the same time. */
+    public maxInFlight = 0;
+
+    public override async callCommand<T = unknown>(userToken: string, name: string, params: object): Promise<T> {
+        this.inFlight += 1;
+        this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
+        try {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            return await super.callCommand<T>(userToken, name, params);
+        } finally {
+            this.inFlight -= 1;
+        }
+    }
+}
+
+/** Returns the parameters of the `get-mcp-shapes` calls of a backend. */
+function shapeCallsOf(backend: FakePenpotBackend): Array<{ ids: string[]; includeChildren?: boolean }> {
+    return backend.callsTo("get-mcp-shapes").map((call) => call.params as { ids: string[] });
+}
+
+test("a load of 20 roots with about 2,600 shapes makes 2 backend calls and no tree call", async () => {
+    // the real backend returns at most 2000 shapes per reply, so 2 calls is the least that 2,600 shapes can take
+    const entries: PageEntry[] = [];
+    for (let board = 0; board < 20; board += 1) {
+        entries.push({ id: `b${board}`, parentId: PAGE_ROOT });
+        for (let child = 0; child < 129; child += 1) {
+            entries.push({ id: `b${board}c${child}`, parentId: `b${board}` });
+        }
+    }
+    const backend = backendOf(partialPage(entries, { shapeReplyLimit: 2000 }));
+    const roots = Array.from({ length: 20 }, (_, index) => `b${index}`);
+    const { host, tokens } = scopedHost(backend, roots);
+
+    const loaded = JSON.parse(await host.loadPage(FILE, PAGE));
+
+    assert.equal(backend.callsTo("get-mcp-page-tree").length, 0);
+    assert.equal(backend.callsTo("get-mcp-shapes").length, 2);
+    const expected = [PAGE_ROOT];
+    for (let board = 0; board < 20; board += 1) {
+        expected.push(`b${board}`, ...Array.from({ length: 129 }, (_, child) => `b${board}c${child}`));
+    }
+    assert.deepEqual(idsOf(loaded), expected);
+    assert.equal(tokens(), 20, "a first partial load still takes one rate-limit token per root");
+});
+
+test("a reply cut short is followed by further rounds for the ids that are absent, and the model is whole", async () => {
+    const backend = backendOf(partialPage(PARTIAL_ENTRIES, { shapeReplyLimit: 3 }));
+    const { host } = scopedHost(backend, ["board", "other"]);
+
+    const loaded = JSON.parse(await host.loadPage(FILE, PAGE));
+
+    assert.deepEqual(idsOf(loaded), [PAGE_ROOT, "board", "c1", "c2", "c2a", "other", "o1"]);
+    assert.deepEqual(
+        shapeCallsOf(backend).map((call) => call.ids),
+        [["board", "other"], ["c2", "other"], ["o1"]]
+    );
+});
+
+test("a round that returns nothing new fails the load with a clear error", async () => {
+    const backend = new FakePenpotBackend().respond("get-mcp-shapes", {
+        revn: PAGE_REVN,
+        shapes: [{ id: "board", shapes: ["c1"], parentId: PAGE_ROOT }],
+        missing: [],
+        truncated: true,
+    });
+    const { host } = scopedHost(backend, ["board"]);
+
+    await assert.rejects(host.loadPage(FILE, PAGE), {
+        message: "get-mcp-shapes answered none of the shapes asked for, so the load cannot finish",
+    });
+    assert.equal(backend.callsTo("get-mcp-shapes").length, 2);
+});
+
+test("a root that the backend reports missing fails a first load after one call, and a refresh drops it", async () => {
+    const entries = PARTIAL_ENTRIES.map((entry) => ({ ...entry }));
+    const backend = backendOf(partialPage(entries));
+    const first = scopedHost(backend, ["nope"]);
+    await assert.rejects(first.host.loadPage(FILE, PAGE), { message: /root shape nope is not a shape of page/ });
+    assert.equal(backend.callsTo("get-mcp-shapes").length, 1);
+    assert.equal(backend.callsTo("get-mcp-page-tree").length, 0);
+
+    const other = backendOf(partialPage(entries));
+    const { host } = scopedHost(other, ["board", "other"]);
+    await host.loadPage(FILE, PAGE);
+    for (const id of ["board", "c1", "c2", "c2a"]) {
+        entries.splice(
+            entries.findIndex((entry) => entry.id === id),
+            1
+        );
+    }
+    const before = other.callsTo("get-mcp-shapes").length;
+    const refreshed = JSON.parse(await host.loadPage(FILE, PAGE));
+
+    assert.deepEqual(idsOf(refreshed), [PAGE_ROOT, "other", "o1"]);
+    // the roots call, then one call for the shapes the last load held and the backend no longer has
+    assert.equal(other.callsTo("get-mcp-shapes").length - before, 2);
+});
+
+test("the loaded order is the tree order: a flex or grid board lists its children in the reverse of its stored order", async () => {
+    // B is a flex board that stores [a, g, b]; g is a flex board that stores [g1, g2]; P is plain
+    const entries: PageEntry[] = [
+        { id: "B", parentId: PAGE_ROOT, layout: "flex" },
+        { id: "a", parentId: "B" },
+        { id: "g", parentId: "B", layout: "flex" },
+        { id: "g1", parentId: "g" },
+        { id: "g2", parentId: "g" },
+        { id: "b", parentId: "B" },
+        { id: "P", parentId: PAGE_ROOT },
+        { id: "p1", parentId: "P" },
+        { id: "p2", parentId: "P" },
+        { id: "G", parentId: PAGE_ROOT, layout: "grid" },
+        { id: "k1", parentId: "G" },
+        { id: "k2", parentId: "G" },
+    ];
+    const expected = [PAGE_ROOT, "P", "p1", "p2", "B", "b", "g", "g2", "g1", "a", "G", "k2", "k1"];
+    const { host } = scopedHost(backendOf(partialPage(entries)), ["P", "B", "G"]);
+
+    const partial = idsOf(JSON.parse(await host.loadPage(FILE, PAGE)));
+
+    assert.deepEqual(partial, expected);
+    // the whole-page load reads the tree itself: the partial order is the whole-page order restricted to the roots
+    const whole = idsOf(JSON.parse(await harness(backendOf(partialPage(entries))).loadPage(FILE, PAGE)));
+    assert.deepEqual(whole, [PAGE_ROOT, "B", "b", "g", "g2", "g1", "a", "P", "p1", "p2", "G", "k2", "k1"]);
+    assert.deepEqual(
+        partial.filter((id) => id !== PAGE_ROOT),
+        [...["P", "p1", "p2"], ...whole.slice(1, 7), ...whole.slice(10)]
+    );
+});
+
+test("the ancestors of a root come in one call, nearest first, and a first load takes no other call", async () => {
+    const entries: PageEntry[] = [
+        { id: "A1", parentId: PAGE_ROOT },
+        { id: "A2", parentId: "A1" },
+        { id: "A3", parentId: "A2" },
+        { id: "R", parentId: "A3" },
+        { id: "r1", parentId: "R" },
+    ];
+    const backend = backendOf(partialPage(entries));
+    const { host } = scopedHost(backend, ["R"]);
+
+    const loaded = JSON.parse(await host.loadPage(FILE, PAGE));
+
+    assert.deepEqual(idsOf(loaded), [PAGE_ROOT, "A3", "A2", "A1", "R", "r1"]);
+    assert.equal(backend.callsTo("get-mcp-shapes").length, 1);
+    assert.deepEqual(
+        loaded.shapes
+            .filter((shape: Record<string, unknown>) => shape.ancestorOnly === true)
+            .map((s: { id: string }) => s.id),
+        ["A3", "A2", "A1"]
+    );
+});
+
+test("a refresh without a change takes one call, which brings the ancestors back", async () => {
+    const entries: PageEntry[] = [
+        { id: "A1", parentId: PAGE_ROOT },
+        { id: "R", parentId: "A1" },
+        { id: "r1", parentId: "R" },
+    ];
+    const backend = backendOf(partialPage(entries));
+    const { host } = scopedHost(backend, ["R"]);
+    const first = JSON.parse(await host.loadPage(FILE, PAGE));
+    const before = backend.callsTo("get-mcp-shapes").length;
+
+    const again = JSON.parse(await host.loadPage(FILE, PAGE));
+
+    assert.equal(backend.callsTo("get-mcp-shapes").length - before, 1);
+    assert.deepEqual(again, first);
+});
+
+test("at most 2 shape calls of a partial load run at the same time", async () => {
+    // 1,000 leaves under one board, and a reply cap of 100 shapes: the board's absent children need many calls
+    const entries: PageEntry[] = [{ id: "wide", parentId: PAGE_ROOT }];
+    for (let index = 0; index < 1000; index += 1) {
+        entries.push({ id: `w${index}`, parentId: "wide" });
+    }
+    const page = partialPage(entries, { shapeReplyLimit: 100 });
+    const backend = new TrackingBackend().respond("get-mcp-shapes", page.shapes);
+    const { host } = scopedHost(backend, ["wide"]);
+
+    const loaded = JSON.parse(await host.loadPage(FILE, PAGE));
+
+    assert.equal(loaded.shapes.length, 1002);
+    assert.equal(backend.maxInFlight, 2);
+    assert.equal(backend.inFlight, 0);
+});
+
+test("a board of 130 groups of 129 leaves loads in at most 12 calls", async () => {
+    // 16,900 shapes; the backend lists the 130 groups before the leaves of the first group, so a cut at 2000 shapes
+    // leaves the leaves of most groups absent. Asking for each group once brings its leaves, instead of one id each.
+    const entries: PageEntry[] = [{ id: "B", parentId: PAGE_ROOT }];
+    for (let group = 0; group < 130; group += 1) {
+        entries.push({ id: `g${group}`, parentId: "B" });
+        for (let leaf = 0; leaf < 129; leaf += 1) {
+            entries.push({ id: `g${group}l${leaf}`, parentId: `g${group}` });
+        }
+    }
+    const backend = backendOf(partialPage(entries, { shapeReplyLimit: 2000 }));
+    const { host } = scopedHost(backend, ["B"]);
+
+    const loaded = JSON.parse(await host.loadPage(FILE, PAGE));
+
+    const calls = shapeCallsOf(backend);
+    const asked = calls.reduce((total, call) => total + call.ids.length, 0);
+    assert.equal(loaded.shapes.length, entries.length + 1, "every shape and the page root");
+    assert.ok(calls.length <= 12, `calls ${calls.length}, ids asked ${asked}`);
+    assert.ok(asked <= 1500, `ids asked ${asked}`);
+    assert.ok(
+        calls.every((call) => call.ids.length <= 200),
+        "at most 200 ids per call"
+    );
+});
+
+test("a load of a board that is not cut asks for nothing more", async () => {
+    // a cut inside the children of one shape: the absent children are asked by id, as before
+    const entries: PageEntry[] = [{ id: "wide", parentId: PAGE_ROOT }];
+    for (let index = 0; index < 500; index += 1) {
+        entries.push({ id: `w${index}`, parentId: "wide" });
+    }
+    const backend = backendOf(partialPage(entries, { shapeReplyLimit: 100 }));
+    const { host } = scopedHost(backend, ["wide"]);
+
+    const loaded = JSON.parse(await host.loadPage(FILE, PAGE));
+
+    assert.equal(loaded.shapes.length, 502);
+    const later = shapeCallsOf(backend).slice(1);
+    assert.ok(
+        later.every((call) => call.ids.every((id) => id.startsWith("w"))),
+        "the absent children are asked by id, not the board again"
+    );
+});
+
+test("a first-window estimate far above the cap refuses a whole-page load after one backend call", async () => {
+    const entries: PageEntry[] = [{ id: "s", parentId: PAGE_ROOT }];
+    const page = partialPage(entries, { estimate: { totalShapes: 28709, estimatedBytes: 21 * 1024 * 1024 } });
+    const backend = backendOf(page);
+
+    await assert.rejects(harness(backend).loadPage(FILE, PAGE), {
+        message:
+            /^page .* has 28709 shapes \(estimated at about 21\.0 MB\); the limit is 16 MB \(PENPOT_MCP_SANDBOX_PAGE_MB\)\. Pass rootIds to load only the boards the script needs, or use export_subtree, get_shapes and find_shapes for reads\.$/,
+    });
+
+    assert.equal(backend.calls.length, 1);
+    assert.deepEqual(backend.callsTo("get-mcp-page-tree")[0]?.params, {
+        fileId: FILE,
+        pageId: PAGE,
+        depth: 20,
+        limit: 5000,
+        estimateSize: true,
+    });
+});
+
+test("an estimate under the margin does not refuse, and the load goes on as before", async () => {
+    // 19 MB is above the 16 MB cap but under the 1.3 margin (20.8 MB): the precise guard decides
+    const entries: PageEntry[] = [{ id: "s", parentId: PAGE_ROOT }];
+    const page = partialPage(entries, { estimate: { totalShapes: 2, estimatedBytes: 19 * 1024 * 1024 } });
+    const backend = backendOf(page);
+
+    const loaded = JSON.parse(await harness(backend).loadPage(FILE, PAGE));
+
+    assert.deepEqual(idsOf(loaded), [PAGE_ROOT, "s"]);
+    assert.equal(backend.callsTo("get-mcp-shapes").length, 1);
+});
+
+test("an estimate that is too low is caught later by the check on the shapes fetched", async () => {
+    const entries: PageEntry[] = [];
+    for (let index = 0; index < 300; index += 1) {
+        entries.push({ id: `k${index}`, parentId: PAGE_ROOT, name: "x".repeat(4096) });
+    }
+    const page = partialPage(entries, { estimate: { totalShapes: 301, estimatedBytes: 100 * 1024 } });
+    const backend = backendOf(page);
+    const services = new BackendServices(backend, new BackendSettings(10, 1000), new FakeExporterClient());
+    const host = new SandboxHost(services, TOKEN, undefined, 512 * 1024);
+
+    await assert.rejects(host.loadPage(FILE, PAGE), {
+        message: /^page .* has 301 shapes \(about [0-9.]+ MB\); the limit is 0\.5 MB \(PENPOT_MCP_SANDBOX_PAGE_MB\)\./,
+    });
+
+    assert.equal(backend.callsTo("get-mcp-page-tree").length, 1);
+    assert.equal(backend.callsTo("get-mcp-shapes").length, 1, "refused after the first batch of shapes");
 });

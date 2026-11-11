@@ -16,6 +16,7 @@
    [app.rpc.commands.profile :as profile]
    [app.util.cache :as cache]
    [backend-tests.helpers :as th]
+   [backend-tests.rpc-mcp-connector-geometry-test :as geom]
    [clojure.data.json :as jd]
    [clojure.string :as str]
    [clojure.test :as t]))
@@ -317,35 +318,100 @@
   (t/is (= 400 (count (proto/sample-points (vec (range 800))))))
   (t/is (<= (count (proto/sample-points (vec (range 100000)))) 400)))
 
-(t/deftest band-width-measures-the-band-only
-  (let [a {:x 0 :y 0}
-        b {:x 10 :y 0}
-        points [{:x 5 :y 3}]]
-    (t/is (== 0 (proto/band-width a b points 0.0 0.2)) "t of the point is 0.5")
-    (t/is (== 3 (proto/band-width a b points 0.4 0.6)))))
-
-(t/deftest outline-head-finds-the-wide-end
-  (let [a      {:x 205 :y 95}
-        b      {:x 395 :y 120}
-        points [{:x 205 :y 95} {:x 395 :y 80} {:x 395 :y 120} {:x 205 :y 105}]]
-    (t/is (= :b (proto/outline-head a b points)))
-    (t/is (= :a (proto/outline-head b a points)) "the same head with the ends swapped")
-    (t/is (nil? (proto/outline-head {:x 0 :y 0} {:x 10 :y 0}
-                                    [{:x 0 :y 0} {:x 10 :y 0}]))
-          "a straight line has no head")))
+(defn- snap
+  "`find-snap-board` over a grid built for `boards` and `max-distance`."
+  [boards excluded a b p max-distance]
+  (proto/find-snap-board (proto/build-board-index boards max-distance)
+                         excluded a b p max-distance))
 
 (t/deftest find-snap-board-prefers-the-outermost-of-the-nearest
   (let [outer (proto/->Board :outer "Outer" 0.0 0.0 200.0 200.0 40000.0 1 #{})
         inner (proto/->Board :inner "Inner" 150.0 50.0 200.0 150.0 5000.0 2 #{:outer})
         far   (proto/->Board :far "Far" 400.0 0.0 600.0 200.0 40000.0 1 #{})
         away  {:x 1e9 :y 1e9}
-        snap  (proto/find-snap-board [inner far outer] #{} away away {:x 205 :y 100} 64)]
-    (t/is (= :outer (:id snap)))
-    (t/is (== 5 (:distance snap)) "the inner board is as near, so it ties")
-    (t/is (nil? (proto/find-snap-board [far] #{} away away {:x 205 :y 100} 64)))
-    (t/is (nil? (proto/find-snap-board [outer] #{} away away {:x 205 :y 100} 4)))
-    (t/is (nil? (proto/find-snap-board [outer] #{:outer} away away {:x 205 :y 100} 64))
+        found (snap [inner far outer] #{} away away {:x 205 :y 100} 64)]
+    (t/is (= :outer (:id found)))
+    (t/is (== 5 (:distance found)) "the inner board is as near, so it ties")
+    (t/is (nil? (snap [far] #{} away away {:x 205 :y 100} 64)))
+    (t/is (nil? (snap [outer] #{} away away {:x 205 :y 100} 4)))
+    (t/is (nil? (snap [outer] #{:outer} away away {:x 205 :y 100} 64))
           "an excluded board is not a candidate")))
+
+(defn- random-boards
+  "`n` boards in a 6000 by 6000 area, from the generator `rnd`: sizes from 20
+  to 620 px, one in 40 up to 3000 wide, one oversized (so that it is kept in
+  the list of big boards), and ancestors drawn from the boards before them."
+  [^java.util.Random rnd n]
+  (let [ids (vec (repeatedly n uuid/next))]
+    (into []
+          (map (fn [i]
+                 (let [x  (* 6000.0 (.nextDouble rnd))
+                       y  (* 6000.0 (.nextDouble rnd))
+                       w  (if (zero? (.nextInt rnd 40)) 3000.0 (+ 20.0 (* 600.0 (.nextDouble rnd))))
+                       h  (+ 20.0 (* 600.0 (.nextDouble rnd)))
+                       big? (= i 7)
+                       x2 (if big? (+ x 90000.0) (+ x w))
+                       y2 (if big? (+ y 90000.0) (+ y h))
+                       up (when (and (pos? i) (zero? (.nextInt rnd 3)))
+                            (nth ids (.nextInt rnd i)))]
+                   (proto/->Board (nth ids i) (str "B" i) x y x2 y2
+                                  (* (- x2 x) (- y2 y)) (if up 2 1)
+                                  (if up #{up} #{})))))
+          (range n))))
+
+(t/deftest the-grid-chooses-the-board-the-plain-loop-chooses
+  (let [rnd    (java.util.Random. 20260611)
+        boards (random-boards rnd 400)
+        point  (fn [] {:x (* 6000.0 (.nextDouble rnd)) :y (* 6000.0 (.nextDouble rnd))})
+        pick   (fn [] (nth boards (.nextInt rnd (count boards))))]
+    (doseq [md [4 64 300]]
+      (let [index (proto/build-board-index boards md)
+            found (atom 0)]
+        (dotimes [_ 600]
+          (let [a (point)
+                b (point)
+                p (if (zero? (.nextInt rnd 2)) a b)
+                excluded (cond-> #{} (zero? (.nextInt rnd 3)) (conj (:id (pick))))
+                plain (#'proto/snap-among boards excluded a b p md)
+                grid  (proto/find-snap-board index excluded a b p md)]
+            (when (some? plain) (swap! found inc))
+            (t/is (= plain grid) (str "md " md " at " p))))
+        (t/is (< 50 @found) (str "md " md ": the points find boards, so the test means something"))))))
+
+(t/deftest the-grid-holds-boards-that-cover-many-cells-and-boards-at-the-edges
+  (let [huge   (proto/->Board :huge "Huge" -50000.0 -50000.0 50000.0 50000.0 1.0e10 1 #{})
+        small  (proto/->Board :small "Small" 100.0 100.0 200.0 200.0 10000.0 2 #{:huge})
+        index  (proto/build-board-index [small huge] 64)
+        away   {:x 1e9 :y 1e9}]
+    (t/is (= 1 (count (:big index))) "the huge board is in the list of big ones")
+    (t/is (= :huge (:id (proto/find-snap-board index #{} away away {:x 150 :y 150} 64)))
+          "the outermost of the tied boards")
+    (t/is (= :huge (:id (proto/find-snap-board index #{} away away {:x 20000 :y 20000} 64))))
+    ;; a point exactly `max-distance` from the board, on a cell border
+    (t/is (= :small (:id (proto/find-snap-board index #{:huge} away away {:x 264 :y 150} 64))))
+    (t/is (nil? (proto/find-snap-board index #{:huge} away away {:x 264.5 :y 150} 64)))))
+
+(t/deftest finding-the-board-of-thousands-of-ends-costs-little
+  ;; 3,000 frames and 6,000 ends. The plain loop took 3.95 s here before the
+  ;; grid (12,000 frames and 24,000 ends took 52 s).
+  (let [boards (vec (for [i (range 3000)]
+                      (let [x (* 1000.0 (mod i 30))
+                            y (* 800.0 (quot i 30))]
+                        (proto/->Board (uuid/next) "b" x y (+ x 800) (+ y 600) 480000.0 2 #{}))))
+        rnd    (java.util.Random. 7)
+        points (vec (for [_ (range 6000)]
+                      {:x (* 30000.0 (.nextDouble rnd)) :y (* 80000.0 (.nextDouble rnd))}))
+        t0     (System/nanoTime)
+        plain  (mapv #(#'proto/snap-among boards #{} % % % 64) points)
+        t1     (System/nanoTime)
+        index  (proto/build-board-index boards 64)
+        grid   (mapv #(proto/find-snap-board index #{} % % % 64) points)
+        t2     (System/nanoTime)
+        plain-ms (/ (- t1 t0) 1000000.0)
+        grid-ms  (/ (- t2 t1) 1000000.0)]
+    (println "snap of 6000 ends over 3000 frames: plain loop" plain-ms "ms, grid with its build" grid-ms "ms")
+    (t/is (= plain grid))
+    (t/is (< grid-ms 1000.0))))
 
 (t/deftest outermost-falls-back-to-the-largest-area
   (let [small {:id :small :area 10 :ancestors #{}}
@@ -449,7 +515,13 @@
         arrow   (by-name "Arrow" conns)
         outline (by-name "Outline" conns)]
     (t/is (nil? (:error out)))
-    (t/is (= #{:revn :page-id :scanned :connectors :truncated} (set (keys result))))
+    (t/is (= #{:revn :page-id :scanned :connectors :total :truncated :selection
+               :same-screen-skipped :non-screen-ends}
+             (disj (set (keys result)) :deeper-boards))
+          "`deeper-boards` is not pinned: it follows `select-boards`")
+    (t/is (= 0 (:same-screen-skipped result)))
+    (t/is (= 0 (:non-screen-ends result)))
+    (t/is (= "auto" (get-in result [:selection :mode])))
     (t/is (= 5 (:scanned result)) "five candidate paths were looked at")
     (t/is (false? (:truncated result)))
     (t/is (= ["Line" "Arrow" "Outline"] (map :name conns)))
@@ -469,16 +541,19 @@
 
     ;; an arrow cap at the end: that end is `to`
     (t/is (= "cap" (:direction arrow)))
+    (t/is (= "high" (:confidence arrow)))
+    (t/is (= "none" (:confidence outline)) "no head tip, and no width test: direction none")
+    (t/is (= "none" (:confidence line)))
     (t/is (= b (get-in arrow [:to :board-id])))
     (t/is (== 395 (get-in arrow [:to :x])))
     (t/is (= a (get-in arrow [:from :board-id])))
 
-    ;; a closed outline wider at B: B is the head
-    (t/is (= "shape" (:direction outline)))
+    ;; a closed outline wider at B: no head is read, so the left end is `from`
+    (t/is (= "none" (:direction outline)))
     (t/is (= b (get-in outline [:to :board-id])))
     (t/is (= a (get-in outline [:from :board-id])))
     (t/is (== 395 (get-in outline [:to :x])))
-    (t/is (== 80 (get-in outline [:to :y])))
+    (t/is (contains? #{80.0 120.0} (double (get-in outline [:to :y]))) "one of the two corners at B")
     (t/is (< 191.6 (:length outline) 191.7))))
 
 (t/deftest connectors-use-the-true-box-of-a-rotated-board
@@ -526,11 +601,55 @@
     (t/is (= 1 (count (:connectors (:result out)))))
     (t/is (true? (:truncated (:result out))))))
 
+(t/deftest connectors-walk-with-offset-and-limit
+  (let [{:keys [profile file-id page]} (connector-fixture)
+        whole (:result (find-connectors profile file-id page))
+        page* (fn [offset]
+                (:result (find-connectors profile file-id page :limit 2 :offset offset)))
+        pages (take-while some?
+                          (iterate (fn [r] (when-let [n (:next-offset r)] (page* n)))
+                                   (page* 0)))]
+    (t/is (= 3 (:total whole)))
+    (t/is (nil? (:next-offset whole)))
+    (t/is (= [2 1] (map (comp count :connectors) pages)))
+    (t/is (= (map :id (:connectors whole)) (mapcat #(map :id (:connectors %)) pages))
+          "each connector once, in the order of one unbounded call")
+    (t/is (= [2 nil] (map :next-offset pages)))
+    (t/is (= [true false] (map :truncated pages)))
+    (t/is (every? #(= 3 (:total %)) pages))
+    (t/is (every? #(= (:scanned whole) (:scanned %)) pages))))
+
+(t/deftest connectors-a-time-cut-gives-no-next-offset
+  (let [{:keys [profile file-id page]} (connector-fixture)
+        select (requiring-resolve 'app.rpc.mcp-boards/select-boards)
+        orig   @select
+        out    (with-redefs-fn {select (fn [& args] (assoc (apply orig args) :timed-out? true))}
+                 #(find-connectors profile file-id page :limit 1))
+        result (:result out)]
+    (t/is (nil? (:error out)))
+    (t/is (= 1 (count (:connectors result))))
+    (t/is (= 3 (:total result)))
+    (t/is (true? (:truncated result)))
+    (t/is (true? (:timed-out result)))
+    (t/is (not (contains? result :next-offset)))))
+
+(t/deftest connectors-offset-past-the-end-gives-an-empty-list
+  (let [{:keys [profile file-id page]} (connector-fixture)
+        out    (find-connectors profile file-id page :offset 40)
+        result (:result out)]
+    (t/is (nil? (:error out)))
+    (t/is (empty? (:connectors result)))
+    (t/is (= 3 (:total result)))
+    (t/is (false? (:truncated result)))
+    (t/is (not (contains? result :next-offset)))))
+
 (t/deftest connectors-stop-at-the-time-budget-and-say-so
   (let [{:keys [profile file-id page]} (connector-fixture)
         out (with-redefs [proto/search-budget-ns 0]
               (find-connectors profile file-id page))]
     (t/is (true? (:truncated (:result out))))
+    (t/is (true? (:timed-out (:result out))))
+    (t/is (not (contains? (:result out) :next-offset)) "a time cut cannot be continued")
     (t/is (= 0 (:scanned (:result out))))))
 
 (t/deftest connectors-are-found-inside-a-container-that-holds-both-boards
@@ -547,7 +666,9 @@
         b        (get ids "$tmp:b")
         _        (add-path profile file-id page "Line" "M 395 50 L 205 50"
                            :parent (get ids "$tmp:c") :stroke solid-stroke)
-        out      (find-connectors profile file-id page)
+        ;; the auto selection takes only the container, so A and B would be
+        ;; one screen: depth 2 selects the container and both boards
+        out      (find-connectors profile file-id page :depth 2)
         line     (by-name "Line" (:connectors (:result out)))]
     (t/is (some? line) "the container is excluded, the boards connect")
     (t/is (= a (get-in line [:from :board-id])))
@@ -593,7 +714,7 @@
         conn  (by-name "Closed" (:connectors (:result out)))]
     (t/is (some? conn))
     (t/is (not= "cap" (:direction conn)) "a closed path gets no cap direction")
-    (t/is (= "shape" (:direction conn)))))
+    (t/is (= "none" (:direction conn)) "no head tip, and no width test: direction none")))
 
 (t/deftest connectors-direction-none-breaks-a-tie-on-x-by-the-upper-end
   (let [{:keys [profile file-id page a]} (pair-fixture)
@@ -639,10 +760,17 @@
                                (set-strokes page [(get inside "$tmp:i")] [solid-stroke]))
         out    (find-connectors profile file-id page)
         conns  (:connectors (:result out))]
-    (t/is (= ["Root"] (map :name conns)) "a child of A cannot connect A to B")
+    ;; A is an ancestor of Child, so the end at A snaps to no frame; the screen of
+    ;; that end stands in for it, and Child joins A and B (since the arrow drawn
+    ;; inside a screen is found). Inside has both ends in A and is left out.
+    (t/is (= ["Root" "Child"] (map :name conns)))
     (t/is (= 3 (:scanned (:result out))) "the skipped child still counts as scanned")
     (t/is (nil? (by-name "Inside" conns)))
-    (t/is (= b (get-in (first conns) [:to :board-id])))))
+    (t/is (= b (get-in (first conns) [:to :board-id])))
+    (let [c (by-name "Child" conns)]
+      (t/is (= a (get-in c [:from :board-id])) "the screen A stands in for the frame")
+      (t/is (= "Board A" (get-in c [:from :board-name])))
+      (t/is (= b (get-in c [:to :board-id]))))))
 
 (t/deftest connectors-left-out-when-hidden-or-under-a-hidden-ancestor
   (let [{:keys [profile file-id page]} (pair-fixture)
@@ -720,6 +848,534 @@
     (t/is (empty? (:connectors (:result out))))
     (t/is (some? inside))
     (t/is (= :shape-not-found (th/ex-code (:error err))))))
+
+;; --- CONNECTORS: SCREENS
+
+(defn- screens-fixture
+  "A section (0..3000 by 0..900) that holds three screens of 800 by 600: Screen 1
+  (x 0), Screen 2 (x 900) and Screen 3 (x 1800). Screen 1 holds two nested
+  frames, Header (y 0..100) and Body (y 150..550). Decision is a frame of
+  the section outside any screen (x 100..250, y 650..800). The auto selection
+  takes the three screens."
+  []
+  (let [{:keys [profile file-id page]} (create-file-with-page)
+        ids (apply-ops!
+             profile file-id
+             [{:op "create_board" :page-id page :id "$tmp:sec" :name "Section"
+               :x 0 :y 0 :width 3000 :height 900}
+              {:op "create_board" :page-id page :id "$tmp:s1" :name "Screen 1"
+               :parent-id "$tmp:sec" :x 0 :y 0 :width 800 :height 600}
+              {:op "create_board" :page-id page :id "$tmp:s2" :name "Screen 2"
+               :parent-id "$tmp:sec" :x 900 :y 0 :width 800 :height 600}
+              {:op "create_board" :page-id page :id "$tmp:s3" :name "Screen 3"
+               :parent-id "$tmp:sec" :x 1800 :y 0 :width 800 :height 600}
+              {:op "create_board" :page-id page :id "$tmp:head" :name "Header"
+               :parent-id "$tmp:s1" :x 0 :y 0 :width 800 :height 100}
+              {:op "create_board" :page-id page :id "$tmp:body" :name "Body"
+               :parent-id "$tmp:s1" :x 0 :y 150 :width 800 :height 400}
+              {:op "create_board" :page-id page :id "$tmp:dec" :name "Decision"
+               :parent-id "$tmp:sec" :x 100 :y 650 :width 150 :height 150}])]
+    {:profile profile
+     :file-id file-id
+     :page    page
+     :sec     (get ids "$tmp:sec")
+     :s1      (get ids "$tmp:s1")
+     :s2      (get ids "$tmp:s2")
+     :s3      (get ids "$tmp:s3")
+     :head    (get ids "$tmp:head")
+     :body    (get ids "$tmp:body")
+     :dec     (get ids "$tmp:dec")}))
+
+(t/deftest connectors-between-two-screens-carry-the-screen-keys-and-the-selection
+  (let [{:keys [profile file-id page s1 s2]} (screens-fixture)
+        _      (add-path profile file-id page "Link" "M 795 300 L 905 300"
+                         :stroke (assoc solid-stroke :stroke-cap-end :line-arrow))
+        out    (find-connectors profile file-id page)
+        result (:result out)
+        link   (by-name "Link" (:connectors result))]
+    (t/is (nil? (:error out)))
+    (t/is (= "auto" (get-in result [:selection :mode])))
+    (t/is (= "standard-size" (get-in result [:selection :basis])))
+    (t/is (= 3 (get-in result [:selection :boards])))
+    (t/is (= 1 (count (:connectors result))))
+    (t/is (= "cap" (:direction link)))
+    (t/is (= s1 (get-in link [:from :screen-id])))
+    (t/is (= "Screen 1" (get-in link [:from :screen-name])))
+    (t/is (= s2 (get-in link [:to :screen-id])))
+    (t/is (= "Screen 2" (get-in link [:to :screen-name])))
+    (t/is (= s1 (get-in link [:from :board-id])) "the frame is the outermost of the near ones, the screen")
+    (t/is (not (contains? (:from link) :non-screen)))
+    (t/is (not (contains? link :same-screen)))
+    (t/is (not (contains? link :composed)))
+    (t/is (= 0 (:same-screen-skipped result)))
+    (t/is (= 0 (:non-screen-ends result)))))
+
+(t/deftest a-divider-between-nested-frames-of-one-screen-is-skipped-and-counted
+  (let [{:keys [profile file-id page s1 head body]} (screens-fixture)
+        _       (add-path profile file-id page "Divider" "M 400 120 L 400 160"
+                          :parent s1 :stroke solid-stroke)
+        _       (add-path profile file-id page "Link" "M 795 300 L 905 300"
+                          :stroke solid-stroke)
+        dropped (:result (find-connectors profile file-id page))
+        kept    (:result (find-connectors profile file-id page :include-same-screen true))
+        divider (by-name "Divider" (:connectors kept))]
+    (t/is (= ["Link"] (map :name (:connectors dropped))))
+    (t/is (= 1 (:same-screen-skipped dropped)))
+    (t/is (= 2 (:scanned dropped)))
+    (t/is (= #{"Divider" "Link"} (set (map :name (:connectors kept)))))
+    (t/is (= 0 (:same-screen-skipped kept)))
+    (t/is (true? (:same-screen divider)))
+    (t/is (not (contains? (by-name "Link" (:connectors kept)) :same-screen)))
+    (t/is (= head (get-in divider [:from :board-id])) "the frames stay the snapped frames")
+    (t/is (= body (get-in divider [:to :board-id])))
+    (t/is (= s1 (get-in divider [:from :screen-id])))
+    (t/is (= s1 (get-in divider [:to :screen-id])))))
+
+(t/deftest an-arrow-to-a-decision-frame-outside-any-screen-has-a-non-screen-end
+  (let [{:keys [profile file-id page s1 dec]} (screens-fixture)
+        _      (add-path profile file-id page "To Decision" "M 100 590 L 175 660"
+                         :stroke solid-stroke)
+        out    (find-connectors profile file-id page)
+        result (:result out)
+        conn   (first (:connectors result))]
+    (t/is (= 1 (count (:connectors result))))
+    (t/is (= s1 (get-in conn [:from :screen-id])))
+    (t/is (= dec (get-in conn [:to :board-id])))
+    (t/is (true? (get-in conn [:to :non-screen])))
+    (t/is (not (contains? (:to conn) :screen-id)))
+    (t/is (not (contains? (:to conn) :screen-name)))
+    (t/is (= 1 (:non-screen-ends result)))
+    (t/is (= 0 (:same-screen-skipped result)))))
+
+(t/deftest selection-parameters-change-the-screens
+  (let [{:keys [profile file-id page s1 s2 head body]} (screens-fixture)
+        _       (add-path profile file-id page "Divider" "M 400 120 L 400 160"
+                          :parent s1 :stroke solid-stroke)
+        _       (add-path profile file-id page "Link" "M 795 300 L 905 300"
+                          :stroke solid-stroke)
+        names   (fn [out] (set (map :name (:connectors (:result out)))))
+        d2      (find-connectors profile file-id page :depth 2)
+        d3      (find-connectors profile file-id page :depth 3)
+        d1      (find-connectors profile file-id page :mode :depth)
+        bad     (find-connectors profile file-id page :mode :auto :depth 2)
+        rx      (find-connectors profile file-id page :mode :auto :board-name-regex "^Screen 1$")
+        rx-link (by-name "Link" (:connectors (:result rx)))]
+    (t/is (= "depth" (get-in d2 [:result :selection :mode])))
+    (t/is (= 2 (get-in d2 [:result :selection :depth])))
+    (t/is (= 5 (get-in d2 [:result :selection :boards])) "the section, three screens and Decision")
+    (t/is (= #{"Link"} (names d2)) "Header and Body lie in Screen 1")
+    (t/is (= 1 (get-in d2 [:result :same-screen-skipped])))
+    (t/is (= s2 (get-in (first (:connectors (:result d2))) [:to :screen-id])))
+    (t/is (= #{"Link" "Divider"} (names d3)) "at depth 3 Header and Body are screens")
+    (t/is (= 0 (get-in d3 [:result :same-screen-skipped])))
+    (let [divider (by-name "Divider" (:connectors (:result d3)))]
+      (t/is (= head (get-in divider [:from :screen-id])))
+      (t/is (= body (get-in divider [:to :screen-id]))))
+    (t/is (= "depth" (get-in d1 [:result :selection :mode])))
+    (t/is (= #{} (names d1)) "depth 1 is the section: everything lies in one screen")
+    (t/is (= 2 (get-in d1 [:result :same-screen-skipped])))
+    (t/is (= :mcp-invalid-board-selection (th/ex-code (:error bad))))
+    (t/is (= 1 (get-in rx [:result :selection :boards])))
+    (t/is (= s1 (get-in rx-link [:from :screen-id])))
+    (t/is (true? (get-in rx-link [:to :non-screen])) "Screen 2 is not selected")
+    (t/is (= 1 (get-in rx [:result :non-screen-ends])))))
+
+(t/deftest a-shape-inside-a-frame-with-no-frame-is-left-out-and-not-counted
+  (let [{:keys [profile file-id page s2]} (screens-fixture)
+        leaf (get (apply-ops! profile file-id
+                              [{:op "create_board" :page-id page :id "$tmp:leaf" :name "Leaf"
+                                :parent-id s2 :x 1000 :y 100 :width 200 :height 100}])
+                  "$tmp:leaf")
+        _    (add-path profile file-id page "Inside Leaf" "M 1010 150 L 1190 150"
+                       :parent leaf :stroke solid-stroke)
+        out  (find-connectors profile file-id page :include-same-screen true)]
+    (t/is (nil? (:error out)))
+    (t/is (empty? (:connectors (:result out))))
+    (t/is (= 0 (:same-screen-skipped (:result out))))
+    (t/is (= 1 (:scanned (:result out))))))
+
+(defn- journeys-fixture
+  "Section A (0..1800 by 0..900) holds Screen A1 (x 50..850) with the nested
+  frames Header A1 and Body A1, Screen A2 (x 900..1700) and three loose frames
+  below the screens: Inside Decision, Near Decision and Tie Decision. Section B
+  (x 2000..2900) holds Screen B1 (x 2050..2850). Between is a loose frame
+  between the two sections (x 1820..1980). The screens are selected by name
+  and depth, so the sections are not screens."
+  []
+  (let [{:keys [profile file-id page]} (create-file-with-page)
+        board (fn [id name parent x y w h]
+                (cond-> {:op "create_board" :page-id page :id (str "$tmp:" id) :name name
+                         :x x :y y :width w :height h}
+                  (some? parent) (assoc :parent-id (str "$tmp:" parent))))
+        ids   (apply-ops!
+               profile file-id
+               [(board "sa" "Section A" nil 0 0 1800 900)
+                (board "sb" "Section B" nil 2000 0 900 900)
+                (board "a1" "Screen A1" "sa" 50 50 800 600)
+                (board "a2" "Screen A2" "sa" 900 50 800 600)
+                (board "b1" "Screen B1" "sb" 2050 50 800 600)
+                (board "head" "Header A1" "a1" 50 50 800 100)
+                (board "body" "Body A1" "a1" 50 200 800 400)
+                (board "in" "Inside Decision" "sa" 100 700 150 150)
+                (board "near" "Near Decision" "sa" 300 690 100 100)
+                (board "tie" "Tie Decision" "sa" 700 710 100 80)
+                (board "between" "Between" nil 1820 300 160 100)])]
+    {:profile profile
+     :file-id file-id
+     :page    page
+     :a1      (get ids "$tmp:a1")
+     :a2      (get ids "$tmp:a2")
+     :b1      (get ids "$tmp:b1")
+     :between (get ids "$tmp:between")
+     :in      (get ids "$tmp:in")
+     :near    (get ids "$tmp:near")}))
+
+(t/deftest an-end-finds-its-screen-by-position-not-by-the-section-it-snaps-to
+  (let [{:keys [profile file-id page a1 a2 b1 between in near]} (journeys-fixture)
+        cap    (assoc solid-stroke :stroke-cap-end :line-arrow)
+        _      (add-path profile file-id page "Cross" "M 840 300 L 2060 300" :stroke cap)
+        _      (add-path profile file-id page "Same" "M 840 500 L 910 500" :stroke cap)
+        _      (add-path profile file-id page "To Between" "M 840 350 L 1900 350" :stroke cap)
+        _      (add-path profile file-id page "To Inside" "M 100 600 L 175 760" :stroke cap)
+        _      (add-path profile file-id page "Divider" "M 450 170 L 450 210" :stroke solid-stroke)
+        _      (add-path profile file-id page "Lost" "M 880 820 L 2060 300" :stroke solid-stroke)
+        _      (add-path profile file-id page "Near" "M 350 680 L 1000 500" :stroke solid-stroke)
+        _      (add-path profile file-id page "Tie" "M 750 680 L 1000 400" :stroke solid-stroke)
+        select {:mode :depth :depth 2 :board-name-regex "^Screen"}
+        out    (apply find-connectors profile file-id page (mapcat identity select))
+        result (:result out)
+        conns  (:connectors result)
+        wide   (apply find-connectors profile file-id page :include-same-screen true
+                      (mapcat identity select))]
+    (t/is (nil? (:error out)))
+    (t/is (= 3 (get-in result [:selection :boards])) "the three screens, not the sections")
+
+    (t/testing "an arrow between screens of two sections: both screens, kept, right way"
+      (let [c (by-name "Cross" conns)]
+        (t/is (some? c))
+        (t/is (= "cap" (:direction c)))
+        (t/is (= a1 (get-in c [:from :screen-id])))
+        (t/is (= b1 (get-in c [:to :screen-id])))
+        (t/is (= "Section A" (get-in c [:from :board-name])) "the frame snap is as it was")
+        (t/is (= "Section B" (get-in c [:to :board-name])))
+        (t/is (not (contains? (:from c) :non-screen)))))
+
+    (t/testing "an arrow between two screens of one section"
+      (let [c (by-name "Same" conns)]
+        (t/is (= a1 (get-in c [:from :screen-id])))
+        (t/is (= a2 (get-in c [:to :screen-id])))
+        (t/is (= a1 (get-in c [:from :board-id])))
+        (t/is (not (contains? c :same-screen)))))
+
+    (t/testing "an arrow to a decision frame between the sections"
+      (let [c (by-name "To Between" conns)]
+        (t/is (= a1 (get-in c [:from :screen-id])))
+        (t/is (= between (get-in c [:to :board-id])))
+        (t/is (true? (get-in c [:to :non-screen])))
+        (t/is (not (contains? (:to c) :screen-id)))))
+
+    (t/testing "an arrow to a decision frame inside a section, outside any screen"
+      (let [c (by-name "To Inside" conns)]
+        (t/is (= a1 (get-in c [:from :screen-id])))
+        (t/is (= in (get-in c [:to :board-id])))
+        (t/is (true? (get-in c [:to :non-screen])))))
+
+    (t/testing "a divider inside a screen is still a same-screen connector"
+      (t/is (nil? (by-name "Divider" conns)))
+      (t/is (= 1 (:same-screen-skipped result)))
+      (let [c (by-name "Divider" (:connectors (:result wide)))]
+        (t/is (true? (:same-screen c)))
+        (t/is (= a1 (get-in c [:from :screen-id])))
+        (t/is (= a1 (get-in c [:to :screen-id])))
+        (t/is (= "Header A1" (get-in c [:from :board-name])))
+        (t/is (= "Body A1" (get-in c [:to :board-name])))))
+
+    (t/testing "an end 30 px from a screen and 10 px from a decision frame: the decision frame wins"
+      (let [c (by-name "Near" conns)]
+        (t/is (= near (get-in c [:from :board-id])))
+        (t/is (true? (get-in c [:from :non-screen])))
+        (t/is (= a2 (get-in c [:to :screen-id])))))
+
+    (t/testing "an end as near a screen as a loose frame: the screen wins"
+      (let [c (by-name "Tie" conns)]
+        (t/is (= a1 (get-in c [:from :screen-id])))
+        (t/is (not (contains? (:from c) :non-screen)))
+        (t/is (= a2 (get-in c [:to :screen-id])))))
+
+    (t/testing "an end with nothing within max-distance has no screen; the frame gate still passes it"
+      (let [c (by-name "Lost" conns)]
+        (t/is (some? c))
+        (t/is (= "Section A" (get-in c [:from :board-name])))
+        (t/is (true? (get-in c [:from :non-screen])))
+        (t/is (= b1 (get-in c [:to :screen-id])))))
+
+    (t/is (= 7 (count conns)))
+    (t/is (= 4 (:non-screen-ends result)) "To Between, To Inside, Lost and Near")))
+
+;; --- CONNECTORS: DIRECTION END TO END
+
+(t/deftest every-arrow-style-names-the-right-screens
+  (let [{:keys [profile file-id page s1 s2]} (screens-fixture)
+        l       400.0
+        cases   (for [style [:triangle :barbs :dot :curved :chevron]
+                      k     [0 4]]
+                  (let [a        (geom/place (geom/arrow style l) k)
+                        tip      (:tip a)
+                        tail     (:tail a)
+                        dx       (- 850.0 (/ (+ (:x tip) (:x tail)) 2))
+                        dy       (- 250.0 (/ (+ (:y tip) (:y tail)) 2))
+                        content  (geom/map-content (fn [x y] [(+ x dx) (+ y dy)]) (:content a))]
+                    {:name  (str (name style) " " k)
+                     :d     (geom/content->d content)
+                     :tip-x (+ (:x tip) dx)
+                     :k     k}))
+        _       (doseq [{:keys [name d]} cases]
+                  (add-path profile file-id page name d))
+        out     (find-connectors profile file-id page)
+        conns   (:connectors (:result out))]
+    (t/is (nil? (:error out)))
+    (t/is (= (count cases) (count conns)))
+    (doseq [{:keys [name tip-x k]} cases]
+      (let [conn (by-name name conns)]
+        (t/is (some? conn) name)
+        (t/is (= "shape" (:direction conn)) name)
+        (t/is (= "high" (:confidence conn)) name)
+        (t/is (= (if (zero? k) s1 s2) (get-in conn [:from :screen-id])) (str name ": from"))
+        (t/is (= (if (zero? k) s2 s1) (get-in conn [:to :screen-id])) (str name ": to"))
+        (t/is (near? tip-x (get-in conn [:to :x]) 1.0) (str name ": the tip is the to end"))))))
+
+(t/deftest an-arrow-drawn-as-a-group-is-one-composed-connector
+  (let [{:keys [profile file-id page s1 s2]} (screens-fixture)
+        east-ids (apply-ops!
+                  profile file-id
+                  [{:op "create_rect" :page-id page :id "$tmp:r" :name "Shaft East"
+                    :x 700 :y 296 :width 170 :height 8}
+                   {:op "create_path" :page-id page :id "$tmp:p" :name "Head East"
+                    :d "M 870 282 L 910 300 L 870 318 Z"}])
+        west-ids (apply-ops!
+                  profile file-id
+                  [{:op "create_rect" :page-id page :id "$tmp:r" :name "Shaft West"
+                    :x 730 :y 396 :width 170 :height 8}
+                   {:op "create_path" :page-id page :id "$tmp:p" :name "Head West"
+                    :d "M 730 382 L 690 400 L 730 418 Z"}])
+        east     (get (apply-ops! profile file-id
+                                  [{:op "create_group" :page-id page :id "$tmp:g" :name "Arrow East"
+                                    :child-ids [(get east-ids "$tmp:r") (get east-ids "$tmp:p")]}])
+                      "$tmp:g")
+        west     (get (apply-ops! profile file-id
+                                  [{:op "create_group" :page-id page :id "$tmp:g" :name "Arrow West"
+                                    :child-ids [(get west-ids "$tmp:r") (get west-ids "$tmp:p")]}])
+                      "$tmp:g")
+        out      (find-connectors profile file-id page)
+        result   (:result out)
+        conns    (:connectors result)
+        e        (by-name "Arrow East" conns)
+        w        (by-name "Arrow West" conns)]
+    (t/is (nil? (:error out)))
+    (t/is (= 2 (count conns)) "the shafts and the heads are not candidates of their own")
+    (t/is (= 2 (:scanned result)))
+    (t/is (= east (:id e)))
+    (t/is (= :group (:type e)))
+    (t/is (true? (:composed e)))
+    (t/is (= "shape" (:direction e)))
+    (t/is (= "high" (:confidence e)))
+    (t/is (= s1 (get-in e [:from :screen-id])))
+    (t/is (= s2 (get-in e [:to :screen-id])))
+    (t/is (near? 910 (get-in e [:to :x]) 0.01))
+    (t/is (= west (:id w)))
+    (t/is (true? (:composed w)))
+    (t/is (= s2 (get-in w [:from :screen-id])))
+    (t/is (= s1 (get-in w [:to :screen-id])))
+    (t/is (near? 690 (get-in w [:to :x]) 0.01))))
+
+(defn- inside-fixture
+  "Screen 1 (0..800 by 0..1000) holds the frame Footer (y 900..1000) and the
+  rect Button; Screen 2 is at x 900..1700. Select the two screens with
+  `:mode :depth :depth 1`."
+  []
+  (let [{:keys [profile file-id page]} (create-file-with-page)
+        ids (apply-ops!
+             profile file-id
+             [{:op "create_board" :page-id page :id "$tmp:s1" :name "Screen 1"
+               :x 0 :y 0 :width 800 :height 1000}
+              {:op "create_board" :page-id page :id "$tmp:s2" :name "Screen 2"
+               :x 900 :y 0 :width 800 :height 1000}
+              {:op "create_board" :page-id page :id "$tmp:foot" :name "Footer"
+               :parent-id "$tmp:s1" :x 0 :y 900 :width 800 :height 100}
+              {:op "create_rect" :page-id page :id "$tmp:btn" :name "Button"
+               :parent-id "$tmp:s1" :x 60 :y 270 :width 80 :height 60}])]
+    {:profile profile
+     :file-id file-id
+     :page    page
+     :s1      (get ids "$tmp:s1")
+     :s2      (get ids "$tmp:s2")
+     :foot    (get ids "$tmp:foot")}))
+
+(t/deftest an-arrow-drawn-inside-a-screen-is-found-when-it-runs-to-another
+  ;; The arrow is a child of Screen 1 and starts at a plain rect with no frame
+  ;; near it, so its start snaps to no frame (Screen 1 is its own ancestor).
+  ;; Before the fix both ends had to snap and it was dropped.
+  (let [{:keys [profile file-id page s1 s2]} (inside-fixture)
+        cap    (assoc solid-stroke :stroke-cap-end :line-arrow)
+        _      (add-path profile file-id page "Arrow In" "M 140 300 L 905 300"
+                         :parent s1 :stroke cap)
+        _      (add-path profile file-id page "Inside" "M 100 400 L 700 400"
+                         :parent s1 :stroke solid-stroke)
+        select {:mode :depth :depth 1}
+        out    (apply find-connectors profile file-id page (mapcat identity select))
+        wide   (apply find-connectors profile file-id page :include-same-screen true
+                      (mapcat identity select))
+        result (:result out)
+        c      (by-name "Arrow In" (:connectors result))]
+    (t/is (nil? (:error out)))
+    (t/is (= 2 (get-in result [:selection :boards])))
+    (t/is (= ["Arrow In"] (map :name (:connectors result))))
+    (t/is (= "cap" (:direction c)))
+    (t/is (= s1 (get-in c [:from :screen-id])))
+    (t/is (= s1 (get-in c [:from :board-id])) "no frame near the start: its screen stands in")
+    (t/is (= "Screen 1" (get-in c [:from :board-name])))
+    (t/is (= 0.0 (double (get-in c [:from :distance]))))
+    (t/is (= s2 (get-in c [:to :screen-id])))
+    (t/is (= s2 (get-in c [:to :board-id])))
+    (t/is (= 140.0 (double (get-in c [:from :x]))))
+    (t/is (= 905.0 (double (get-in c [:to :x]))) "direction right: the head is at Screen 2")
+    (t/is (not (contains? c :same-screen)))
+    (t/is (= 1 (:same-screen-skipped result)) "the arrow inside Screen 1 is dropped and counted")
+    (t/is (= 0 (:non-screen-ends result)))
+    (let [i (by-name "Inside" (:connectors (:result wide)))]
+      (t/is (true? (:same-screen i)))
+      (t/is (= s1 (get-in i [:from :screen-id])))
+      (t/is (= s1 (get-in i [:to :screen-id])))
+      (t/is (= s1 (get-in i [:from :board-id]))))))
+
+(t/deftest two-opposite-arrows-in-one-group-are-two-connectors
+  ;; Before the fix the group counted as one composed arrow and one direction
+  ;; was lost.
+  (let [{:keys [profile file-id page s1 s2]} (screens-fixture)
+        right (add-path profile file-id page "Arrow Right"
+                        "M 700 297 L 985 297 L 985 288 L 1000 300 L 985 312 L 985 303 L 700 303 Z")
+        left  (add-path profile file-id page "Arrow Left"
+                        "M 1000 337 L 715 337 L 715 328 L 700 340 L 715 352 L 715 343 L 1000 343 Z")
+        group (get (apply-ops! profile file-id
+                               [{:op "create_group" :page-id page :id "$tmp:g" :name "Both"
+                                 :child-ids [right left]}])
+                   "$tmp:g")
+        out    (find-connectors profile file-id page)
+        result (:result out)
+        r      (by-name "Arrow Right" (:connectors result))
+        l      (by-name "Arrow Left" (:connectors result))]
+    (t/is (nil? (:error out)))
+    (t/is (some? group))
+    (t/is (= 2 (count (:connectors result))))
+    (t/is (= 2 (:scanned result)) "the two paths, not the group")
+    (t/is (not (contains? r :composed)))
+    (t/is (not (contains? l :composed)))
+    (t/is (= "shape" (:direction r)))
+    (t/is (= "shape" (:direction l)))
+    (t/is (= s1 (get-in r [:from :screen-id])))
+    (t/is (= s2 (get-in r [:to :screen-id])))
+    (t/is (= s2 (get-in l [:from :screen-id])))
+    (t/is (= s1 (get-in l [:to :screen-id])))
+    (t/is (near? 1000 (get-in r [:to :x]) 0.01))
+    (t/is (near? 700 (get-in l [:to :x]) 0.01))))
+
+(t/deftest an-end-of-an-arrow-that-snaps-to-no-frame-needs-its-own-screen
+  ;; An arrow inside Screen 1 that runs to a place that is no frame and no
+  ;; screen is still no connector: the end has no target.
+  (let [{:keys [profile file-id page s1]} (inside-fixture)
+        _   (add-path profile file-id page "Nowhere" "M 140 300 L 2500 300"
+                      :parent s1 :stroke solid-stroke)
+        out (apply find-connectors profile file-id page (mapcat identity {:mode :depth :depth 1}))]
+    (t/is (empty? (:connectors (:result out))))
+    (t/is (= 0 (:same-screen-skipped (:result out))))))
+
+;; --- CONNECTORS: MANY CANDIDATES
+
+(t/deftest three-thousand-candidates-stay-inside-the-time-budget
+  (let [{:keys [profile file-id page]} (create-file-with-page)
+        _       (apply-ops! profile file-id
+                            [{:op "create_board" :page-id page :id "$tmp:a" :name "Board A"
+                              :x 0 :y 0 :width 200 :height 6200}
+                             {:op "create_board" :page-id page :id "$tmp:b" :name "Board B"
+                              :x 400 :y 0 :width 200 :height 6200}])
+        arrow-d (fn [y]
+                  (str "M 205 " (+ y 8) " L 380 " (+ y 8) " L 380 " (+ y 2) " L 395 " (+ y 10)
+                       " L 380 " (+ y 18) " L 380 " (+ y 12) " L 205 " (+ y 12) " Z"))
+        inside  (fn [y]
+                  (str "M 20 " y " L 180 " y " L 180 " (+ y 3) " L 20 " (+ y 3) " Z"))
+        ops     (concat
+                 (for [i (range 1500)]
+                   {:op "create_path" :page-id page :name (str "Arrow " i) :d (arrow-d (* 4 i))})
+                 (for [i (range 1500)]
+                   {:op "create_path" :page-id page :name (str "Bar " i) :d (inside (* 4 i))}))
+        _       (doseq [batch (partition-all 500 ops)]
+                  (apply-ops! profile file-id (vec batch)))
+        started (System/nanoTime)
+        out     (find-connectors profile file-id page :limit 2000)
+        ms      (/ (- (System/nanoTime) started) 1000000.0)
+        result  (:result out)]
+    (println "find-mcp-connectors on 3000 candidates:" ms "ms")
+    (t/is (nil? (:error out)))
+    (t/is (= 3000 (:scanned result)))
+    (t/is (false? (:truncated result)))
+    (t/is (= 1500 (count (:connectors result))))
+    (t/is (every? #(= "shape" (:direction %)) (:connectors result)))
+    (t/is (< ms 5000.0))))
+
+(t/deftest three-thousand-frames-and-three-thousand-arrows-stay-inside-the-budget
+  ;; 3,000 frames in 60 columns and 3,000 arrows: 2,000 in the gap beside a
+  ;; frame (a connector each) and 1,000 inside a frame (same screen, counted).
+  ;; The limit of the command is 2,000. With the plain loop over all frames the
+  ;; matching of the ends alone took about 4 s here (see
+  ;; `finding-the-board-of-thousands-of-ends-costs-little`).
+  (let [{:keys [profile file-id page]} (create-file-with-page)
+        frames  3000
+        links   2000
+        frame-x (fn [i] (* 1000 (mod i 60)))
+        frame-y (fn [i] (* 800 (quot i 60)))
+        _       (doseq [batch (partition-all 500 (range frames))]
+                  (apply-ops! profile file-id
+                              (mapv (fn [i]
+                                      {:op "create_board" :page-id page :id (str "$tmp:f" i)
+                                       :name (str "Frame " i)
+                                       :x (frame-x i) :y (frame-y i) :width 800 :height 600})
+                                    batch)))
+        arrow-d (fn [i]
+                  (if (< i links)
+                    ;; into the gap beside the frame, or beside the one before the last
+                    ;; of a row, which has no neighbour on its right
+                    (let [g (if (< (mod i 60) 59) i (dec i))]
+                      (str "M " (+ (frame-x g) 790) " " (+ (frame-y g) 300)
+                           " L " (+ (frame-x g) 1010) " " (+ (frame-y g) 300)))
+                    (str "M " (+ (frame-x i) 100) " " (+ (frame-y i) 300)
+                         " L " (+ (frame-x i) 400) " " (+ (frame-y i) 300))))
+        _       (doseq [batch (partition-all 500 (range frames))]
+                  (apply-ops! profile file-id
+                              (mapv (fn [i]
+                                      {:op "create_path" :page-id page :name (str "Arrow " i)
+                                       :d (arrow-d i)})
+                                    batch)))
+        run     (fn []
+                  (let [started (System/nanoTime)
+                        out     (find-connectors profile file-id page :limit 2000)]
+                    [out (/ (- (System/nanoTime) started) 1000000.0)]))
+        [out ms] (run)
+        result  (:result out)
+        ;; the same page with the plain loop over every frame, for the time
+        [old-out old-ms] (with-redefs [proto/build-board-index (fn [boards _] {:all boards})
+                                       proto/find-snap-board
+                                       (fn [index excluded a b p md]
+                                         (#'proto/snap-among (:all index) excluded a b p md))]
+                           (run))]
+    (println "find-mcp-connectors on 3000 frames and 3000 arrows:" ms "ms with the grid,"
+             old-ms "ms with the plain loop over all frames, scanned"
+             (:scanned (:result old-out)) "of 3000")
+    (t/is (nil? (:error out)))
+    (t/is (= 3000 (:scanned result)))
+    (t/is (false? (:truncated result)))
+    (t/is (= 2000 (count (:connectors result))))
+    (t/is (= 1000 (:same-screen-skipped result)))
+    (t/is (< ms 5000.0))))
 
 ;; --- BOTH COMMANDS
 

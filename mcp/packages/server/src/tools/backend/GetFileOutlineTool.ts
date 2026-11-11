@@ -35,6 +35,14 @@ export class GetFileOutlineTool extends BackendTool<GetFileOutlineArgs> {
         return (
             "Returns a file's outline: its pages with ids and shape counts, its linked libraries, component, " +
             "color and token counts, and the revision (revn) to pass as baseRevn to writes. " +
+            "warnings lists the fonts that do not resolve, per page, and carries suggestedFontId and " +
+            "suggestedFamily when a font that resolves has the same family. warningsComplete false means that " +
+            "some pages are not covered: warningsPendingPages lists them (pageId, shapeCount, reason, page-too-large or time; " +
+            "at most 50, warningsPendingTruncated says when more exist), and " +
+            "warningsCompleteWith names the tool that holds the complete answer: call list_fonts for the file. " +
+            "A list_fonts reply that is not truncated is the complete font report, so read it there and do not " +
+            "call the outline again. The warnings here are a fast first look; on a server with several backend " +
+            "processes they may stay incomplete after list_fonts. " +
             "Next: get_page_tree with a fileId and a pageId."
         );
     }

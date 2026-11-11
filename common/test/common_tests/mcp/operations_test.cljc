@@ -20,6 +20,7 @@
    [app.common.mcp.operations.layout :as f-layout]
    [app.common.mcp.operations.library :as f-library]
    [app.common.mcp.operations.prototype :as f-prototype]
+   [app.common.mcp.operations.replace-font :as f-replace-font]
    [app.common.mcp.operations.schema]
    [app.common.mcp.operations.shapes :as f-shapes]
    [app.common.mcp.operations.state]
@@ -45,6 +46,7 @@
    [app.common.types.tokens-lib :as ctob]
    [app.common.types.tokens-status :as ctos]
    [app.common.uuid :as uuid]
+   [clojure.string :as str]
    [clojure.test :as t]))
 
 (t/use-fixtures :each thi/test-fixture)
@@ -2360,6 +2362,17 @@
     (t/is (= :mcp-invalid-operation (:code data)))
     (t/is (some? (re-find #"structural key :id" (str (:hint data)))))))
 
+(t/deftest props-cannot-set-the-page-id-link-key
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "create_rect" :page-id pid
+                                               :x 0 :y 0 :width 1 :height 1
+                                               :props {:page-id (uuid/next)}}]))]
+    (t/is (= :validation (:type data)))
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (some? (re-find #"structural key :page-id; use the page-id of the operation"
+                          (str (:hint data)))))))
+
 (t/deftest create-props-with-invalid-value-is-refused
   (let [file (thf/sample-file :file1)
         pid  (page-id-of file)
@@ -2587,7 +2600,7 @@
      (let [file (thf/sample-file :file1)
            pid  (page-id-of file)
            err  (with-redefs-fn {#'app.common.mcp.operations.schema/decode-op-values
-                                 (fn [_] (throw (NullPointerException. "boom")))}
+                                 (fn [& _] (throw (NullPointerException. "boom")))}
                   (fn []
                     (try
                       (compile-ops file [{:op "create_rect" :page-id pid
@@ -3453,7 +3466,7 @@
 
 (def ^:private family-maps
   [f-shapes/ops f-layout/ops f-text/ops f-components/ops f-library/ops
-   f-tokens/ops f-prototype/ops f-arrange/ops])
+   f-tokens/ops f-prototype/ops f-arrange/ops f-replace-font/ops])
 
 (t/deftest family-keys-are-the-op-names-of-their-schemas
   (doseq [family family-maps
@@ -3561,7 +3574,7 @@
      ;; A NullPointerException from the tokens parser is a fault, not a bad document
      (let [file (thf/sample-file :file1)
            data (with-redefs-fn {#'ctob/read-multi-set-dtcg
-                                 (fn [_] (throw (NullPointerException. "boom")))}
+                                 (fn [& _] (throw (NullPointerException. "boom")))}
                   (fn []
                     (thrown-data #(compile-ops file [{:op "import_tokens_dtcg"
                                                       :json "{}" :mode "merge"}]))))]
@@ -3593,3 +3606,116 @@
         objects (get-in (:data file) [:pages-index (page-id-of file) :objects])
         inner   (shape-of file (first (:shapes (shape-of file (thi/id :copy)))))]
     (t/is (integer? (ctn/get-nesting-level-delta objects inner (get objects (thi/id :outside)))))))
+
+;; --- PROPS THAT CANNOT BE SET ALONE
+
+(t/deftest update-shape-refuses-a-flip-on-a-rect
+  (let [file (two-rects-file)
+        pid  (page-id-of file)
+        r1   (thi/id :rect1)]
+    (doseq [k [:flip-x :flip-y]]
+      (let [data (thrown-data #(compile-ops file [{:op "update_shape" :page-id pid :id r1
+                                                   :props {k true}}]))]
+        (t/is (= :validation (:type data)))
+        (t/is (= :mcp-invalid-operation (:code data)))
+        (t/is (str/includes? (str (:hint data)) (str k)))
+        (t/is (str/includes? (str (:hint data)) "a flip cannot be set through this operation"))))))
+
+(t/deftest update-shape-refuses-a-flip-on-a-group
+  (let [file (-> (two-rects-file)
+                 (tho/add-group :group1))
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "update_shape" :page-id pid :id (thi/id :group1)
+                                               :props {:flip-x true}}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (str/includes? (str (:hint data)) ":flip-x"))))
+
+(t/deftest create-ops-refuse-a-flip
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)]
+    (doseq [op ["create_rect" "create_ellipse" "create_board"]]
+      (let [data (thrown-data #(compile-ops file [{:op op :page-id pid
+                                                   :x 0 :y 0 :width 10 :height 10
+                                                   :props {:flip-y true}}]))]
+        (t/is (= :mcp-invalid-operation (:code data)))
+        (t/is (str/includes? (str (:hint data)) ":flip-y"))))))
+
+(t/deftest create-ops-refuse-a-rotation-in-props
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "create_rect" :page-id pid
+                                               :x 0 :y 0 :width 10 :height 10
+                                               :props {:rotation 45}}]))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (str/includes? (str (:hint data)) "update_shape"))))
+
+(t/deftest geometry-key-hint-does-not-send-update-shape-to-itself
+  (let [file (two-rects-file)
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "update_shape" :page-id pid :id (thi/id :rect1)
+                                               :props {:transform {}}}]))]
+    (t/is (str/includes? (str (:hint data)) "x, y, width, height and rotation in update_shape"))))
+
+;; --- SHADOWS WITHOUT AN ID
+
+(def ^:private shadow-without-id
+  (dissoc drop-shadow :id))
+
+(t/deftest create-rect-fills-in-the-id-of-a-shadow
+  (let [file (thf/sample-file :file1)
+        pid  (page-id-of file)
+        [file' result] (apply-ops file [{:op "create_rect" :page-id pid :id "$tmp:r"
+                                         :x 0 :y 0 :width 40 :height 40
+                                         :props {:shadow [shadow-without-id
+                                                          (assoc shadow-without-id :style "inner-shadow")]}}])
+        shadows (:shadow (shape-of file' (created result "$tmp:r")))]
+    (t/is (= 2 (count shadows)))
+    (t/is (every? uuid? (map :id shadows)))
+    (t/is (= 2 (count (distinct (map :id shadows)))))
+    (t/is (= [:drop-shadow :inner-shadow] (mapv :style shadows)))))
+
+(t/deftest update-shape-fills-in-the-id-of-a-shadow-and-keeps-a-given-one
+  (let [file (two-rects-file)
+        pid  (page-id-of file)
+        r1   (thi/id :rect1)
+        given (uuid/next)
+        [file' _] (apply-ops file [{:op "update_shape" :page-id pid :id r1
+                                    :props {:shadow [shadow-without-id
+                                                     (assoc shadow-without-id :id (str given))]}}])
+        shadows (:shadow (shape-of file' r1))]
+    (t/is (uuid? (:id (first shadows))))
+    (t/is (not= given (:id (first shadows))))
+    (t/is (= given (:id (second shadows))))))
+
+(t/deftest the-new-id-fn-makes-the-id-of-a-shadow
+  (let [file  (two-rects-file)
+        pid   (page-id-of file)
+        fixed (uuid/next)
+        result (mops/compile-operations (:data file)
+                                        [{:op "update_shape" :page-id pid :id (thi/id :rect1)
+                                          :props {:shadow [shadow-without-id]}}]
+                                        {:new-id-fn (constantly fixed)})
+        file' (thf/apply-changes file {:redo-changes (:changes result)})]
+    (t/is (= fixed (:id (first (:shadow (shape-of file' (thi/id :rect1)))))))))
+
+(t/deftest a-wrong-shadow-gives-one-error-that-names-the-path
+  (let [file (two-rects-file)
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "update_shape" :page-id pid :id (thi/id :rect1)
+                                               :props {:shadow [(assoc shadow-without-id
+                                                                       :style "glow")]}}]))
+        hint (str (:hint data))]
+    (t/is (= :mcp-invalid-operation (:code data)))
+    (t/is (str/includes? hint "props.shadow"))
+    (t/is (str/includes? hint ":style"))
+    (t/is (= 1 (count (re-seq #"props\.shadow" hint))))))
+
+(t/deftest a-shadow-missing-a-required-key-is-named-once
+  (let [file (two-rects-file)
+        pid  (page-id-of file)
+        data (thrown-data #(compile-ops file [{:op "update_shape" :page-id pid :id (thi/id :rect1)
+                                               :props {:shadow [(dissoc shadow-without-id :blur)]}}]))
+        hint (str (:hint data))]
+    (t/is (str/includes? hint "props.shadow"))
+    (t/is (str/includes? hint ":blur"))
+    (t/is (<= (count (re-seq #"missing required key" hint)) 1))))

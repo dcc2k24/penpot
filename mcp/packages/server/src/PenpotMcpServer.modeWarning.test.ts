@@ -95,6 +95,37 @@ test("progress is reported to a request only when it carries a progress token", 
     assert.equal(sent.length, 1);
 });
 
+test("a progress notification that is not above the last one of its request is not sent", async () => {
+    const sent: Array<{ params: { progress: number } }> = [];
+    const notify = async (notification: unknown) => {
+        sent.push(notification as { params: { progress: number } });
+    };
+    const request = { mcpReq: { _meta: { progressToken: "tok-1" }, notify } } as unknown as ServerContext;
+    const reporter = PenpotMcpServer.progressReporterOf(request);
+    assert.ok(reporter !== undefined);
+    for (const progress of [0.5, 0.5, 0.25, 0.75, 1, 1, 2, 1.5, 3]) {
+        await reporter(progress, 3);
+    }
+    assert.deepEqual(
+        sent.map((notification) => notification.params.progress),
+        [0.5, 0.75, 1, 2, 3]
+    );
+    // 200 heartbeats of one shape, then the real report of the next: every one is sent
+    const beats = Array.from({ length: 200 }, (_, index) => 5 + (index + 1) / (index + 2));
+    const heart = PenpotMcpServer.progressReporterOf(request);
+    assert.ok(heart !== undefined);
+    const before = sent.length;
+    for (const progress of [...beats, 6]) {
+        await heart(progress, 9);
+    }
+    assert.equal(sent.length - before, 201);
+    // another request starts from nothing
+    const other = PenpotMcpServer.progressReporterOf(request);
+    assert.ok(other !== undefined);
+    await other(0.1);
+    assert.equal(sent.length, 207);
+});
+
 test("only loopback socket addresses count as local, including the IPv4 form of IPv6", () => {
     for (const address of ["127.0.0.1", "127.8.9.10", "::1", "::ffff:127.0.0.1"]) {
         assert.equal(isLoopbackAddress(address), true, address);

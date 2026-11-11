@@ -60,6 +60,15 @@ export class FindShapesArgs {
             .max(1000)
             .optional()
             .describe("Maximum number of matches (1 to 1000, default 100)."),
+        cursor: z
+            .string()
+            .min(1)
+            .max(4096)
+            .optional()
+            .describe(
+                "nextCursor of an earlier reply, to go on after the matches that reply held. " +
+                    "Send the same filters with it."
+            ),
     };
 
     fileId!: string;
@@ -83,12 +92,42 @@ export class FindShapesArgs {
     colors?: string[];
 
     limit?: number;
+
+    cursor?: string;
 }
 
 /** Finds shapes by type, name, component, token, text or color. */
 export class FindShapesTool extends BackendTool<FindShapesArgs> {
+    /**
+     * Share of the response cap that the matches of one reply may fill. The backend counts its own encoding of the
+     * matches, and the reply adds the fields around them and a cursor, so the matches get less than the whole cap.
+     */
+    public static readonly MATCH_SHARE = 0.85;
+
+    /** Smallest byte budget the backend accepts for the matches of a reply. */
+    private static readonly MIN_MATCH_BYTES = 1000;
+
+    /** Largest byte budget the backend accepts for the matches of a reply. */
+    private static readonly MAX_MATCH_BYTES = 1_000_000;
+
+    /** Bytes of matches that the backend may put in one reply, from the response cap. */
+    private readonly matchBytes: number;
+
     constructor(mcpServer: PenpotMcpServer, services: BackendServices) {
         super(mcpServer, FindShapesArgs.schema, services);
+        this.matchBytes = FindShapesTool.matchBytesFor(BackendTool.readMaxResponseBytes(process.env));
+    }
+
+    /**
+     * Returns the byte budget of the matches of one reply for a response cap. The backend keeps whole matches within
+     * it, and gives a cursor when more remain, so the adapter never has to cut a reply that fits the cap.
+     *
+     * @param capBytes - the response cap of the tool, in bytes
+     * @returns the budget the backend is asked for, within the range it accepts
+     */
+    public static matchBytesFor(capBytes: number): number {
+        const budget = Math.floor(capBytes * FindShapesTool.MATCH_SHARE);
+        return Math.min(FindShapesTool.MAX_MATCH_BYTES, Math.max(FindShapesTool.MIN_MATCH_BYTES, budget));
     }
 
     public annotations(): ToolAnnotations {
@@ -105,14 +144,19 @@ export class FindShapesTool extends BackendTool<FindShapesArgs> {
             "Use type ellipse for ellipses; circle is accepted too. Matches show ellipses as ellipse. " +
             "Use type frame for boards; board is accepted too. Matches show boards as frame. " +
             "Each match carries its id, page id and a path such as Board / Group / Shape. " +
-            "The search stops early on large files; truncated true means the list is incomplete. " +
+            "A search that ends early still returns the matches it found. truncated true means the list is " +
+            "incomplete: reason says why (size: the reply is full, limit: the limit is reached, time: the search " +
+            "budget of five seconds ran out), scanned counts the shapes the call looked at, and nextCursor goes " +
+            "back in cursor, with the same filters, to get the next matches. " +
+            "skippedLarge counts matches left out because one match alone is too large for a reply, and " +
+            "skippedLargeIds lists the first ones: read such a shape with get_shapes or export_subtree. " +
             "Next: get_shapes with the ids you need."
         );
     }
 
     protected async executeBackend(args: FindShapesArgs, userToken: string): Promise<ToolResponse> {
         const { fileId, ...filters } = args;
-        const params: Record<string, unknown> = { fileId };
+        const params: Record<string, unknown> = { fileId, maxBytes: this.matchBytes };
         for (const [key, value] of Object.entries(filters)) {
             if (value !== undefined) {
                 params[key] = value;

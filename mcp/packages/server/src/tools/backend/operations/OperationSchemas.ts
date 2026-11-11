@@ -48,6 +48,75 @@ const numberOrText = z.union([z.string(), safeNumber]);
 /** Plain object with any keys, the compiler's map type. */
 const plainMap = z.record(z.string(), z.unknown());
 
+/** Keys of `props` that mirror a shape. Neither a create nor an update operation sets them. */
+const FLIP_KEYS = ["flipX", "flipY", "flip-x", "flip-y"];
+
+/**
+ * Refuses a flip in `props`, naming the key. A flip changes the transform and the points of a shape, so the flag
+ * alone leaves an inconsistent shape; no operation sets it.
+ *
+ * @param props - the `props` of a create or update operation
+ * @param context - receives one issue for each flip key
+ */
+function refuseFlips(props: Record<string, unknown>, context: z.RefinementCtx): void {
+    for (const key of FLIP_KEYS) {
+        if (key in props) {
+            context.addIssue({
+                code: "custom",
+                path: [key],
+                message: `${key} cannot be set: a flip cannot be set through this operation`,
+            });
+        }
+    }
+}
+
+/** Keys of the page id, which `props` cannot set: the operation carries it. */
+const PAGE_ID_KEYS = ["pageId", "page-id"];
+
+/**
+ * Refuses a page id in `props`, naming the key. The page id belongs to the operation, as the backend says.
+ *
+ * @param props - the `props` of a create or update operation
+ * @param context - receives one issue for each page id key
+ */
+function refusePageId(props: Record<string, unknown>, context: z.RefinementCtx): void {
+    for (const key of PAGE_ID_KEYS) {
+        if (key in props) {
+            context.addIssue({
+                code: "custom",
+                path: [key],
+                message: `props cannot set the structural key ${key}; use the pageId of the operation instead`,
+            });
+        }
+    }
+}
+
+/**
+ * Refuses a rotation in the `props` of a create operation, as the backend does: a create operation sets no
+ * transform.
+ *
+ * @param props - the `props` of a create operation
+ * @param context - receives one issue when `rotation` is present
+ */
+function refuseRotation(props: Record<string, unknown>, context: z.RefinementCtx): void {
+    if ("rotation" in props) {
+        context.addIssue({
+            code: "custom",
+            path: ["rotation"],
+            message:
+                "props cannot set rotation on a create operation: a create operation sets no transform; " +
+                "create the shape, then turn it with update_shape",
+        });
+    }
+}
+
+/** Shape attributes of a create operation: any keys, but no flip, no rotation and no page id. */
+const shapeProps = plainMap.superRefine((props, context) => {
+    refuseFlips(props, context);
+    refuseRotation(props, context);
+    refusePageId(props, context);
+});
+
 /** Value of any type that must be present, the compiler's any type. */
 const requiredAny = z.unknown().refine((value) => value !== undefined, { error: "is required" });
 
@@ -241,7 +310,12 @@ function shapeOperation<T extends OperationShape>(opName: string, extra: T) {
         parentId: optionalRef,
         index: index.optional().describe(childIndexDoc),
         name: z.string().optional(),
-        props: plainMap.optional(),
+        props: shapeProps
+            .optional()
+            .describe(
+                "Shape attributes to set. A flip (flipX, flipY) is refused. So is rotation: create the shape, " +
+                    "then set rotation with update_shape."
+            ),
         ...box,
         ...extra,
     });
@@ -279,6 +353,13 @@ export const OPERATION_SCHEMAS = {
         fills: z.array(plainMap).optional(),
     }),
     create_path: shapeOperation("create_path", {
+        props: shapeProps
+            .optional()
+            .describe(
+                "Shape attributes to set. A path gets the default stroke of a path drawn in the workspace: a " +
+                    "centered 1 px black stroke and no fill. Pass strokes: [] for a filled outline. A flip " +
+                    "(flipX, flipY) is refused. So is rotation: create the path, then set rotation with update_shape."
+            ),
         content: z.unknown().optional(),
         d: z.string().optional(),
     }),
@@ -310,13 +391,18 @@ export const OPERATION_SCHEMAS = {
     update_shape: operation("update_shape", {
         pageId: ref,
         id: ref,
-        props: z.looseObject({
-            x: safeNumber.optional(),
-            y: safeNumber.optional(),
-            width: nonNegativeNumber.optional(),
-            height: nonNegativeNumber.optional(),
-            rotation: safeNumber.optional(),
-        }),
+        props: z
+            .looseObject({
+                x: safeNumber.optional(),
+                y: safeNumber.optional(),
+                width: nonNegativeNumber.optional(),
+                height: nonNegativeNumber.optional(),
+                rotation: safeNumber.optional(),
+            })
+            .superRefine((props, context) => {
+                refuseFlips(props, context);
+                refusePageId(props, context);
+            }),
     }),
     move_shapes: operation("move_shapes", {
         pageId: ref,
@@ -390,7 +476,13 @@ export const OPERATION_SCHEMAS = {
                     name: z.string().optional(),
                     path: z.string().optional(),
                     characters: z.string().optional(),
-                    props: z.looseObject({}).optional(),
+                    props: z
+                        .looseObject({})
+                        .superRefine((props, context) => {
+                            refuseFlips(props, context);
+                            refusePageId(props, context);
+                        })
+                        .optional(),
                 })
             )
             .optional()
@@ -526,6 +618,33 @@ export const OPERATION_SCHEMAS = {
         pageId: ref,
         ids: refs,
         axis: z.enum(["horizontal", "vertical"]),
+    }),
+    replace_font: operation("replace_font", {
+        pageId: ref,
+        fromFontId: z.string().min(1).describe("Font id to replace, as the texts store it, such as gfont-access-sans."),
+        toFontId: z
+            .string()
+            .min(1)
+            .describe("Font id to use instead. It must resolve: a bundled font, a Google font, or a font of the team."),
+        rootIds: z
+            .array(ref)
+            .min(1)
+            .max(500)
+            .optional()
+            .describe("Limits the swap to these shapes and what they hold. Without it, every text on the page."),
+        variantMatch: z
+            .enum(["exact", "nearest"])
+            .optional()
+            .describe(
+                "exact (default) refuses the whole op when a weight and style in use is missing in the target. nearest takes the closest variant."
+            ),
+        maxTexts: z
+            .number()
+            .int()
+            .min(1)
+            .max(2000)
+            .optional()
+            .describe("Most texts to change. Default 1000. More matching texts refuse the op."),
     }),
 };
 

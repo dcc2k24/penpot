@@ -13,6 +13,7 @@
    [app.common.mcp.operations.layout :as f-layout]
    [app.common.mcp.operations.library :as f-library]
    [app.common.mcp.operations.prototype :as f-prototype]
+   [app.common.mcp.operations.replace-font :as f-replace-font]
    [app.common.mcp.operations.schema :as schema :refer [decode-op-values json-transformer]]
    [app.common.mcp.operations.shapes :as f-shapes]
    [app.common.mcp.operations.state :as state :refer [check-changed-shapes fatal? initial-state raise-compile-error reflow-pages]]
@@ -23,7 +24,7 @@
 (def op-table
   "The ops of the compiler, merged from the families. An op is declared once,
   in its family, with its schema and its compile function."
-  (merge f-shapes/ops f-layout/ops f-text/ops f-components/ops f-library/ops f-tokens/ops f-prototype/ops f-arrange/ops))
+  (merge f-shapes/ops f-layout/ops f-text/ops f-components/ops f-library/ops f-tokens/ops f-prototype/ops f-arrange/ops f-replace-font/ops))
 
 (def schema:operation
   "The schema of the ops: a `:multi` on the op name, built from the families."
@@ -93,9 +94,13 @@
                 :op (:op op)))
     (try
       (let [changes-before (count (:changes state))
-            state          (family state (decode-op-values op))
+            state          (family state (decode-op-values op (:new-id-fn state)))
             state          (check-changed-shapes state (subvec (:changes state) changes-before))]
-        (update state :op-ranges conj [changes-before (count (:changes state))]))
+        (-> state
+            (update :op-ranges conj [changes-before (count (:changes state))])
+            ;; An op that reports a result leaves it in `:op-result`.
+            (update :op-results conj (:op-result state))
+            (dissoc :op-result)))
       (catch #?(:clj Throwable :cljs :default) cause
         (if (fatal? cause)
           (throw cause)
@@ -108,14 +113,19 @@
   `file-data` is the `:data` map of a file. `operations` is a vector of op
   maps. JSON-style enum strings are decoded, and the vector is checked
   against the operation schema before any op runs. `opts` may hold
-  `:new-id-fn` (default `uuid/next`) and `:libraries`, a map from library
-  id to library file data.
+  `:new-id-fn` (default `uuid/next`), `:libraries`, a map from library
+  id to library file data, and `:font-lookup`, a function from a font id to
+  `{:family :variants}` (or `{:reason code}`, or nil), which `replace_font`
+  needs.
 
   Returns a map with `:changes` (every emitted change in order, each with
   its page id), `:op-ranges` (one `[start end]` pair per op, in op order:
   the indexes in `:changes` of the first change the op emitted and one past
   its last, so `start` equals `end` for an op that emits nothing; the
-  changes of the layout reflow come after the last range), `:created-ids`
+  changes of the layout reflow come after the last range), `:op-results`
+  (one entry per op, in op order: the result map of an op that reports one,
+  else nil), `:snapshot-hint` (true when an op asks for a snapshot before the
+  write), `:created-ids`
   (each `$tmp:` handle to its uuid), `:warnings` (maps with `:code` and
   `:id`), `:touched-page-ids` (the page ids of the changes) and `:summary`
   (`:op-count`, `:change-count` and `:change-types`, a map from change type
@@ -149,6 +159,8 @@
         changes (:changes state)]
     {:changes changes
      :op-ranges (:op-ranges state)
+     :op-results (:op-results state)
+     :snapshot-hint (:snapshot-hint state)
      :created-ids (:created-ids state)
      :warnings (:warnings state)
      :touched-page-ids (into #{} (keep :page-id) changes)

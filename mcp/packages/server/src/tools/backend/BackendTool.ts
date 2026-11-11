@@ -33,6 +33,10 @@ export abstract class BackendTool<TArgs extends object> extends Tool<TArgs> {
     private static readonly CURSOR_NOTE =
         "nextCursor was removed, because it points past the nodes that were cut. Repeat the call with a smaller limit.";
 
+    /** Note added when the adapter drops `nextOffset` from a truncated answer. */
+    private static readonly OFFSET_NOTE =
+        "nextOffset was removed, because it points past the items that were cut. Narrow the request instead.";
+
     /** Writes that ended, per token and file, in this process; bounded, so that many files cannot grow it. */
     private static readonly writeCounter = new WriteCounter(BackendTool.WRITE_COUNT_FILES);
 
@@ -235,16 +239,27 @@ export abstract class BackendTool<TArgs extends object> extends Tool<TArgs> {
      * @throws Error when the setting is set and is not a whole number of kilobytes from 1 to 10000
      */
     public static readMaxResponseBytes(env: NodeJS.ProcessEnv): number {
-        const raw = env[BackendTool.MAX_RESPONSE_KB_VARIABLE];
+        return BackendTool.readCapBytes(env, BackendTool.MAX_RESPONSE_KB_VARIABLE, BackendTool.MAX_RESPONSE_BYTES);
+    }
+
+    /**
+     * Reads a response cap, in whole kilobytes, from one environment variable. The shared cap and the cap of one
+     * tool use the same range.
+     *
+     * @param env - environment to read; the process environment in production
+     * @param variable - name of the variable that holds the cap in kilobytes
+     * @param fallback - cap in bytes when the variable is unset or empty
+     * @returns the cap in bytes
+     * @throws Error when the variable is set and is not a whole number of kilobytes from 1 to 10000
+     */
+    public static readCapBytes(env: NodeJS.ProcessEnv, variable: string, fallback: number): number {
+        const raw = env[variable];
         if (raw === undefined || raw.trim() === "") {
-            return BackendTool.MAX_RESPONSE_BYTES;
+            return fallback;
         }
         const kilobytes = Number(raw);
         if (!Number.isInteger(kilobytes) || kilobytes < 1 || kilobytes > 10_000) {
-            throw new Error(
-                `${BackendTool.MAX_RESPONSE_KB_VARIABLE} must be a whole number of kilobytes from 1 to 10000, ` +
-                    `got "${raw}".`
-            );
+            throw new Error(`${variable} must be a whole number of kilobytes from 1 to 10000, got "${raw}".`);
         }
         return kilobytes * 1_000;
     }
@@ -267,6 +282,87 @@ export abstract class BackendTool<TArgs extends object> extends Tool<TArgs> {
             return text;
         }
         return BackendTool.truncatedText(value, maxBytes);
+    }
+
+    /**
+     * Wraps a reply that holds one list as a JSON text response, with whole items only.
+     *
+     * A reply within the cap is returned as it is. A larger one keeps as many leading items of the list as fit,
+     * leaving room for the other fields, and gets `truncated: true`, `nextOffset` (the `offset` of the call plus
+     * the items kept) and a `note`. A client that calls again with `nextOffset` as its `offset` reads every item
+     * once while `revn` stays the same. A reply with `timedOut` true is cut at whole items too, but gets no
+     * `nextOffset`: its list is not complete and cannot be continued, so the note says to narrow the call. When
+     * not even one item fits, the generic cut of {@link formatJson} applies, and it drops `nextOffset`.
+     *
+     * @param value - the reply of the backend; an object that holds the list at `listKey`
+     * @param listKey - name of the list field
+     * @param offset - the offset the call asked for, 0 when it asked for none
+     * @param narrow - what a caller can narrow after a time cut, for the note, for example "fewer rules"
+     */
+    protected pagedJsonResponse(value: unknown, listKey: string, offset: number, narrow: string): ToolResponse {
+        return new TextResponse(BackendTool.formatPagedJson(value, listKey, offset, narrow, this.maxResponseBytes));
+    }
+
+    /**
+     * Serialises a reply that holds one list, cutting the list at a whole item when the text is too large.
+     *
+     * @param value - the reply of the backend
+     * @param listKey - name of the list field
+     * @param offset - the offset the call asked for
+     * @param narrow - what a caller can narrow after a time cut, for the note
+     * @param maxBytes - largest text returned, in UTF-8 bytes
+     */
+    public static formatPagedJson(
+        value: unknown,
+        listKey: string,
+        offset: number,
+        narrow: string,
+        maxBytes: number = BackendTool.MAX_RESPONSE_BYTES
+    ): string {
+        const object = value !== null && typeof value === "object" && !Array.isArray(value);
+        const reply = (object ? value : {}) as Record<string, unknown>;
+        const list = object ? reply[listKey] : null;
+        const timedOut = reply.timedOut === true;
+        // a note that the backend sent stays, and the notes of the adapter follow it
+        const joined = (...notes: string[]): string =>
+            [typeof reply.note === "string" ? reply.note : "", ...notes].filter((note) => note !== "").join(" ");
+        const timeNote =
+            "The call ran out of time, so the list and the totals are not complete, and it cannot be continued " +
+            `with offset. Start again with a narrower call: ${narrow}.`;
+        // a reply that ran out of time carries its note, whether or not the list is cut by bytes
+        const whole = timedOut ? { ...reply, note: joined(timeNote) } : value;
+        const text = JSON.stringify(whole) ?? "null";
+        if (Buffer.byteLength(text, "utf8") <= maxBytes || !Array.isArray(list)) {
+            return BackendTool.formatJson(whole, maxBytes);
+        }
+        const { nextOffset: _dropped, ...rest } = reply;
+        const render = (kept: number): string =>
+            JSON.stringify({
+                ...rest,
+                [listKey]: list.slice(0, kept),
+                truncated: true,
+                ...(timedOut ? {} : { nextOffset: offset + kept }),
+                note: timedOut
+                    ? joined(`Reply cut to fit ${maxBytes} bytes: kept ${kept} of the ${list.length} items.`, timeNote)
+                    : joined(
+                          `Reply cut to fit ${maxBytes} bytes: kept ${kept} of the ${list.length} items this call ` +
+                              `read. Call again with offset ${offset + kept} for the rest.`
+                      ),
+            });
+        let low = 1;
+        let high = list.length - 1;
+        let best: string | undefined;
+        while (low <= high) {
+            const kept = Math.floor((low + high) / 2);
+            const candidate = render(kept);
+            if (Buffer.byteLength(candidate, "utf8") <= maxBytes) {
+                best = candidate;
+                low = kept + 1;
+            } else {
+                high = kept - 1;
+            }
+        }
+        return best ?? BackendTool.formatJson(whole, maxBytes);
     }
 
     /**
@@ -344,11 +440,18 @@ export abstract class BackendTool<TArgs extends object> extends Tool<TArgs> {
      * @param notes - receives the cursor note when the cursor is removed
      */
     private static withoutCursor(value: unknown, notes: string[]): unknown {
-        if (value === null || typeof value !== "object" || Array.isArray(value) || !("nextCursor" in value)) {
+        if (value === null || typeof value !== "object" || Array.isArray(value)) {
             return value;
         }
-        notes.push(BackendTool.CURSOR_NOTE);
-        return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "nextCursor"));
+        if ("nextCursor" in value) {
+            notes.push(BackendTool.CURSOR_NOTE);
+        }
+        if ("nextOffset" in value) {
+            notes.push(BackendTool.OFFSET_NOTE);
+        }
+        return Object.fromEntries(
+            Object.entries(value).filter(([key]) => key !== "nextCursor" && key !== "nextOffset")
+        );
     }
 
     /**

@@ -538,7 +538,10 @@
     :fn (mg/resource "app/migrations/sql/0158-add-client-to-access-token.sql")}
 
    {:name "0159-add-file-change-indexes"
-    :fn (mg/resource "app/migrations/sql/0159-add-file-change-indexes.sql")}])
+    :fn (mg/resource "app/migrations/sql/0159-add-file-change-indexes.sql")}
+
+   {:name "0160-add-mcp-reply-to-file-change"
+    :fn (mg/resource "app/migrations/sql/0160-add-mcp-reply-to-file-change.sql")}])
 
 (defn apply-migrations!
   [pool name migrations]

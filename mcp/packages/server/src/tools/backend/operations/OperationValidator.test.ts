@@ -447,3 +447,133 @@ test("reorder takes the full list of child ids in visual order", () => {
     const operation = { op: "reorder", pageId: PAGE, parentId: BOARD, ids: [SHAPE_2, SHAPE] };
     assert.deepEqual(validator.validate([operation]), [operation]);
 });
+
+const REPLACE_FONT = { op: "replace_font", pageId: PAGE, fromFontId: "gfont-access-sans", toFontId: "custom-1" };
+
+test("replace_font accepts the required parameters alone and with every option", () => {
+    assert.deepEqual(validator.validate([REPLACE_FONT]), [REPLACE_FONT]);
+    const full = { ...REPLACE_FONT, rootIds: [SHAPE, "$tmp:board"], variantMatch: "nearest", maxTexts: 2000 };
+    assert.deepEqual(validator.validate([full]), [full]);
+});
+
+test("replace_font rejects a missing target font", () => {
+    assert.throws(
+        () => validator.validate([{ op: "replace_font", pageId: PAGE, fromFontId: "gfont-access-sans" }]),
+        /Operation 0 \(replace_font\) is invalid: toFontId:/
+    );
+});
+
+test("replace_font rejects a variantMatch that is neither exact nor nearest", () => {
+    assert.throws(
+        () => validator.validate([{ ...REPLACE_FONT, variantMatch: "closest" }]),
+        /Operation 0 \(replace_font\) is invalid: variantMatch:/
+    );
+});
+
+test("replace_font keeps maxTexts between 1 and 2000", () => {
+    for (const maxTexts of [0, 2001, 1.5]) {
+        assert.throws(
+            () => validator.validate([{ ...REPLACE_FONT, maxTexts }]),
+            /Operation 0 \(replace_font\) is invalid: maxTexts:/
+        );
+    }
+    assert.deepEqual(validator.validate([{ ...REPLACE_FONT, maxTexts: 1 }]), [{ ...REPLACE_FONT, maxTexts: 1 }]);
+});
+
+test("replace_font takes between 1 and 500 root ids", () => {
+    const tooMany = Array.from({ length: 501 }, () => SHAPE);
+    for (const rootIds of [[], tooMany]) {
+        assert.throws(
+            () => validator.validate([{ ...REPLACE_FONT, rootIds }]),
+            /Operation 0 \(replace_font\) is invalid: rootIds:/
+        );
+    }
+});
+
+test("replace_font rejects an empty font id", () => {
+    assert.throws(
+        () => validator.validate([{ ...REPLACE_FONT, fromFontId: "" }]),
+        /Operation 0 \(replace_font\) is invalid: fromFontId:/
+    );
+});
+
+test("update_shape refuses a flip and names the key", () => {
+    for (const key of ["flipX", "flipY", "flip-x"]) {
+        assert.throws(
+            () => validator.validate([{ op: "update_shape", pageId: PAGE, id: SHAPE, props: { [key]: true } }]),
+            (error: Error) => {
+                assert.match(error.message, /Operation 0 \(update_shape\) is invalid/);
+                assert.ok(error.message.includes(`props.${key}: ${key} cannot be set`));
+                assert.match(error.message, /a flip cannot be set through this operation/);
+                return true;
+            }
+        );
+    }
+});
+
+test("a create operation refuses a flip in its props, and accepts other props", () => {
+    for (const op of ["create_rect", "create_ellipse", "create_board", "create_path"]) {
+        const base = { op, pageId: PAGE, x: 0, y: 0, width: 10, height: 10, d: "M0 0 L10 10 Z" };
+        assert.throws(
+            () => validator.validate([{ ...base, props: { flipY: true } }]),
+            /props\.flipY: flipY cannot be set: a flip cannot be set through this operation/
+        );
+        assert.deepEqual(validator.validate([{ ...base, props: { opacity: 0.5, strokes: [] } }]).length, 1);
+    }
+});
+
+test("a create operation refuses rotation in its props, and update_shape accepts it", () => {
+    for (const op of ["create_rect", "create_ellipse", "create_board", "create_path"]) {
+        const base = { op, pageId: PAGE, x: 0, y: 0, width: 10, height: 10, d: "M0 0 L10 10 Z" };
+        assert.throws(
+            () => validator.validate([{ ...base, props: { rotation: 45 } }]),
+            /props\.rotation: props cannot set rotation on a create operation/
+        );
+    }
+    assert.equal(
+        validator.validate([{ op: "update_shape", pageId: PAGE, id: SHAPE, props: { rotation: 45 } }]).length,
+        1
+    );
+});
+
+test("props refuse a page id in a create operation, update_shape and a component override", () => {
+    for (const key of ["pageId", "page-id"]) {
+        const message = new RegExp(`props\.${key}: props cannot set the structural key ${key}`);
+        assert.throws(() => validator.validate([{ op: "create_rect", pageId: PAGE, props: { [key]: PAGE } }]), message);
+        assert.throws(
+            () => validator.validate([{ op: "update_shape", pageId: PAGE, id: SHAPE, props: { [key]: PAGE } }]),
+            message
+        );
+        assert.throws(
+            () =>
+                validator.validate([
+                    {
+                        op: "instantiate_component",
+                        pageId: PAGE,
+                        componentId: COMPONENT,
+                        x: 0,
+                        y: 0,
+                        overrides: [{ name: "Label", props: { [key]: PAGE } }],
+                    },
+                ]),
+            message
+        );
+    }
+});
+
+test("a component override refuses a flip in its props", () => {
+    assert.throws(
+        () =>
+            validator.validate([
+                {
+                    op: "instantiate_component",
+                    pageId: PAGE,
+                    componentId: COMPONENT,
+                    x: 0,
+                    y: 0,
+                    overrides: [{ name: "Label", props: { flipX: true } }],
+                },
+            ]),
+        /flipX cannot be set/
+    );
+});

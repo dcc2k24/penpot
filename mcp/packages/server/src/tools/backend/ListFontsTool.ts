@@ -67,7 +67,18 @@ export class ListFontsTool extends BackendTool<ListFontsArgs> {
             "reason says why: not-in-google-catalog, google-fonts-disabled, custom-font-not-in-team, unknown-font-id " +
             "or variant-not-found. unresolved counts the fonts that do not resolve. truncated true means the read " +
             "ran out of time, the reply holds more than 500 fonts, or the reply reached the response size; " +
-            "only what was read is listed. " +
+            "only what was read is listed. pagesRead and pagesTotal count the pages read and the pages asked for: " +
+            "when truncated is true and pagesRead is lower, the pages after it were not read, the list is not " +
+            "complete, and a note says what to do: call list_fonts again with the same arguments. The backend " +
+            "process that read a page keeps it for up to 10 minutes, so a call goes on from there, but behind " +
+            "several backend processes a call may start again. " +
+            "A reply for the whole file that is not truncated is the complete font report: read it here, there is " +
+            "no need to call get_file_outline again for the font warnings. " +
+            "A font that does not resolve also has suggestedFontId, suggestedFamily, suggestedSource (custom, " +
+            "builtin or google), suggestedMatch (exact, or stem when only the weight or style words of the names " +
+            "differ) and suggestedVariantsMissing (the weight and style pairs the text uses that the suggested " +
+            "font lacks), when a font that resolves has the same family. Use suggestedFontId; penpot_api_info and " +
+            "the instructions describe the font swap operation that replaces a font across a page. " +
             "Attribute names in the response are camelCase. " +
             "Next: fix the unresolved fonts in the design, then export_shape or get_shapes."
         );
@@ -90,6 +101,38 @@ export class ListFontsTool extends BackendTool<ListFontsArgs> {
             ...(args.rootIds !== undefined ? { rootIds: args.rootIds } : {}),
         };
         const response = await this.callCommand<unknown>(userToken, "get-mcp-fonts", params);
-        return this.jsonResponse(response);
+        return this.jsonResponse(ListFontsTool.withNote(response));
+    }
+
+    /**
+     * Adds a `note` to a reply that read fewer pages than were asked for, saying how to read the rest.
+     *
+     * The backend process that finished a page keeps its font usage for up to ten minutes (the cache is bounded by
+     * weight, so a page can leave early). A call always finishes at least one page its process has not kept.
+     * Behind several backend processes a call may start again, so `pagesRead` need not grow on every call.
+     *
+     * @param response - the reply of the backend
+     */
+    private static withNote(response: unknown): unknown {
+        if (response === null || typeof response !== "object") {
+            return response;
+        }
+        const reply = response as { pagesRead?: unknown; pagesTotal?: unknown };
+        if (
+            typeof reply.pagesRead !== "number" ||
+            typeof reply.pagesTotal !== "number" ||
+            reply.pagesRead >= reply.pagesTotal
+        ) {
+            return response;
+        }
+        return {
+            ...reply,
+            note:
+                `Read ${reply.pagesRead} of ${reply.pagesTotal} pages in the time limit: the list is not ` +
+                "complete, and unresolved counts only the pages read. Call list_fonts again with the same " +
+                "arguments. The backend process that read a page keeps it for up to 10 minutes. Behind several " +
+                "backend processes a call may start again, so pagesRead need not grow on every call, but each " +
+                "call finishes at least one page that its process has not kept.",
+        };
     }
 }

@@ -135,7 +135,8 @@
 
       (some? props)
       (compile-update-op (decode-op-values {:op "update_shape" :page-id page-id
-                                            :id id :props props})))))
+                                            :id id :props props}
+                                           (:new-id-fn state))))))
 
 (defn- instantiate-change
   [state page-id objects op]

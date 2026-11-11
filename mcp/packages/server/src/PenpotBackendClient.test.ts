@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { once } from "node:events";
 import { afterEach, beforeEach, test } from "node:test";
-import { BackendRpcError } from "./backend/BackendRpcError";
+import { BackendRateLimitError, BackendRpcError } from "./backend/BackendRpcError";
+import { RateLimitError } from "./backend/TokenRateLimiter";
 import { PenpotBackendClient, isWriteCommand } from "./PenpotBackendClient";
 import { CallContext } from "./backend/CallContext";
 
@@ -22,6 +23,8 @@ interface Reply {
     delayMs: number;
     /** Sends the body in pieces without a Content-Length, so the client reads it as a stream. */
     chunked: boolean;
+    /** Headers sent with the answer, besides the content type. */
+    headers?: Record<string, string>;
 }
 
 /** Piece size of a chunked stub reply, in bytes. */
@@ -43,7 +46,7 @@ beforeEach(async () => {
         if (reply.delayMs > 0) {
             await new Promise((resolve) => setTimeout(resolve, reply.delayMs));
         }
-        res.writeHead(reply.status, { "content-type": reply.contentType });
+        res.writeHead(reply.status, { "content-type": reply.contentType, ...reply.headers });
         if (reply.chunked) {
             for (let offset = 0; offset < reply.body.length; offset += CHUNK_BYTES) {
                 res.write(reply.body.slice(offset, offset + CHUNK_BYTES));
@@ -113,6 +116,57 @@ for (const status of [400, 401, 403, 404, 409, 429, 500]) {
         });
     });
 }
+
+const RATE_LIMIT_BODY = JSON.stringify({ type: "rate-limit", code: "request-blocked", hint: "rate limit reached" });
+
+test("callCommand maps the backend rate limit to an error with the retry time from retry-after, rounded up", async () => {
+    reply.status = 429;
+    reply.body = RATE_LIMIT_BODY;
+    reply.headers = { "retry-after": "3.2" };
+    await assert.rejects(client().callCommand("alice", "get-mcp-subtree", {}), (error: unknown) => {
+        assert.ok(error instanceof BackendRateLimitError);
+        assert.ok(error instanceof RateLimitError);
+        assert.equal(error.retryAfterSeconds, 4);
+        assert.match(error.message, /^backend rate limit reached, retry after 4 s\./);
+        assert.match(error.message, /cursor/);
+        return true;
+    });
+});
+
+test("callCommand states at most 10 s when retry-after gives the time to a full bucket", async () => {
+    reply.status = 429;
+    reply.body = RATE_LIMIT_BODY;
+    reply.headers = { "retry-after": "120" };
+    await assert.rejects(client().callCommand("alice", "get-mcp-subtree", {}), (error: unknown) => {
+        assert.ok(error instanceof BackendRateLimitError);
+        assert.equal(error.retryAfterSeconds, 10);
+        assert.match(error.message, /^backend rate limit reached, retry after 10 s\./);
+        return true;
+    });
+});
+
+test("callCommand gives a fixed wait for the backend rate limit when the refusal has no retry-after", async () => {
+    reply.status = 429;
+    reply.body = RATE_LIMIT_BODY;
+    await assert.rejects(client().callCommand("alice", "get-mcp-subtree", {}), (error: unknown) => {
+        assert.ok(error instanceof BackendRateLimitError);
+        assert.equal(error.retryAfterSeconds, undefined);
+        assert.match(error.message, /^backend rate limit reached, wait about 10 s and retry\./);
+        assert.match(error.message, /cursor/);
+        return true;
+    });
+});
+
+test("callCommand ignores a retry-after that is not a number of seconds", async () => {
+    reply.status = 429;
+    reply.body = RATE_LIMIT_BODY;
+    reply.headers = { "retry-after": "soon" };
+    await assert.rejects(client().callCommand("alice", "get-mcp-subtree", {}), (error: unknown) => {
+        assert.ok(error instanceof BackendRateLimitError);
+        assert.equal(error.retryAfterSeconds, undefined);
+        return true;
+    });
+});
 
 test("callCommand reports the status only when the error body is not JSON", async () => {
     reply.status = 502;

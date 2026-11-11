@@ -153,6 +153,24 @@ test("import_image uploads a base64 PNG and places it as an image shape", async 
     });
 });
 
+test("import_image answers a replay without a kept reply: no shape id and a note", async () => {
+    const { backend, services, server } = harness();
+    backend.respond("mcp-apply-operations", { revn: 7, alreadyApplied: true });
+    const result = jsonOf(
+        await new ImportImageBackendTool(server, services).execute({
+            fileId: FILE,
+            pageId: PAGE,
+            base64: PNG_BASE64,
+            requestId: "1b2c3d4e-0000-4000-8000-0000000000c1",
+        })
+    );
+    assert.equal(result.alreadyApplied, true);
+    assert.equal(result.shapeId, undefined);
+    assert.equal(result.revn, 7);
+    assert.match(String(result.note), /already applied/);
+    assert.match(String(result.note), /id of the shape is not known/);
+});
+
 test("import_image accepts a data URL with the same bytes as plain base64", async () => {
     const { backend, services, server } = harness();
     const tool = new ImportImageBackendTool(server, services);

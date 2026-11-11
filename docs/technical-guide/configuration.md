@@ -1003,6 +1003,7 @@ mode means the `backend` or `both` value of `PENPOT_MCP_MODE`. Bridge mode means
 | `PENPOT_MCP_BACKEND_MAX_RESPONSE_MB` | `8` | Cap, in megabytes, on the body of one backend or exporter response. A larger response fails. Backend mode. |
 | `PENPOT_MCP_MAX_BODY_MB` | `32` | Largest HTTP request body, in megabytes. A request without a token gets 4 MB. The same cap limits the inline base64 of `import_archive` and `import_image`. |
 | `PENPOT_MCP_MAX_TOOL_RESPONSE_KB` | `100` | Largest JSON answer of one backend tool, in kilobytes (1 to 10000). Longer answers are cut. Backend mode. |
+| `PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB` | the value of `PENPOT_MCP_MAX_TOOL_RESPONSE_KB` | Largest answer of `export_subtree`, in kilobytes (1 to 10000). It is never cut: it holds as many shapes as fit, with a `nextCursor`. Raise it for scripted clients that accept large answers (1000 or more); a model client's context will not hold such answers. Backend mode. |
 | `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` | `0` (no limit), or `4` in backend mode | Most export shape requests that run at once. Zero means no limit. |
 | `PENPOT_MCP_EXPORT_TOTAL_PERMITS` | `4` | Most renders that run at once across all adapters that share `PENPOT_MCP_REDIS_URI`. Each permit lasts at most 65 s. Without Redis, each process uses its own cap. |
 | `PENPOT_MCP_EXPORT_BATCH_SIZE` | `10` | Most shapes that one exporter request renders in a `shapeIds` batch, from 1 to 50. Backend mode. |

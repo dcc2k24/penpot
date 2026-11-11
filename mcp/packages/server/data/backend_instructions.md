@@ -22,10 +22,17 @@ Follow these steps in order. Each step gives the id that the next step needs.
    its size before rotation, as the plugin API gives them; `rotation` comes apart. `get_shapes` fills `hidden: false`,
    `blocked: false`, `opacity: 1`, stroke `strokeAlignment: "center"` and layout `layoutItemHSizing`/
    `layoutItemVSizing: "fix"` when the shape stores none. A text with `textSizeApproximate: true` has an estimated
-   box (see "Text sizes").
+   box (see "Text sizes"). `fields` may also name `textLayoutState` and `characters`: a text always carries them, and
+   any other shape answers null.
 8. `find_shapes`, `get_library` and `get_tokens`: search by name, type, component, text or color, and read the library
    and design tokens. `get_tokens` takes an optional `setId` to read one token set, and `format`: `tokens` (the default:
    sets, themes and tokens) or `dtcg` (the DTCG export instead). It returns only one of the two.
+   A `find_shapes` search that ends early still returns the matches it found. Then `truncated` is true, `reason` says
+   why (`size`: the reply is full; `limit`: your `limit` is reached; `time`: the five-second search budget ran out),
+   `scanned` counts the shapes the call looked at, and `nextCursor` goes back in `cursor`, with the same filters, for
+   the next matches. A reply never holds half a match. A cursor with other filters, or after pages were added, removed or
+   reordered, is refused: start again without a cursor. When `skipped` is present, the call left out that many shapes
+   (`skippedIds` lists up to 20) whose name ran the regex out of time; search them with a simpler filter.
 
 Write with `apply_operations`. Its operations use ids from the steps above.
 
@@ -41,15 +48,48 @@ Write with `apply_operations`. Its operations use ids from the steps above.
 ## Bulk reads and checks
 
 - `export_subtree` returns every attribute of every shape under `rootId`, or of the whole page when `rootId` is left out.
-  It comes in windows: pass `nextCursor` as `cursor`. Pass `filePath` to write the whole subtree to one JSON file in
-  one call, and then read that file, not the reply.
+  A reply holds as many shapes as fit the response cap of the tool, and has `nextCursor` while shapes remain: pass it as
+  `cursor` until there is none. Pass `filePath` to write the whole subtree to one JSON file in one call, and then read
+  that file, not the reply. One shape above the cap comes back alone with its large attributes shown as omitted, listed
+  in `oversize` with its real size; `nextCursor` goes on after it, and the note says how to get the whole shape (the
+  operator raises `PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB`, or use `filePath`). `compact: true` drops null keys and the
+  top-level keys that hold their default (`defaults` lists them), and `strokeAlignment` when it is `center` inside
+  each stroke. Do not ask for `encoding`: it is for scripts.
 - `get_interactions` lists the flows and the prototype links of a page. `find_connectors` finds the arrows and lines
-  that run between two boards. On a large page, pass `withinId` to scan one part at a time.
+  that run between two screens, drawn as paths or as small groups of shapes. A group counts as one arrow only when it
+  has a shaft and heads at its ends; a row of arrows in one group is read arrow by arrow. An arrow drawn inside a screen
+  is found. A rounded or blunt head is read too, with `medium` confidence. A connector inside one screen is dropped
+  (`includeSameScreen` returns it). An end in a frame that is no screen has `nonScreen`. `direction` says how the head
+  was found, and `confidence` how sure that is: read `none` as "unknown": take the direction then from other evidence, such as labels or the order of the screens. It selects screens as `lint_page`
+  does. On a large page, pass `withinId` to scan one part at a time.
 - Run `list_fonts` before an export or a code generation. A font that does not resolve renders with a fallback font.
-- Run `lint_page` and `find_similar_boards` before you generate code from a page. `lint_page` finds empty boards, boards
-  with only one instance, and controls that are clipped or off their board. A control that its board hides, but that a
-  scrolling board brings into view, is `scroll-hidden-control`. `find_similar_boards` finds copies, so
-  that each repeated board is built once.
+  Such a font can carry `suggestedFontId`: a font of the same family that does resolve, often a team font uploaded under
+  a longer name. `suggestedVariantsMissing` lists the faces that the text uses and that font lacks. When
+  `get_file_outline` says `warningsComplete` false, `warningsPendingPages` names the pages its warnings miss: run
+  `list_fonts` for the file. A `list_fonts` reply that is not `truncated` is the complete font report, so read it there; when `pagesRead` is below `pagesTotal`, call `list_fonts` again with the same arguments (the backend process keeps the pages it read for up to 10 minutes, so a call usually goes on from there, but behind several processes it may start again);
+  do not call the outline again to confirm. The outline warnings are a fast first look, and with several backend
+  processes they may stay incomplete after `list_fonts`.
+- Run `lint_page` and `find_similar_boards` before you generate code from a page. Both find the screens by size. With
+  no `depth`, `boardNameRegex` or `mode`, they first look for frames of a standard screen size (a phone, tablet,
+  desktop or kiosk size) that occur at least three times, however deep they lie. If there are none, they use the
+  nesting of repeated frame sizes. Frames under 200 px on a side are never screens. `selection` in the reply says what
+  was chosen, with `basis` (`standard-size`, `structure` or `depth-fallback`), and `otherSizes` lists up to 5 sizes
+  that repeat on the page but were not chosen. In mode `depth`, `deeperBoards` counts the repeated screen-sized frames
+  below the chosen boards: when it is not 0, call again without `depth`, or with a larger one. To choose boards by hand,
+  pass `mode: "depth"` with a `depth` up to 12, or a `boardNameRegex`. `mode: "auto"` does not take `depth`.
+- `lint_page` finds empty boards, boards that hold only chrome (`instance-only-board`; chrome is the components that
+  repeat in the same place across the screens and touch a screen edge or sit on most screens, such as a header, a
+  footer or a side rail (a header that sits in different places is not chrome); the variants of a component count as one; `chromeComponents` lists them; an image, even a
+  full-screen one, is content), and controls that are clipped or off their board. A control that its board hides, but that a
+  scrolling board brings into view, is `scroll-hidden-control`.
+- `scroll-candidate` names a clipping frame without `overflowScroll` whose content reaches past its right or bottom
+  edge (a track that starts left of the frame counts; a background that covers the frame on both axes does not), and
+  suggests `vertical`, `horizontal` or `both`. To set them, send one `apply_operations` call with one
+  `update_shape` operation per reported frame, for example
+  `[{"op": "update_shape", "pageId": "P", "id": "F1", "props": {"overflowScroll": "vertical"}}]`. A finding with
+  `inComponentCopy` true is a copy: set the value on the main component instead, or it becomes an override.
+- `find_similar_boards` finds copies, so that each repeated board is built once. It compares only boards with at least
+  `minShapes` shapes; `skippedSmall` lists the others.
 
 ## Writing with apply_operations
 
@@ -83,6 +123,68 @@ family name of the font. Penpot's built-in Source Sans Pro has the family `sourc
   "characters": "Hello", "fontSize": "18", "fontFamily": "sourcesanspro"}]
 ```
 
+Replace a font on a page with `replace_font`. It needs `pageId`, `fromFontId` and `toFontId`. Take the ids from
+`list_fonts`. It swaps the font of every text in one pass, so it is the call to use after a font fails to load.
+
+```json
+[{"op": "replace_font", "pageId": "P", "fromFontId": "gfont-access-sans", "toFontId": "custom-4f6d1b2a-7c3e-4a5b-9d80-1e2f3a4b5c6d"}]
+```
+
+- `toFontId` must resolve: a built-in font, a Google font (only when the deployment allows them) or a font of the team.
+  The call fails when it does not, or when it equals `fromFontId`.
+- The scope is one page. `rootIds` (1 to 500 shapes) limits it to those shapes and everything under them.
+- A run changes when its font id is `fromFontId`. A run with no font id counts as `sourcesanspro`. The other runs of the
+  same text stay as they are.
+- A changed run gets `fontId`, `fontFamily`, `fontVariantId`, `fontWeight` and `fontStyle` of the target. The size,
+  fills and spacing stay. The variant id is the one the workspace writes for that font: a table id for a built-in font
+  (`bold`), `regular`, `italic`, `700` or `700italic` for a Google font, and `<style>-<weight>` for a team font
+  (`normal-700`).
+- A run with no weight of its own keeps the weight of its paragraph. A root or a paragraph set gives a run nothing: a
+  run under a root of weight 700 renders at 400, and stays 400. A paragraph, paragraph set or root changes only its
+  `fontId`, `fontFamily` and `fontVariantId`; its weight and style stay. A weight word such as `bold` gives way to a
+  `fontVariantId` that names a face; with none it counts as the renderer reads it, case-sensitively (`bold` 700,
+  `Bold` 400). `semibold` and `extrabold` are not mapped, and the call refuses them.
+- `variantMatch` `exact` (the default) needs the target to hold each weight and style in use. If one is missing, the
+  whole call fails, writes nothing, and the error names the missing pairs. `nearest` takes the closest weight instead;
+  `variantsUsed` in the reply shows each pick, with `exact` false for a near one. Use a dry run to see the picks first.
+- `maxTexts` (1 to 2000, default 1000) caps the texts one call changes. If more would change, the call fails and says
+  how many. Narrow it with `rootIds`, or raise `maxTexts`.
+- These texts are skipped, never written, and listed in the reply with a reason: `component-copy` (a text inside a
+  component copy), `typography-ref` (a text linked to a typography) and `font-token` (a text with a font family, font
+  weight or typography token applied). Detach or change those by hand, or swap the font in the main component.
+- A text inside a main component of this file does change, and its component id is in `mainsChanged`. To carry the change
+  to the copies, add `{"op": "sync_components"}` to the same call: with no ids it syncs the mains that the call touched.
+  Do it in the same call: a later `sync_components` with no ids does not know which mains this call touched. Dry-run
+  first when you want the lists. The op also stamps the changed components as modified, so other files see the change.
+- A copy whose text was overridden in any way (colour, size, anything) keeps all its text attributes after the sync,
+  the old font included. After the sync, run `list_fonts` again to see what is left. For a team font, reset the
+  override with `reset_overrides` on the text shape in the copy (the id of the copy's top shape would drop every
+  override in the copy), or set the font in the workspace; do not use `set_text_style` for a team font, which writes a
+  plain weight such as `700` as the variant id. `replace_font` on the copy's own page skips it as `component-copy`.
+  A main in another file is never written.
+- Runs of other fonts under a changed paragraph that name no weight of their own are not written, but in the workspace
+  they may show a different weight, because they take it from the paragraph's new font.
+- Hidden and locked texts change too, as in the workspace.
+- Copies that the sync changes lose their `positionData` too; `layoutDropped` does not count them, and the svg export
+  note below applies to them.
+- Auto-width and auto-height texts keep their old box size until someone edits the text in the workspace, and layout
+  parents do not reflow. `autoSizeTexts` and `autoSizeIds` in the reply name them.
+- The call drops `positionData` from every text it changes, as the workspace does when a font changes, and it does not
+  resize the text box. `layoutDropped` and `layoutDroppedIds` name those texts. Until someone opens the page in the
+  workspace, which rebuilds the layout, an svg export of a shape that holds such a text fails with an exporter timeout,
+  and `textLayoutState` is `approximate`. A png export works.
+- A call that changes at least one text takes a snapshot first, unless you pass `snapshot: false`.
+- The reply holds `opResults`, one entry per operation (null for an operation with no result). The entry for
+  `replace_font` has `textsScanned`, `textsMatched`, `textsChanged`, `runsChanged`, `toFamily`, `variantsUsed`,
+  `changedIds`, `layoutDropped`, `layoutDroppedIds`, `autoSizeTexts`, `autoSizeIds`, `mainsChanged` and `skipped` (`total`, `byReason`, and `items` with
+  `id`, `reason` and `detail`). Each list of ids holds at most 100, and a `...Truncated` flag says when it was cut; the
+  counts are always complete. A `dryRun` returns the same entry and writes nothing.
+- A replay of the same `requestId` returns `alreadyApplied` true and the `opResults` of the first answer. Run it
+  again as a dry run to see what is left.
+- It does not change typographies of the file library that use the source font, texts on other pages, or texts in other
+  files. Run it once per page. `set_text_style` and `create_text` still write a plain weight, such as `700`, as the
+  variant id of a team font, which the workspace does not know.
+
 Example 3: move shapes into another parent, in a given order.
 
 ```json
@@ -96,6 +198,23 @@ Example 4: change the properties of a shape. Only the given keys change.
 ```
 
 `props` refuses the layout-item keys, the gap keys and the padding keys (`layout-gap`, `layout-padding` and their variants). Use `set_layout_child` for a child's layout item, and `set_flex_layout` or `set_grid_layout` for gap and padding.
+
+`props` also refuses `flipX` and `flipY` on every create and update operation: a flip changes the transform and the
+points, so the flag alone would leave a broken shape. No operation sets a flip. A create operation refuses `rotation`
+in `props` too; create the shape, then turn it with `update_shape`.
+
+A shadow in `props.shadow` needs `style` (`drop-shadow` or `inner-shadow`), `offsetX`, `offsetY`, `blur`, `spread`,
+`hidden` and `color`. Its `id` is optional: a shadow without one gets a new id. A wrong shadow fails once, with the key
+path, for example `props.shadow is invalid`.
+
+```json
+[{"op": "update_shape", "pageId": "P", "id": "S1", "props": {"shadow": [
+  {"style": "drop-shadow", "offsetX": 0, "offsetY": 4, "blur": 8, "spread": 0, "hidden": false,
+   "color": {"color": "#000000", "opacity": 0.25}}]}}]
+```
+
+A path made by `create_path` gets the default stroke of a path drawn in the workspace: a centered 1 px black stroke and
+no fill. For a filled outline, such as an arrow, pass `"props": {"strokes": []}` and the fills you want.
 
 Example 5: delete shapes.
 
@@ -186,8 +305,20 @@ change. Restoring a snapshot replaces the current content of the file, so confir
 - A write that you retry must reuse its `requestId` with the same payload. The server answers `alreadyApplied: true` for
   a repeat of that write within about an hour, and then nothing changes. A reused `requestId` with another payload is a
   new write and is applied. A call without a `requestId` gets a new one, so a retry of it is applied again.
+- The reply of the repeat carries the `createdIds` (the `$tmp:` handle to id map) and the `opResults` of the first
+  answer, so a retry of a create gives you the real ids. The server keeps up to 10,000 entries of `createdIds` and a
+  reply of up to 1 MiB for about an hour, until the record expires. When it had to cut them, the repeat says `replayTruncated: true`: read the page to
+  find the rest. A write that committed in several batches keeps one reply for the whole call.
 - A response larger than 100 kB (`PENPOT_MCP_MAX_TOOL_RESPONSE_KB`) is cut, and the text says so. It is cut at whole
   items, and a cut answer has no `nextCursor`: repeat the call with a smaller `limit`. Narrow the request instead.
+  `find_connectors` and `lint_page` are cut that way only when a single item does not fit, and that reply has no
+  `nextOffset`. When their list does not fit, the reply holds whole items, `truncated` is true and `nextOffset` is set:
+  call again with `offset` set to `nextOffset`, until no `nextOffset` comes back. That reads every item once while
+  `revn` stays the same and no reply has `timedOut`. A reply with `timedOut` is not complete and cannot be continued:
+  start again with a narrower call (fewer `rules`, `boardNameRegex`, `withinId`).
+- The backend has its own rate limit. When it refuses a call, the text says how long to wait. Wait, then send the same
+  call again, with the same `cursor` if there was one: a cursor stays valid. An `export_subtree` call that the limit
+  stops after some windows returns them, with a `nextCursor` and a note.
 
 ## Text sizes
 
@@ -223,9 +354,13 @@ the sides.
 `transform` maps the `selrect` to the `points`. It works about the centre of the shape. `transformInverse` is its inverse.
 A shape that is neither rotated nor flipped has the identity for both. A flipped shape has a mirror in `transform`.
 
-To draw a shape, draw its unrotated rectangle through `translate(centre) · transform · translate(-centre)`.
-`export_subtree` gives this product as `worldMatrix` for each shape, with the values `a` to `f` in SVG order. A shape
-without `selrect` has no `worldMatrix`.
+`worldMatrix` is the matrix that maps the four corners of the `selrect` (top-left, top-right, bottom-right, bottom-left)
+onto the four `points`, in that order. To draw a shape, draw its unrotated rectangle through it. `export_subtree` gives
+it for each shape, with the values `a` to `f` in SVG order. When the `transform` agrees with the `points`, it equals
+`translate(centre) · transform · translate(-centre)`. For a flipped group it can differ from the stored `transform`: an
+import can leave the `transform` at the identity while the `points` are mirrored. When a shape has no four `points`, its
+box has no width or no height, or its `points` are degenerate (two or more coincide, or all lie on one line),
+`worldMatrix` is that product. A shape without `selrect` has no `worldMatrix`.
 
 The `content` of a path or a boolean is a string of absolute SVG commands `M`, `L`, `C` and `Z`, for example
 `M10.0,20.0L110.0,20.0C...Z`. Its points are in page space with `transform` already applied. Do not apply `transform` to
@@ -313,7 +448,7 @@ on those axes is meant to be reached by scrolling. The viewer does not act on it
 
 To place shapes in another program, read a board with `export_subtree`, with `rootId` set to the board's id.
 
-1. Read every window. Pass `nextCursor` as `cursor` while `truncated` is true.
+1. Read every reply. Pass `nextCursor` as `cursor` while `truncated` is true.
 2. Place each shape with its `worldMatrix`. A path and a boolean are the exception. Their `content` is already in page
    space, so draw it without `transform` and without `worldMatrix`. Use `points` for their box.
 3. Paint each shape with its `fills`. For each stroke, use `strokeAlignment` and the side widths.
@@ -333,6 +468,16 @@ To place shapes in another program, read a board with `export_subtree`, with `ro
 - In `positionData`, `fontSize`, `letterSpacing` and the other font values are strings, such as `"14px"`.
 - `text` in `positionData` is not case-transformed. Apply `textTransform` yourself.
 - `x1`, `y1`, `x2` and `y2` in a run come from the browser's layout. They do not move with the shape, so ignore them.
+
+### Names that differ from the stored file
+
+The tools show some names in a form that differs from the stored file. A generator ported from a binfile must map them.
+
+| Stored in the file | Shown by the tools | Notes |
+|---|---|---|
+| shape type `circle` | `ellipse` | `find_shapes` accepts `ellipse` or `circle` as `type`. The create op is `create_ellipse`. |
+| shape type `frame` (a board) | `frame` | `find_shapes` accepts `board` or `frame` as `type`. The create op is `create_board`. |
+| kebab-case attribute keys, such as `fill-color` | camelCase keys, such as `fillColor` | Every read tool and every write tool. |
 
 ## When to use execute_code
 
@@ -384,6 +529,8 @@ Use the typed tools for one or two simple changes.
   whose children did not all load refuses an insert at an index, a z-order move of its children, a `parentIndex` read of
   a child, and `remove` or `ungroup` of itself. Add that shape's id to `rootIds`, or leave `rootIds` out. An append on
   top still works. The ancestors of the roots are stubs: `children` lists them, and `findShapes` does not. The reply carries a `partial-page` warning.
+  A page above the 16 MB cap fails at once when its estimated size is clearly over: the error says "estimated" and asks
+  for `rootIds`.
 - Calls return values at once, so `await` is not needed. The sandbox removes an `await` in front of a call to `penpot`,
   `penpotUtils` or `penpotMgmt`, or in front of `.export(...)` or `.exportImage(...)`. Any other `await` fails. An
   async function fails.

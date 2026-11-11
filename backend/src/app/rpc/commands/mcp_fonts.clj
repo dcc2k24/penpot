@@ -35,8 +35,11 @@
   "Fonts the text of a file uses. Each font says where it comes from
   (`source`), whether it resolves and why not, its runs and shapes, the pages
   it is on, and its variants with their download `url` when they have one.
+  A font that does not resolve carries `suggested-font-id` and the other
+  `suggested-*` keys when a font that resolves has the same family.
   Without `page-id` every page is read, within five seconds; past that,
-  `truncated`. `root-ids` (which needs `page-id`) limits the report to the
+  `truncated`. A reply that is not `truncated` is the complete font report of
+  the file. `pages-read` and `pages-total` count the pages read and asked for. `root-ids` (which needs `page-id`) limits the report to the
   subtrees of those shapes. A reply holds at most 500 fonts and stays within
   the response byte budget."
   {::rpc/token-type "mcp"
@@ -75,6 +78,8 @@
                     [{:revn revn
                       :fonts kept
                       :unresolved (count (remove :resolved fonts))
+                      :pages-read (count (:page-usages scan))
+                      :pages-total (count pages)
                       :truncated (or (not (:complete scan))
                                      (> (count fonts) max-fonts)
                                      byte-cut?)}

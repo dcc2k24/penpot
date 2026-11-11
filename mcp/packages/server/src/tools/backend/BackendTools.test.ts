@@ -120,7 +120,7 @@ const cases: [string, string, Record<string, unknown>, string, Record<string, un
         "find_shapes",
         { fileId: FILE, type: "text", limit: 5 },
         "find-mcp-shapes",
-        { fileId: FILE, type: "text", limit: 5 },
+        { fileId: FILE, type: "text", limit: 5, maxBytes: 85_000 },
     ],
     [
         "get_library",
@@ -142,7 +142,7 @@ const cases: [string, string, Record<string, unknown>, string, Record<string, un
         "export_subtree",
         { fileId: FILE, pageId: PAGE, rootId: SHAPE, limit: 50 },
         "get-mcp-subtree",
-        { fileId: FILE, pageId: PAGE, rootId: SHAPE, limit: 50, maxBytes: 80_000 },
+        { fileId: FILE, pageId: PAGE, rootId: SHAPE, limit: 50, maxJsonBytes: 96_996 },
     ],
     [
         "get_interactions",

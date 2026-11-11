@@ -72,3 +72,25 @@ test("get_page_tree shows circle nodes as ellipse at every depth and keeps other
     assert.equal(body.root.children[0].children[0].type, "ellipse");
     assert.equal(body.root.children[1].type, "rect");
 });
+
+test("get_page_tree never asks for the size estimate, and its reply carries none", async () => {
+    // the size estimate is for the sandbox page load only; the tool passes the backend reply through to the model
+    const backend = acceptingBackend().respond("get-mcp-page-tree", (params: object) => ({
+        revn: 1,
+        pageId: PAGE,
+        root: { id: "1b2c3d4e-0000-4000-8000-000000000010", type: "frame", children: [] },
+        truncated: false,
+        ...((params as { estimateSize?: boolean }).estimateSize === true
+            ? { totalShapes: 1, estimatedBytes: 100 }
+            : {}),
+    }));
+    const tool = new GetPageTreeTool(sessionServer(), servicesFor(backend));
+
+    const response = await tool.execute({ fileId: FILE, pageId: PAGE });
+    const body = JSON.parse((response.content[0] as { text: string }).text) as Record<string, unknown>;
+
+    const params = backend.callsTo("get-mcp-page-tree")[0]?.params as Record<string, unknown>;
+    assert.equal("estimateSize" in params, false);
+    assert.equal("totalShapes" in body, false);
+    assert.equal("estimatedBytes" in body, false);
+});

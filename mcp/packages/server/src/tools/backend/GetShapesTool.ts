@@ -24,7 +24,9 @@ export class GetShapesArgs {
             .describe(
                 "Attributes to return per shape, such as width, parent-id or parentId. " +
                     "camelCase and kebab-case names both work. Default: id, name, type, parentId, x, y, width, height, " +
-                    "hidden and shapes (the ids of the children). Name more, such as fills or content, to get them."
+                    "hidden and shapes (the ids of the children). Name more, such as fills or content, to get them. " +
+                    "textLayoutState and characters can be named too: a text shape always carries them, and any " +
+                    "other shape answers null."
             ),
         includeChildren: z
             .boolean()

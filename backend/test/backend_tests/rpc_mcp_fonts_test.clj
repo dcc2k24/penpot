@@ -256,7 +256,8 @@
   (let [{:keys [profile file-id owned-id lack-id]} (create-fixture)
         out (get-fonts profile file-id)]
     (t/is (nil? (:error out)))
-    (t/is (= #{:revn :fonts :unresolved :truncated} (set (keys (:result out)))))
+    (t/is (= #{:revn :fonts :unresolved :pages-read :pages-total :truncated}
+             (set (keys (:result out)))))
     (t/is (= (current-revn file-id) (:revn (:result out))))
     (t/is (false? (:truncated (:result out))))
 
@@ -611,6 +612,362 @@
         (t/is (true? (:warnings-complete second-out)))
         (t/is (some #(= page1 (:page-id %)) (:warnings second-out)))
         (t/is (= 3 @scans))))))
+
+;; --- SUGGESTIONS
+
+(def ^:private stem-table
+  [["Access Sans Bold" "accesssans"]
+   ["Access Sans" "accesssans"]
+   ["AccessSans-Bold" "accesssans"]
+   ["access_sans" "accesssans"]
+   ["Inter Semi Bold Italic" "inter"]
+   ["Inter SemiBold" "inter"]
+   ["Roboto Condensed Light" "robotocondensed"]
+   ["Roboto" "roboto"]
+   ["Black" "black"]
+   ["Source Sans Pro" "sourcesanspro"]
+   ["SourceSansPro-Regular" "sourcesanspro"]
+   ["IBM Plex Sans Medium" "ibmplexsans"]
+   ["Noto Sans JP" "notosansjp"]
+   ["Open Sans Extra Bold" "opensans"]
+   ["Open Sans ExtraBold Italic" "opensans"]
+   ["Lato Ultra Light" "lato"]
+   ["Lato Hairline" "lato"]
+   ["Playfair Display Black Oblique" "playfairdisplay"]
+   ["Work Sans Demi Bold" "worksans"]
+   ["Fira-Code_Regular" "firacode"]
+   ["Merriweather Bold Bold" "merriweather"]
+   ["Heavy Metal" "heavymetal"]
+   ["Poppins Book Roman" "poppinsbookroman"]
+   ["Times New Roman" "timesnewroman"]
+   ["Extra Light" "extralight"]
+   ["Ultra Light Italic" "ultralight"]
+   ["Semi" "semi"]
+   ["Access Sans Bd" "accesssans"]
+   ["AccessSans-Rg" "accesssans"]
+   ["Inter Lt" "inter"]
+   ["Inter Md" "inter"]
+   ["Inter Blk" "inter"]
+   ["Inter Sb It" "inter"]
+   ["Inter Reg" "inter"]
+   ["Inter Xb" "inter"]
+   ["Inter Obl" "inter"]
+   ["Montserrat 700" "montserrat"]
+   ["Montserrat 700i" "montserrat"]
+   ["Montserrat 150 Italic" "montserrat"]
+   ["Montserrat 700 Italic" "montserrat"]
+   ["Montserrat 950" "montserrat"]
+   ["Montserrat 725" "montserrat725"]
+   ["Montserrat 1000" "montserrat1000"]
+   ["700" "700"]
+   ["" nil]])
+
+(t/deftest font-name-stem-table
+  (doseq [[font-name expected] stem-table]
+    (t/is (= expected (mcp-fonts/get-name-stem font-name)) font-name)))
+
+(t/deftest font-name-key-drops-separators-only
+  (t/is (= "accesssansbold" (mcp-fonts/get-name-key "Access Sans-Bold")))
+  (t/is (= "accesssans" (mcp-fonts/get-name-key "access_sans")))
+  (t/is (nil? (mcp-fonts/get-name-key " - "))))
+
+(defn- team-ctx
+  "A font context with the team fonts `fonts`, a map of font id to
+  `[family [[weight style] ...]]`."
+  [google-on fonts]
+  {:google-on google-on
+   :public-uri "http://localhost"
+   :team-fonts (into {}
+                     (map (fn [[id [family pairs]]]
+                            [id (mapv (fn [[w s]]
+                                        {:font-family family
+                                         :font-weight w
+                                         :font-style s})
+                                      pairs)]))
+                     fonts)})
+
+(defn- suggest
+  [ctx font-id family & used]
+  (mcp-fonts/get-font-suggestion ctx font-id family used))
+
+(t/deftest suggestion-stem-match-on-a-team-font
+  (let [ctx (team-ctx true {"custom-aaa" ["Access Sans Bold" [[700 "normal"]]]})
+        s   (suggest ctx "gfont-access-sans" "Access Sans" ["700" "normal"])]
+    (t/is (= {:suggested-font-id "custom-aaa"
+              :suggested-family "Access Sans Bold"
+              :suggested-source :custom
+              :suggested-match :stem
+              :suggested-variants-missing []}
+             s))
+    ;; runs at 400: the real font lacks that face
+    (t/is (= [{:weight "400" :style "normal"}]
+             (:suggested-variants-missing
+              (suggest ctx "gfont-access-sans" "Access Sans" ["400" "normal"]))))
+    ;; sorted by weight, then style
+    (t/is (= [{:weight "300" :style "italic"} {:weight "400" :style "normal"}]
+             (:suggested-variants-missing
+              (suggest ctx "gfont-access-sans" "Access Sans"
+                       ["400" "normal"] ["300" "italic"] ["700" "normal"]))))))
+
+(t/deftest suggestion-id-is-a-second-name
+  ;; the runs name another family, the font id carries the right one
+  (let [ctx (team-ctx true {"custom-aaa" ["Access Sans" [[400 "normal"]]]})]
+    (t/is (= "custom-aaa"
+             (:suggested-font-id
+              (suggest ctx "gfont-access-sans" "Something Else" ["400" "normal"]))))))
+
+(t/deftest suggestion-exact-beats-stem
+  (let [ctx (team-ctx true {"custom-a" ["Access Sans Bold" [[700 "normal"]]]
+                            "custom-b" ["Access Sans" [[400 "normal"]]]})
+        s   (suggest ctx "gfont-access-sans" "Access Sans" ["700" "normal"])]
+    (t/is (= "custom-b" (:suggested-font-id s)))
+    (t/is (= :exact (:suggested-match s)))
+    (t/is (= [{:weight "700" :style "normal"}] (:suggested-variants-missing s)))))
+
+(t/deftest suggestion-team-beats-builtin-of-the-same-kind
+  (let [none (team-ctx false {})
+        with (team-ctx false {"custom-z" ["Source Sans Pro" [[400 "normal"]]]})
+        ks   [:suggested-font-id :suggested-source :suggested-match]]
+    (t/is (= {:suggested-font-id "sourcesanspro"
+              :suggested-source :builtin
+              :suggested-match :exact}
+             (select-keys (suggest none "gfont-source-sans-pro" "Source Sans Pro"
+                                   ["400" "normal"])
+                          ks)))
+    (t/is (= {:suggested-font-id "custom-z"
+              :suggested-source :custom
+              :suggested-match :exact}
+             (select-keys (suggest with "gfont-source-sans-pro" "Source Sans Pro"
+                                   ["400" "normal"])
+                          ks)))))
+
+(t/deftest suggestion-exact-builtin-beats-stem-team-font
+  (let [ctx (team-ctx false {"custom-z" ["Source Sans Pro Bold" [[700 "normal"]]]})
+        s   (suggest ctx "gfont-source-sans-pro" "Source Sans Pro" ["700" "normal"])]
+    (t/is (= "sourcesanspro" (:suggested-font-id s)))
+    (t/is (= :builtin (:suggested-source s)))
+    (t/is (= :exact (:suggested-match s)))))
+
+(t/deftest suggestion-uses-google-only-when-the-provider-is-on
+  (let [on  (team-ctx true {})
+        off (team-ctx false {})
+        s   (suggest on "custom-gone" "Roboto" ["400" "normal"])]
+    (t/is (= {:suggested-font-id "gfont-roboto"
+              :suggested-family "Roboto"
+              :suggested-source :google
+              :suggested-match :exact
+              :suggested-variants-missing []}
+             s))
+    (t/is (nil? (suggest off "custom-gone" "Roboto" ["400" "normal"])))))
+
+(t/deftest suggestion-prefers-the-candidate-with-more-used-variants
+  (let [ctx (team-ctx false {"custom-a" ["Brand Light" [[300 "normal"]]]
+                             "custom-b" ["Brand Bold" [[700 "normal"] [400 "normal"]]]
+                             "custom-c" ["Brand Regular" [[700 "normal"]]]})
+        s   (suggest ctx "custom-gone" "Brand" ["400" "normal"] ["700" "normal"])]
+    (t/is (= "custom-b" (:suggested-font-id s)))
+    (t/is (= :stem (:suggested-match s)))
+    (t/is (= [] (:suggested-variants-missing s)))))
+
+(t/deftest suggestion-ties-break-on-the-font-id
+  (let [ctx (team-ctx false {"custom-b" ["Brand Bold" [[700 "normal"]]]
+                             "custom-a" ["Brand Light" [[700 "normal"]]]})]
+    (t/is (= "custom-a"
+             (:suggested-font-id (suggest ctx "custom-gone" "Brand" ["700" "normal"]))))))
+
+(t/deftest suggestion-none-without-a-candidate
+  (let [ctx (team-ctx true {"custom-a" ["Other Family" [[400 "normal"]]]})]
+    (t/is (nil? (suggest ctx "zzz-unknown" "Mystery" ["400" "normal"])))))
+
+(t/deftest suggestion-never-names-the-font-itself
+  (let [ctx (team-ctx true {"custom-a" ["Brand" [[400 "normal"]]]})]
+    (t/is (nil? (suggest ctx "custom-a" "Brand" ["400" "normal"])))))
+
+(t/deftest report-suggests-for-unresolved-fonts-only
+  (let [{:keys [profile file-id team-id]}
+        (create-runs-file! 9 [{:font-id "gfont-access-sans" :font-family "Access Sans"
+                               :font-weight "700"}
+                              {:font-id "gfont-roboto" :font-family "Roboto"}
+                              {:font-id "zzz-unknown" :font-family "Mystery"}])
+        _      (insert-font-row! team-id (uuid/next)
+                                 {:font-family "Access Sans Bold" :font-weight 700
+                                  :ttf-file-id (insert-storage!)})
+        out    (get-fonts profile file-id)
+        access (font-of out "gfont-access-sans")]
+    (t/is (false? (:resolved access)))
+    (t/is (= "not-in-google-catalog" (:reason access)))
+    (t/is (= :custom (:suggested-source access)))
+    (t/is (= :stem (:suggested-match access)))
+    (t/is (= "Access Sans Bold" (:suggested-family access)))
+    (t/is (.startsWith ^String (:suggested-font-id access) "custom-"))
+    (t/is (= [] (:suggested-variants-missing access)))
+    (t/is (not-any? #(contains? (font-of out "gfont-roboto") %)
+                    [:suggested-font-id :suggested-family :suggested-source
+                     :suggested-match :suggested-variants-missing]))
+    (t/is (not-any? #(contains? (font-of out "zzz-unknown") %)
+                    [:suggested-font-id :suggested-variants-missing]))
+    ;; the outline warning carries the id and the family
+    (let [warnings (:warnings (:result (call! profile :get-mcp-file-outline
+                                              {:file-id file-id})))
+          w        (first (filter #(= "gfont-access-sans" (:font-id %)) warnings))]
+      (t/is (= (:suggested-font-id access) (:suggested-font-id w)))
+      (t/is (= "Access Sans Bold" (:suggested-family w)))
+      (t/is (not (contains? w :suggested-match))))))
+
+(defn- add-text!
+  "A board with one text shape of the runs `runs` on page `page-id` of the file."
+  [profile file-id page-id runs]
+  (let [board (uuid/next)
+        text  (uuid/next)]
+    (apply-changes!
+     profile file-id
+     [(add-obj page-id board uuid/zero uuid/zero {:type :frame :name "Board"})
+      (add-obj page-id text board board
+               {:type :text :name "Text" :x 0 :y 0 :width 100 :height 20
+                :content (text-content runs)})])))
+
+(t/deftest suggestion-never-crosses-teams
+  (let [profile  (th/create-profile* 20 {:is-active true})
+        team-b   (th/create-team* 20 {:profile-id (:id profile)})
+        project  (th/create-project* 20 {:profile-id (:id profile) :team-id (:id team-b)})
+        file-a   (th/create-file* 20 {:profile-id (:id profile)
+                                      :project-id (:default-project-id profile)})
+        file-b   (th/create-file* 21 {:profile-id (:id profile)
+                                      :project-id (:id project)})
+        runs     [{:font-id "gfont-access-sans" :font-family "Access Sans"
+                   :font-weight "700"}]
+        keys*    [:suggested-font-id :suggested-family :suggested-source
+                  :suggested-match :suggested-variants-missing]
+        _        (insert-font-row! (:id team-b) (uuid/next)
+                                   {:font-family "Access Sans Bold" :font-weight 700
+                                    :ttf-file-id (insert-storage!)})
+        _        (add-text! profile (:id file-a) (get-in file-a [:data :pages 0]) runs)
+        _        (add-text! profile (:id file-b) (get-in file-b [:data :pages 0]) runs)
+        in-a     (font-of (get-fonts profile (:id file-a)) "gfont-access-sans")
+        in-b     (font-of (get-fonts profile (:id file-b)) "gfont-access-sans")]
+    (t/is (not= (:team-id (th/db-get :project {:id (:default-project-id profile)}))
+                (:id team-b)))
+    (t/is (false? (:resolved in-a)))
+    (t/is (not-any? #(contains? in-a %) keys*) "team B's font is not offered to team A")
+    (t/is (false? (:resolved in-b)))
+    (t/is (= "Access Sans Bold" (:suggested-family in-b)))
+    (t/is (= :custom (:suggested-source in-b)))
+    ;; the outline of the file of team A carries no suggestion either
+    (let [w (first (:warnings (:result (call! profile :get-mcp-file-outline
+                                              {:file-id (:id file-a)}))))]
+      (t/is (= "gfont-access-sans" (:font-id w)))
+      (t/is (not-any? #(contains? w %) [:suggested-font-id :suggested-family])))))
+
+(t/deftest family-of-an-unresolved-font-is-the-most-frequent-string
+  ;; one font id, two family strings: the one with most runs names the font on
+  ;; every page and in the file report; the first run seen would say AccessSans
+  (let [{:keys [profile file-id]} (create-runs-file!
+                                   30 [{:font-id "gfont-access-sans" :font-family "AccessSans"}
+                                       {:font-id "gfont-access-sans" :font-family "Access Sans"}
+                                       {:font-id "gfont-access-sans" :font-family "Access Sans"}])
+        page2 (uuid/next)
+        _     (apply-changes! profile file-id [{:type :add-page :id page2 :name "Second"}])
+        _     (add-text! profile file-id page2
+                         [{:font-id "gfont-access-sans" :font-family "AccessSans"}
+                          {:font-id "gfont-access-sans" :font-family "Access Sans"}
+                          {:font-id "gfont-access-sans" :font-family "Access Sans"}])
+        ws    (:warnings (:result (call! profile :get-mcp-file-outline {:file-id file-id})))
+        font  (font-of (get-fonts profile file-id) "gfont-access-sans")]
+    (t/is (= 2 (count ws)))
+    (t/is (= ["Access Sans" "Access Sans"] (map :family ws)))
+    (t/is (= "Access Sans" (:family font)))
+    (t/is (= 6 (:runs font)))))
+
+(t/deftest family-ties-go-to-the-first-string-seen
+  (let [{:keys [profile file-id]} (create-runs-file!
+                                   31 [{:font-id "gfont-access-sans" :font-family "AccessSans"}
+                                       {:font-id "gfont-access-sans" :font-family "Access Sans"}])
+        font (font-of (get-fonts profile file-id) "gfont-access-sans")]
+    (t/is (= "AccessSans" (:family font)))))
+
+(t/deftest report-suggests-for-a-custom-font-gone-from-the-team
+  (let [gone (uuid/next)
+        {:keys [profile file-id team-id]}
+        (create-runs-file! 10 [{:font-id (str "custom-" gone) :font-family "Brand"
+                                :font-variant-id "normal-400"}])
+        _    (insert-font-row! team-id (uuid/next) {:font-family "Brand"})
+        font (font-of (get-fonts profile file-id) (str "custom-" gone))]
+    (t/is (= "custom-font-not-in-team" (:reason font)))
+    (t/is (= :exact (:suggested-match font)))
+    (t/is (= "Brand" (:suggested-family font)))))
+
+;; --- PENDING PAGES
+
+(t/deftest outline-lists-the-pages-too-large-to-scan
+  (let [{:keys [profile file-id page1]} (create-fixture)]
+    (with-redefs [mcp-fonts/outline-max-shapes 2]
+      (let [out (:result (call! profile :get-mcp-file-outline {:file-id file-id}))]
+        (t/is (false? (:warnings-complete out)))
+        (t/is (= "list_fonts" (:warnings-complete-with out)))
+        (t/is (false? (:warnings-pending-truncated out)))
+        (t/is (= [{:page-id page1 :shape-count 3 :reason "page-too-large"}]
+                 (:warnings-pending-pages out)))))))
+
+(t/deftest outline-lists-the-pages-the-time-ran-out-on
+  (let [{:keys [profile file-id page2 page3]} (create-fixture)]
+    (with-redefs [mcp-fonts/outline-budget-ns 0]
+      (let [out (:result (call! profile :get-mcp-file-outline {:file-id file-id}))]
+        (t/is (false? (:warnings-complete out)))
+        (t/is (= "list_fonts" (:warnings-complete-with out)))
+        (t/is (= [page2 page3] (map :page-id (:warnings-pending-pages out))))
+        (t/is (= ["time" "time"] (map :reason (:warnings-pending-pages out))))
+        (t/is (every? #(contains? % :shape-count) (:warnings-pending-pages out)))))))
+
+(t/deftest outline-complete-has-no-pending-pages-and-no-pointer-to-list-fonts
+  (let [{:keys [profile file-id]} (create-fixture)
+        out (:result (call! profile :get-mcp-file-outline {:file-id file-id}))]
+    (t/is (true? (:warnings-complete out)))
+    (t/is (= [] (:warnings-pending-pages out)))
+    (t/is (false? (:warnings-pending-truncated out)))
+    (t/is (not (contains? out :warnings-complete-with)))))
+
+(t/deftest outline-caps-the-pending-pages-at-fifty
+  (let [{:keys [profile file-id]} (create-runs-file! 11 [{:font-id "sourcesanspro"}])
+        page-ids (vec (repeatedly 55 uuid/next))]
+    (apply-changes! profile file-id
+                    (mapv (fn [id] {:type :add-page :id id :name "P"}) page-ids))
+    (with-redefs [mcp-fonts/outline-budget-ns 0]
+      (let [out (:result (call! profile :get-mcp-file-outline {:file-id file-id}))]
+        ;; the first page is read, the 55 added pages are pending
+        (t/is (= 50 (count (:warnings-pending-pages out))))
+        (t/is (true? (:warnings-pending-truncated out)))
+        (t/is (= (take 50 page-ids) (map :page-id (:warnings-pending-pages out)))
+              "pages come in page order")
+        (t/is (false? (:warnings-complete out)))))))
+
+(t/deftest whole-file-fonts-complete-the-next-outline-also-for-large-pages
+  (let [{:keys [profile file-id page1]} (create-fixture)]
+    (with-redefs [mcp-fonts/outline-max-shapes 2]
+      (let [before (:result (call! profile :get-mcp-file-outline {:file-id file-id}))
+            fonts  (:result (get-fonts profile file-id))
+            after  (:result (call! profile :get-mcp-file-outline {:file-id file-id}))]
+        (t/is (= [page1] (map :page-id (:warnings-pending-pages before))))
+        (t/is (false? (:truncated fonts)))
+        (t/is (true? (:warnings-complete after)))
+        (t/is (= [] (:warnings-pending-pages after)))
+        (t/is (not (contains? after :warnings-complete-with)))
+        (t/is (= 3 (count (:warnings after))))))))
+
+(t/deftest fonts-reply-counts-the-pages-read
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        whole (:result (get-fonts profile file-id))
+        one   (:result (get-fonts profile file-id :page-id page1))]
+    (t/is (= 3 (:pages-read whole)))
+    (t/is (= 3 (:pages-total whole)))
+    (t/is (= 1 (:pages-read one)))
+    (t/is (= 1 (:pages-total one)))
+    ;; the reads above cached every page: empty the cache so the budget cuts
+    (cache/invalidate @#'mcp-fonts/usage-cache)
+    (with-redefs [mcp-fonts/scan-budget-ns 0]
+      (let [cut (:result (get-fonts profile file-id))]
+        (t/is (true? (:truncated cut)))
+        (t/is (= 1 (:pages-read cut)))
+        (t/is (= 3 (:pages-total cut)))))))
 
 ;; --- ACCESS AND AUDIT
 

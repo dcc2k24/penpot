@@ -350,8 +350,12 @@
   call: the repair row when the batch repaired the file, the automatic
   snapshot the batch took, and the change row. Queues the notifications
   of the batch, which run when the transaction commits. `revn` is the
-  revn before the batch."
-  [{:keys [::db/conn ::timestamp] :as cfg} {:keys [profile-id session-id team]} file changes revn]
+  revn before the batch. `reply` (bytes, or nil) is stored in the `mcp_reply`
+  column of the change row (never in `data`, which the file restore reads as
+  durable history): the reply of an MCP call, which a replay of the
+  call reads. The row expires with the others, and no snapshot reader looks
+  at it, since a snapshot has a label."
+  [{:keys [::db/conn ::timestamp] :as cfg} {:keys [profile-id session-id team]} file changes revn reply]
   (let [snapshot-deleted-at (ct/plus timestamp (ldel/get-deletion-delay team))
         deleted-at          (ct/plus timestamp (ct/duration {:hours 1}))
         repair              (::repair file)
@@ -399,17 +403,19 @@
     ;; Insert change (xlog) with deleted_at in a future data for
     ;; make them automatically eleggible for GC once they expires
     (db/insert! conn :file-change
-                {:id (uuid/next)
-                 :session-id session-id
-                 :profile-id profile-id
-                 :created-at change-created-at
-                 :updated-at change-created-at
-                 :deleted-at deleted-at
-                 :file-id (:id file)
-                 :revn (:revn file)
-                 :version (:version file)
-                 :features (into-array (:features file))
-                 :changes (blob/encode changes)}
+                (cond-> {:id (uuid/next)
+                         :session-id session-id
+                         :profile-id profile-id
+                         :created-at change-created-at
+                         :updated-at change-created-at
+                         :deleted-at deleted-at
+                         :file-id (:id file)
+                         :revn (:revn file)
+                         :version (:version file)
+                         :features (into-array (:features file))
+                         :changes (blob/encode changes)}
+                  (some? reply)
+                  (assoc :mcp-reply reply))
                 {::db/return-keys false})
 
     (when repair
@@ -456,7 +462,7 @@
 
       (commit-batch! cfg
                      {:profile-id profile-id :session-id session-id :team team}
-                     file changes revn)
+                     file changes revn nil)
 
       (persist-file! cfg (dissoc file ::repair))
 
@@ -1060,14 +1066,16 @@
   file is not written here: `finish-batches!` writes it once.
 
   `opts` holds `::mcp-snapshot`, the snapshot spec of a call that takes
-  one (give it on the first batch only), and `::skip-auto-snapshot`.
+  one (give it on the first batch only), `::reply`, the bytes that the
+  change row of the batch keeps for a replay (give it on the first batch
+  only), and `::skip-auto-snapshot`.
   Give `::skip-auto-snapshot` true on every batch after the first, and
   on every batch of a call that takes its own snapshot. So the automatic
   snapshot is taken at most once per call, before the first batch, and
   never on a half-applied state. Returns the next context."
   [{:keys [cfg file profile-id session-id team features tracked] :as ctx}
    changes
-   {::keys [mcp-snapshot skip-auto-snapshot]}]
+   {::keys [mcp-snapshot skip-auto-snapshot reply]}]
   (let [revn         (:revn file)
         mcp-snapshot (when-let [{:keys [label keep]} mcp-snapshot]
                        {:label label
@@ -1090,7 +1098,7 @@
 
         (commit-batch! cfg
                        {:profile-id profile-id :session-id session-id :team team}
-                       file' changes revn)
+                       file' changes revn reply)
 
         (-> ctx
             (assoc :file (dissoc file' ::snapshot ::repair))

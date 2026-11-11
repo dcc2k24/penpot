@@ -149,7 +149,7 @@ interface ApplyAnswer {
     /** Revision the file has after the write. */
     revn: number;
     /** Ids of the created shapes, keyed by their `$tmp:` handle. */
-    createdIds: Record<string, string>;
+    createdIds?: Record<string, string>;
     /** True when an earlier call with the same requestId already applied this write. */
     alreadyApplied?: boolean;
 }
@@ -232,14 +232,18 @@ export class ImportImageBackendTool extends BackendTool<ImportImageBackendArgs> 
             operations: [ImportImageBackendTool.createImageOperation(args, media, pageId)],
             ...WriteOptions.toParams(args),
         });
-        return this.jsonResponse(
-            WriteOptions.withAlreadyApplied({
-                ...ImportImageBackendTool.mediaSummary(media),
-                shapeId: answer.createdIds["$tmp:image"],
-                revn: answer.revn,
-                alreadyApplied: answer.alreadyApplied,
-            })
-        );
+        const shapeId = answer.createdIds?.["$tmp:image"];
+        const result = WriteOptions.withAlreadyApplied({
+            ...ImportImageBackendTool.mediaSummary(media),
+            shapeId,
+            revn: answer.revn,
+            alreadyApplied: answer.alreadyApplied,
+        }) as Record<string, unknown>;
+        if (shapeId === undefined && answer.alreadyApplied === true) {
+            // the backend kept no reply for the first call, so the id of the shape is not known
+            result.note = `${String(result.note ?? "")} The id of the shape is not known: find it with get_page_tree.`;
+        }
+        return this.jsonResponse(result);
     }
 
     /**

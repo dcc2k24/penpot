@@ -114,6 +114,7 @@ Limits and timeouts:
 | `PENPOT_MCP_BACKEND_TIMEOUT_S` | `55` | Timeout of each backend call |
 | `PENPOT_MCP_BACKEND_MAX_RESPONSE_MB` | `8` | Cap on one backend or exporter response |
 | `PENPOT_MCP_MAX_TOOL_RESPONSE_KB` | `100` | Cap on one tool answer. Longer answers are cut. |
+| `PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB` | the value above | Cap on one `export_subtree` answer, from 1 to 10000. That answer is never cut: it holds as many shapes as fit. Raise it for scripts that accept large answers, to 1000 or more; a model client's context will not hold such answers. |
 | `PENPOT_MCP_MAX_BODY_MB` | `32` | Request body cap after the token check. Before it, 4 MB (contract 4.8). |
 | `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` | `4` in backend mode | Exports that run at once in one process. `0` means no limit. |
 | `PENPOT_MCP_EXPORT_TOTAL_PERMITS` | `4` | Renders that run at once across all adapters that share `PENPOT_MCP_REDIS_URI`. Each permit lasts at most 65 s. If Redis fails, each process uses its own cap. |
@@ -228,6 +229,13 @@ Migration `0158` adds two nullable columns and a partial unique index on `access
 (`0158-add-client-to-access-token.sql`). It uses a plain `CREATE UNIQUE INDEX`. Its lock time has not been measured.
 Check the row count of `access_token` before the deploy.
 
+Migration `0160` adds one nullable column, `mcp_reply bytea`, to `file_change`
+(`0160-add-mcp-reply-to-file-change.sql`). The backend keeps the reply of a write there, so a replay can return the
+created ids. The change is additive and needs no downtime: PostgreSQL adds a nullable column with no default
+without rewriting the table, and the statement uses `ADD COLUMN IF NOT EXISTS`, so it is safe to run twice. Old rows
+keep `NULL`, and a replay of such a row answers as before, without the ids. An old backend process that runs beside
+the new one never selects the column, so a rolling deploy works.
+
 ### 4.2 Deploy order
 
 1. Back up the database (section 8.3).
@@ -259,7 +267,8 @@ When you roll back the backend, these stay. They are harmless, as the configurat
 
 - the `client_id` and `client_name` columns of `access_token` and the unique index from `0158`;
 - the `mcp:*` scopes in the token rows;
-- the render props of the session rows.
+- the render props of the session rows;
+- the `mcp_reply` column of `file_change` from `0160`. The old code ignores it, so a rollback needs no schema change.
 
 The two `file_change` indexes from `0159` also stay. The old backend does not use them, and they still take space
 and slow writes a little. Drop them only if you have a reason.
@@ -343,7 +352,7 @@ There are two layers of limits. The adapter limits each token. The backend limit
 | Layer | Limit | What the agent sees when it trips | How to retry |
 |---|---|---|---|
 | Adapter, per token | 10 calls a second, burst 20 (`PENPOT_MCP_RATE_LIMIT_*`). Shared through Redis when set. | `rate limited, retry after N s` | Wait N seconds |
-| Backend reads, per profile | Bucket of 1200, refill 600 a minute (10 a second). `rlimit` `:mcp-read` (`backend/resources/rlimit.edn`). | `Backend error request-blocked: rate limit reached` (HTTP 429) | Back off, then retry |
+| Backend reads, per profile | Bucket of 1200, refill 600 a minute (10 a second). `rlimit` `:mcp-read` (`backend/resources/rlimit.edn`). | `backend rate limit reached, retry after N s` (HTTP 429; N is the `retry-after` of the refusal rounded up and at most 10, because the backend sends the time to a full bucket, not to the next permit; with no header the text says `wait about 10 s`). A cursor stays valid. | Wait N seconds, then retry, with the same cursor if there was one |
 | Backend writes, per profile | Bucket of 600, refill 300 a minute (5 a second). `rlimit` `:mcp-write` (`backend/resources/rlimit.edn`) | Same as above | Back off. Retry a write with the same `requestId`. |
 | Backend reads per profile, in flight | 4 at once, queue 20, 30 s (`:mcp-read/by-profile`) | HTTP 429 naming the limit (see the note below the table) | Retry later |
 | Backend reads, all profiles, per process | 8 at once, queue 64, 30 s (`:mcp-read/global`) | Same | Retry later |
@@ -356,7 +365,8 @@ There are two layers of limits. The adapter limits each token. The backend limit
 | Row or project lock | 15 s | `mcp-lock-timeout` (HTTP 409) | Retry later |
 | Write size | 2000 changes or operations per call, 8 MB payload, 100000 compiled changes | `mcp-batch-too-large` (HTTP 400) before the file is locked | Split the call |
 | Batches | 50 commits per call, 60 s budget for the batches after the first | `mcp-too-many-batches`, `mcp-time-budget-exceeded` | Split the call. Use `allowSplit` for `apply_operations`. |
-| Tool answers | 100 kB (`PENPOT_MCP_MAX_TOOL_RESPONSE_KB`) | The answer is cut. It says `truncated`, and its `nextCursor` is dropped. | Repeat the call with a smaller `limit` |
+| Tool answers | 100 kB (`PENPOT_MCP_MAX_TOOL_RESPONSE_KB`) | The answer is cut. It says `truncated`, and its `nextCursor` is dropped. `find_connectors` and `lint_page` are not cut: they return whole items with `nextOffset`. | Repeat the call with a smaller `limit`. For those two, call again with `offset` set to `nextOffset`. |
+| `export_subtree` answers | The shared cap, or `PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB` | A reply is never cut and keeps its `nextCursor`. One shape above the cap comes back alone, cut, listed in `oversize`. | Raise the variable, or write the subtree with `filePath` |
 | Backend answers | 8 MB (`PENPOT_MCP_BACKEND_MAX_RESPONSE_MB`) | An error | Narrow the request |
 | Backend call | 55 s (`PENPOT_MCP_BACKEND_TIMEOUT_S`) | A timeout error. A sent write may still commit. | Check the file state before you retry the write |
 | Client tokens per profile | 20 (`mcp-client-limit`) | `mcp-client-limit` (restriction). An OAuth approval answers `access_denied`. | Revoke a client token |
@@ -377,6 +387,14 @@ Export answers name the cause in text. These are the texts a client may see:
 - `too large for an inline reply on their own, not returned` An image over 8 MB is skipped. Pass `outputDir` or `filePath`.
 - `an earlier shape failed, so the shapes after it were not rendered.` Only a `shapeId: "page"` export stops at a failed shape.
 - `Font warning: these fonts did not resolve, so the render used a fallback font: ... These renders are kept for up to 15 minutes; after the font is fixed, pass refresh: true to render again.` The reply names each font with its reason, in `warnings` (with `outputDir`) or as a text item. The check runs within 3 s and only adds this notice. Run `list_fonts` to see the font.
+
+A whole-page walk with `export_subtree` spends the backend read bucket. A call reads from 1 to about 24 windows, and
+each read takes one permit of the bucket (1200, refilling 600 a minute). A page of 115,219 shapes walked at the
+default cap of 100 kB took 3,356 reads over 818 calls, and then the backend refused a read. The call that meets the
+limit after it holds a window returns what it has, with `nextCursor` and a note; the call that meets it on its first
+window fails with `backend rate limit reached, retry after N s`. To spend fewer reads, raise
+`PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB`, or send `encoding: "gzip-base64"`. Or wait and send the same cursor again: it
+stays valid while the page is not edited.
 
 The concurrency limits answer HTTP 429 with a body whose `type` is `concurrency-limit` and whose `code` is
 `capacity-limit-reached`. The body names the `limit` (for example `mcp-apply/by-team`) and the `reason`

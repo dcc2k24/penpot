@@ -46,6 +46,16 @@ test("the Geometry topic has the members the instructions describe", () => {
     ]);
 });
 
+test("the Geometry topic names the circle to ellipse mapping and the other names that differ", () => {
+    const topic = new ApiDocs().getTopic("Geometry");
+    assert.ok(topic);
+    const text = collapse(topicParagraphs(topic).join(" "));
+    assert.ok(text.includes("Names that differ") || text.includes("differs from the stored file"));
+    assert.ok(text.includes("| shape type `circle` | `ellipse` |"), "circle is shown as ellipse");
+    assert.ok(text.includes("| shape type `frame` (a board) | `frame` |"), "a board is stored and shown as frame");
+    assert.ok(text.includes("such as `fill-color` | camelCase keys, such as `fillColor`"), "keys are camelCase");
+});
+
 test("an API type lookup is unchanged and topics are not API types", () => {
     const docs = new ApiDocs();
     assert.equal(docs.getType("board")?.getName(), "Board");

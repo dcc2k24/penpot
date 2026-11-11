@@ -73,7 +73,7 @@ function pageFixture(): object {
                 id: ROOT_ID,
                 type: "frame",
                 name: "Root",
-                parentId: null,
+                parentId: ROOT_ID,
                 frameId: null,
                 shapes: ["B1"],
                 x: 0,
@@ -334,6 +334,24 @@ test("a border radius write sets all four corners in one op", () => {
     const updates = lastOperations(host).filter((op) => op.op === "update_shape");
     assert.equal(updates.length, 1);
     assert.deepEqual(updates[0].props, { r1: 8, r2: 8, r3: 8, r4: 8 });
+});
+
+test("the parent of the root frame is null, so a climb up the parents ends", () => {
+    const { context } = setup();
+    const envelope = runScript(
+        context,
+        `
+        const path = [];
+        let node = penpot.currentPage.getShapeById("R1");
+        while (node && path.length < 20) {
+            path.push(node.id);
+            node = node.parent;
+        }
+        return { path: path, rootParent: penpot.root.parent };
+        `
+    );
+    assert.equal(envelope.ok, true);
+    assert.deepEqual(envelope.result, { path: ["R1", "B1", ROOT_ID], rootParent: null });
 });
 
 test("x is absolute: the board is at 100 and R1 is at 110, so parentX is 10 and a write of x 10 stays 10", () => {

@@ -75,5 +75,6 @@
   { "op": "set_board_grid_guides", "pageId": "3f2c1a9e-0b7d-4c1e-9a55-2d6f0e8b7c10", "id": "5b8e2d1f-3c4a-4e6b-9f70-1a2b3c4d5e6f", "grids": [{ "type": "column", "size": 8, "gutter": 16 }] },
   { "op": "set_plugin_data", "target": "shape", "id": "6c9f3e2a-4d5b-4f7c-8a81-2b3c4d5e6f70", "pageId": "3f2c1a9e-0b7d-4c1e-9a55-2d6f0e8b7c10", "namespace": "com.example.app", "key": "owner", "value": "team-a" },
   { "op": "align", "pageId": "3f2c1a9e-0b7d-4c1e-9a55-2d6f0e8b7c10", "ids": ["6c9f3e2a-4d5b-4f7c-8a81-2b3c4d5e6f70", "8e1a5c2d-6f7b-4a9e-8b03-4c5d6e7f8092"], "axis": "hleft" },
-  { "op": "distribute", "pageId": "3f2c1a9e-0b7d-4c1e-9a55-2d6f0e8b7c10", "ids": ["6c9f3e2a-4d5b-4f7c-8a81-2b3c4d5e6f70", "8e1a5c2d-6f7b-4a9e-8b03-4c5d6e7f8092"], "axis": "horizontal" }
+  { "op": "distribute", "pageId": "3f2c1a9e-0b7d-4c1e-9a55-2d6f0e8b7c10", "ids": ["6c9f3e2a-4d5b-4f7c-8a81-2b3c4d5e6f70", "8e1a5c2d-6f7b-4a9e-8b03-4c5d6e7f8092"], "axis": "horizontal" },
+  { "op": "replace_font", "pageId": "3f2c1a9e-0b7d-4c1e-9a55-2d6f0e8b7c10", "fromFontId": "gfont-access-sans", "toFontId": "custom-4f6d1b2a-7c3e-4a5b-9d80-1e2f3a4b5c6d", "rootIds": ["6c9f3e2a-4d5b-4f7c-8a81-2b3c4d5e6f70"], "variantMatch": "nearest", "maxTexts": 500 }
 ]

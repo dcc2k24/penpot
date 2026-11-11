@@ -617,7 +617,8 @@ export const API_SOURCE: string = String.raw`
     }
     switch (name) {
       case "parent":
-        return shapeOrNull(ref.pageId, record.parentId);
+        // the root frame is its own parent in the data; the plugin API answers null for it, so a climb ends
+        return record.id === ROOT_ID ? null : shapeOrNull(ref.pageId, record.parentId);
       case "parentIndex":
         requireAllChildren(modelOf(ref.pageId).get(record.parentId), "parentIndex");
         return indexInParent(ref, record);

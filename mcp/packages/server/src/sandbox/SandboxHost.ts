@@ -23,6 +23,10 @@ interface PageTreeResult {
     root: TreeNode;
     truncated: boolean;
     nextCursor?: string;
+    /** Shapes of the whole walk. Present when the call asked for `estimateSize`. */
+    totalShapes?: number;
+    /** Backend estimate of the JSON bytes of those shapes. Present when the call asked for `estimateSize`. */
+    estimatedBytes?: number;
 }
 
 /** The `get-mcp-shapes` response. */
@@ -192,6 +196,19 @@ export class SandboxHost implements SandboxHostCalls {
     private static readonly TREE_DEPTH = 20;
     /** Most nodes returned in one `get-mcp-page-tree` response. */
     private static readonly TREE_LIMIT = 5000;
+    /**
+     * Most `get-mcp-shapes` calls of one partial load that run at the same time. The backend lets one profile run 4
+     * MCP reads at once and all profiles 8 (`:mcp-read/by-profile` and `:mcp-read/global` in `climit.edn`), so 2 leave
+     * the user's other reads, and half of the global permits, free.
+     */
+    private static readonly MAX_IN_FLIGHT = 2;
+    /** Most rounds of `get-mcp-shapes` calls that one partial load makes before it gives up. */
+    private static readonly MAX_SUBTREE_ROUNDS = 100;
+    /**
+     * A whole-page load is refused at once when the estimate of its size is above the cap times this margin. The
+     * backend estimate is within 0.7 to 1.3 times the real size, so a page that fits is never refused by it.
+     */
+    private static readonly ESTIMATE_MARGIN = 1.3;
     /** Largest rendered file that one export returns to the guest, in bytes. */
     private static readonly MAX_EXPORT_BYTES = 8 * 1024 * 1024;
     /** Largest image that one media upload sends, in bytes. */
@@ -573,7 +590,17 @@ export class SandboxHost implements SandboxHostCalls {
         deepest: { dropped: boolean }
     ): Promise<LoadedParts> {
         const ids = new Set<string>();
-        await this.readTree(fileId, pageId, undefined, ids, deepest, read);
+        await this.readTree(fileId, pageId, undefined, ids, deepest, read, (first) => {
+            // the first window carries the size of the whole page: a page far above the cap is refused before the
+            // rest of its tree is read.
+            if (
+                first.totalShapes !== undefined &&
+                first.estimatedBytes !== undefined &&
+                first.estimatedBytes > this.maxPageBytes * SandboxHost.ESTIMATE_MARGIN
+            ) {
+                throw this.pageTooLarge(pageId, first.totalShapes, first.estimatedBytes, false, true);
+            }
+        });
         // each shape is serialised once; the page text is then joined from those pieces.
         const allIds = [...ids];
         const fetched = new Map<string, FetchedShape>();
@@ -618,50 +645,27 @@ export class SandboxHost implements SandboxHostCalls {
         read: LoadRead
     ): Promise<LoadedParts> {
         const refresh = state.held !== undefined;
-        const given = new Set(state.liveRoots);
+        // the roots with their subtrees, and their ancestors, come from `get-mcp-shapes` rounds
+        const pool = new Map<string, FetchedShape>();
+        const tree = await this.fetchSubtrees(fileId, pageId, state.liveRoots, read, pool);
         const dropped = new Set<string>();
-        const tree: string[] = [];
-        const inTree = new Set<string>();
-        const walked = new Set<string>();
-        const pending = [...state.liveRoots];
-        while (pending.length > 0) {
-            const rootId = pending.shift() as string;
-            if (walked.has(rootId)) {
+        for (const rootId of state.liveRoots) {
+            if (pool.has(rootId)) {
                 continue;
             }
-            walked.add(rootId);
-            const ids = new Set<string>();
-            const walk: { dropped: boolean; cut: string[] } = { dropped: false, cut: [] };
-            try {
-                await this.readTree(fileId, pageId, rootId, ids, walk, read);
-            } catch (error) {
-                if (refresh && given.has(rootId) && error instanceof MissingRootError) {
-                    dropped.add(rootId);
-                    continue;
-                }
-                throw error;
+            if (!refresh) {
+                throw new Error(`execute_code: root shape ${rootId} is not a shape of page ${pageId}`);
             }
-            for (const id of ids) {
-                if (!inTree.has(id)) {
-                    inTree.add(id);
-                    tree.push(id);
-                }
-            }
-            pending.push(...walk.cut);
+            dropped.add(rootId);
         }
         if (dropped.size > 0) {
             state.liveRoots = state.liveRoots.filter((id) => !dropped.has(id));
         }
-
+        // what is left in the pool is not under a root: the ancestors that the first call returned
         const fetched = new Map<string, FetchedShape>();
-        await this.fetchShapes(fileId, pageId, tree, read, fetched, (done, bytes) =>
-            this.checkEstimate(pageId, tree.length, done, bytes, true)
-        );
-        const heldInTree = tree.filter((id) => fetched.has(id)).length;
-        for (const rootId of state.liveRoots) {
-            if (!fetched.has(rootId)) {
-                throw new Error(`execute_code: root shape ${rootId} is not a shape of page ${pageId}`);
-            }
+        for (const id of tree) {
+            fetched.set(id, pool.get(id) as FetchedShape);
+            pool.delete(id);
         }
 
         // the shapes that this call created or imported, and the children that they hold
@@ -687,25 +691,44 @@ export class SandboxHost implements SandboxHostCalls {
         if (state.held !== undefined) {
             const held = state.held;
             const candidates = [...held].filter((id) => !fetched.has(id) && id !== SandboxHost.PAGE_ROOT_ID);
-            for (const id of await this.fetchShapes(fileId, pageId, candidates, read, fetched)) {
-                (state.ancestorIds.has(id) ? movedAncestors : moved).push(id);
+            // the ancestors that the roots call returned are in the pool already; the rest are asked for
+            await this.fetchShapes(
+                fileId,
+                pageId,
+                candidates.filter((id) => !pool.has(id)),
+                read,
+                pool
+            );
+            for (const id of candidates) {
+                const kept = pool.get(id);
+                if (kept !== undefined) {
+                    fetched.set(id, kept);
+                    pool.delete(id);
+                    (state.ancestorIds.has(id) ? movedAncestors : moved).push(id);
+                }
             }
         }
 
-        // the ancestors of everything loaded, up to the page root, which is always loaded
+        // the ancestors of everything loaded, up to the page root, which is always loaded. They come level by level,
+        // nearest first. The first call of a first load returned the ancestors of the roots already; only the parents
+        // of other shapes (created, imported) cost a call.
         const ancestors: string[] = [];
-        let wanted = SandboxHost.missingParents(SandboxHost.shapesOf([...fetched.keys()], fetched), fetched);
-        wanted.add(SandboxHost.PAGE_ROOT_ID);
-        while (wanted.size > 0) {
-            const stored = await this.fetchShapes(
-                fileId,
-                pageId,
-                [...wanted].filter((id) => !fetched.has(id)),
-                read,
-                fetched
-            );
+        const seen = new Set([...fetched.keys(), SandboxHost.PAGE_ROOT_ID]);
+        let level = SandboxHost.parentsOf(SandboxHost.shapesOf([...fetched.keys()], fetched), seen);
+        let withRoot = true;
+        while (level.length > 0 || withRoot) {
+            const wanted = withRoot ? [...level, SandboxHost.PAGE_ROOT_ID] : level;
+            withRoot = false;
+            const absent = wanted.filter((id) => !fetched.has(id) && !pool.has(id));
+            await this.fetchShapes(fileId, pageId, absent, read, pool);
+            const stored = wanted.filter((id) => pool.has(id));
+            for (const id of stored) {
+                fetched.set(id, pool.get(id) as FetchedShape);
+                pool.delete(id);
+                seen.add(id);
+            }
             ancestors.push(...stored);
-            wanted = SandboxHost.missingParents(SandboxHost.shapesOf(stored, fetched), fetched);
+            level = SandboxHost.parentsOf(SandboxHost.shapesOf(stored, fetched), seen);
         }
 
         const ancestorOnly = new Set([...ancestors, ...movedAncestors].filter((id) => id !== SandboxHost.PAGE_ROOT_ID));
@@ -746,7 +769,7 @@ export class SandboxHost implements SandboxHostCalls {
             shapes: order.filter((id) => id !== SandboxHost.PAGE_ROOT_ID && !ancestorOnly.has(id)).length,
             ancestors: [...ancestorOnly],
         };
-        return { pieces, count: order.length, missing: tree.length - heldInTree };
+        return { pieces, count: order.length, missing: 0 };
     }
 
     /**
@@ -760,6 +783,8 @@ export class SandboxHost implements SandboxHostCalls {
      * @param walk - receives `dropped` for a node cut at the limit of a whole walk, and `cut` for the nodes that a
      *   partial walk must continue from
      * @param read - the revn of the reads, checked against each answer
+     * @param onFirst - when given, the first window asks for the size estimate of the page (`estimateSize`), and this
+     *   runs with that window before the next one is read; it may throw to stop the walk
      * @throws Error when the file changed between the pages, or a truncated page has no cursor
      */
     private async readTree(
@@ -768,9 +793,11 @@ export class SandboxHost implements SandboxHostCalls {
         rootId: string | undefined,
         ids: Set<string>,
         walk: { dropped: boolean; cut?: string[] },
-        read: LoadRead
+        read: LoadRead,
+        onFirst?: (first: PageTreeResult) => void
     ): Promise<void> {
         let cursor: string | undefined;
+        let isFirst = true;
         do {
             const params: Record<string, unknown> = {
                 fileId,
@@ -783,9 +810,15 @@ export class SandboxHost implements SandboxHostCalls {
             }
             if (cursor !== undefined) {
                 params.cursor = cursor;
+            } else if (onFirst !== undefined) {
+                params.estimateSize = true;
             }
             const page = await this.callTree(pageId, rootId, params);
             read.revn = this.checkRevn(read.revn, page.revn);
+            if (isFirst) {
+                isFirst = false;
+                onFirst?.(page);
+            }
             this.collectIds(page.root, ids, 1, walk);
             if (page.truncated && page.nextCursor === undefined) {
                 throw new Error("get-mcp-page-tree reported a truncated page without a cursor");
@@ -938,21 +971,252 @@ export class SandboxHost implements SandboxHostCalls {
     }
 
     /**
-     * Returns the parents of the given shapes that are not loaded, other than the page root.
+     * Returns the parents of the given shapes that are not in a set, other than the page root, without repeats.
      *
      * @param shapes - shapes whose parents are wanted
-     * @param fetched - the loaded shapes by id
-     * @returns the ids of the parents that still have to be fetched
+     * @param seen - ids that need no fetch: the loaded shapes and the page root
+     * @returns the parent ids, in the order they are first met
      */
-    private static missingParents(shapes: Record<string, unknown>[], fetched: Map<string, FetchedShape>): Set<string> {
-        const missing = new Set<string>();
+    private static parentsOf(shapes: Record<string, unknown>[], seen: ReadonlySet<string>): string[] {
+        const parents = new Set<string>();
         for (const shape of shapes) {
             const parent = SandboxHost.parentIdOf(shape);
-            if (parent !== undefined && parent !== SandboxHost.PAGE_ROOT_ID && !fetched.has(parent)) {
-                missing.add(parent);
+            if (parent !== undefined && parent !== SandboxHost.PAGE_ROOT_ID && !seen.has(parent)) {
+                parents.add(parent);
             }
         }
-        return missing;
+        return [...parents];
+    }
+
+    /**
+     * Returns the child ids of a shape in the order of the page tree: the stored order, reversed for a flex or grid
+     * board, whose children are stored in the reverse of their visual order (`shape-children` in `mcp.clj`).
+     *
+     * @param shape - the shape
+     * @returns the child ids in tree order
+     */
+    private static treeChildrenOf(shape: Record<string, unknown>): string[] {
+        const children = SandboxHost.childIdsOf(shape);
+        const stacked = shape.type === "frame" && (shape.layout === "flex" || shape.layout === "grid");
+        return stacked ? children.reverse() : children;
+    }
+
+    /**
+     * Walks the loaded shapes from the roots in the order of the page tree: each root in turn, a shape before its
+     * children, each shape once.
+     *
+     * @param roots - ids to start from, in order
+     * @param loaded - the shapes that are loaded
+     * @param reported - ids that the backend reported as missing
+     * @param asked - ids that a reply has returned after a request that named them with their children
+     * @returns `order`, the loaded ids reached; `absent`, the ids reached that are neither loaded nor reported missing,
+     *   in the order they are met; and `ask`, the ids to request for them: a loaded shape that no reply has returned after such a request
+     *   and none of whose children is loaded stands for all its children, so that one call brings the children and
+     *   what is below them, and any other absent id stands for itself
+     */
+    private static walkSubtrees(
+        roots: readonly string[],
+        loaded: ReadonlyMap<string, FetchedShape>,
+        reported: ReadonlySet<string>,
+        asked: ReadonlySet<string>
+    ): { order: string[]; absent: string[]; ask: string[] } {
+        const order: string[] = [];
+        const absent = new Set<string>();
+        const ask = new Set<string>();
+        const covered = new Set<string>();
+        const seen = new Set<string>();
+        for (const root of roots) {
+            const stack = [root];
+            while (stack.length > 0) {
+                const id = stack.pop() as string;
+                if (seen.has(id)) {
+                    continue;
+                }
+                const held = loaded.get(id);
+                if (held === undefined) {
+                    if (!reported.has(id)) {
+                        absent.add(id);
+                        if (!covered.has(id)) {
+                            ask.add(id);
+                        }
+                    }
+                    continue;
+                }
+                seen.add(id);
+                order.push(id);
+                const children = SandboxHost.treeChildrenOf(held.shape);
+                if (
+                    children.length > 0 &&
+                    !asked.has(id) &&
+                    children.every((child) => !loaded.has(child) && !reported.has(child))
+                ) {
+                    ask.add(id);
+                    for (const child of children) {
+                        covered.add(child);
+                    }
+                }
+                for (let index = children.length - 1; index >= 0; index -= 1) {
+                    stack.push(children[index]);
+                }
+            }
+        }
+        return { order, absent: [...absent], ask: [...ask] };
+    }
+
+    /**
+     * Splits the ids of a round of a partial load into calls of at most {@link SHAPE_BATCH_SIZE} ids, the most one
+     * request takes. A round with fewer ids is one call: the backend cap of a reply, not the count of ids, limits
+     * what a call returns, so more calls would only cost more.
+     *
+     * @param ids - the ids to ask for
+     * @returns the ids of each call, in order
+     */
+    private static splitIds(ids: string[]): string[][] {
+        const parts: string[][] = [];
+        for (let start = 0; start < ids.length; start += SandboxHost.SHAPE_BATCH_SIZE) {
+            parts.push(ids.slice(start, start + SandboxHost.SHAPE_BATCH_SIZE));
+        }
+        return parts;
+    }
+
+    /**
+     * Runs an async function over the items with at most `limit` runs at the same time.
+     *
+     * @param items - the items
+     * @param limit - most runs at the same time
+     * @param run - the function; it gets the item and its index
+     * @returns the results, in the order of the items
+     * @throws the first error of a run; runs that have not started do not start
+     */
+    private static async mapLimited<T, R>(
+        items: readonly T[],
+        limit: number,
+        run: (item: T, index: number) => Promise<R>
+    ): Promise<R[]> {
+        const results: R[] = new Array<R>(items.length);
+        let next = 0;
+        let failed = false;
+        const worker = async (): Promise<void> => {
+            while (!failed && next < items.length) {
+                const index = next;
+                next += 1;
+                try {
+                    results[index] = await run(items[index], index);
+                } catch (error) {
+                    failed = true;
+                    throw error;
+                }
+            }
+        };
+        await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+        return results;
+    }
+
+    /**
+     * Reads the roots of a partial load with their subtrees, in rounds of `get-mcp-shapes` calls.
+     *
+     * Round one is one call that names every root with `includeChildren` and `includeAncestors`.
+     * The backend answers a shape, then all its children in stored order, then for each child its own children and
+     * theirs by the same rule, up to its cap of shapes and bytes, and sets `truncated` when it cut the reply. So a cut
+     * can leave the children of a shape whose first children are loaded. After each round the shapes are walked in
+     * tree order from the roots; what the walk reaches and nobody holds is asked for in the next round, as roots of
+     * their own, split over up to {@link MAX_IN_FLIGHT} calls at the same time. A loaded shape that no reply has
+     * returned for a request of its own yet and none of whose children is loaded is asked for in the place of its children (one id, and its
+     * subtree comes with it); any other absent id is asked for by id. A round that only repeated such a shape and
+     * brought nothing new is not an error: the shape counts as reached, and its children are asked for by id in
+     * the next round. The size cap is checked at each reply, on the running total of the bytes of the shapes the load has
+     * received, and again after each round on the shapes under the roots. A reply that passes the cap stops the load:
+     * no later call starts, and the calls in flight are ignored. The ids that the backend reports as missing are dropped.
+     *
+     * @param fileId - file that holds the page
+     * @param pageId - page to read
+     * @param roots - the roots, in order
+     * @param read - the revn of the reads, checked against each answer
+     * @param pool - receives every shape the backend returned, the ancestors included
+     * @returns the ids under the roots in tree order, each once; a root that the backend does not hold is not in it
+     * @throws Error when the cap is passed, a round brings nothing new, or the rounds do not end
+     */
+    private async fetchSubtrees(
+        fileId: string,
+        pageId: string,
+        roots: readonly string[],
+        read: LoadRead,
+        pool: Map<string, FetchedShape>
+    ): Promise<string[]> {
+        const reported = new Set<string>();
+        let frontier = [...roots];
+        const asked = new Set<string>();
+        // shapes whose reply bytes the running total already holds, and that total
+        const counted = new Set<string>();
+        let replyBytes = 0;
+        let order: string[] = [];
+        for (let round = 0; frontier.length > 0; round += 1) {
+            if (round >= SandboxHost.MAX_SUBTREE_ROUNDS) {
+                throw new Error(
+                    `get-mcp-shapes did not return the shapes of page ${pageId} in ` +
+                        `${SandboxHost.MAX_SUBTREE_ROUNDS} rounds, so the load cannot finish`
+                );
+            }
+            const parts = round === 0 ? [frontier] : SandboxHost.splitIds(frontier);
+            const known = pool.size + reported.size;
+            // a loaded shape in the request stands for its children; a round that only repeats it is not stuck
+            const stood = round > 0 && frontier.some((id) => pool.has(id));
+            const sent = new Set(frontier);
+            const replies = await SandboxHost.mapLimited(parts, SandboxHost.MAX_IN_FLIGHT, async (ids) => {
+                const reply = await this.services.backend.callCommand<ShapesResult>(this.userToken, "get-mcp-shapes", {
+                    fileId,
+                    pageId,
+                    ids,
+                    includeChildren: true,
+                    ...(round === 0 ? { includeAncestors: true } : {}),
+                });
+                // the cap is checked at each reply: a call that crosses it stops the load, and no later call starts
+                const texts = new Map<string, string>();
+                for (const shape of reply.shapes) {
+                    const text = JSON.stringify(shape);
+                    texts.set(shape.id, text);
+                    if (!counted.has(shape.id)) {
+                        counted.add(shape.id);
+                        replyBytes += Buffer.byteLength(text, "utf8");
+                    }
+                }
+                if (replyBytes > this.maxPageBytes) {
+                    throw this.pageTooLarge(pageId, counted.size, replyBytes, true);
+                }
+                return { reply, texts };
+            });
+            for (const { reply, texts } of replies) {
+                read.revn = this.checkRevn(read.revn, reply.revn);
+                for (const shape of reply.shapes) {
+                    pool.set(shape.id, { shape, text: texts.get(shape.id) as string });
+                    if (sent.has(shape.id)) {
+                        // the reply reached this shape, so its children were in the cut
+                        asked.add(shape.id);
+                    }
+                }
+                for (const id of reply.missing ?? []) {
+                    reported.add(id);
+                }
+            }
+            if (pool.size + reported.size === known && !stood) {
+                throw new Error("get-mcp-shapes answered none of the shapes asked for, so the load cannot finish");
+            }
+            const walk = SandboxHost.walkSubtrees(roots, pool, reported, asked);
+            order = walk.order;
+            frontier = walk.ask;
+            let bytes = 0;
+            for (const id of order) {
+                bytes += Buffer.byteLength((pool.get(id) as FetchedShape).text, "utf8");
+            }
+            const total = order.length + walk.absent.length;
+            if (bytes > this.maxPageBytes) {
+                throw this.pageTooLarge(pageId, total, bytes, true);
+            }
+            if (order.length > 0) {
+                this.checkEstimate(pageId, total, order.length, bytes, true);
+            }
+        }
+        return order;
     }
 
     /**
@@ -1743,16 +2007,17 @@ export class SandboxHost implements SandboxHostCalls {
      * @param shapes - shapes that the load holds, or that a whole load would hold
      * @param bytes - size of the loaded shapes as JSON, or the estimate of it
      * @param partial - whether the load is partial; then the advice is to pass fewer or smaller rootIds
+     * @param estimated - whether the size is an estimate, and not the measured size of shapes already loaded
      * @returns the error, which names the page, its size and shape count, the limit and the way out
      */
-    private pageTooLarge(pageId: string, shapes: number, bytes: number, partial: boolean): Error {
+    private pageTooLarge(pageId: string, shapes: number, bytes: number, partial: boolean, estimated = false): Error {
         const megabytes = (bytes / (1024 * 1024)).toFixed(1);
         const limit = Number((this.maxPageBytes / (1024 * 1024)).toFixed(1));
         const advice = partial
             ? "Pass fewer or smaller rootIds, or use export_subtree, get_shapes and find_shapes for reads."
             : "Pass rootIds to load only the boards the script needs, or use export_subtree, get_shapes and find_shapes for reads.";
         return new Error(
-            `page ${pageId} has ${shapes} shapes (about ${megabytes} MB); the limit is ${limit} MB ` +
+            `page ${pageId} has ${shapes} shapes (${estimated ? "estimated at " : ""}about ${megabytes} MB); the limit is ${limit} MB ` +
                 `(PENPOT_MCP_SANDBOX_PAGE_MB). ${advice}`
         );
     }

@@ -2,12 +2,16 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { finished } from "node:stream/promises";
+import { promisify } from "node:util";
+import * as zlib from "node:zlib";
 import { z } from "zod";
 import type { PenpotMcpServer } from "../../PenpotMcpServer";
 import type { ToolAnnotations } from "../../Tool";
-import type { ToolResponse } from "../../ToolResponse";
+import { TextResponse, type ToolResponse } from "../../ToolResponse";
 import type { BackendServices } from "../../backend/BackendServices";
-import { BackendRpcError } from "../../backend/BackendRpcError";
+import { BackendRateLimitError, BackendRpcError } from "../../backend/BackendRpcError";
+import { RateLimitError } from "../../backend/TokenRateLimiter";
+import { BackendSettings } from "../../backend/BackendSettings";
 import { CallContext } from "../../backend/CallContext";
 import { ExportDirectory } from "../../utils/ExportDirectory";
 import { FileUtils } from "../../utils/FileUtils";
@@ -19,37 +23,32 @@ import { FilePathAccess } from "./FilePathAccess";
 /** Id of the page root, which the backend uses as the root of a whole page. */
 const PAGE_ROOT_ID = "00000000-0000-0000-0000-000000000000";
 
-/** Shapes per window when the caller names no limit. */
-const DEFAULT_LIMIT = 100;
+/** Most shapes in one reply, and the default: the reply cap, not the count, limits a reply. */
+const MAX_LIMIT = 5000;
 
-/** Share of the response cap that one window may fill, so that the reply fits the cap with its own fields. */
-const WINDOW_SHARE = 0.8;
-
-/** Smallest byte limit the backend accepts for a window. */
+/** Smallest byte budget the backend accepts for a window. */
 const MIN_WINDOW_BYTES = 1000;
 
-/** Largest byte limit the backend accepts for a window. */
-const MAX_WINDOW_BYTES = 1_000_000;
+/** Smallest window that file mode and inline mode ask for, however low PENPOT_MCP_BACKEND_MAX_RESPONSE_MB is. */
+const MIN_BIG_WINDOW_BYTES = 64_000;
 
-/** Size of one window as the backend is asked for it. */
-interface WindowSize {
-    /** Most shapes in the window. */
-    limit: number;
-    /** Most encoded bytes in the window. */
-    maxBytes: number;
-}
+/** Share of the backend response cap (PENPOT_MCP_BACKEND_MAX_RESPONSE_MB) that one window may take. */
+const RESPONSE_SHARE = 0.5;
 
 /**
- * Window of file mode: the largest the backend takes. The response cap limits what goes back to the client, not what
- * is written to disk, so a file walk is not held to the inline size.
+ * Most bytes of JSON text, before any compression, that one tool call gathers, whatever the encoding. It bounds the
+ * memory of a call when the cap is raised and the shapes compress well.
  */
-const FILE_WINDOW: WindowSize = { limit: 5000, maxBytes: MAX_WINDOW_BYTES };
+const MAX_PLAIN_BYTES_PER_CALL = 16 * 1024 * 1024;
 
-/** Backend error code of a cursor whose page version is no longer the current one. */
-const STALE_CURSOR = "mcp-stale-cursor";
+/** Share of the cap that a window cut by the estimate of its compressed size aims at, to leave room for the error. */
+const GZIP_FIT_SHARE = 0.95;
 
-/** File name extensions that a subtree file may have. */
-const FILE_EXTENSIONS = [".json"];
+/** Factor on the estimated compressed size of a window that was not compressed alone, to cover the error. */
+const GZIP_ESTIMATE_MARGIN = 1.1;
+
+/** Compresses text without blocking the event loop. */
+const gzipAsync = (text: Buffer): Promise<Buffer> => promisify(zlib.gzip)(text);
 
 /** Attributes that are cut first when one shape alone is larger than the response cap. */
 const TRIM_FIRST = ["content", "positionData", "shapes"];
@@ -57,11 +56,47 @@ const TRIM_FIRST = ["content", "positionData", "shapes"];
 /** Other strings and arrays above this many bytes are cut next, largest first. */
 const OVERSIZE_BYTES = 2000;
 
-/** Note that goes with a trimmed shape in an inline reply. */
-const OVERSIZE_NOTE =
-    "The full shape is larger than the response cap, so its large attributes are shown as omitted. " +
-    "Write the subtree to a file with filePath to get every attribute, " +
-    "or read one attribute with get_shapes and fields.";
+/** Largest byte budget the backend accepts for a window (the hard maximum of `max-json-bytes`). */
+const MAX_WINDOW_BYTES = 4_000_000;
+
+/**
+ * Share of the room left in a reply that one window asks for. The backend counts the JSON it writes, and the adapter
+ * writes a little more (a circle is called ellipse), so a window asked for the whole room could overflow it by a few
+ * bytes.
+ */
+const WINDOW_SHARE = 0.98;
+
+/** Bytes kept free in the reply for the fields around the shapes, before the first window shows their size. */
+const HEAD_RESERVE_BYTES = 1024;
+
+/** Characters added to the first nextCursor when the head is measured, since a later cursor can be a little longer. */
+const CURSOR_PAD_CHARS = 40;
+
+/** Most backend windows that one tool call reads. */
+const MAX_WINDOWS_PER_CALL = 24;
+
+/** Most times that a first window that does not fit is asked again with fewer shapes. */
+const MAX_SHRINKS = 8;
+
+/** Bytes of JSON that one byte of the gzip-base64 form holds, until a window shows the real ratio. */
+const GZIP_RATIO_GUESS = 3;
+
+/** Name of the encoding that compresses the shapes of a reply. */
+const GZIP_ENCODING = "gzip-base64";
+
+/** Size of one window as the backend is asked for it. */
+interface WindowSize {
+    /** Most shapes in the window. */
+    limit: number;
+    /** Most bytes of JSON text in the window. */
+    maxJsonBytes: number;
+}
+
+/** Backend error code of a cursor whose page version is no longer the current one. */
+const STALE_CURSOR = "mcp-stale-cursor";
+
+/** File name extensions that a subtree file may have. */
+const FILE_EXTENSIONS = [".json"];
 
 /** Arguments of {@link ExportSubtreeTool}. */
 export class ExportSubtreeArgs {
@@ -76,18 +111,19 @@ export class ExportSubtreeArgs {
             .max(4096)
             .optional()
             .describe(
-                "nextCursor of an earlier inline response, to read the next window. Not allowed with filePath: " +
+                "nextCursor of an earlier inline response, to read the next shapes. Not allowed with filePath: " +
                     "the file always holds the whole subtree."
             ),
         limit: z
             .number()
             .int()
             .min(1)
-            .max(5000)
+            .max(MAX_LIMIT)
             .optional()
             .describe(
-                "Most shapes per window in inline mode (1 to 5000, default 100). A window also stops at about " +
-                    "80 % of the cap. Applies to inline mode only: a call with filePath reads 5000 shapes per window."
+                "Most shapes in one inline reply (1 to 5000, default 5000). A reply holds as many shapes as fit " +
+                    "the response cap of this tool, so leave it out unless you want fewer. Applies to inline " +
+                    "mode only: a call with filePath reads the whole subtree."
             ),
         filePath: z
             .string()
@@ -96,12 +132,33 @@ export class ExportSubtreeArgs {
             .describe(
                 "Absolute path to write the whole subtree to, as one JSON file. It must lie inside the export " +
                     "directory (PENPOT_MCP_EXPORT_DIR, or penpot-exports in the home directory by default) and end " +
-                    "in .json. When omitted, one window is returned in the response."
+                    "in .json. When omitted, the shapes are returned in the response."
             ),
         overwrite: z
             .boolean()
             .optional()
             .describe("When true, replace the file at filePath if one is there. Default false: it is refused."),
+        compact: z
+            .boolean()
+            .optional()
+            .describe(
+                "When true, each shape leaves out its keys whose value is null, and its top-level keys that hold " +
+                    "the value that defaults lists for them (hidden false, blocked false, opacity 1). Inside each " +
+                    "stroke of strokes, strokeAlignment is left out when it is center (defaults.strokes names that). " +
+                    "The reply says compact: true and lists defaults once. A top-level key that is absent is null " +
+                    "when defaults has no value for it; defaults.strokes is not a value for a missing strokes key. Smaller " +
+                    "replies, so fewer calls. Works with filePath too."
+            ),
+        encoding: z
+            .enum([GZIP_ENCODING])
+            .optional()
+            .describe(
+                "For scripts only: a model should not ask for it, since base64 text is waste in a model's context. " +
+                    "With gzip-base64 the reply's shapes become {encoding, bytes, count, data}: data is the base64 " +
+                    "text of the gzip of the JSON array of the shapes, bytes its size before compression and count " +
+                    "the number of shapes. The other fields stay plain, and the cap applies to the reply as sent. " +
+                    "Inline mode only: it is refused with filePath."
+            ),
     };
 
     fileId!: string;
@@ -117,6 +174,10 @@ export class ExportSubtreeArgs {
     filePath?: string;
 
     overwrite?: boolean;
+
+    compact?: boolean;
+
+    encoding?: typeof GZIP_ENCODING;
 }
 
 /** One window of the walk, as the backend answers it. */
@@ -135,6 +196,42 @@ interface SubtreeWindow {
     truncated?: boolean;
     /** Cursor of the next window, present when shapes remain. */
     nextCursor?: string;
+    /** True when the shapes are compact. */
+    compact?: boolean;
+    /** Values to assume for the keys that compact shapes leave out. */
+    defaults?: Record<string, unknown>;
+}
+
+/** The fields of a reply that do not depend on which windows it holds. */
+interface ReplyHead {
+    /** Revision of the file the walk reads. */
+    revn: number | undefined;
+    /** Id of the page. */
+    pageId: string | undefined;
+    /** Id of the root of the walk. */
+    rootId: string | undefined;
+    /** Number of shapes in the whole walk. */
+    total: number | undefined;
+    /** True when the shapes are compact. */
+    compact: boolean;
+    /** Defaults of a compact walk. */
+    defaults: Record<string, unknown> | undefined;
+}
+
+/** One backend window that an inline reply holds, in the caller's form. */
+interface ReadWindow {
+    /** The window as the backend answered it. */
+    raw: SubtreeWindow;
+    /** Shapes of the window, with the types as the other tools show them. */
+    shapes: unknown[];
+    /** Bytes that the window adds to the reply, as it will be sent. */
+    cost: number;
+    /** Bytes of the JSON text of the shapes, before any compression. */
+    plainBytes: number;
+    /** Cursor that continues the walk after the window, or undefined at the end. */
+    nextCursor: string | undefined;
+    /** Set when the window holds one shape that was cut to fit the cap: its id, real size and the cut attributes. */
+    oversize?: { id: unknown; bytes: number; omitted: string[] };
 }
 
 /** Result of a subtree export to a file. */
@@ -169,23 +266,39 @@ function jsonBytes(value: unknown): number {
 /**
  * Tells whether a value is a plain object.
  *
- * @param value - the value to look at
+ * @param value - the value to test
  */
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
+ * Returns the length of the base64 text of some bytes.
+ *
+ * @param bytes - the number of bytes to encode
+ */
+function base64Length(bytes: number): number {
+    return Math.ceil(bytes / 3) * 4;
+}
+
+/**
  * Exports every attribute of every shape under one root as data, in windows, inline or to a JSON file.
  *
- * Without filePath the tool returns one window, fitted to the response cap. With filePath it reads every window and
- * streams one JSON document to the file, so the whole subtree never sits in memory.
+ * Without filePath the tool reads as many backend windows as fit its response cap and returns them as one reply with
+ * the cursor of the next shapes; a reply never lacks a cursor while shapes remain. With filePath it reads every window
+ * and streams one JSON document to the file, so the whole subtree never sits in memory.
  */
 export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
+    /** Environment variable that sets the response cap of this tool, in kilobytes. */
+    public static readonly CAP_VARIABLE = "PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB";
+
     /** Response cap of this tool, in bytes. */
     private readonly capBytes: number;
 
-    /** Largest byte limit that one inline window asks the backend for, from the response cap of this tool. */
+    /**
+     * Most bytes of JSON text that one window asks for: the largest the backend takes, or less when the backend
+     * response cap of the adapter (PENPOT_MCP_BACKEND_MAX_RESPONSE_MB) is low.
+     */
     private readonly windowBytes: number;
 
     /**
@@ -193,11 +306,35 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
      *
      * @param mcpServer - the MCP server instance
      * @param services - backend, rate limiter and write queue shared by all backend tools
+     * @throws Error when PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB is set and is not a whole number of kilobytes from 1 to 10000
      */
     constructor(mcpServer: PenpotMcpServer, services: BackendServices) {
         super(mcpServer, ExportSubtreeArgs.schema, services);
-        this.capBytes = BackendTool.readMaxResponseBytes(process.env);
-        this.windowBytes = ExportSubtreeTool.windowBytesFor(this.capBytes);
+        this.capBytes = ExportSubtreeTool.readCapBytes(process.env);
+        this.windowBytes = ExportSubtreeTool.windowBytesFor(BackendSettings.readMaxResponseMb(process.env));
+    }
+
+    /**
+     * Returns the byte budget of one window for a backend response cap: the largest window the backend takes, cut to
+     * half of the cap so that a window and the envelope around it fit one response, and not below a floor.
+     *
+     * @param maxResponseMb - the backend response cap in megabytes (PENPOT_MCP_BACKEND_MAX_RESPONSE_MB)
+     * @returns the budget in bytes of JSON text
+     */
+    public static windowBytesFor(maxResponseMb: number): number {
+        const share = Math.floor(maxResponseMb * 1024 * 1024 * RESPONSE_SHARE);
+        return Math.min(MAX_WINDOW_BYTES, Math.max(MIN_BIG_WINDOW_BYTES, share));
+    }
+
+    /**
+     * Reads the response cap of this tool: PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB, or the shared cap when it is unset.
+     *
+     * @param env - environment to read; the process environment in production
+     * @returns the cap in bytes
+     * @throws Error when either setting is not a whole number of kilobytes from 1 to 10000
+     */
+    public static readCapBytes(env: NodeJS.ProcessEnv): number {
+        return BackendTool.readCapBytes(env, ExportSubtreeTool.CAP_VARIABLE, BackendTool.readMaxResponseBytes(env));
     }
 
     /**
@@ -215,16 +352,25 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
     /** Returns the description that tells clients what the tool is for and what its fields mean. */
     public getToolDescription(): string {
         let description =
-            "Exports every attribute of every shape under rootId (or the whole page) as data, in windows. " +
+            "Exports every attribute of every shape under rootId (or the whole page) as data. " +
             "Each shape carries all its stored attributes, such as content, fills, strokes, shadows, interactions, " +
             "points and transform, plus x, y, width, height, characters for text, depth, index (its place in the " +
-            "walk) and worldMatrix (maps the unrotated box to page space). A path's or boolean's content is an SVG " +
+            "walk) and worldMatrix (maps the four corners of the selrect, in order, onto the four points; for a flipped " +
+            "group it can differ from the stored transform). A path's or boolean's content is an SVG " +
             "path string in page space; a text's content is its tree of paragraphs. " +
             "Shapes come in walk order, parents first. " +
-            "Without filePath the reply is one window: revn, pageId, rootId, total (shapes in the whole walk), " +
-            "shapes, truncated, and nextCursor when shapes remain; " +
-            "pass nextCursor as cursor to read the next window. " +
-            "A shape too large for the response comes back with its large attributes omitted, and the note says so. ";
+            "Without filePath the reply is revn, pageId, rootId, total (shapes in the whole walk), windows (backend " +
+            "windows read for this reply), shapes, truncated, and nextCursor when shapes remain. " +
+            "A reply holds as many shapes as fit the response cap, and has a nextCursor whenever shapes remain: " +
+            "pass it as cursor to read the next shapes, until there is none. " +
+            "A reply read through the backend rate limit may hold fewer shapes, with a note: wait a little and pass " +
+            "the same cursor again. A cursor stays valid while revn is unchanged. " +
+            "A single shape above the response cap comes back alone with its large attributes shown as omitted, " +
+            "listed in oversize with its id and real size, and nextCursor continues after it; the note says how " +
+            "to get the whole shape. " +
+            "With compact: true each shape leaves out its null keys and its default values, and the reply lists the " +
+            "defaults once. For scripts there is also encoding gzip-base64 (the shapes come as a base64 gzip " +
+            "text); a model should not ask for it. ";
         if (this.mcpServer.isFileSystemAccessEnabled()) {
             description +=
                 "With filePath the tool reads every window and writes one JSON file, " +
@@ -243,11 +389,12 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
     }
 
     /**
-     * Returns one window as inline JSON, or walks every window into a file.
+     * Returns the next shapes as one inline reply, or walks every window into a file.
      *
      * @param args - the validated tool arguments
      * @param userToken - the MCP token of the request
-     * @throws Error when filePath is refused, the path is not allowed, a cursor comes with filePath, or the walk fails
+     * @throws Error when filePath is refused, the path is not allowed, a cursor or an encoding comes with filePath, or
+     *   the walk fails
      */
     protected async executeBackend(args: ExportSubtreeArgs, userToken: string): Promise<ToolResponse> {
         if (args.filePath === undefined) {
@@ -257,91 +404,517 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
         if (args.cursor !== undefined) {
             throw new Error("cursor cannot be used with filePath: the file always holds the whole subtree.");
         }
+        if (args.encoding !== undefined) {
+            throw new Error(
+                "encoding cannot be used with filePath: a file is plain JSON, and the encoding is for replies."
+            );
+        }
         const result = await this.writeFile(args, userToken, args.filePath, args.overwrite === true);
         return this.jsonResponse(result);
     }
 
     /**
-     * Returns one inline window that fits the response cap. A window too large is cut to fewer shapes; a single shape
-     * too large is returned with its large attributes omitted. In every case the reply keeps nextCursor.
+     * Compresses text for the gzip-base64 form. It runs off the event loop; tests replace it to count the runs.
+     *
+     * @param text - the JSON text of some shapes
+     * @returns the gzip bytes
+     */
+    protected compress(text: string): Promise<Buffer> {
+        return gzipAsync(Buffer.from(text, "utf8"));
+    }
+
+    /**
+     * Returns one inline reply that fits the response cap and never lacks a cursor while shapes remain.
+     *
+     * It reads backend windows one after the other, each asked for the room that is left in the reply, and stops
+     * before the first window that does not fit, with the cursor that resumes there. It also stops when the plain
+     * text it holds reaches {@link MAX_PLAIN_BYTES_PER_CALL}. When the first window does not fit, it asks again for
+     * fewer shapes. One shape that is above the cap by itself comes back alone, with its large attributes cut, listed
+     * in `oversize`, and the cursor after it.
      *
      * @param args - the validated tool arguments
      * @param userToken - the MCP token of the request
+     * @throws Error when a shape cannot fit even cut, or a window fails
      */
     private async inlineReply(args: ExportSubtreeArgs, userToken: string): Promise<ToolResponse> {
-        const first = await this.callWindow(userToken, args, args.cursor, this.inlineParams(args));
-        if (this.fits(this.callerWindow(first))) {
-            return this.jsonResponse(this.callerWindow(first));
-        }
-        const count = Array.isArray(first?.shapes) ? first.shapes.length : 0;
-        if (count > 1) {
-            const k = this.largestFittingCount(first, count - 1);
-            if (k > 0) {
-                const smaller = await this.callWindow(userToken, args, args.cursor, {
-                    limit: k,
-                    maxBytes: this.windowBytes,
-                });
-                if (this.fits(this.callerWindow(smaller))) {
-                    return this.jsonResponse(this.callerWindow(smaller));
+        const gzip = args.encoding === GZIP_ENCODING;
+        const limit = args.limit ?? MAX_LIMIT;
+        const windows: ReadWindow[] = [];
+        let head: ReplyHead | undefined;
+        let budget = this.capBytes - HEAD_RESERVE_BYTES;
+        let used = 0;
+        let plain = 0;
+        let count = 0;
+        // bytes of JSON per byte of the compressed window, as the first window shows it; later windows are not
+        // compressed alone, their size is estimated from it
+        let measured: number | undefined;
+        let cursor = args.cursor;
+        let limitNote: string | undefined;
+        for (;;) {
+            CallContext.current()?.signal?.throwIfAborted();
+            const ratio = used > 0 ? plain / used : GZIP_RATIO_GUESS;
+            const size = {
+                limit: limit - count,
+                maxJsonBytes: this.askBytes(budget - used, gzip ? ratio : 1, MAX_PLAIN_BYTES_PER_CALL - plain),
+            };
+            let window: ReadWindow;
+            try {
+                window = await this.readWindow(await this.callWindow(userToken, args, cursor, size), gzip, measured);
+            } catch (error) {
+                // the page changed after some shapes were read: they are one revision, and the next call restarts
+                if (windows.length > 0 && ExportSubtreeTool.isStaleCursor(error)) {
+                    limitNote = ExportSubtreeTool.staleNote();
+                    break;
                 }
+                // a rate limit after some windows: send those, with the cursor that continues after them
+                if (windows.length > 0 && error instanceof RateLimitError) {
+                    limitNote = ExportSubtreeTool.rateLimitNote(error, windows.length);
+                    break;
+                }
+                throw error;
             }
-        }
-        const single =
-            count === 1
-                ? first
-                : await this.callWindow(userToken, args, args.cursor, { limit: 1, maxBytes: this.windowBytes });
-        return this.jsonResponse(this.oneShapeReply(single));
-    }
-
-    /**
-     * Returns the largest number of leading shapes of a window whose reply fits the response cap.
-     *
-     * @param window - the window to cut
-     * @param high - the largest count to try
-     * @returns the count, which is 0 when even one shape does not fit
-     */
-    private largestFittingCount(window: SubtreeWindow | undefined, high: number): number {
-        const shapes = window?.shapes ?? [];
-        let low = 0;
-        let top = high;
-        while (low < top) {
-            const middle = Math.ceil((low + top) / 2);
-            if (this.fits(this.callerWindow({ ...window, shapes: shapes.slice(0, middle) }))) {
-                low = middle;
-            } else {
-                top = middle - 1;
-            }
-        }
-        return low;
-    }
-
-    /**
-     * Returns a reply that holds one shape, cut until the reply fits the response cap. The reply lists the cut
-     * attributes in `oversize` and keeps nextCursor.
-     *
-     * @param window - the window that holds the shape
-     */
-    private oneShapeReply(window: SubtreeWindow | undefined): Record<string, unknown> {
-        const reply = this.callerWindow(window);
-        const shape = Array.isArray(reply.shapes) ? (reply.shapes[0] as unknown) : undefined;
-        if (!isRecord(shape) || this.fits(reply)) {
-            return reply;
-        }
-        const full = jsonBytes(shape);
-        const trimmed: Record<string, unknown> = { ...shape };
-        const omitted: string[] = [];
-        const build = (): Record<string, unknown> => ({
-            ...reply,
-            shapes: [trimmed],
-            oversize: [{ id: shape.id, bytes: full, omitted: [...omitted] }],
-            note: OVERSIZE_NOTE,
-        });
-        for (const key of ExportSubtreeTool.trimOrder(shape)) {
-            trimmed[key] = { omitted: true, bytes: jsonBytes(shape[key]) };
-            omitted.push(key);
-            if (this.fits(build())) {
+            if (head === undefined) {
+                budget = this.capBytes - this.headBytes(ExportSubtreeTool.headOf(window.raw), window.nextCursor, gzip);
+                const fitted = await this.fitFirstWindow(
+                    userToken,
+                    args,
+                    cursor,
+                    ExportSubtreeTool.headOf(window.raw),
+                    window,
+                    budget,
+                    gzip
+                );
+                head = fitted.head;
+                window = fitted.window;
+                if (gzip && window.oversize === undefined && window.cost > 0) {
+                    measured = window.plainBytes / window.cost;
+                }
+            } else if (
+                window.raw.revn !== head.revn ||
+                used + window.cost > budget ||
+                plain + window.plainBytes > MAX_PLAIN_BYTES_PER_CALL
+            ) {
                 break;
             }
+            windows.push(window);
+            used += window.cost;
+            plain += window.plainBytes;
+            count += window.shapes.length;
+            if (window.oversize !== undefined || window.nextCursor === undefined) {
+                break;
+            }
+            if (window.nextCursor === cursor) {
+                throw new Error("The backend repeated a cursor, so the walk would not end.");
+            }
+            cursor = window.nextCursor;
+            if (
+                count >= limit ||
+                windows.length >= MAX_WINDOWS_PER_CALL ||
+                budget - used < MIN_WINDOW_BYTES ||
+                MAX_PLAIN_BYTES_PER_CALL - plain < MIN_BIG_WINDOW_BYTES
+            ) {
+                break;
+            }
+        }
+        return this.finishReply(head, windows, gzip, limitNote);
+    }
+
+    /**
+     * Returns the note of a reply that a stale cursor cut: the page changed after the windows of the reply were read.
+     */
+    private static staleNote(): string {
+        return (
+            "The page changed (its revn moved) while this call read it. The shapes in this reply are from before " +
+            "the change, and the backend will refuse nextCursor as stale. Start the walk again without a cursor."
+        );
+    }
+
+    /**
+     * Returns the note of a reply that the rate limit cut.
+     *
+     * @param error - the refusal
+     * @param windows - the number of windows the reply holds
+     */
+    private static rateLimitNote(error: RateLimitError, windows: number): string {
+        const wait =
+            error instanceof BackendRateLimitError && error.retryAfterSeconds !== undefined
+                ? `${error.retryAfterSeconds} s`
+                : "10 s";
+        return (
+            `The rate limit stopped this call after ${windows} backend ` +
+            `${windows === 1 ? "window" : "windows"}. Wait about ${wait}, then pass nextCursor as cursor to go on.`
+        );
+    }
+
+    /**
+     * Returns the first window of a reply, cut to a prefix that fits the room of the reply. A window that does not
+     * fit is asked again with the number of leading shapes that fit, so that the cursor resumes right after them.
+     * When even the first shape does not fit, the window is that shape alone, cut to fit.
+     *
+     * The window is asked for again, so the page may have changed since the first answer. The reply then takes the
+     * head (revision and total) of the newest answer, so its fields and its shapes are one revision.
+     *
+     * @param userToken - the MCP token of the request
+     * @param args - the validated tool arguments
+     * @param cursor - cursor the window was read at
+     * @param head - the fields of the reply that the first answer gave
+     * @param first - the first window, as the backend answered it
+     * @param budget - the bytes that the shapes may take in the reply
+     * @param gzip - whether the shapes are compressed
+     * @returns the window that fits, and the head of the answer it came from
+     * @throws Error when a shape cannot fit even cut, or the window will not fit after a few tries
+     */
+    private async fitFirstWindow(
+        userToken: string,
+        args: ExportSubtreeArgs,
+        cursor: string | undefined,
+        head: ReplyHead,
+        first: ReadWindow,
+        budget: number,
+        gzip: boolean
+    ): Promise<{ window: ReadWindow; head: ReplyHead }> {
+        let window = first;
+        let current = head;
+        for (let attempt = 0; attempt < MAX_SHRINKS; attempt++) {
+            if (window.cost <= budget) {
+                return { window, head: current };
+            }
+            const fitting = ExportSubtreeTool.fittingCount(window, budget, gzip);
+            const size = { limit: Math.max(1, fitting), maxJsonBytes: this.windowBytes };
+            if (fitting > 0 || window.shapes.length > 1) {
+                window = await this.readWindow(await this.callWindow(userToken, args, cursor, size), gzip, undefined);
+                current = ExportSubtreeTool.sameRevision(current, window);
+            }
+            if (fitting === 0) {
+                // the first shape alone is the window: it comes whole when it fits, and cut when it does not
+                if (window.cost <= budget) {
+                    return { window, head: current };
+                }
+                return { window: await this.trimmedWindow(current, window, gzip), head: current };
+            }
+        }
+        throw new Error(
+            `A window would not fit the response cap of ${this.capBytes} bytes after ${MAX_SHRINKS} tries. ` +
+                `Raise ${ExportSubtreeTool.CAP_VARIABLE}, or read the shapes with get_shapes and fields.`
+        );
+    }
+
+    /**
+     * Returns the head to use after a window was asked for again: the old head when the revision and the total are
+     * the same, else the head of the new answer.
+     *
+     * @param head - the head so far
+     * @param window - the window that was read last
+     */
+    private static sameRevision(head: ReplyHead, window: ReadWindow): ReplyHead {
+        if (window.raw.revn === head.revn && window.raw.total === head.total) {
+            return head;
+        }
+        return ExportSubtreeTool.headOf(window.raw);
+    }
+
+    /**
+     * Builds the reply from the windows that were read, and checks that it fits the cap as it will be sent. The
+     * check is for what the sums could not see: the estimate of a compressed size, or the bytes around the shapes.
+     * When it fails, whole trailing windows are left for the next call. A gzip reply is compressed once, and once
+     * more after windows are dropped.
+     *
+     * @param head - the fields of the reply that the first window gave
+     * @param windows - the windows to send, in order; at least one
+     * @param gzip - whether the shapes are compressed
+     * @param limitNote - note to add when the rate limit or a stale cursor cut the call, or undefined. A reply of
+     *   one window that fits only without the note is sent without it: the note never makes the call fail.
+     * @throws Error when one window alone does not fit
+     */
+    private async finishReply(
+        head: ReplyHead | undefined,
+        windows: ReadWindow[],
+        gzip: boolean,
+        limitNote?: string
+    ): Promise<ToolResponse> {
+        if (head === undefined || windows.length === 0) {
+            throw new Error("The backend answered no window.");
+        }
+        let held = [...windows];
+        let note = limitNote;
+        for (;;) {
+            const shapes = held.flatMap((window) => window.shapes);
+            const text = JSON.stringify(
+                ExportSubtreeTool.replyOf(
+                    head,
+                    held,
+                    gzip ? await this.packed(shapes) : shapes,
+                    ExportSubtreeTool.withLimitNote(this.noteOf(held), note)
+                )
+            );
+            const bytes = Buffer.byteLength(text, "utf8");
+            if (bytes <= this.capBytes) {
+                return new TextResponse(text);
+            }
+            if (held.length === 1 && note !== undefined) {
+                note = undefined;
+                continue;
+            }
+            if (held.length === 1) {
+                throw this.oversizeError(held[0].shapes[0]);
+            }
+            held = gzip
+                ? ExportSubtreeTool.leadingWindows(held, (this.capBytes * GZIP_FIT_SHARE) / bytes)
+                : held.slice(0, -1);
+        }
+    }
+
+    /**
+     * Adds the rate-limit note to the note of a reply.
+     *
+     * @param note - the oversize note, or undefined
+     * @param limitNote - the rate-limit note, or undefined
+     */
+    private static withLimitNote(
+        note: { oversize: unknown[]; note: string } | undefined,
+        limitNote: string | undefined
+    ): { oversize?: unknown[]; note: string } | undefined {
+        if (limitNote === undefined) {
+            return note;
+        }
+        return note === undefined ? { note: limitNote } : { ...note, note: `${note.note} ${limitNote}` };
+    }
+
+    /**
+     * Returns the leading windows whose plain bytes are at most a share of the plain bytes of all of them: at least
+     * one window, and at least one fewer than all.
+     *
+     * @param windows - the windows, in order; at least two
+     * @param share - the share of the plain bytes to keep
+     */
+    private static leadingWindows(windows: ReadWindow[], share: number): ReadWindow[] {
+        const allowed = windows.reduce((sum, window) => sum + window.plainBytes, 0) * share;
+        let sum = 0;
+        let keep = 0;
+        while (keep < windows.length - 1 && sum + windows[keep].plainBytes <= allowed) {
+            sum += windows[keep].plainBytes;
+            keep += 1;
+        }
+        return windows.slice(0, Math.max(1, keep));
+    }
+
+    /**
+     * Builds the reply of some windows. Its cursor is the one after the last window.
+     *
+     * @param head - the fields of the reply that do not depend on the windows
+     * @param windows - the windows to send, in order; at least one
+     * @param shapes - the `shapes` field: the shapes, or their gzip-base64 envelope
+     * @param note - the note about a cut shape, or undefined
+     */
+    private static replyOf(
+        head: ReplyHead,
+        windows: ReadWindow[],
+        shapes: unknown,
+        note: { oversize?: unknown[]; note: string } | undefined
+    ): Record<string, unknown> {
+        const nextCursor = windows[windows.length - 1].nextCursor;
+        return {
+            revn: head.revn,
+            pageId: head.pageId,
+            rootId: head.rootId,
+            total: head.total,
+            ...(head.compact ? { compact: true, defaults: head.defaults } : {}),
+            windows: windows.length,
+            shapes,
+            truncated: nextCursor !== undefined,
+            ...(nextCursor !== undefined ? { nextCursor } : {}),
+            ...(note !== undefined ? note : {}),
+        };
+    }
+
+    /**
+     * Returns the `oversize` list and the note of a reply that holds a cut shape, or undefined.
+     *
+     * @param windows - the windows of the reply
+     */
+    private noteOf(windows: ReadWindow[]): { oversize: unknown[]; note: string } | undefined {
+        const oversize = windows.flatMap((window) => (window.oversize === undefined ? [] : [window.oversize]));
+        if (oversize.length === 0) {
+            return undefined;
+        }
+        const way = this.mcpServer.isFileSystemAccessEnabled()
+            ? "Raise PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB (up to 10000), or write the subtree to a file with filePath."
+            : "Raise PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB (up to 10000).";
+        return {
+            oversize,
+            note:
+                `A shape is larger than the response cap of ${this.capBytes} bytes, so its large attributes are ` +
+                `shown as omitted; nextCursor continues after it. To get the whole shape: ${way}`,
+        };
+    }
+
+    /**
+     * Returns the fields of the reply that come from the first window.
+     *
+     * @param window - the first window, as the backend answered it
+     */
+    private static headOf(window: SubtreeWindow): ReplyHead {
+        return {
+            revn: window.revn,
+            pageId: window.pageId,
+            rootId: window.rootId,
+            total: window.total,
+            compact: window.compact === true,
+            defaults: window.defaults,
+        };
+    }
+
+    /**
+     * Returns the bytes of the reply without its shapes: the head fields, the largest count of windows, the largest
+     * envelope of packed shapes and a cursor a little longer than the first one. The shapes of a plain reply take
+     * their own bytes besides, so this overstates the bytes around them by a few.
+     *
+     * @param head - the fields of the reply that do not depend on the windows
+     * @param nextCursor - the cursor after the first window
+     * @param gzip - whether the shapes are compressed
+     */
+    private headBytes(head: ReplyHead, nextCursor: string | undefined, gzip: boolean): number {
+        const sample = {
+            revn: head.revn,
+            pageId: head.pageId,
+            rootId: head.rootId,
+            total: head.total,
+            ...(head.compact ? { compact: true, defaults: head.defaults } : {}),
+            windows: MAX_WINDOWS_PER_CALL,
+            shapes: gzip ? { encoding: GZIP_ENCODING, bytes: 1_000_000_000, count: MAX_LIMIT, data: "" } : [],
+            truncated: true,
+            nextCursor: "x".repeat((nextCursor?.length ?? 0) + CURSOR_PAD_CHARS),
+        };
+        return jsonBytes(sample);
+    }
+
+    /**
+     * Turns a backend window into the form of the reply and measures what it adds to the reply: the JSON text of
+     * its shapes and one comma each, or the base64 text of their gzip. A gzip window is compressed alone only when
+     * no ratio is known yet; later windows are estimated from the ratio of the first, with a margin.
+     *
+     * @param window - the window as the backend answered it
+     * @param gzip - whether the shapes are compressed
+     * @param measured - bytes of JSON per byte of the compressed first window, or undefined when none is known
+     * @throws Error when the window has no shapes, or is cut without a cursor
+     */
+    private async readWindow(
+        window: SubtreeWindow | undefined,
+        gzip: boolean,
+        measured: number | undefined
+    ): Promise<ReadWindow> {
+        if (!Array.isArray(window?.shapes)) {
+            throw new Error("The backend answered a window without shapes.");
+        }
+        if (window.truncated === true && typeof window.nextCursor !== "string") {
+            throw new Error("The backend cut a window without a cursor to continue from.");
+        }
+        const shapes = window.shapes.map((shape) => BackendShapeTypes.toCallerShape(shape));
+        const nextCursor = typeof window.nextCursor === "string" ? window.nextCursor : undefined;
+        if (!gzip) {
+            const plainBytes = shapes.reduce<number>((sum, shape) => sum + jsonBytes(shape), 0);
+            return { raw: window, shapes, nextCursor, cost: plainBytes + shapes.length, plainBytes };
+        }
+        const text = JSON.stringify(shapes);
+        const plainBytes = Buffer.byteLength(text, "utf8");
+        const cost =
+            measured === undefined
+                ? base64Length((await this.compress(text)).length)
+                : Math.ceil((plainBytes / measured) * GZIP_ESTIMATE_MARGIN);
+        return { raw: window, shapes, nextCursor, cost, plainBytes };
+    }
+
+    /**
+     * Returns the byte budget to ask the backend for, from the room left in the reply and in the plain bytes of the
+     * call.
+     *
+     * @param room - bytes left in the reply
+     * @param ratio - bytes of JSON that one byte in the reply holds: 1, or the gzip ratio
+     * @param plainLeft - bytes of JSON text that the call may still gather
+     */
+    private askBytes(room: number, ratio: number, plainLeft: number): number {
+        const asked = Math.floor(room * ratio * WINDOW_SHARE);
+        return Math.max(MIN_WINDOW_BYTES, Math.min(this.windowBytes, asked, Math.floor(plainLeft * WINDOW_SHARE)));
+    }
+
+    /**
+     * Wraps the shapes of a reply in the gzip-base64 form, compressing them once.
+     *
+     * @param shapes - the shapes, in the caller's form
+     */
+    private async packed(shapes: unknown[]): Promise<Record<string, unknown>> {
+        const text = JSON.stringify(shapes);
+        return {
+            encoding: GZIP_ENCODING,
+            bytes: Buffer.byteLength(text, "utf8"),
+            count: shapes.length,
+            data: (await this.compress(text)).toString("base64"),
+        };
+    }
+
+    /**
+     * Returns the largest number of leading shapes of a window that fit a budget. A plain window is counted exactly.
+     * A gzip window is counted by the compression ratio of the whole window, which is one compression and no search.
+     *
+     * @param window - the window, with its cost
+     * @param budget - the bytes that the shapes may take in the reply
+     * @param gzip - whether the shapes are compressed
+     * @returns the count, which is 0 when even the first shape does not fit
+     */
+    private static fittingCount(window: ReadWindow, budget: number, gzip: boolean): number {
+        const allowed = gzip ? budget * (window.plainBytes / window.cost) * GZIP_FIT_SHARE : budget;
+        let sum = 0;
+        for (let index = 0; index < window.shapes.length; index++) {
+            sum += jsonBytes(window.shapes[index]) + (gzip ? 0 : 1);
+            if (sum > allowed) {
+                return index;
+            }
+        }
+        return window.shapes.length;
+    }
+
+    /**
+     * Returns a window that holds one shape, cut until the reply fits the response cap. The cut attributes are
+     * listed in `oversize` with the id and the real size of the shape, and the cursor is the one after the shape. A
+     * gzip reply is fitted by its plain size with some room, since the compressed size is known only at the end.
+     *
+     * @param head - the fields of the reply
+     * @param window - the window that holds the shape, and only it
+     * @param gzip - whether the shapes are compressed
+     * @throws Error when the shape does not fit even with every attribute but its id and type cut
+     */
+    private async trimmedWindow(head: ReplyHead, window: ReadWindow, gzip: boolean): Promise<ReadWindow> {
+        const shape = window.shapes[0];
+        if (!isRecord(shape)) {
+            throw this.oversizeError(shape);
+        }
+        const bytes = jsonBytes(shape);
+        const trimmed: Record<string, unknown> = { ...shape };
+        const omitted: string[] = [];
+        const build = (): ReadWindow => ({
+            ...window,
+            shapes: [trimmed],
+            cost: jsonBytes(trimmed) + 1,
+            plainBytes: jsonBytes(trimmed),
+            oversize: { id: shape.id, bytes, omitted: [...omitted] },
+        });
+        // a gzip reply is measured as it will be sent: compressed text can be larger than plain text
+        const fits = async (): Promise<boolean> => {
+            const built = build();
+            const field = gzip ? await this.packed([trimmed]) : [trimmed];
+            const reply = ExportSubtreeTool.replyOf(head, [built], field, this.noteOf([built]));
+            return jsonBytes(reply) <= this.capBytes;
+        };
+        for (const key of ExportSubtreeTool.trimOrder(shape)) {
+            if (await fits()) {
+                break;
+            }
+            trimmed[key] = { omitted: true, bytes: jsonBytes(shape[key]) };
+            omitted.push(key);
+        }
+        // with every value cut, only the id, the type and the markers are left, which fits any sane cap
+        if (!(await fits())) {
+            throw this.oversizeError(shape);
         }
         return build();
     }
@@ -368,24 +941,17 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
     }
 
     /**
-     * Returns a window with its shape types in the caller's form.
+     * Builds the error of one shape that does not fit the response cap even with its large attributes cut.
      *
-     * @param window - the window as the backend answered it
+     * @param shape - the shape, in the caller's form
      */
-    private callerWindow(window: SubtreeWindow | undefined): Record<string, unknown> {
-        const shapes = Array.isArray(window?.shapes)
-            ? window.shapes.map((shape) => BackendShapeTypes.toCallerShape(shape))
-            : window?.shapes;
-        return { ...window, shapes };
-    }
-
-    /**
-     * Tells whether a reply fits the response cap, measured as the JSON text it would be sent as.
-     *
-     * @param reply - the reply to measure
-     */
-    private fits(reply: unknown): boolean {
-        return jsonBytes(reply) <= this.capBytes;
+    private oversizeError(shape: unknown): Error {
+        const id = isRecord(shape) ? shape.id : undefined;
+        return new Error(
+            `Shape ${String(id)} is ${jsonBytes(shape)} bytes of JSON and does not fit the response cap of ` +
+                `${this.capBytes} bytes even with its large attributes cut. Raise ` +
+                `${ExportSubtreeTool.CAP_VARIABLE} (in kilobytes, up to 10000).`
+        );
     }
 
     /**
@@ -486,7 +1052,10 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
             const usedCursors = new Set<string>();
             do {
                 CallContext.current()?.signal?.throwIfAborted();
-                const part = await this.callWindow(userToken, args, cursor, FILE_WINDOW);
+                const part = await this.callWindow(userToken, args, cursor, {
+                    limit: MAX_LIMIT,
+                    maxJsonBytes: this.windowBytes,
+                });
                 if (!Array.isArray(part?.shapes)) {
                     throw new Error("The backend answered a window without shapes.");
                 }
@@ -499,6 +1068,7 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
                         rootId: part.rootId ?? args.rootId ?? PAGE_ROOT_ID,
                         revn: part.revn,
                         total: part.total,
+                        ...(part.compact === true ? { compact: true, defaults: part.defaults } : {}),
                     };
                     await writer.write(`${JSON.stringify(head).slice(0, -1)},"shapes":[`);
                 }
@@ -549,7 +1119,7 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
      * @param userToken - the MCP token of the request
      * @param args - the validated tool arguments
      * @param cursor - cursor of the window, or undefined for the first one
-     * @param size - the most shapes and bytes of the window
+     * @param size - the most shapes and bytes of JSON text of the window
      */
     private callWindow(
         userToken: string,
@@ -562,29 +1132,11 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
             pageId: args.pageId,
             ...(args.rootId !== undefined ? { rootId: args.rootId } : {}),
             ...(cursor !== undefined ? { cursor } : {}),
+            ...(args.compact === true ? { compact: true } : {}),
             limit: size.limit,
-            maxBytes: size.maxBytes,
+            maxJsonBytes: size.maxJsonBytes,
         };
         return this.callCommand<SubtreeWindow>(userToken, "get-mcp-subtree", params);
-    }
-
-    /**
-     * Returns the size of an inline window: the caller's limit, and 80 % of the response cap in bytes.
-     *
-     * @param args - the validated tool arguments
-     */
-    private inlineParams(args: ExportSubtreeArgs): WindowSize {
-        return { limit: args.limit ?? DEFAULT_LIMIT, maxBytes: this.windowBytes };
-    }
-
-    /**
-     * Returns the byte limit of one window: 80 % of the response cap, kept inside the range the backend accepts.
-     *
-     * @param capBytes - the response cap of the tool, in bytes
-     */
-    private static windowBytesFor(capBytes: number): number {
-        const share = Math.floor(capBytes * WINDOW_SHARE);
-        return Math.min(MAX_WINDOW_BYTES, Math.max(MIN_WINDOW_BYTES, share));
     }
 
     /**

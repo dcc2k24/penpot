@@ -8,6 +8,9 @@
   (:require
    [app.binfile.common :as bfc]
    [app.common.geom.matrix :as gmt]
+   [app.common.geom.point :as gpt]
+   [app.common.geom.rect :as grc]
+   [app.common.geom.shapes :as gsh]
    [app.common.json :as json]
    [app.common.math :as mth]
    [app.common.types.path :as path]
@@ -20,7 +23,8 @@
    [app.util.cache :as cache]
    [backend-tests.helpers :as th]
    [clojure.data.json :as jd]
-   [clojure.test :as t]))
+   [clojure.test :as t]
+   [clojure.walk :as walk]))
 
 (t/use-fixtures :once (t/compose-fixtures
                        (partial th/init-config [:enable-access-tokens
@@ -531,11 +535,20 @@
     (t/is (= [first' second'] ids))
     (t/is (= (vec stored) ids))))
 
-;; --- WORLD MATRIX SIGNS
+;; --- WORLD MATRIX
+
+(def ^:private eps
+  "The tolerance of the world-matrix tests: 1e-6, tighter than `mth/close?`."
+  1e-6)
+
+(defn- near?
+  "Whether the numbers `a` and `b` differ by less than `eps`."
+  [a b]
+  (< (Math/abs (double (- a b))) eps))
 
 (defn- corners
   "The four corners of the selrect of `shape`, mapped through its world
-  matrix: the rectangle the matrix draws."
+  matrix: top-left, top-right, bottom-right, bottom-left."
   [shape]
   (let [{:keys [x y width height]} (:selrect shape)
         m (:world-matrix shape)]
@@ -544,48 +557,275 @@
              (+ (* (:b m) px) (* (:d m) py) (:f m))])
           [[x y] [(+ x width) y] [(+ x width) (+ y height)] [x (+ y height)]])))
 
-(defn- same-points?
-  "Whether the point lists `as` and `bs` hold the same points, in any order."
+(defn- same-points-in-order?
+  "Whether the point lists `as` and `bs` hold the same points at the same
+  indexes. A mirrored shape has its points in another order, so every world
+  matrix test uses this and none uses an unordered comparison."
   [as bs]
   (and (= (count as) (count bs))
-       (every? (fn [[ax ay]]
-                 (some (fn [[bx by]]
-                         (and (mth/close? ax bx) (mth/close? ay by)))
-                       bs))
-               as)))
+       (every? (fn [[[ax ay] [bx by]]] (and (near? ax bx) (near? ay by)))
+               (map vector as bs))))
 
 (defn- point-pairs
   [shape]
   (mapv (fn [p] [(:x p) (:y p)]) (:points shape)))
 
-(t/deftest subtree-world-matrix-of-a-flipped-shape-draws-its-points
-  (let [{:keys [profile file-id page1 board1]} (create-fixture)
-        flipped (uuid/next)
-        _       (apply-changes! profile file-id
-                                [(add-obj page1 flipped board1 board1
-                                          {:type :rect :name "Flipped"
-                                           :x 10 :y 20 :width 100 :height 50
-                                           :flip-x true
-                                           :transform (gmt/matrix -1 0 0 1 0 0)
-                                           :transform-inverse (gmt/matrix -1 0 0 1 0 0)})])
-        shape   (first (filter #(= flipped (:id %))
-                               (:shapes (:result (subtree profile file-id page1 board1)))))
-        matrix  (:world-matrix shape)]
-    (t/is (neg? (:a matrix)))
-    (t/is (same-points? (corners shape) (point-pairs shape)))))
+(defn- matrix-values
+  [m]
+  [(:a m) (:b m) (:c m) (:d m) (:e m) (:f m)])
 
-(t/deftest subtree-world-matrix-of-a-rotated-shape-draws-its-points
+(defn- same-matrix?
+  "Whether the matrices `m1` and `m2` hold the same six values within `eps`."
+  [m1 m2]
+  (every? true? (map near? (matrix-values m1) (matrix-values m2))))
+
+(defn- shape-of
+  "The shape `id` of the subtree walk of `root-id`, as the command replies."
+  [profile file-id page-id root-id id]
+  (first (filter #(= id (:id %))
+                 (:shapes (:result (subtree profile file-id page-id root-id))))))
+
+(defn- stored-shape
+  "The shape `id` as the page stores it."
+  [file-id page-id id]
+  (get-in (bfc/get-file th/*system* file-id :realize? true)
+          [:data :pages-index page-id :objects id]))
+
+(defn- check-agrees!
+  "Asserts, for a shape whose transform agrees with its points, that the
+  reply's world matrix equals the matrix of the stored transform and maps
+  the selrect corners onto the points in order."
+  [file-id page-id shape]
+  (let [stored (stored-shape file-id page-id (:id shape))]
+    (t/is (same-matrix? (:world-matrix shape) (gsh/transform-matrix stored)))
+    (t/is (same-points-in-order? (corners shape) (point-pairs shape)))))
+
+(t/deftest subtree-world-matrix-of-a-plain-shape-equals-the-transform-matrix
+  (let [{:keys [profile file-id page1 board1 rect1]} (create-fixture)
+        shape (shape-of profile file-id page1 board1 rect1)]
+    (check-agrees! file-id page1 shape)
+    (t/is (same-matrix? (:world-matrix shape) (gmt/matrix)))))
+
+(t/deftest subtree-world-matrix-of-a-flipped-rect-equals-the-transform-matrix
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)]
+    (doseq [[flip-x flip-y matrix] [[true false (gmt/matrix -1 0 0 1 0 0)]
+                                    [false true (gmt/matrix 1 0 0 -1 0 0)]
+                                    [true true (gmt/matrix -1 0 0 -1 0 0)]]]
+      (let [id    (uuid/next)
+            _     (apply-changes! profile file-id
+                                  [(add-obj page1 id board1 board1
+                                            {:type :rect :name "Flipped"
+                                             :x 10 :y 20 :width 100 :height 50
+                                             :flip-x flip-x :flip-y flip-y
+                                             :transform matrix
+                                             :transform-inverse matrix})])
+            shape (shape-of profile file-id page1 board1 id)]
+        (check-agrees! file-id page1 shape)
+        ;; the mirrored points do not start at the top-left corner
+        (t/is (not (same-points-in-order?
+                    (point-pairs shape)
+                    [[10 20] [110 20] [110 70] [10 70]])))))))
+
+(t/deftest subtree-world-matrix-of-a-rotated-rect-equals-the-transform-matrix
   (let [{:keys [profile file-id page1]} (create-fixture)
         ids    (apply-ops! profile file-id
                            [{:op "create_rect" :page-id page1 :id "$tmp:r"
-                             :x 0 :y 0 :width 100 :height 50}])
+                             :x 5 :y 7 :width 120 :height 40}])
         rect   (get ids "$tmp:r")
         _      (apply-ops! profile file-id
                            [{:op "update_shape" :page-id page1 :id rect
-                             :props {:rotation 45}}])
-        shape  (first (filter #(= rect (:id %))
-                              (:shapes (:result (subtree profile file-id page1 uuid/zero)))))]
-    (t/is (same-points? (corners shape) (point-pairs shape)))))
+                             :props {:rotation 30}}])
+        shape  (shape-of profile file-id page1 uuid/zero rect)]
+    (check-agrees! file-id page1 shape)
+    (t/is (not (same-matrix? (:world-matrix shape) (gmt/matrix))))))
+
+(def ^:private flipped-group-cases
+  "A group of the box `x 10, y 20, 100 by 50` flipped on x, on y and on both:
+  the flip flags and the page corners of its first to fourth point."
+  [[true false [[110 20] [10 20] [10 70] [110 70]]]
+   [false true [[10 70] [110 70] [110 20] [10 20]]]
+   [true true [[110 70] [10 70] [10 20] [110 20]]]])
+
+(defn- add-flipped-group!
+  "Writes, through raw changes, a group that came from an import: its
+  `:transform` and `:transform-inverse` are the identity while its `:points`
+  are mirrored. `apply_operations` cannot write this state, because Penpot
+  recomputes the transform of a group from its points. The group holds one
+  rect child at 30,30 of 20 by 20. Returns the ids `{:group :child}`."
+  [profile file-id page-id board-id flip-x flip-y corners-in]
+  (let [group (uuid/next)
+        child (uuid/next)]
+    (apply-changes! profile file-id
+                    [(add-obj page-id group board-id board-id
+                              {:type :group :name "Imported group"
+                               :x 10 :y 20 :width 100 :height 50
+                               :flip-x flip-x :flip-y flip-y
+                               :selrect (grc/make-rect 10 20 100 50)
+                               :points (mapv (fn [[x y]] (gpt/point x y)) corners-in)
+                               :transform (gmt/matrix)
+                               :transform-inverse (gmt/matrix)})
+                     (add-obj page-id child group board-id
+                              {:type :rect :name "Child"
+                               :x 30 :y 30 :width 20 :height 20})])
+    {:group group :child child}))
+
+(t/deftest subtree-world-matrix-of-a-flipped-group-draws-its-points-in-order
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)]
+    (doseq [[flip-x flip-y corners-in] flipped-group-cases]
+      (let [{:keys [group]} (add-flipped-group! profile file-id page1 board1 flip-x flip-y corners-in)
+            stored (stored-shape file-id page1 group)
+            shape  (shape-of profile file-id page1 board1 group)]
+        ;; the stored state is the faulty one: identity transform, mirrored points
+        (t/is (same-matrix? (gsh/transform-matrix stored) (gmt/matrix)))
+        (t/is (same-points-in-order? (point-pairs stored) corners-in))
+        ;; the world matrix follows the points, and the old one did not
+        (t/is (same-points-in-order? (corners shape) (point-pairs shape)))
+        (t/is (not (same-points-in-order?
+                    (corners (assoc shape :world-matrix (gsh/transform-matrix stored)))
+                    (point-pairs shape))))))))
+
+(defn- apply-affine
+  "The point `[x y]` mapped through the matrix `m`."
+  [m [x y]]
+  [(+ (* (:a m) x) (* (:c m) y) (:e m))
+   (+ (* (:b m) x) (* (:d m) y) (:f m))])
+
+(defn- compose-affine
+  "The matrix of `m1` applied after `m2`."
+  [m1 m2]
+  (gmt/matrix (+ (* (:a m1) (:a m2)) (* (:c m1) (:b m2)))
+              (+ (* (:b m1) (:a m2)) (* (:d m1) (:b m2)))
+              (+ (* (:a m1) (:c m2)) (* (:c m1) (:d m2)))
+              (+ (* (:b m1) (:c m2)) (* (:d m1) (:d m2)))
+              (+ (* (:a m1) (:e m2)) (* (:c m1) (:f m2)) (:e m1))
+              (+ (* (:b m1) (:e m2)) (* (:d m1) (:f m2)) (:f m1))))
+
+(defn- invert-affine
+  "The inverse of the matrix `m`."
+  [m]
+  (let [det (- (* (:a m) (:d m)) (* (:b m) (:c m)))
+        a   (/ (:d m) det)
+        b   (/ (- (:b m)) det)
+        c   (/ (- (:c m)) det)
+        d   (/ (:a m) det)]
+    (gmt/matrix a b c d
+                (- (+ (* a (:e m)) (* c (:f m))))
+                (- (+ (* b (:e m)) (* d (:f m)))))))
+
+(t/deftest subtree-child-of-a-flipped-group-lands-on-its-own-points
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)]
+    (doseq [[flip-x flip-y corners-in] flipped-group-cases]
+      (let [{:keys [group child]} (add-flipped-group! profile file-id page1 board1 flip-x flip-y corners-in)
+            walk   (:shapes (:result (subtree profile file-id page1 group)))
+            parent (first (filter #(= group (:id %)) walk))
+            kid    (first (filter #(= child (:id %)) walk))
+            wp     (:world-matrix parent)
+            ;; the matrix a generator writes for the child inside the group
+            local  (compose-affine (invert-affine wp) (:world-matrix kid))
+            {:keys [x y width height]} (:selrect kid)
+            sel    [[x y] [(+ x width) y] [(+ x width) (+ y height)] [x (+ y height)]]
+            placed (mapv #(apply-affine wp (apply-affine local %)) sel)]
+        (t/is (some? kid))
+        (t/is (same-points-in-order? placed (point-pairs kid)))
+        (t/is (same-points-in-order? (corners kid) (point-pairs kid)))))))
+
+(t/deftest subtree-world-matrix-of-a-flat-path-draws-its-points-without-error
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        id    (uuid/next)
+        _     (apply-changes! profile file-id
+                              [(add-obj page1 id board1 board1
+                                        {:type :path :name "Line"
+                                         :content [{:command :move-to :params {:x 10 :y 20}}
+                                                   {:command :line-to :params {:x 110 :y 20}}]
+                                         :fills red-fill})])
+        out   (subtree profile file-id page1 board1)
+        shape (first (filter #(= id (:id %)) (:shapes (:result out))))
+        saved (stored-shape file-id page1 id)]
+    (t/is (nil? (:error out)))
+    (t/is (some? shape))
+    ;; Penpot keeps a path box at 0.01 at least, so this one is not a
+    ;; zero box: the zero box is covered by the pure test below
+    (t/is (pos? (:height (:selrect saved))))
+    (t/is (same-points-in-order? (corners shape) (point-pairs shape)))))
+
+(t/deftest get-world-matrix-falls-back-to-the-stored-transform
+  (let [selrect   (grc/make-rect 10 20 100 50)
+        transform (gmt/matrix 0 1 -1 0 0 0)
+        base      {:selrect selrect :transform transform}
+        old       (gsh/transform-matrix base)
+        four      (mapv (fn [[x y]] (gpt/point x y))
+                        [[110 20] [10 20] [10 70] [110 70]])]
+    (t/testing "no points"
+      (t/is (same-matrix? old (subtree/get-world-matrix base))))
+    (t/testing "not four points"
+      (t/is (same-matrix? old (subtree/get-world-matrix (assoc base :points (vec (take 3 four)))))))
+    ;; `grc/make-rect` keeps a size of 0.01 at least, so these selrects are
+    ;; built from the record directly, as a file can store them
+    (t/testing "a box of zero height"
+      (let [flat {:selrect (grc/map->Rect {:x 10 :y 20 :width 100 :height 0 :x1 10 :y1 20 :x2 110 :y2 20})
+                  :transform transform :points four}]
+        (t/is (same-matrix? (gsh/transform-matrix flat) (subtree/get-world-matrix flat)))))
+    (t/testing "a box of zero width"
+      (let [flat {:selrect (grc/map->Rect {:x 10 :y 20 :width 0 :height 50 :x1 10 :y1 20 :x2 10 :y2 70})
+                  :transform transform :points four}]
+        (t/is (same-matrix? (gsh/transform-matrix flat) (subtree/get-world-matrix flat)))))
+    (t/testing "degenerate points give a singular matrix: the stored transform is used"
+      (doseq [[label corners-in] [["all four points coincide" [[10 20] [10 20] [10 20] [10 20]]]
+                                  ["two points coincide" [[10 20] [10 20] [10 70] [110 70]]]
+                                  ["all points on one line" [[10 20] [60 20] [110 20] [160 20]]]]]
+        (let [shape (assoc base :points (mapv (fn [[x y]] (gpt/point x y)) corners-in))
+              m     (subtree/get-world-matrix shape)]
+          (t/is (same-matrix? old m) label)
+          (t/is (> (Math/abs (- (* (:a m) (:d m)) (* (:b m) (:c m)))) 1e-9) label))))
+    (t/testing "points given: the matrix follows them, not the transform"
+      (let [m (subtree/get-world-matrix (assoc base :points four))]
+        (t/is (not (same-matrix? old m)))
+        (t/is (same-points-in-order?
+               (map #(apply-affine m %) [[10 20] [110 20] [110 70] [10 70]])
+               [[110 20] [10 20] [10 70] [110 70]]))))))
+
+(def ^:private property-cases
+  "How many random shapes the property test draws."
+  300)
+
+(t/deftest get-world-matrix-maps-the-selrect-corners-onto-the-points
+  ;; fixed seed: a failure names its case, and the same run replays it
+  (let [rnd  (java.util.Random. 20260611)
+        pick (fn [lo hi] (+ lo (* 0.25 (.nextInt rnd (int (* 4 (- hi lo)))))))]
+    (dotimes [i property-cases]
+      (let [x       (pick -500 500)
+            y       (pick -500 500)
+            w       (pick 1 400)
+            h       (pick 1 400)
+            deg     (.nextInt rnd 360)
+            fx      (if (.nextBoolean rnd) -1 1)
+            fy      (if (.nextBoolean rnd) -1 1)
+            true-t? (.nextBoolean rnd)
+            rad     (Math/toRadians deg)
+            cos     (Math/cos rad)
+            sin     (Math/sin rad)
+            cx      (+ x (/ w 2.0))
+            cy      (+ y (/ h 2.0))
+            ;; the transform Penpot stores: the flip, then the rotation
+            tm      (gmt/matrix (* cos fx) (* sin fx) (- (* sin fy)) (* cos fy) 0 0)
+            src     [[x y] [(+ x w) y] [(+ x w) (+ y h)] [x (+ y h)]]
+            points  (mapv (fn [[px py]]
+                            (let [dx (- px cx) dy (- py cy)]
+                              (gpt/point (+ cx (* (:a tm) dx) (* (:c tm) dy))
+                                         (+ cy (* (:b tm) dx) (* (:d tm) dy)))))
+                          src)
+            shape   (cond-> {:selrect (grc/make-rect x y w h)
+                             :points points
+                             :transform (gmt/matrix)}
+                      true-t? (assoc :transform tm))
+            m       (subtree/get-world-matrix shape)
+            msg     (str "case " i " " (pr-str [x y w h deg fx fy true-t?]))]
+        (t/is (same-points-in-order?
+               (map #(apply-affine m %) src)
+               (map (fn [p] [(:x p) (:y p)]) points))
+              msg)
+        (when true-t?
+          (t/is (same-matrix? m (gsh/transform-matrix shape)) msg))))))
 
 ;; --- PAGES
 
@@ -625,3 +865,253 @@
                  b    {:id b :shapes [a root]}}]
     (t/is (= [[0 root] [1 a] [2 b]]
              (@#'subtree/get-walk-entries objects root)))))
+
+;; --- JSON BYTE BUDGET
+
+(defn- json-bytes
+  "Bytes of the JSON text of `value` as the HTTP layer writes it: the same
+  encoder and the camel-case key function. The text is ASCII."
+  [value]
+  (let [writer (java.io.StringWriter.)]
+    (json/write writer value :key-fn json/write-camel-key)
+    (.length (.getBuffer writer))))
+
+(defn- array-bytes
+  "Bytes of the JSON array of `shapes` as the client receives it."
+  [shapes]
+  (json-bytes (vec shapes)))
+
+(defn- add-rects!
+  "Adds `n` rects, each with a stroke, to the board `board1` of page one."
+  [profile file-id page1 board1 n]
+  (apply-changes! profile file-id
+                  (vec (for [i (range n)]
+                         (add-obj page1 (uuid/next) board1 board1
+                                  {:type :rect :name (str "Extra " i)
+                                   :strokes [{:stroke-color "#000000" :stroke-width 1}]})))))
+
+(t/deftest subtree-max-json-bytes-is-measured-in-the-json-the-client-receives
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        _       (add-rects! profile file-id page1 board1 6)
+        all     (:shapes (:result (subtree profile file-id page1 uuid/zero)))
+        budget  (array-bytes (take 3 all))
+        replies (read-all profile file-id page1 uuid/zero :max-json-bytes budget)]
+    (t/is (= 9 (count all)))
+    (t/is (every? #(> (json-bytes %) 100) all))
+    ;; the budget is exactly the array of the first three shapes
+    (t/is (= 3 (count (:shapes (first replies)))))
+    (t/is (= (map :id all) (shape-ids replies)))
+    (t/is (> (count replies) 1))
+    ;; every window with more than one shape is within the budget as sent
+    (t/is (every? (fn [result]
+                    (or (= 1 (count (:shapes result)))
+                        (<= (array-bytes (:shapes result)) budget)))
+                  replies))
+    ;; one byte less leaves the third shape for the next window
+    (let [tight (read-all profile file-id page1 uuid/zero :max-json-bytes (dec budget))]
+      (t/is (= 2 (count (:shapes (first tight)))))
+      (t/is (= (map :id all) (shape-ids tight))))))
+
+(t/deftest subtree-json-windows-hold-at-least-one-shape
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        long-name (apply str (repeat 1500 "n"))
+        _       (apply-changes! profile file-id
+                                [(add-obj page1 (uuid/next) board1 board1 {:type :rect :name long-name})
+                                 (add-obj page1 (uuid/next) board1 board1 {:type :rect :name long-name})])
+        all     (:shapes (:result (subtree profile file-id page1 uuid/zero)))
+        big     (filter #(> (json-bytes %) 1000) all)
+        replies (read-all profile file-id page1 uuid/zero :max-json-bytes 1000)]
+    ;; the two long shapes are each above the smallest budget by themselves
+    (t/is (<= 2 (count big)))
+    (t/is (= (map :id all) (shape-ids replies)))
+    ;; each of them is alone in its window, and every window has a shape
+    (t/is (every? (fn [shape]
+                    (some #(and (= 1 (count (:shapes %)))
+                                (= (:id shape) (:id (first (:shapes %)))))
+                          replies))
+                  big))
+    (t/is (every? #(seq (:shapes %)) replies))
+    (t/is (every? (fn [result]
+                    (or (= 1 (count (:shapes result)))
+                        (<= (array-bytes (:shapes result)) 1000)))
+                  replies))))
+
+(t/deftest subtree-without-max-json-bytes-keeps-the-windows-of-today
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        _       (add-rects! profile file-id page1 board1 2)
+        plain   (:result (subtree profile file-id page1 uuid/zero))
+        by-size (read-all profile file-id page1 uuid/zero :max-bytes 1000)
+        shapes  (:shapes plain)
+        budget  (reduce + (map mcp/encoded-size (take 2 shapes)))
+        two     (read-all profile file-id page1 uuid/zero :max-bytes budget)]
+    (t/is (= 5 (count shapes)))
+    (t/is (false? (:truncated plain)))
+    (t/is (= #{:revn :page-id :root-id :total :shapes :truncated} (set (keys plain))))
+    ;; max-bytes counts transit text, as before
+    (t/is (every? #(= 1 (count (:shapes %))) by-size))
+    (t/is (= 2 (count (:shapes (first two)))))
+    (t/is (= (map :id shapes) (shape-ids two)))))
+
+(t/deftest subtree-refuses-both-budgets-and-values-out-of-range
+  (let [{:keys [profile file-id page1]} (create-fixture)]
+    (t/is (= :mcp-invalid-window
+             (th/ex-code (:error (subtree profile file-id page1 uuid/zero
+                                          :max-bytes 2000 :max-json-bytes 2000)))))
+    (doseq [value [999 4000001 0]]
+      (t/is (some? (:error (subtree profile file-id page1 uuid/zero
+                                    :max-json-bytes value)))
+            (str "max-json-bytes " value)))
+    ;; the hard maximum is accepted
+    (t/is (nil? (:error (subtree profile file-id page1 uuid/zero
+                                 :max-json-bytes subtree/max-json-bytes))))
+    (t/is (= 4000000 subtree/max-json-bytes))))
+
+(t/deftest subtree-cursors-of-json-windows-bind-to-the-page-version
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        first-window (:result (subtree profile file-id page1 uuid/zero :max-json-bytes 1000))
+        cursor       (:next-cursor first-window)]
+    (t/is (string? cursor))
+    (t/is (= 1 (count (:shapes first-window))))
+    ;; the cursor is the same whichever unit the next window is measured in
+    (t/is (nil? (:error (subtree profile file-id page1 uuid/zero
+                                 :max-json-bytes 1000 :cursor cursor))))
+    (t/is (nil? (:error (subtree profile file-id page1 uuid/zero
+                                 :max-bytes 1000 :cursor cursor))))
+    (apply-changes! profile file-id
+                    [(add-obj page1 (uuid/next) board1 board1 {:type :rect :name "Late"})])
+    (t/is (= :mcp-stale-cursor
+             (th/ex-code (:error (subtree profile file-id page1 uuid/zero
+                                          :max-json-bytes 1000 :cursor cursor)))))))
+
+;; --- COMPACT SHAPES
+
+(defn- create-typed-page!
+  "Adds to the empty page three of the fixture a shape of every type the
+  tests can create, with strokes, a hidden shape, a half transparent one
+  and a flex layout with a child."
+  [profile file-id page3]
+  (let [flex  (uuid/next)
+        group (uuid/next)
+        board (uuid/next)]
+    (apply-changes!
+     profile file-id
+     [(add-obj page3 board uuid/zero uuid/zero {:type :frame :name "Board"})
+      (add-obj page3 (uuid/next) board board
+               {:type :rect :name "Stroked" :fills red-fill
+                :strokes [{:stroke-color "#000000" :stroke-width 2}
+                          {:stroke-color "#FF0000" :stroke-width 1 :stroke-alignment :inner}]})
+      (add-obj page3 (uuid/next) board board
+               {:type :rect :name "Hidden" :hidden true :opacity 0.5 :blocked true})
+      (add-obj page3 (uuid/next) board board {:type :circle :name "Round"})
+      (add-obj page3 (uuid/next) board board
+               {:type :text :name "Label" :x 0 :y 0 :width 100 :height 20
+                :content text-content})
+      (add-obj page3 (uuid/next) board board
+               {:type :path :name "Triangle" :content path-content :fills red-fill})
+      (add-obj page3 (uuid/next) board board
+               {:type :image :name "Picture"
+                :metadata {:id (uuid/next) :width 10 :height 10 :mtype "image/png"}})
+      (add-obj page3 group board board {:type :group :name "Group"})
+      (add-obj page3 (uuid/next) group board {:type :rect :name "Grouped"})
+      (add-obj page3 flex board board
+               {:type :frame :name "Flex" :layout :flex :layout-flex-dir :row})
+      (add-obj page3 (uuid/next) flex flex {:type :rect :name "Item"})])
+    flex))
+
+(defn- remove-nils
+  "`m` without the keys whose value is nil."
+  [m]
+  (into {} (remove (comp nil? val)) m))
+
+(defn- numbers-as-doubles
+  "`value` with every number turned into a double, so that `1` and `1.0`
+  compare equal, as they do in the JSON the client parses."
+  [value]
+  (walk/postwalk (fn [x] (if (number? x) (double x) x)) value))
+
+(defn- restore-shape
+  "The full shape of the compact JSON shape `shape`: the defaults the reply
+  lists are put back under the keys it does not carry, and the default
+  stroke alignment into each stroke."
+  [defaults shape]
+  (let [stroke-defaults (get defaults "strokes")
+        base            (dissoc defaults "strokes")]
+    (cond-> (merge base shape)
+      (seq (get shape "strokes"))
+      (update "strokes" (partial mapv (partial merge stroke-defaults))))))
+
+(t/deftest subtree-compact-shapes-restore-to-the-full-shapes
+  (let [{:keys [profile file-id page3]} (create-fixture)
+        _        (create-typed-page! profile file-id page3)
+        full     (over-http (:result (subtree profile file-id page3 uuid/zero)))
+        compact  (over-http (:result (subtree profile file-id page3 uuid/zero :compact true)))
+        defaults (get compact "defaults")
+        types    (set (map #(get % "type") (get full "shapes")))]
+    (t/is (= #{"frame" "rect" "circle" "text" "path" "image" "group"} types))
+    (t/is (= 11 (count (get full "shapes"))))
+    (t/is (= {"hidden" false "blocked" false "opacity" 1 "strokes" {"strokeAlignment" "center"}}
+             defaults))
+    (t/is (true? (get compact "compact")))
+    (t/is (not (contains? full "compact")))
+    (t/is (not (contains? full "defaults")))
+    (t/is (= (count (get full "shapes")) (count (get compact "shapes"))))
+    (doseq [[f c] (map vector (get full "shapes") (get compact "shapes"))]
+      ;; restoring gives the full shape, but for its nil keys
+      (t/is (= (numbers-as-doubles (remove-nils f))
+               (numbers-as-doubles (restore-shape defaults c)))
+            (str (get f "name")))
+      ;; names and types are the plain form's
+      (t/is (= (get f "type") (get c "type")))
+      (t/is (= (get f "name") (get c "name")))
+      (t/is (every? #(contains? f %) (keys c)))
+      (t/is (not-any? nil? (vals c))))
+    ;; a compact reply is smaller
+    (t/is (< (json-bytes (get compact "shapes")) (json-bytes (get full "shapes"))))))
+
+(t/deftest subtree-compact-keeps-what-is-not-a-default
+  (let [{:keys [profile file-id page3]} (create-fixture)
+        _        (create-typed-page! profile file-id page3)
+        shapes   (over-http (:result (subtree profile file-id page3 uuid/zero :compact true)))
+        by-name  (into {} (map (juxt #(get % "name") identity)) (get shapes "shapes"))
+        hidden   (get by-name "Hidden")
+        stroked  (get by-name "Stroked")
+        item     (get by-name "Item")
+        plain    (get by-name "Grouped")]
+    ;; a value that differs from the default stays
+    (t/is (= true (get hidden "hidden")))
+    (t/is (= true (get hidden "blocked")))
+    (t/is (= 0.5 (get hidden "opacity")))
+    ;; a value that is the default goes
+    (t/is (not (contains? plain "hidden")))
+    (t/is (not (contains? plain "blocked")))
+    (t/is (not (contains? plain "opacity")))
+    ;; the first stroke has the default alignment, the second does not
+    (t/is (= [false true]
+             (mapv #(contains? % "strokeAlignment") (get stroked "strokes"))))
+    (t/is (= "inner" (get-in stroked ["strokes" 1 "strokeAlignment"])))
+    ;; the sizing of a layout item depends on its parent, so it stays
+    (t/is (= "fix" (get item "layoutItemHSizing")))
+    (t/is (= "fix" (get item "layoutItemVSizing")))))
+
+(t/deftest subtree-compact-defaults-are-the-ones-with-defaults-adds
+  (let [shape   (mcp/with-defaults {} {:id (uuid/next) :type :rect})
+        stroked (mcp/with-defaults {} {:id (uuid/next) :type :rect :strokes [{:stroke-width 1}]})]
+    (t/is (= (select-keys subtree/compact-defaults [:hidden :blocked :opacity])
+             (select-keys shape [:hidden :blocked :opacity])))
+    (t/is (= (get-in subtree/compact-defaults [:strokes :stroke-alignment])
+             (get-in stroked [:strokes 0 :stroke-alignment])))))
+
+(t/deftest subtree-compact-windows-are-measured-compact
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        _       (add-rects! profile file-id page1 board1 6)
+        all     (:shapes (:result (subtree profile file-id page1 uuid/zero :compact true)))
+        budget  (array-bytes (take 4 all))
+        replies (read-all profile file-id page1 uuid/zero :max-json-bytes budget :compact true)]
+    (t/is (= 4 (count (:shapes (first replies)))))
+    (t/is (= (map :id all) (shape-ids replies)))
+    (t/is (every? #(true? (:compact %)) replies))
+    (t/is (every? #(= subtree/compact-defaults (:defaults %)) replies))
+    (t/is (every? (fn [result]
+                    (or (= 1 (count (:shapes result)))
+                        (<= (array-bytes (:shapes result)) budget)))
+                  replies))))

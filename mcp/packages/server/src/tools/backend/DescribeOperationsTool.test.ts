@@ -50,6 +50,18 @@ test("describe_operations returns the JSON Schema of each named op", async () =>
     assert.ok(createText.required.includes("op"));
 });
 
+test("describe_operations describes replace_font with its limits", async () => {
+    const body = bodyOf(await toolFor().execute({ ops: ["replace_font"] }));
+    const schema = body.operations.replace_font as {
+        properties: Record<string, { maximum?: number; minimum?: number; enum?: string[] }>;
+        required: string[];
+    };
+    assert.deepEqual([...schema.required].sort(), ["fromFontId", "op", "pageId", "toFontId"]);
+    assert.deepEqual(schema.properties.variantMatch.enum, ["exact", "nearest"]);
+    assert.equal(schema.properties.maxTexts.minimum, 1);
+    assert.equal(schema.properties.maxTexts.maximum, 2000);
+});
+
 test("describe_operations sends the rules that span ops, with the font, token, override and index texts", async () => {
     const body = bodyOf(await toolFor().execute({ ops: ["set_text"] }));
     assert.deepEqual(Object.keys(body.rules).sort(), [

@@ -1,6 +1,6 @@
 import type { Dispatcher } from "undici";
 import { createLogger } from "./logger";
-import { BackendRpcError } from "./backend/BackendRpcError";
+import { BackendRateLimitError, BackendRpcError } from "./backend/BackendRpcError";
 import { BackendSettings } from "./backend/BackendSettings";
 import { CallContext } from "./backend/CallContext";
 import { withDispatcher } from "./backend/ConnectionPools";
@@ -263,7 +263,7 @@ export class PenpotBackendClient implements PenpotBackend {
 
     /**
      * Reads a response: parses its JSON result, decodes its event stream, or throws a {@link BackendRpcError}
-     * for an error status.
+     * for an error status, or a {@link BackendRateLimitError} for the rate limit of the backend.
      *
      * @param name - command name, for error messages
      * @param response - response whose body is still unread
@@ -272,7 +272,11 @@ export class PenpotBackendClient implements PenpotBackend {
     private async readResult(name: string, response: Response): Promise<unknown> {
         const text = await this.readBody(response);
         if (!response.ok) {
-            throw new BackendRpcError(response.status, name, BackendRpcError.decodeBody(text));
+            const body = BackendRpcError.decodeBody(text);
+            if (BackendRateLimitError.matches(response.status, body)) {
+                throw new BackendRateLimitError(BackendRateLimitError.secondsFrom(response.headers.get("retry-after")));
+            }
+            throw new BackendRpcError(response.status, name, body);
         }
         const contentType = response.headers.get("content-type") ?? "";
         if (contentType.includes("text/event-stream")) {

@@ -46,6 +46,7 @@ test("find_similar_boards sends every argument that is given, under its camelCas
         fileId: FILE,
         pageId: PAGE,
         depth: 3,
+        mode: "depth",
         boardNameRegex: "^Card",
         threshold: 0.75,
         minShapes: 4,
@@ -58,6 +59,7 @@ test("find_similar_boards sends every argument that is given, under its camelCas
                 fileId: FILE,
                 pageId: PAGE,
                 depth: 3,
+                mode: "depth",
                 boardNameRegex: "^Card",
                 threshold: 0.75,
                 minShapes: 4,
@@ -98,7 +100,12 @@ test("the find_similar_boards schema refuses values outside the bounds", () => {
     assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, minShapes: 0 }).success, false);
     assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, minShapes: 1000 }).success, true);
     assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, minShapes: 1001 }).success, false);
-    assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, depth: 6 }).success, false);
+    assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, depth: 12 }).success, true);
+    assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, depth: 13 }).success, false);
+    assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, depth: 0 }).success, false);
+    assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, mode: "auto" }).success, true);
+    assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, mode: "depth" }).success, true);
+    assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, mode: "size" }).success, false);
     assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, limit: 500 }).success, true);
     assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, limit: 501 }).success, false);
 });
@@ -115,4 +122,62 @@ test("find_similar_boards passes compared through and names it with truncated in
     assert.deepEqual(JSON.parse((response.content[0] as { text: string }).text), reply);
     assert.match(tool.getToolDescription(), /compared the number of pairs whose similarity was computed/);
     assert.match(tool.getToolDescription(), /truncated true means more than 1000 boards/);
+});
+
+test("find_similar_boards explains the automatic board selection", () => {
+    const { tool } = harness();
+    const description = tool.getToolDescription();
+    assert.match(description, /mode auto first looks for frames of a standard screen size/);
+    assert.match(description, /at least three times/);
+    assert.match(description, /falls back to the frames at depth 1/);
+    assert.match(description, /Frames under 200 px on a side are never boards/);
+    assert.match(description, /If there are none, it uses the nesting of repeated frame sizes/);
+    assert.match(description, /basis \(standard-size, structure or depth-fallback\)/);
+    assert.match(description, /depth or boardNameRegex alone chooses boards by hand/);
+    assert.match(description, /selection says what was selected: mode, depth, fallback/);
+    assert.match(description, /sizesOmitted \(sizes left out of the list of 20\)/);
+    assert.match(description, /otherSizes: up to 5 sizes that repeat on the page but were not selected/);
+    assert.match(
+        description,
+        /relation \(inside when they lie inside the selected boards, outside otherwise, wrapper when the frames only wrap the screens\)/
+    );
+    assert.match(description, /In mode depth, deeperBoards is the number of frames below the selected boards/);
+    assert.match(description, /call again without depth to let the selection find them, or with a larger depth/);
+    assert.match(description, /Mode auto has no deeperBoards/);
+});
+
+test("find_similar_boards describes skippedSmall", () => {
+    const { tool } = harness();
+    const description = tool.getToolDescription();
+    assert.match(description, /Boards with fewer visible shapes than minShapes are not compared/);
+    assert.match(description, /skippedSmall lists them: count, and ids for the first 50 in page order/);
+});
+
+test("find_similar_boards passes the selection, deeperBoards and skippedSmall through, and sends mode", async () => {
+    const reply = {
+        revn: 7,
+        pageId: PAGE,
+        boards: 2,
+        selection: {
+            mode: "auto",
+            fallback: false,
+            sizes: [{ width: 800, height: 600, boards: 3 }],
+            sizesOmitted: 0,
+            boards: 3,
+            minDepth: 5,
+            maxDepth: 5,
+        },
+        deeperBoards: 4,
+        skippedSmall: { count: 1, ids: [BOARD_B] },
+        compared: 1,
+        groups: [],
+        truncated: false,
+    };
+    const { backend, tool } = harness(reply);
+    const response = await tool.execute({ fileId: FILE, pageId: PAGE, mode: "auto", boardNameRegex: "^Parent" });
+    assert.deepEqual(
+        backend.callsTo("find-mcp-similar-boards").map((call) => call.params),
+        [{ fileId: FILE, pageId: PAGE, mode: "auto", boardNameRegex: "^Parent" }]
+    );
+    assert.deepEqual(JSON.parse((response.content[0] as { text: string }).text), reply);
 });

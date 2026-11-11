@@ -47,7 +47,8 @@
   ids (`mk-uuid \"file\" i`), so a root cached by one test would answer
   for another test's file with the same revision."
   [f]
-  (doseq [c [@#'mcp/root-cache @#'mcp/page-cache @#'mcp/outline-cache]]
+  (doseq [c [@#'mcp/root-cache @#'mcp/page-cache @#'mcp/outline-cache
+             @#'mcp/preorder-cache]]
     (cache/invalidate c))
   (f))
 
@@ -1269,3 +1270,599 @@
     (t/is (= 1 (:opacity shape)))
     (t/is (contains? shape :component-id) "an absent attribute named by the caller is nil")
     (t/is (nil? (:component-id shape)))))
+
+;; --- LOAD ORDER, ANCESTORS, SIZE ESTIMATE AND WALK CACHE
+
+(defn- shape-ids
+  "The ids of the shapes of a `get-mcp-shapes` reply, in reply order."
+  [out]
+  (mapv :id (:shapes (:result out))))
+
+(t/deftest shapes-with-children-come-in-stored-order-children-first
+  ;; The adapter's fake backend (`partialPage` in `SandboxHost.test.ts`)
+  ;; mirrors this order. It is the stored child order, NOT the visual order
+  ;; of `get-mcp-page-tree`: a flex board stores its children reversed. All
+  ;; children of a shape come before the descendants of its first child
+  ;; (`get-children-ids`), so it is not a pre-order walk.
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        {:keys [board rects]} (create-board-with-rects! profile file-id page1 true)
+        stored (:shapes (stored-shape file-id page1 board))
+        out    (call! profile :get-mcp-shapes {:file-id file-id
+                                               :page-id page1
+                                               :ids [board]
+                                               :include-children true})]
+    (t/is (nil? (:error out)))
+    (t/is (= (into [board] stored) (shape-ids out)))
+    (t/is (= (reverse rects) stored) "a flex board stores its children reversed")
+    (t/is (= rects (tree-child-ids profile file-id page1 board)) "the tree shows them visually")))
+
+(t/deftest shapes-with-children-list-the-children-of-a-shape-before-its-grandchildren
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        board (uuid/next)
+        group (uuid/next)
+        x1    (uuid/next)
+        x2    (uuid/next)
+        y     (uuid/next)]
+    (apply-changes! profile file-id
+                    [(add-obj page1 board uuid/zero uuid/zero {:type :frame :name "N"})
+                     (add-obj page1 group board board {:type :frame :name "G"})
+                     (add-obj page1 x1 group group {:type :rect :name "x1"})
+                     (add-obj page1 x2 group group {:type :rect :name "x2"})
+                     (add-obj page1 y board board {:type :rect :name "y"})])
+    (let [stored-of (fn [id] (:shapes (stored-shape file-id page1 id)))
+          below     (fn below [id]
+                      (let [kids (stored-of id)]
+                        (into (vec kids) (mapcat below) kids)))
+          out       (call! profile :get-mcp-shapes {:file-id file-id
+                                                    :page-id page1
+                                                    :ids [board]
+                                                    :include-children true})]
+      (t/is (= (into [board] (below board)) (shape-ids out)))
+      (t/is (= [board group y x1 x2] (shape-ids out))))))
+
+(t/deftest shapes-with-ancestors-come-first-top-down-and-once
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        {:keys [board rects]} (create-board-with-rects! profile file-id page1 false)
+        [r1 r2 r3] rects
+        ask (fn [ids & {:as more}]
+              (call! profile :get-mcp-shapes
+                     (merge {:file-id file-id :page-id page1 :ids ids
+                             :include-ancestors true}
+                            more)))]
+    ;; the ancestors of two siblings are listed once, before the shapes asked for
+    (t/is (= [uuid/zero board r1 r2] (shape-ids (ask [r1 r2]))))
+    ;; a root inside another root is not repeated as an ancestor
+    (t/is (= [uuid/zero board r1 r2 r3]
+             (shape-ids (ask [board r1] :include-children true))))
+    ;; the ancestors of a board under the page root: the page root alone
+    (t/is (= [uuid/zero board] (shape-ids (ask [board]))))
+    ;; without the flag nothing is added
+    (t/is (= [r1] (shape-ids (call! profile :get-mcp-shapes
+                                    {:file-id file-id :page-id page1 :ids [r1]}))))
+    ;; an unknown id is missing and has no ancestors
+    (let [ghost (uuid/next)
+          out   (ask [ghost])]
+      (t/is (= [] (shape-ids out)))
+      (t/is (= [ghost] (:missing (:result out)))))))
+
+(t/deftest shapes-ancestors-count-against-the-cap
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        {:keys [rects]} (create-board-with-rects! profile file-id page1 false)
+        out (with-redefs [mcp/shapes-cap 2]
+              (call! profile :get-mcp-shapes {:file-id file-id :page-id page1
+                                              :ids [(first rects)]
+                                              :include-ancestors true}))]
+    (t/is (= 2 (count (shape-ids out))))
+    (t/is (true? (:truncated (:result out))))
+    (t/is (= uuid/zero (first (shape-ids out)))
+          "ancestors come first, so a cut drops the tail")))
+
+(t/deftest shapes-refuse-a-non-boolean-ancestor-flag
+  (let [{:keys [profile file-id page1 rect1]} (create-fixture)
+        out (call! profile :get-mcp-shapes {:file-id file-id :page-id page1
+                                            :ids [rect1] :include-ancestors "yes"})]
+    (t/is (some? (:error out)))
+    (t/is (= :validation (:type (ex-data (:error out)))))))
+
+(defn- real-page-bytes
+  "The JSON size of every shape of the page as `get-mcp-shapes` returns
+  them, one comma each, which is what the estimate stands for."
+  [profile file-id page-id]
+  (let [root (:root (:result (call! profile :get-mcp-page-tree
+                                    {:file-id file-id :page-id page-id
+                                     :depth 20 :limit 5000})))
+        ids  (mapv :id (tree-seq (comp seq :children) :children root))
+        out  (call! profile :get-mcp-shapes {:file-id file-id :page-id page-id
+                                             :ids (vec (take 200 ids))})]
+    (t/is (= (count ids) (count (:shapes (:result out)))))
+    (reduce + (map #(inc (count (json/encode % :key-fn json/write-camel-key)))
+                   (:shapes (:result out))))))
+
+(defn- estimate-of
+  [profile file-id page-id]
+  (:result (call! profile :get-mcp-page-tree {:file-id file-id :page-id page-id
+                                              :depth 20 :limit 5000
+                                              :estimate-size true})))
+
+(t/deftest page-tree-estimates-the-size-of-a-small-page
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        result (estimate-of profile file-id page1)
+        real   (real-page-bytes profile file-id page1)]
+    (t/is (= 4 (:total-shapes result)) "the page root, the board, the rect and the text")
+    (t/is (<= 0.7 (/ (:estimated-bytes result) real) 1.3))))
+
+(t/deftest page-tree-gives-no-estimate-unless-asked
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        result (:result (call! profile :get-mcp-page-tree {:file-id file-id :page-id page1}))]
+    (t/is (not (contains? result :total-shapes)))
+    (t/is (not (contains? result :estimated-bytes)))))
+
+(t/deftest page-tree-estimates-a-page-of-small-and-large-shapes
+  ;; 196 shapes, every fifth one large: the large ones dominate the bytes.
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        big  (apply str (repeat 3000 "x"))
+        adds (mapv (fn [i]
+                     (add-obj page1 (uuid/next) uuid/zero uuid/zero
+                              {:type :rect
+                               :name (if (zero? (mod i 5)) big (str "r" i))}))
+                   (range 192))]
+    (apply-changes! profile file-id adds)
+    (let [result (estimate-of profile file-id page1)
+          real   (real-page-bytes profile file-id page1)]
+      (t/is (= 196 (:total-shapes result)))
+      (t/is (> real 100000) "the large shapes dominate the page")
+      (t/is (<= 0.7 (/ (:estimated-bytes result) real) 1.3)))))
+
+(defn- synth-shape
+  [id parent type name kids]
+  {:id id :parent-id parent :frame-id uuid/zero :type type :name name :shapes kids})
+
+(defn- synth-page
+  "A page of synthetic shapes: `cards` boards under the root, each holding
+  the rects that `(names card)` lists as names, in order. Returns
+  `{:objects :flat}`, with `:flat` the pre-order walk of the whole page."
+  [cards names]
+  (let [card-ids (vec (repeatedly cards uuid/next))
+        objects  (reduce (fn [objs [c card]]
+                           (let [nms  (names c)
+                                 kids (vec (repeatedly (count nms) uuid/next))]
+                             (-> (reduce (fn [o [k nm]]
+                                           (assoc o k (synth-shape k card :rect nm [])))
+                                         objs
+                                         (map vector kids nms))
+                                 (assoc card (synth-shape card uuid/zero :frame "Card" kids)))))
+                         {uuid/zero (synth-shape uuid/zero uuid/zero :frame "Root" card-ids)}
+                         (map-indexed vector card-ids))]
+    {:objects objects
+     :flat    (mcp/page-preorder objects uuid/zero 20 true)}))
+
+(defn- synth-real-bytes
+  "Size of the page as the adapter counts it: the UTF-8 bytes of the JSON
+  of each shape as `get-mcp-shapes` returns it, one comma each."
+  [{:keys [objects flat]}]
+  (reduce + (map (fn [[_ id]]
+                   (inc (alength (.getBytes ^String (json/encode (mcp/shape-out objects (get objects id) nil)
+                                                                 :key-fn json/write-camel-key
+                                                                 :escape-unicode false
+                                                                 :escape-slash false)
+                                            "UTF-8"))))
+                 flat)))
+
+(defn- synth-estimate
+  [{:keys [objects flat]}]
+  (mcp/estimate-page-size objects flat "version-1"))
+
+(defn- ratio-of-real
+  [page]
+  (/ (double (synth-estimate page)) (synth-real-bytes page)))
+
+(t/deftest estimate-is-not-fooled-by-a-repeated-component
+  ;; 100 identical cards of 50 shapes whose last child is large. A fixed
+  ;; stride read that position in every copy or in none: 12 times too high.
+  (let [big  (apply str (repeat 4000 "x"))
+        page (synth-page 100 (fn [_] (conj (mapv #(str "r" %) (range 48)) big)))]
+    (t/is (= 5001 (count (:flat page))))
+    (t/is (<= 0.7 (ratio-of-real page) 1.3))))
+
+(t/deftest estimate-follows-pages-of-periodic-sizes
+  (doseq [period [2 5 50 100]]
+    (let [big  (apply str (repeat 3000 "x"))
+          page (synth-page 1 (fn [_] (mapv #(if (zero? (mod % period)) big (str "r" %))
+                                           (range 6000))))
+          r    (ratio-of-real page)]
+      (t/is (<= 0.7 r 1.3) (str "period " period ", ratio " r)))))
+
+(t/deftest estimate-counts-utf-8-bytes-without-escapes
+  ;; CJK and emoji take 3 or 4 bytes as UTF-8 and 6 or 12 characters as
+  ;; \uXXXX escapes; a slash takes 2 characters when escaped.
+  (let [cjk  (apply str (repeat 100 "漢字仮名😀"))
+        page (synth-page 1 (fn [_] (mapv #(str cjk "/" %) (range 3000))))
+        r    (ratio-of-real page)]
+    (t/is (<= 0.7 r 1.3) (str "ratio " r))))
+
+(t/deftest estimate-counts-a-common-large-shape-in-full
+  ;; 40 % of the shapes are 50 kB each (about 40 MB): the early check must
+  ;; see a page far over the cap, so the clamp must not hide them.
+  (let [big  (apply str (repeat 50000 "x"))
+        page (synth-page 1 (fn [_] (mapv #(if (< (mod % 10) 4) big (str "r" %)) (range 2000))))
+        est  (synth-estimate page)
+        r    (ratio-of-real page)]
+    (t/is (<= 0.7 r 1.3) (str "ratio " r))
+    (t/is (> est (* 1.25 16 1024 1024)) (str "estimate " est))))
+
+(t/deftest estimate-is-deterministic
+  (let [big   (apply str (repeat 2000 "y"))
+        names (fn [c] (mapv #(if (zero? (mod (+ % c) 7)) big (str "r" %)) (range 100)))
+        page  (synth-page 20 names)]
+    (t/is (= (synth-estimate page) (synth-estimate page)))
+    (t/is (= (synth-estimate page) (synth-estimate (synth-page 20 names)))
+          "the pick depends on the page version, not on the shape ids")))
+
+(t/deftest estimate-is-not-fooled-by-one-sampled-giant
+  ;; One shape of 2 MB among 3000 small ones. When a stratum samples it,
+  ;; the estimate must not count it once per shape of the stratum: a page
+  ;; that fits would be refused. When no stratum samples it, the estimate
+  ;; is low, and the precise guard of the adapter decides.
+  (let [giant (apply str (repeat 2000000 "g"))
+        ratios (mapv (fn [pos]
+                       (ratio-of-real (synth-page 1 (fn [_] (assoc (mapv #(str "r" %) (range 3000)) pos giant)))))
+                     (range 0 3000 47))]
+    (t/is (every? #(<= % 1.3) ratios) (str "ratios " (pr-str ratios)))
+    (t/is (some #(> % 0.7) ratios) "some position is sampled, so the case is exercised")))
+
+(t/deftest ancestor-chain-stops-at-the-page-root
+  ;; The page root is its own parent. A chain that followed it ran to the
+  ;; step cap before `distinct` dropped the copies.
+  (let [lookups (atom 0)
+        board   (uuid/next)
+        rect    (uuid/next)
+        base    {uuid/zero (synth-shape uuid/zero uuid/zero :frame "Root" [board])
+                 board     (synth-shape board uuid/zero :frame "Board" [rect])
+                 rect      (synth-shape rect board :rect "Rect" [])}
+        objects (reify
+                  clojure.lang.ILookup
+                  (valAt [_ k] (swap! lookups inc) (get base k))
+                  (valAt [_ k nf] (swap! lookups inc) (get base k nf))
+                  clojure.lang.Associative
+                  (containsKey [_ k] (contains? base k))
+                  (entryAt [_ k] (find base k))
+                  (assoc [_ k v] (assoc base k v))
+                  clojure.lang.IPersistentCollection
+                  (count [_] (count base))
+                  (cons [_ o] (conj base o))
+                  (empty [_] {})
+                  (equiv [_ o] (= base o))
+                  clojure.lang.Seqable
+                  (seq [_] (seq base)))]
+    (t/is (= [uuid/zero board] (#'mcp/get-ancestor-ids objects [rect] #{})))
+    (t/is (< @lookups 20) (str "lookups " @lookups))))
+
+(t/deftest page-tree-walks-a-page-once-for-all-its-windows
+  (let [{:keys [profile file-id page1]} (create-fixture)
+        walks (atom 0)
+        real  mcp/page-preorder
+        read! (fn [cursor]
+                (call! profile :get-mcp-page-tree
+                       (cond-> {:file-id file-id :page-id page1 :depth 20 :limit 1}
+                         (some? cursor) (assoc :cursor cursor))))]
+    (with-redefs [mcp/page-preorder (fn [& args] (swap! walks inc) (apply real args))]
+      (let [w1 (:result (read! nil))
+            w2 (:result (read! (:next-cursor w1)))
+            w3 (:result (read! (:next-cursor w2)))]
+        (t/is (true? (:truncated w1)))
+        (t/is (some? (:next-cursor w3)))
+        (t/is (= 1 @walks) "the later windows cost no new walk")
+        ;; a write to the page changes its version: the walk is made again
+        (apply-changes! profile file-id
+                        [(add-obj page1 (uuid/next) uuid/zero uuid/zero
+                                  {:type :rect :name "New"})])
+        (t/is (nil? (:error (read! nil))))
+        (t/is (= 2 @walks))
+        (t/is (= :mcp-stale-cursor (th/ex-code (:error (read! (:next-cursor w1)))))
+              "a cursor from before the write is still stale")))))
+
+;; --- SEARCH THAT ENDS EARLY, AND TEXT FIELDS
+
+(defn- add-named-rects!
+  "Adds `n` rects to the board `board`, named by `name-fn` of their index, in
+  one commit. Returns their ids in creation order."
+  [profile file-id page-id board n name-fn]
+  (let [ids (vec (repeatedly n uuid/next))]
+    (apply-changes! profile file-id
+                    (mapv (fn [i id]
+                            (add-obj page-id id board board
+                                     {:type :rect :name (name-fn i)
+                                      :x i :y 0 :width 5 :height 5}))
+                          (range) ids))
+    ids))
+
+(defn- find-all
+  "Every call of `find-mcp-shapes` with `params`, following `next-cursor`
+  until a reply has none. Returns the replies, at most `max-calls` of them."
+  [profile params max-calls]
+  (loop [replies []
+         cursor  nil]
+    (let [out   (call! profile :find-mcp-shapes
+                       (cond-> params (some? cursor) (assoc :cursor cursor)))
+          reply (:result out)]
+      (t/is (nil? (:error out)))
+      (let [replies (conj replies reply)]
+        (if (and (some? (:next-cursor reply)) (< (count replies) max-calls))
+          (recur replies (:next-cursor reply))
+          replies)))))
+
+(t/deftest find-with-room-returns-every-match-and-no-reason
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        ids   (add-named-rects! profile file-id page1 board1 207 (constantly "Parent"))
+        reply (:result (call! profile :find-mcp-shapes {:file-id file-id
+                                                        :page-id page1
+                                                        :name-regex "^Parent$"
+                                                        :limit 300}))]
+    (t/is (= (set ids) (set (map :id (:matches reply)))))
+    (t/is (false? (:truncated reply)))
+    (t/is (not (contains? reply :reason)))
+    (t/is (not (contains? reply :next-cursor)))
+    (t/is (pos? (:scanned reply)))))
+
+(t/deftest find-keeps-the-matches-when-the-page-load-uses-the-search-budget
+  ;; The search budget used to start before the page was read. A slow first
+  ;; read of a large page spent it all, and the search answered no match
+  ;; with `truncated` and nothing to go on with.
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        ids   (add-named-rects! profile file-id page1 board1 20 (constantly "Parent"))
+        real  mcp/get-page-data
+        slow  (fn [& args] (Thread/sleep 300) (apply real args))
+        reply (with-redefs [mcp/search-budget-ns 100000000
+                            mcp/get-page-data slow]
+                (:result (call! profile :find-mcp-shapes {:file-id file-id
+                                                          :page-id page1
+                                                          :name-regex "^Parent$"})))]
+    (t/is (= (set ids) (set (map :id (:matches reply)))))
+    (t/is (false? (:truncated reply)))))
+
+(t/deftest find-that-runs-out-of-time-returns-its-matches-and-a-cursor
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        ids     (add-named-rects! profile file-id page1 board1 25 (constantly "Parent"))
+        ;; An exact name, not a regex: a regex reads the deadline per
+        ;; character and, with a budget of zero, would refuse every shape
+        params  {:file-id file-id :page-id page1 :name "Parent"}
+        replies (with-redefs [mcp/search-budget-ns 0]
+                  (find-all profile params 200))
+        found   (mapcat #(map :id (:matches %)) replies)]
+    (t/is (< 1 (count replies)) "a budget of zero cuts the search into calls")
+    (t/is (every? #(= "time" (:reason %)) (butlast replies)))
+    (t/is (every? :truncated (butlast replies)))
+    (t/is (every? #(pos? (:scanned %)) replies) "every call moves on")
+    (t/is (nil? (:next-cursor (last replies))))
+    (t/is (false? (:truncated (last replies))))
+    (t/is (= (set ids) (set found)))
+    (t/is (= (count ids) (count found)) "no match twice")))
+
+(t/deftest find-that-reaches-the-limit-says-so-and-goes-on
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        ids     (add-named-rects! profile file-id page1 board1 12 (constantly "Parent"))
+        replies (find-all profile {:file-id file-id :page-id page1
+                                   :name-regex "^Parent$" :limit 5}
+                          10)
+        found   (mapcat #(map :id (:matches %)) replies)]
+    (t/is (= [5 5 2] (mapv #(count (:matches %)) replies)))
+    (t/is (= ["limit" "limit" nil] (mapv :reason replies)))
+    (t/is (= [true true false] (mapv :truncated replies)))
+    (t/is (= ids found) "the matches come in tree order, each once")))
+
+(t/deftest find-that-fills-its-byte-budget-keeps-whole-matches-and-a-cursor
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        long-name (apply str (repeat 150 "x"))
+        ids       (add-named-rects! profile file-id page1 board1 15 (constantly long-name))
+        replies   (find-all profile {:file-id file-id :page-id page1
+                                     :name long-name :limit 100 :max-bytes 1000}
+                            40)
+        found     (mapcat #(map :id (:matches %)) replies)]
+    (t/is (< 1 (count replies)))
+    (t/is (every? #(= "size" (:reason %)) (butlast replies)))
+    (t/is (every? #(pos? (count (:matches %))) replies) "a reply is never cut to nothing")
+    (t/is (every? (fn [reply]
+                    (every? #(and (:id %) (= long-name (:name %))) (:matches reply)))
+                  replies)
+          "each match is whole")
+    (t/is (= ids found))))
+
+(t/deftest find-that-ends-by-size-scans-each-shape-once-plus-one-per-call
+  ;; The search stops at the first match that does not fit, so a walk does
+  ;; not scan what the byte cut drops. The shape that did not fit is the
+  ;; first one of the next call: one shape of overlap per call that ends by
+  ;; size, so the sum of `scanned` is the shapes of the page plus calls - 1.
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        name      (apply str (repeat 40 "x"))
+        ids       (add-named-rects! profile file-id page1 board1 300 (constantly name))
+        params    {:file-id file-id :page-id page1 :name name :limit 1000}
+        whole     (:result (call! profile :find-mcp-shapes params))
+        shapes    (:scanned whole)
+        replies   (find-all profile (assoc params :max-bytes 2000) 400)
+        found     (mapcat #(map :id (:matches %)) replies)]
+    (t/is (false? (:truncated whole)))
+    (t/is (<= 300 shapes) "the page holds the 300 rects")
+    (t/is (< 10 (count replies)) "the small budget cuts the walk into many calls")
+    (t/is (every? #(= "size" (:reason %)) (butlast replies)))
+    (t/is (= ids found) "every match once, in order")
+    (t/is (= (+ shapes (dec (count replies)))
+             (reduce + (map :scanned replies))))))
+
+(defn- add-big-and-small-rects!
+  "Adds rects to the board in one commit, named by the entries of `kinds`:
+  `:big` gets a 200 kB name, `:small` the name \"Small\". Returns their ids."
+  [profile file-id page-id board kinds]
+  (let [big (str "Big" (apply str (repeat 200000 "x")))]
+    (add-named-rects! profile file-id page-id board (count kinds)
+                      (fn [i] (if (= :big (nth kinds i)) big "Small")))))
+
+(defn- found-and-large
+  "The ids of the matches and of `skipped-large-ids` of `replies`."
+  [replies]
+  [(vec (mapcat #(map :id (:matches %)) replies))
+   (vec (mapcat :skipped-large-ids replies))])
+
+(t/deftest find-leaves-out-a-match-too-large-for-the-byte-budget
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        ids     (add-big-and-small-rects! profile file-id page1 board1
+                                          [:small :big :small :small])
+        replies (find-all profile {:file-id file-id :page-id page1
+                                   :name-regex "^(Big|Small)" :limit 2
+                                   :max-bytes 1000}
+                          20)
+        [found large] (found-and-large replies)]
+    (t/is (= [(nth ids 0) (nth ids 2) (nth ids 3)] found)
+          "the other matches all come, once each, in order")
+    (t/is (= [(nth ids 1)] large))
+    (t/is (= 1 (reduce + (map #(or (:skipped-large %) 0) replies))))
+    (t/is (nil? (:next-cursor (last replies))) "the walk ends")
+    (t/is (every? #(<= (count (json/encode %)) 1000) replies)
+          "no reply passes max-bytes")))
+
+(t/deftest find-ends-without-cursor-when-the-last-match-is-too-large
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        ids     (add-big-and-small-rects! profile file-id page1 board1
+                                          [:small :small :big])
+        replies (find-all profile {:file-id file-id :page-id page1
+                                   :name-regex "^(Big|Small)" :max-bytes 1000}
+                          20)
+        [found large] (found-and-large replies)]
+    (t/is (= (subvec ids 0 2) found))
+    (t/is (= [(nth ids 2)] large))
+    (t/is (nil? (:next-cursor (last replies))))
+    (t/is (false? (:truncated (last replies))))))
+
+(t/deftest find-passes-several-too-large-matches-in-a-row
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        ids     (add-big-and-small-rects! profile file-id page1 board1
+                                          [:big :big :small :big :big])
+        replies (find-all profile {:file-id file-id :page-id page1
+                                   :name-regex "^(Big|Small)" :limit 1
+                                   :max-bytes 1000}
+                          30)
+        [found large] (found-and-large replies)]
+    (t/is (= [(nth ids 2)] found))
+    (t/is (= [(nth ids 0) (nth ids 1) (nth ids 3) (nth ids 4)] large))
+    (t/is (nil? (:next-cursor (last replies))))))
+
+(t/deftest find-goes-on-across-pages-with-a-cursor
+  (let [{:keys [profile file-id page1 page2]} (create-fixture)
+        replies (find-all profile {:file-id file-id :type :rect :limit 1} 10)]
+    (t/is (= 2 (count replies)))
+    (t/is (= #{page1 page2} (set (mapcat #(map :page-id (:matches %)) replies))))
+    (t/is (= "limit" (:reason (first replies))))
+    (t/is (nil? (:reason (second replies))))))
+
+(t/deftest find-refuses-a-cursor-of-another-search-or-an-old-page
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        _      (add-named-rects! profile file-id page1 board1 4 (constantly "Parent"))
+        params {:file-id file-id :page-id page1 :name-regex "^Parent$" :limit 1}
+        cursor (:next-cursor (:result (call! profile :find-mcp-shapes params)))
+        other  (call! profile :find-mcp-shapes (assoc params :within-id board1 :cursor cursor))
+        junk   (call! profile :find-mcp-shapes (assoc params :cursor "not-a-cursor"))
+        _      (apply-changes! profile file-id
+                               [(add-obj page1 (uuid/next) uuid/zero uuid/zero
+                                         {:type :rect :name "New"})])
+        stale  (call! profile :find-mcp-shapes (assoc params :cursor cursor))]
+    (t/is (some? cursor))
+    (t/is (= :mcp-invalid-cursor (th/ex-code (:error other))))
+    (t/is (= :mcp-invalid-cursor (th/ex-code (:error junk))))
+    (t/is (= :mcp-stale-cursor (th/ex-code (:error stale))))))
+
+(t/deftest shapes-accept-the-text-fields-the-reply-always-carries
+  (let [{:keys [profile file-id page1 text1 rect1]} (create-fixture)
+        text (read-shape profile file-id page1 text1
+                         :fields [:text-layout-state :characters])
+        rect (read-shape profile file-id page1 rect1
+                         :fields [:text-layout-state])]
+    (t/is (= "approximate" (:text-layout-state text)))
+    (t/is (= "Hello Penpot" (:characters text)))
+    (t/is (contains? rect :text-layout-state))
+    (t/is (nil? (:text-layout-state rect)))))
+
+;; --- FIND: BYTE BUDGET, CURSOR BINDING, SKIPPED SHAPES
+
+(defn- json-bytes
+  "The UTF-8 bytes of `value` as JSON, camel-cased, with neither unicode nor
+  slash escapes: what the adapter counts after it parses the reply and
+  writes it again."
+  [value]
+  (-> (json/encode value
+                   :key-fn json/write-camel-key
+                   :escape-unicode false
+                   :escape-slash false)
+      (.getBytes "UTF-8")
+      (alength)))
+
+(t/deftest find-keeps-every-reply-within-max-bytes-for-multibyte-names
+  ;; A character of these names is one character of transit text and three
+  ;; bytes of JSON, and the path of each match repeats its ancestors.
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        jp        (apply str (repeat 12 "日本語の名前"))
+        ids       (add-named-rects! profile file-id page1 board1 40 #(str jp %))
+        max-bytes 4000
+        replies   (find-all profile {:file-id file-id :page-id page1
+                                     :name-regex (str "^" jp)
+                                     :limit 100 :max-bytes max-bytes}
+                            60)
+        found     (mapcat #(map :id (:matches %)) replies)]
+    (t/is (< 2 (count replies)))
+    (t/is (every? #(<= (json-bytes %) max-bytes) replies)
+          (str "sizes " (mapv json-bytes replies)))
+    (t/is (every? #(some? (:next-cursor %)) (butlast replies)))
+    (t/is (= ids found) "no match lost or repeated")))
+
+(t/deftest find-refuses-a-cursor-sent-with-other-filters
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        _      (add-named-rects! profile file-id page1 board1 4 (constantly "Parent"))
+        params {:file-id file-id :page-id page1 :name-regex "^Parent$" :limit 1}
+        cursor (:next-cursor (:result (call! profile :find-mcp-shapes params)))
+        again  (call! profile :find-mcp-shapes (assoc params :cursor cursor))
+        regex  (call! profile :find-mcp-shapes (assoc params :name-regex "Parent" :cursor cursor))
+        typed  (call! profile :find-mcp-shapes (assoc params :type :rect :cursor cursor))
+        scoped (call! profile :find-mcp-shapes (-> params (dissoc :page-id) (assoc :cursor cursor)))]
+    (t/is (some? cursor))
+    (t/is (nil? (:error again)) "the same filters go on")
+    (doseq [out [regex typed scoped]]
+      (t/is (= :mcp-invalid-cursor (th/ex-code (:error out))))
+      (t/is (re-find #"filters changed" (str (:hint (ex-data (:error out)))))))))
+
+(t/deftest find-refuses-a-cursor-made-for-other-pages-of-the-file
+  (let [{:keys [profile file-id page3]} (create-fixture)
+        params {:file-id file-id :type :rect :limit 1}
+        cursor (:next-cursor (:result (call! profile :find-mcp-shapes params)))
+        ok     (call! profile :find-mcp-shapes (assoc params :cursor cursor))
+        _      (apply-changes! profile file-id [{:type :del-page :id page3}])
+        gone   (call! profile :find-mcp-shapes (assoc params :cursor cursor))
+        _      (apply-changes! profile file-id [{:type :add-page :id (uuid/next) :name "Fourth"}])
+        added  (call! profile :find-mcp-shapes (assoc params :cursor cursor))]
+    (t/is (some? cursor))
+    (t/is (nil? (:error ok)))
+    (t/is (= :mcp-stale-cursor (th/ex-code (:error gone))))
+    (t/is (= :mcp-stale-cursor (th/ex-code (:error added))))))
+
+(t/deftest find-says-which-shapes-it-left-out-when-their-name-ran-out-of-time
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        ids     (add-named-rects! profile file-id page1 board1 6 (constantly "Parent"))
+        ;; With a budget of zero the regex stops on every name, and a call
+        ;; leaves out the first shape it examines to move on.
+        replies (with-redefs [mcp/search-budget-ns 0]
+                  (find-all profile {:file-id file-id :page-id page1 :name-regex "^Parent$"} 200))
+        skipped (mapcat :skipped-ids replies)
+        marked  (filter #(contains? % :skipped) replies)]
+    (t/is (not (contains? (first replies) :skipped)) "a call that left nothing out says nothing")
+    (t/is (not (contains? (first replies) :skipped-ids)))
+    (t/is (seq marked))
+    (t/is (every? #(and (= 1 (:skipped %)) (= 1 (count (:skipped-ids %)))) marked))
+    (t/is (every? (set skipped) ids) "every shape that was left out is named")
+    (t/is (= (count skipped) (count (set skipped))) "no shape twice")))
+
+(t/deftest find-lists-at-most-twenty-skipped-ids
+  (let [ids   (vec (repeatedly 25 uuid/next))
+        reply (#'mcp/find-reply nil 0 nil 100 100000 [0 0]
+                                {:matches [] :scanned 3 :stop nil :skipped ids})]
+    (t/is (= 25 (:skipped reply)))
+    (t/is (= (subvec ids 0 20) (:skipped-ids reply)))
+    (t/is (not (contains? (#'mcp/find-reply nil 0 nil 100 100000 [0 0]
+                                            {:matches [] :scanned 3 :stop nil :skipped []})
+                          :skipped)))))

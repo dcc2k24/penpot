@@ -14,6 +14,9 @@ import {
     ExportBatchError,
     ExporterError,
     ExportTooLargeError,
+    type ExportOptions,
+    type ExportShapeRequest,
+    type RenderedFile,
 } from "../../backend/ExporterClient";
 import { BusyError } from "../../utils/PermitGate";
 import { CallContext } from "../../backend/CallContext";
@@ -61,7 +64,10 @@ interface ContentItem {
  *
  * @param fsEnabled - whether the server offers file system access
  */
-function harness(fsEnabled = false, extra: { settings?: BackendSettings; tool?: ExportShapeOptions } = {}) {
+function harness(
+    fsEnabled = false,
+    extra: { settings?: BackendSettings; tool?: ExportShapeOptions; exporter?: FakeExporterClient } = {}
+) {
     const backend = new FakePenpotBackend()
         .respond("mcp-whoami", { contractVersion: 1, profileId: "profile-1", scopes: ["mcp:read"] })
         .respond("create-mcp-render-session", {
@@ -69,7 +75,7 @@ function harness(fsEnabled = false, extra: { settings?: BackendSettings; tool?: 
             expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
         })
         .respond("get-mcp-shapes", { shapes: [{ id: SHAPE, type: "rect" }], missing: [] });
-    const exporter = new FakeExporterClient();
+    const exporter = extra.exporter ?? new FakeExporterClient();
     // the clock is moved by the tests; the retry waits no time and the font check is short
     const clock = { now: 0 };
     const services = new BackendServices(backend, extra.settings ?? new BackendSettings(), exporter, () => clock.now);
@@ -1547,6 +1553,215 @@ test("progress is reported once for each shape of a chunk that is rendered one b
         steps.push(done);
     });
     assert.deepEqual(steps, [1, 2, 3]);
+});
+
+/** An exporter whose batch requests wait until the test lets them go, so that a chunk stays in flight. */
+class GatedExporter extends FakeExporterClient {
+    /** Releases of the batch requests that are waiting, in the order they came. */
+    public readonly gates: Array<() => void> = [];
+
+    /**
+     * Holds the batch request until its gate is released, then answers it as the fake exporter does.
+     *
+     * @param renderToken - render session token of the call
+     * @param requests - the requests of the batch
+     * @param options - the renderer
+     */
+    public override async exportShapes(
+        renderToken: string,
+        requests: ExportShapeRequest[],
+        options?: ExportOptions
+    ): Promise<Map<string, RenderedFile>> {
+        await new Promise<void>((resolve) => this.gates.push(resolve));
+        return super.exportShapes(renderToken, requests, options);
+    }
+}
+
+/** One progress notification of a call. */
+interface Beat {
+    /** Shapes finished. */
+    done: number;
+    /** Shapes of the call. */
+    total: number | undefined;
+    /** The message of the notification. */
+    message: string | undefined;
+}
+
+/**
+ * Waits until a condition holds, for up to 5 s. Only setInterval is faked in these tests, so setTimeout is real.
+ *
+ * @param condition - what to wait for
+ */
+async function until(condition: () => boolean): Promise<void> {
+    const deadline = Date.now() + 5_000;
+    while (!condition() && Date.now() < deadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 2));
+    }
+    assert.equal(condition(), true, "the condition did not come true");
+}
+
+test("a chunk in flight sends a progress notification every 5 s, and each one is above the last", async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const exporter = new GatedExporter();
+    const { backend, tool } = harness(false, { exporter });
+    answerShapes(backend, 1);
+    const beats: Beat[] = [];
+    const run = tool.execute(
+        { fileId: FILE, pageId: PAGE, shapeIds: shapeIdsOf(3) },
+        undefined,
+        async (done, total, message) => {
+            beats.push({ done, total, message });
+        }
+    );
+    await until(() => exporter.gates.length === 1);
+    // the chunk takes 12 s: two heartbeats, at 5 s and 10 s
+    t.mock.timers.tick(5_000);
+    t.mock.timers.tick(5_000);
+    t.mock.timers.tick(2_000);
+    assert.deepEqual(beats, [
+        { done: 0.5, total: 3, message: "Rendering chunk 1 of 1 (3 shapes)." },
+        { done: 2 / 3, total: 3, message: "Rendering chunk 1 of 1 (3 shapes)." },
+    ]);
+    exporter.gates[0]();
+    await run;
+    // the real progress of each shape is still sent, and it is above the heartbeats before it
+    assert.deepEqual(
+        beats.map((beat) => beat.done),
+        [0.5, 2 / 3, 1, 2, 3]
+    );
+    // none after the chunk returned, and none after the reply
+    const sent = beats.length;
+    t.mock.timers.tick(30_000);
+    assert.equal(beats.length, sent);
+});
+
+test("heartbeats rise toward the next shape without reaching it, and a finished shape is above them", async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const exporter = new GatedExporter();
+    const { backend, tool } = harness(false, { exporter });
+    answerShapes(backend, 1);
+    const beats: Beat[] = [];
+    const run = tool.execute(
+        { fileId: FILE, pageId: PAGE, shapeIds: shapeIdsOf(3) },
+        undefined,
+        async (done, total, message) => {
+            beats.push({ done, total, message });
+        }
+    );
+    await until(() => exporter.gates.length === 1);
+    for (let tick = 0; tick < 200; tick += 1) {
+        t.mock.timers.tick(5_000);
+    }
+    exporter.gates[0]();
+    await run;
+    const progress = beats.map((beat) => beat.done);
+    assert.equal(
+        progress.every((value, index) => index === 0 || value > progress[index - 1]),
+        true,
+        progress.join(", ")
+    );
+    const heartbeats = progress.slice(0, 200);
+    assert.equal(
+        heartbeats.every((value) => value > 0 && value < 1),
+        true
+    );
+    assert.deepEqual(progress.slice(200), [1, 2, 3]);
+});
+
+test("the heartbeat says which chunk of how many is rendering, and keeps the shapes done so far", async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const exporter = new GatedExporter();
+    const { backend, tool } = harness(false, { exporter });
+    answerShapes(backend, 1);
+    const beats: Beat[] = [];
+    const run = tool.execute(
+        { fileId: FILE, pageId: PAGE, shapeIds: shapeIdsOf(25) },
+        undefined,
+        async (done, total, message) => {
+            beats.push({ done, total, message });
+        }
+    );
+    await until(() => exporter.gates.length === 1);
+    exporter.gates[0]();
+    await until(() => exporter.gates.length === 2);
+    beats.length = 0;
+    t.mock.timers.tick(5_000);
+    assert.deepEqual(beats, [{ done: 10.5, total: 25, message: "Rendering chunk 2 of 3 (10 shapes)." }]);
+    exporter.gates[1]();
+    await until(() => exporter.gates.length === 3);
+    beats.length = 0;
+    t.mock.timers.tick(5_000);
+    assert.deepEqual(beats, [{ done: 20.5, total: 25, message: "Rendering chunk 3 of 3 (5 shapes)." }]);
+    exporter.gates[2]();
+    await run;
+});
+
+test("a call without a progress token starts no heartbeat timer and sends nothing", async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const spy = t.mock.method(globalThis, "setInterval");
+    const exporter = new GatedExporter();
+    const { backend, tool } = harness(false, { exporter });
+    answerShapes(backend, 1);
+    const run = tool.execute({ fileId: FILE, pageId: PAGE, shapeIds: shapeIdsOf(3) });
+    await until(() => exporter.gates.length === 1);
+    t.mock.timers.tick(12_000);
+    exporter.gates[0]();
+    const response = await run;
+    assert.notEqual(response.isError, true);
+    // other code may keep a timer of its own, but none runs at the heartbeat interval
+    assert.equal(spy.mock.calls.filter((call) => call.arguments[1] === 5_000).length, 0);
+});
+
+test("a chunk that fails stops the timer at once", async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const exporter = new GatedExporter();
+    exporter.failBatch(new ExporterError(500, "busy"), 1);
+    const { backend, tool } = harness(false, { exporter });
+    answerShapes(backend, 1);
+    const beats: Beat[] = [];
+    const run = tool.execute(
+        { fileId: FILE, pageId: PAGE, shapeIds: shapeIdsOf(3) },
+        undefined,
+        async (done, total, message) => {
+            beats.push({ done, total, message });
+        }
+    );
+    await until(() => exporter.gates.length === 1);
+    t.mock.timers.tick(5_000);
+    assert.equal(beats.length, 1);
+    exporter.gates[0]();
+    await run;
+    // the failed batch went on to render the shapes one by one: one notification each, and no heartbeat
+    assert.deepEqual(
+        beats.map((beat) => beat.done),
+        [0.5, 1, 2, 3]
+    );
+    assert.equal(
+        beats.slice(1).every((beat) => /^(Rendered shape|Shape)/.test(beat.message ?? "")),
+        true
+    );
+    const sent = beats.length;
+    t.mock.timers.tick(30_000);
+    assert.equal(beats.length, sent);
+});
+
+test("the fallback of one request per shape sends only its per-shape progress", async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const { exporter, tool } = harness();
+    exporter.failBatch(new ExporterError(500, "busy"), 1);
+    const beats: Beat[] = [];
+    await tool.execute(
+        { fileId: FILE, pageId: PAGE, shapeIds: shapeIdsOf(3) },
+        undefined,
+        async (done, total, message) => {
+            beats.push({ done, total, message });
+        }
+    );
+    t.mock.timers.tick(30_000);
+    assert.deepEqual(
+        beats.map((beat) => beat.done),
+        [1, 2, 3]
+    );
 });
 
 test("outputDir with an existing file in its place is refused before any render", async () => {

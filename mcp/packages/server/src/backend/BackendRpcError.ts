@@ -1,3 +1,67 @@
+import { RateLimitError } from "./TokenRateLimiter";
+
+/** Seconds to wait that the message names when the backend refusal gives no retry time. */
+const DEFAULT_RETRY_SECONDS = 10;
+
+/**
+ * Longest wait that the message names, in seconds. For a bucket limit the `retry-after` header of the backend is the
+ * time until the whole bucket is full again (about 120 s for the read bucket), but a permit comes back every 100 ms,
+ * so a short wait is enough to go on. The header is used only up to this value.
+ */
+const MAX_RETRY_SECONDS = 10;
+
+/**
+ * The backend refused a call on its own rate limit (HTTP 429, type `rate-limit`, code `request-blocked`).
+ *
+ * The refusal comes before the command runs, so nothing was changed, and a cursor from an earlier reply stays
+ * valid. It is a {@link RateLimitError}, so tools report it like the limit of the adapter.
+ */
+export class BackendRateLimitError extends RateLimitError {
+    /**
+     * Creates the error.
+     *
+     * @param retryAfterSeconds - whole seconds to wait, from the `retry-after` header of the refusal, or
+     *     `undefined` when the refusal gave none
+     */
+    constructor(public readonly retryAfterSeconds: number | undefined) {
+        super(
+            retryAfterSeconds === undefined
+                ? `backend rate limit reached, wait about ${DEFAULT_RETRY_SECONDS} s and retry. A cursor from an ` +
+                      "earlier reply stays valid."
+                : `backend rate limit reached, retry after ${retryAfterSeconds} s. A cursor from an earlier reply ` +
+                      "stays valid."
+        );
+        this.name = "BackendRateLimitError";
+    }
+
+    /**
+     * Reads the seconds to wait from the `retry-after` header of a refusal, rounded up and at most
+     * {@link MAX_RETRY_SECONDS}, because the header gives the time to a full bucket, not to the next permit.
+     *
+     * @param header - value of the header, or null when it is absent
+     * @returns whole seconds from 1 to 10, or `undefined` when the header is absent or not a number of seconds
+     */
+    public static secondsFrom(header: string | null): number | undefined {
+        if (header === null || header.trim() === "") {
+            return undefined;
+        }
+        const seconds = Number(header);
+        return Number.isFinite(seconds) && seconds >= 0
+            ? Math.min(MAX_RETRY_SECONDS, Math.max(1, Math.ceil(seconds)))
+            : undefined;
+    }
+
+    /**
+     * Tells whether a decoded error body and status are the rate-limit refusal of the backend.
+     *
+     * @param status - HTTP status of the response
+     * @param body - decoded error body, if any
+     */
+    public static matches(status: number, body: Record<string, unknown> | undefined): boolean {
+        return status === 429 && (body?.type === "rate-limit" || body?.code === "request-blocked");
+    }
+}
+
 /**
  * Error raised when the Penpot backend answers an RPC call with an error status.
  *

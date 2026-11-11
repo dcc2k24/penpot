@@ -51,11 +51,11 @@ test("find_shapes sends hasToken as a boolean", async () => {
     const tool = new FindShapesTool(sessionServer(), servicesFor(backend));
 
     await tool.execute({ fileId: FILE, hasToken: true });
-    assert.deepEqual(onlyParams(backend, "find-mcp-shapes"), { fileId: FILE, hasToken: true });
+    assert.deepEqual(onlyParams(backend, "find-mcp-shapes"), { fileId: FILE, hasToken: true, maxBytes: 85_000 });
 
     backend.calls.length = 0;
     await tool.execute({ fileId: FILE, hasToken: false });
-    assert.deepEqual(onlyParams(backend, "find-mcp-shapes"), { fileId: FILE, hasToken: false });
+    assert.deepEqual(onlyParams(backend, "find-mcp-shapes"), { fileId: FILE, hasToken: false, maxBytes: 85_000 });
 });
 
 test("the find_shapes schema accepts hasToken only as a boolean", () => {
@@ -157,7 +157,7 @@ test("find_shapes sends the ellipse type as circle and shows circle matches as e
 
     const response = await tool.execute({ fileId: FILE, type: "ellipse" });
 
-    assert.deepEqual(onlyParams(backend, "find-mcp-shapes"), { fileId: FILE, type: "circle" });
+    assert.deepEqual(onlyParams(backend, "find-mcp-shapes"), { fileId: FILE, type: "circle", maxBytes: 85_000 });
     const body = JSON.parse((response.content[0] as { text: string }).text) as {
         matches: Array<{ type: string }>;
     };
@@ -176,7 +176,7 @@ test("find_shapes type board sends frame to the backend and shows frame matches 
 
     const response = await tool.execute({ fileId: FILE, type: "board" });
 
-    assert.deepEqual(onlyParams(backend, "find-mcp-shapes"), { fileId: FILE, type: "frame" });
+    assert.deepEqual(onlyParams(backend, "find-mcp-shapes"), { fileId: FILE, type: "frame", maxBytes: 85_000 });
     const body = JSON.parse((response.content[0] as { text: string }).text) as {
         matches: Array<{ type: string }>;
     };
@@ -192,7 +192,7 @@ test("find_shapes passes the frame type through unchanged", async () => {
 
     await tool.execute({ fileId: FILE, type: "frame" });
 
-    assert.deepEqual(onlyParams(backend, "find-mcp-shapes"), { fileId: FILE, type: "frame" });
+    assert.deepEqual(onlyParams(backend, "find-mcp-shapes"), { fileId: FILE, type: "frame", maxBytes: 85_000 });
 });
 
 test("find_shapes passes the circle type through unchanged", async () => {
@@ -201,5 +201,86 @@ test("find_shapes passes the circle type through unchanged", async () => {
 
     await tool.execute({ fileId: FILE, type: "circle" });
 
-    assert.deepEqual(onlyParams(backend, "find-mcp-shapes"), { fileId: FILE, type: "circle" });
+    assert.deepEqual(onlyParams(backend, "find-mcp-shapes"), { fileId: FILE, type: "circle", maxBytes: 85_000 });
+});
+
+test("find_shapes asks the backend for matches that fit the response cap, and sends the cursor on", async () => {
+    const backend = acceptingBackend().respond("find-mcp-shapes", { matches: [] });
+    const tool = new FindShapesTool(sessionServer(), servicesFor(backend));
+
+    await tool.execute({ fileId: FILE, nameRegex: "^Parent$", limit: 300, cursor: "abc" });
+    assert.deepEqual(onlyParams(backend, "find-mcp-shapes"), {
+        fileId: FILE,
+        nameRegex: "^Parent$",
+        limit: 300,
+        cursor: "abc",
+        maxBytes: 85_000,
+    });
+});
+
+test("the match budget follows the response cap, within the range the backend accepts", () => {
+    assert.equal(FindShapesTool.matchBytesFor(100_000), 85_000);
+    assert.equal(FindShapesTool.matchBytesFor(500), 1000);
+    assert.equal(FindShapesTool.matchBytesFor(10_000_000), 1_000_000);
+});
+
+test("a truncated reply keeps its matches, its reason and its cursor, and is not cut by the adapter", async () => {
+    const matches = Array.from({ length: 300 }, (_, i) => ({
+        id: `1b2c3d4e-0000-4000-8000-${String(i).padStart(12, "0")}`,
+        pageId: PAGE,
+        name: "Parent",
+        type: "frame",
+        path: "Screens / Parent",
+    }));
+    const backend = acceptingBackend().respond("find-mcp-shapes", {
+        matches,
+        truncated: true,
+        reason: "limit",
+        scanned: 28695,
+        nextCursor: "cursor-after-300",
+    });
+    const tool = new FindShapesTool(sessionServer(), servicesFor(backend));
+
+    const response = await tool.execute({ fileId: FILE, nameRegex: "^Parent$", limit: 300 });
+    const text = (response.content[0] as { text: string }).text;
+    const body = JSON.parse(text) as Record<string, unknown>;
+    assert.equal((body.matches as unknown[]).length, 300);
+    assert.equal(body.truncated, true);
+    assert.equal(body.reason, "limit");
+    assert.equal(body.scanned, 28695);
+    assert.equal(body.nextCursor, "cursor-after-300");
+    assert.equal(body.partial, undefined);
+});
+
+test("get_shapes sends textLayoutState and characters as backend field names", async () => {
+    const backend = acceptingBackend().respond("get-mcp-shapes", { shapes: [] });
+    const tool = new GetShapesTool(sessionServer(), servicesFor(backend));
+
+    await tool.execute({ fileId: FILE, pageId: PAGE, ids: [SHAPE], fields: ["textLayoutState", "characters"] });
+    assert.deepEqual((onlyParams(backend, "get-mcp-shapes") as { fields: string[] }).fields, [
+        "text-layout-state",
+        "characters",
+    ]);
+});
+
+test("find_shapes passes skippedLarge and skippedLargeIds through and describes them", async () => {
+    const backend = acceptingBackend().respond("find-mcp-shapes", {
+        matches: [],
+        truncated: true,
+        reason: "size",
+        scanned: 3,
+        nextCursor: "cursor-past-large",
+        skippedLarge: 2,
+        skippedLargeIds: [SHAPE, "1b2c3d4e-0000-4000-8000-000000000006"],
+    });
+    const tool = new FindShapesTool(sessionServer(), servicesFor(backend));
+
+    const response = await tool.execute({ fileId: FILE, nameRegex: "^Big" });
+    const body = JSON.parse((response.content[0] as { text: string }).text) as Record<string, unknown>;
+    assert.equal(body.skippedLarge, 2);
+    assert.deepEqual(body.skippedLargeIds, [SHAPE, "1b2c3d4e-0000-4000-8000-000000000006"]);
+    assert.equal(body.nextCursor, "cursor-past-large");
+    const description = tool.getToolDescription();
+    assert.match(description, /skippedLarge/);
+    assert.match(description, /get_shapes or export_subtree/);
 });

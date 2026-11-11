@@ -36,6 +36,7 @@
    [app.rpc.commands.mcp :as mcp]
    [app.rpc.commands.mcp-limits :as limits]
    [app.rpc.doc :as-alias doc]
+   [app.rpc.mcp-font-lookup :as font-lookup]
    [app.util.blob :as blob]
    [app.util.pointer-map :as pmap]
    [app.util.services :as sv]
@@ -50,6 +51,19 @@
 (def ^:private max-changes limits/max-changes)
 (def ^:private max-operations limits/max-operations)
 (def ^:private max-payload-bytes limits/max-payload-bytes)
+(def ^:private replay-max-entries
+  "The most entries of one list (`created-ids`, `shape-ids`) that the record of
+  a request keeps for a replay."
+  10000)
+
+(def ^:private replay-max-bytes
+  "The most bytes the encoded reply of a request may take in its record: 1 MiB.
+  The record is the `mcp_reply` column of the first change row of the call, which the
+  database drops with the other change rows after about an hour. One row of a
+  call holds its compiled changes, which are far larger, so the reply adds a
+  small share to what the call already stores."
+  (* 1024 1024))
+
 (def ^:private snapshot-threshold 100)
 (def ^:private snapshot-keep 20)
 
@@ -386,6 +400,81 @@
   [cfg file-id session]
   (boolean (db/exec-one! (::db/conn cfg) [sql:session-exists file-id session])))
 
+(def ^:private replay-keys
+  "The keys of the reply of a write that a replay returns again: the handle
+  to id map and the per-operation results of `apply_operations`, and the ids
+  of `import_svg`."
+  [:created-ids :op-results :root-id :shape-ids])
+
+(defn- encode-reply
+  "The bytes of `reply` for the change row, and whether the reply was cut."
+  [reply truncated?]
+  (blob/encode (cond-> reply truncated? (assoc :replay-truncated true))))
+
+(defn- cap-list
+  "The first `n` entries of the list or map `value`. A map is cut in the order
+  of its sorted keys, so the same map gives the same part."
+  [value n]
+  (if (map? value)
+    (into {} (take n) (sort-by (comp str key) value))
+    (vec (take n value))))
+
+(defn- replay-reply
+  "The bytes to store for a replay of the call that `extra` answers, or nil
+  when the call has no reply data. At most `replay-max-entries` entries of
+  each list are kept; a reply larger than `replay-max-bytes` loses its
+  `op-results` first, then half of its entries at a time until it fits. A cut
+  reply is flagged `:replay-truncated` when it is read back."
+  [extra]
+  (let [reply (select-keys extra replay-keys)]
+    (when (seq reply)
+      (let [capped (reduce-kv (fn [m k v]
+                                (if (and (contains? #{:created-ids :shape-ids :op-results} k)
+                                         (coll? v)
+                                         (> (count v) replay-max-entries))
+                                  (-> m (assoc k (cap-list v replay-max-entries)) (assoc ::cut true))
+                                  m))
+                              reply
+                              reply)]
+        (loop [reply     (dissoc capped ::cut)
+               truncated? (some? (::cut capped))
+               dropped?  false]
+          (let [bytes (encode-reply reply truncated?)]
+            (cond
+              (<= (alength ^bytes bytes) replay-max-bytes)
+              bytes
+
+              (and (not dropped?) (contains? reply :op-results))
+              (recur (dissoc reply :op-results) true true)
+
+              :else
+              (recur (reduce (fn [m k]
+                               (cond-> m
+                                 (coll? (get m k))
+                                 (update k cap-list (quot (count (get m k)) 2))))
+                             reply
+                             [:created-ids :shape-ids])
+                     true
+                     dropped?))))))))
+
+(def ^:private sql:session-reply
+  "select c.mcp_reply
+     from file_change as c
+    where c.file_id = ?
+      and c.session_id = ?
+      and c.changes is not null
+      and c.mcp_reply is not null
+    order by c.revn asc
+    limit 1")
+
+(defn- stored-reply
+  "The reply data a call kept in its first change row, decoded, or nil when
+  the row holds none (a call made before the reply was kept)."
+  [cfg file-id session]
+  (some-> (db/exec-one! (::db/conn cfg) [sql:session-reply file-id session])
+          :mcp-reply
+          blob/decode))
+
 (defn- snapshot-label
   [tool request-id]
   (str "mcp/" tool "/" (ct/format-inst (ct/now)) "/" request-id))
@@ -401,13 +490,18 @@
 (defn- snapshot-wanted?
   "The snapshot rule: a delete always takes one, more than 100 operations
   or changes take one unless `snapshot` is false, and `snapshot` true
-  forces one."
-  [snapshot? changes size]
-  (boolean
-   (or (true? snapshot?)
-       (some delete-change? changes)
-       (and (not (false? snapshot?))
-            (> size snapshot-threshold)))))
+  forces one. With `hint?` (an operation asked for a snapshot, as
+  `replace_font` does when it changes a text) a snapshot is taken unless
+  `snapshot` is false."
+  ([snapshot? changes size]
+   (snapshot-wanted? snapshot? changes size false))
+  ([snapshot? changes size hint?]
+   (boolean
+    (or (true? snapshot?)
+        (some delete-change? changes)
+        (and (not (false? snapshot?))
+             (or (true? hint?)
+                 (> size snapshot-threshold)))))))
 
 (defn- split-batches
   "Cuts `changes` into batches of whole operations. `op-ranges` holds one
@@ -609,8 +703,9 @@
 
   Before a batch after the first, the call checks its time budget
   (`:mcp-time-budget-exceeded`). A failed batch raises with the context
-  of the call. Returns the stored revn and the snapshot id."
-  [cfg file libraries batches {:keys [profile-id session-id snapshot? label tool started-ns]}]
+  of the call. The `reply` bytes (see `replay-reply`) go with the change row
+  of the first batch. Returns the stored revn and the snapshot id."
+  [cfg file libraries batches {:keys [profile-id session-id reply snapshot? label tool started-ns]}]
   (let [ctx (files-update/begin-batches!
              cfg file
              {:profile-id profile-id
@@ -631,6 +726,9 @@
                       :budget-ms batch-time-budget-ms
                       :revn-before-call (:revn file)))
           (let [opts (cond-> {::files-update/skip-auto-snapshot (or snapshot? (pos? index))}
+                       ;; The reply of the call goes with the first change row
+                       (and (zero? index) (some? reply))
+                       (assoc ::files-update/reply reply)
                        (and snapshot? (zero? index))
                        (assoc ::files-update/mcp-snapshot {:label label
                                                            :keep snapshot-keep}))
@@ -704,17 +802,26 @@
   [file libraries]
   (into [(:id file)] (keys libraries)))
 
+(defn- font-lookup-for
+  "The font lookup that `replace_font` reads, or nil when no operation of the
+  call is one: a call without it builds no lookup and reads no font data."
+  [cfg file operations]
+  (when (some #(= "replace_font" (:op %)) operations)
+    (font-lookup/make-font-lookup cfg (:team-id file))))
+
 (defn- compile-ops!
   "Compiles `operations` against the data of `file`, with the resolved
   `libraries`. A library's pages load when an operation reads them, through
-  the loader that names the library's file id."
+  the loader that names the library's file id. The font lookup is built only
+  for a call that holds a `replace_font` operation (see `font-lookup-for`)."
   [file libraries cfg operations]
   (binding [pmap/*load-fn* (partial feat.fdata/load-pointer-of-files cfg
                                     (file-ids-of file libraries))]
     (operations/compile-operations (:data file)
                                    operations
                                    {:new-id-fn uuid/next
-                                    :libraries libraries})))
+                                    :libraries libraries
+                                    :font-lookup (font-lookup-for cfg file operations)})))
 
 (defn- schema-errors
   "The schema errors of `file`, as error summaries. Empty when the schema is valid."
@@ -853,17 +960,22 @@
 (defn- applied-result
   "The result of a call whose request an earlier call already applied.
   Nothing is written: the counts come from the change rows of that call,
-  and no change is recorded or notified again."
+  and no change is recorded or notified again. The reply data of the first
+  answer (the `created-ids` handle map, the `op-results`, the ids of an SVG
+  import) comes from the first change row of the call, as it was kept,
+  flagged `replay-truncated` when it was cut. An `apply_operations` replay
+  with no kept reply has none of them."
   [cfg tool file session]
   (let [changes (session-changes cfg (:id file) session)
-        result  {:revn (:revn file)
-                 :already-applied true
-                 :commits 0
-                 :change-count (count changes)
-                 :change-types (change-types changes)
-                 :warnings []
-                 :dry-run false
-                 :validation {:ok true :checks []}}]
+        result  (merge {:revn (:revn file)
+                        :already-applied true
+                        :commits 0
+                        :change-count (count changes)
+                        :change-types (change-types changes)
+                        :warnings []
+                        :dry-run false
+                        :validation {:ok true :checks []}}
+                       (stored-reply cfg (:id file) session))]
     [result {:tool tool
              :file-id (:id file)
              :id (:id file)
@@ -880,8 +992,9 @@
   file and the resolved libraries, and returns a map with `:changes`, and
   optionally `:warnings`, `:op-count` (the operations or changes the call
   names, for the snapshot rule), `:op-ranges` (the change range of each
-  operation, see `split-batches`), `:split?` and `:extra` (merged into the
-  result). `text` is the canonical text of the call, see `canonical-text`.
+  operation, see `split-batches`), `:split?`, `:snapshot-hint` (true when an
+  operation wants a snapshot, see `snapshot-wanted?`) and `:extra` (merged into
+  the result). `text` is the canonical text of the call, see `canonical-text`.
   Returns the result and the audit props.
 
   A write takes the file lock before it loads the file. Under the lock,
@@ -953,13 +1066,15 @@
           (let [label     (snapshot-label tool request-id)
                 snapshot? (snapshot-wanted? snapshot
                                             changes
-                                            (or (:op-count derived) (count changes)))
+                                            (or (:op-count derived) (count changes))
+                                            (:snapshot-hint derived))
                 batches   (batches-of changes (:op-ranges derived) (:split? derived))
                 _         (check-batch-count! batches)
                 outcome   (if (seq batches)
                             (commit-batches! cfg file libraries batches
                                              {:profile-id profile-id
                                               :session-id session
+                                              :reply (replay-reply (:extra derived))
                                               :snapshot? snapshot?
                                               :label label
                                               :tool tool
@@ -1111,7 +1226,12 @@
                                :op-count (count operations)
                                :op-ranges (:op-ranges compiled)
                                :split? (boolean (:allow-split params))
-                               :extra {:created-ids (:created-ids compiled)}}))}))
+                               :snapshot-hint (:snapshot-hint compiled)
+                               ;; The per-operation results, only when an
+                               ;; operation reports one.
+                               :extra (cond-> {:created-ids (:created-ids compiled)}
+                                        (some some? (:op-results compiled))
+                                        (assoc :op-results (:op-results compiled)))}))}))
 
 ;; --- COMMAND: mcp-import-svg
 

@@ -110,3 +110,74 @@ test("list_fonts describes the 500-font cap, the merged runs and what truncated 
     assert.match(description, /Runs of one face are merged into one variant, under the font's own variantId/);
     assert.match(description, /the reply holds more than 500 fonts, or the reply reached the response size/);
 });
+
+test("list_fonts passes the suggestion and page count fields through", async () => {
+    const reply = {
+        revn: 3,
+        fonts: [
+            {
+                fontId: "gfont-access-sans",
+                family: "Access Sans",
+                source: "google",
+                resolved: false,
+                reason: "not-in-google-catalog",
+                runs: 2,
+                shapes: 1,
+                pages: [{ pageId: PAGE, runs: 2 }],
+                variants: [],
+                suggestedFontId: "custom-1b2c3d4e",
+                suggestedFamily: "Access Sans Bold",
+                suggestedSource: "custom",
+                suggestedMatch: "stem",
+                suggestedVariantsMissing: [{ weight: "400", style: "normal" }],
+            },
+        ],
+        unresolved: 1,
+        pagesRead: 3,
+        pagesTotal: 3,
+        truncated: false,
+    };
+    const { tool } = harness(reply);
+    const response = await tool.execute({ fileId: FILE });
+    assert.deepEqual(JSON.parse((response.content[0] as { text: string }).text), reply);
+});
+
+test("list_fonts adds a note that says what to do when it read only some of the pages", async () => {
+    const reply = { revn: 3, fonts: [], unresolved: 0, pagesRead: 1, pagesTotal: 2, truncated: true };
+    const { tool } = harness(reply);
+    const response = await tool.execute({ fileId: FILE });
+    const body = JSON.parse((response.content[0] as { text: string }).text);
+    assert.deepEqual({ ...body, note: undefined }, { ...reply, note: undefined });
+    assert.match(body.note, /Read 1 of 2 pages in the time limit: the list is not complete/);
+    assert.match(body.note, /Call list_fonts again with the same arguments/);
+    assert.match(body.note, /process that read a page keeps it for up to 10 minutes/);
+    assert.match(body.note, /pagesRead need not grow on every call/);
+});
+
+test("list_fonts adds no note when every page was read", async () => {
+    const reply = { revn: 3, fonts: [], unresolved: 0, pagesRead: 2, pagesTotal: 2, truncated: false };
+    const { tool } = harness(reply);
+    const response = await tool.execute({ fileId: FILE });
+    assert.deepEqual(JSON.parse((response.content[0] as { text: string }).text), reply);
+});
+
+test("list_fonts says in its description that a partial read goes on when called again", () => {
+    assert.match(harness().tool.getToolDescription(), /a note says what to do: call list_fonts again/);
+});
+
+test("list_fonts describes the suggestion fields and the page counts", () => {
+    const description = harness().tool.getToolDescription();
+    for (const name of [
+        "suggestedFontId",
+        "suggestedFamily",
+        "suggestedSource",
+        "suggestedMatch",
+        "suggestedVariantsMissing",
+        "pagesRead",
+        "pagesTotal",
+    ]) {
+        assert.ok(description.includes(name), name);
+    }
+    assert.match(description, /Use suggestedFontId; penpot_api_info/);
+    assert.match(description, /whole file that is not truncated is the complete font report/);
+});

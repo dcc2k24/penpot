@@ -276,6 +276,42 @@ test("a write that an earlier call with the same requestId applied says so, and 
     assert.match(body.note, /already applied by an earlier call with the same requestId/);
 });
 
+test("a replay returns the createdIds and opResults of the first answer, with a note", async () => {
+    const { backend, tool } = harness();
+    const createdIds = { "$tmp:a": "6f1c9a0e-5b0f-4a52-9d3f-0c5a3d2e8b11" };
+    const opResults = [null, { op: "replace_font", textsChanged: 2 }];
+    backend.respond("mcp-apply-operations", { revn: 3, createdIds, opResults, alreadyApplied: true });
+    const response = await tool.execute({ fileId: FILE, operations: [RECT_OPERATION], requestId: RETRY_ID });
+    const body = JSON.parse(textOf(response)) as { createdIds: unknown; opResults: unknown; note: string };
+    assert.deepEqual(body.createdIds, createdIds);
+    assert.deepEqual(body.opResults, opResults);
+    assert.match(body.note, /those of the first answer/);
+});
+
+test("the per-operation results of the backend reach the caller as they are", async () => {
+    const { backend, tool } = harness();
+    const opResults = [
+        null,
+        {
+            op: "replace_font",
+            textsChanged: 2,
+            layoutDropped: 2,
+            variantsUsed: [{ from: { weight: "700", style: "normal" }, to: { variantId: "normal-700" }, exact: true }],
+            skipped: { total: 0, byReason: [], items: [], itemsTruncated: false },
+        },
+    ];
+    backend.respond("mcp-apply-operations", { revn: 4, createdIds: {}, opResults });
+    const response = await tool.execute({
+        fileId: FILE,
+        operations: [
+            RECT_OPERATION,
+            { op: "replace_font", pageId: PAGE, fromFontId: "gfont-access-sans", toFontId: "custom-1" },
+        ],
+    });
+    const body = JSON.parse(textOf(response)) as { opResults: unknown };
+    assert.deepEqual(body.opResults, opResults);
+});
+
 test("a write whose request is cancelled before its turn in the queue is not sent", async () => {
     const { backend, tool } = heldHarness(() => "#ff8800");
     const first = tool.execute({ fileId: FILE, operations: [RECT_OPERATION] });

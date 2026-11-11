@@ -83,6 +83,7 @@
    [common-tests.logic.variants-test]
    [common-tests.math-test]
    [common-tests.mcp.operations-test]
+   [common-tests.mcp.replace-font-test]
    [common-tests.media-test]
    [common-tests.path-names-test]
    [common-tests.path-names-tree-test]
@@ -195,6 +196,7 @@
    'common-tests.logic.variants-test
    'common-tests.math-test
    'common-tests.mcp.operations-test
+   'common-tests.mcp.replace-font-test
    'common-tests.media-test
    'common-tests.path-names-test
    'common-tests.path-names-tree-test

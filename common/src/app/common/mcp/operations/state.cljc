@@ -145,7 +145,14 @@
    ;; earlier op added, modified or deleted in this compile.
    :touched-mains #{}
    :new-id-fn (or (:new-id-fn opts) uuid/next)
-   :libraries (library-records (:libraries opts))})
+   :libraries (library-records (:libraries opts))
+   ;; Font data for the ops that need it (`replace_font`): a function from a
+   ;; font id to its family and variants. Nil when the call has no such op.
+   :font-lookup (:font-lookup opts)
+   ;; One result per op, in op order: a map for an op that reports one, else nil.
+   :op-results []
+   ;; Set by an op that wants the call to take a snapshot before it writes.
+   :snapshot-hint false})
 
 (defn get-file-record
   "The working file as a library record, the shape the sync builders read."
@@ -166,7 +173,7 @@
       (pcb/with-file-data (:file-data state))
       (pcb/with-library-data (:file-data state))))
 
-(defn- main-component-ids
+(defn main-component-ids
   "The ids of the components whose main instance is `shape-id` or one of its
   ancestors in `objects`."
   [objects shape-id]

@@ -1,16 +1,19 @@
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
+import { gunzipSync } from "node:zlib";
 import { z } from "zod";
 import type { PenpotMcpServer } from "../../PenpotMcpServer";
 import type { ToolResponse } from "../../ToolResponse";
-import { BackendRpcError } from "../../backend/BackendRpcError";
+import { BackendRateLimitError, BackendRpcError } from "../../backend/BackendRpcError";
 import { BackendSettings } from "../../backend/BackendSettings";
 import { BackendServices } from "../../backend/BackendServices";
 import { FakeExporterClient } from "../../backend/testing/FakeExporterClient";
 import { FakePenpotBackend, type RecordedCall } from "../../backend/testing/FakePenpotBackend";
+import { BackendTool } from "./BackendTool";
 import { ExportSubtreeArgs, ExportSubtreeTool } from "./ExportSubtreeTool";
 
 const TOKEN = "alice-token";
@@ -19,10 +22,7 @@ const PAGE = "1b2c3d4e-0000-4000-8000-000000000004";
 const ROOT = "1b2c3d4e-0000-4000-8000-000000000100";
 const COMMAND = "get-mcp-subtree";
 const EXPORT_DIR_VARIABLE = "PENPOT_MCP_EXPORT_DIR";
-const CAP_VARIABLE = "PENPOT_MCP_MAX_TOOL_RESPONSE_KB";
-
-/** Window byte limit that the tool asks for under the default response cap: 80 % of 100 kB. */
-const DEFAULT_WINDOW_BYTES = 80_000;
+const SUBTREE_CAP_VARIABLE = "PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB";
 
 /** Shape id of the n-th shape of the test walk. */
 function idOf(n: number): string {
@@ -82,7 +82,9 @@ function harness(fsEnabled = true) {
         profileId: "profile-1",
         scopes: ["mcp:read"],
     });
-    const services = new BackendServices(backend, new BackendSettings(), new FakeExporterClient());
+    // a walk of many calls must not meet the rate limit, which is not what these tests are about
+    const settings = new BackendSettings(undefined, 1_000_000, 1_000_000);
+    const services = new BackendServices(backend, settings, new FakeExporterClient());
     const server = {
         getSessionContext: () => ({ userToken: TOKEN }),
         isFileSystemAccessEnabled: () => fsEnabled,
@@ -179,46 +181,44 @@ test("the export_subtree schema accepts the bounds and refuses values outside th
     assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, overwrite: "yes" }).success, false);
 });
 
-test("an inline call sends only the given fields, with the window byte limit of 80 % of the cap", async () => {
+/** Largest byte budget that the first window of an inline call asks for under the default 100 kB cap. */
+const FIRST_WINDOW_BYTES = Math.floor((100_000 - 1024) * 0.98);
+
+test("an inline call sends only the given fields, and asks the first window for the room of the reply", async () => {
     const { backend, tool } = harness();
     answerWalk(backend);
     await tool.execute({ fileId: FILE, pageId: PAGE });
-    assert.deepEqual(paramsOf(backend.calls), [{ fileId: FILE, pageId: PAGE, limit: 100, maxBytes: 80_000 }]);
+    assert.deepEqual(paramsOf(backend.calls)[0], {
+        fileId: FILE,
+        pageId: PAGE,
+        limit: 5000,
+        maxJsonBytes: FIRST_WINDOW_BYTES,
+    });
 });
 
 test("an inline call with every argument sends them all", async () => {
     const { backend, tool } = harness();
     answerWalk(backend);
-    await tool.execute({ fileId: FILE, pageId: PAGE, rootId: ROOT, cursor: "cursor-2", limit: 50 });
-    assert.deepEqual(paramsOf(backend.calls), [
-        { fileId: FILE, pageId: PAGE, rootId: ROOT, cursor: "cursor-2", limit: 50, maxBytes: DEFAULT_WINDOW_BYTES },
-    ]);
+    await tool.execute({
+        fileId: FILE,
+        pageId: PAGE,
+        rootId: ROOT,
+        cursor: "cursor-2",
+        limit: 50,
+        compact: true,
+    });
+    assert.deepEqual(paramsOf(backend.calls)[0], {
+        fileId: FILE,
+        pageId: PAGE,
+        rootId: ROOT,
+        cursor: "cursor-2",
+        compact: true,
+        limit: 50,
+        maxJsonBytes: FIRST_WINDOW_BYTES,
+    });
 });
 
-test("the inline window limit follows PENPOT_MCP_MAX_TOOL_RESPONSE_KB and stays inside the backend range", async () => {
-    const previous = process.env[CAP_VARIABLE];
-    try {
-        process.env[CAP_VARIABLE] = "50";
-        const small = harness();
-        answerWalk(small.backend);
-        await small.tool.execute({ fileId: FILE, pageId: PAGE });
-        assert.equal((paramsOf(small.backend.calls)[0] as { maxBytes: number }).maxBytes, 40_000);
-
-        process.env[CAP_VARIABLE] = "1";
-        const tiny = harness();
-        answerWalk(tiny.backend);
-        await tiny.tool.execute({ fileId: FILE, pageId: PAGE });
-        assert.equal((paramsOf(tiny.backend.calls)[0] as { maxBytes: number }).maxBytes, 1000);
-    } finally {
-        if (previous === undefined) {
-            delete process.env[CAP_VARIABLE];
-        } else {
-            process.env[CAP_VARIABLE] = previous;
-        }
-    }
-});
-
-test("an inline reply passes the window through and maps circle to ellipse", async () => {
+test("an inline reply joins the windows that fit, maps circle to ellipse and ends without a cursor", async () => {
     const { backend, tool } = harness();
     answerWalk(backend);
     const response = await tool.execute({ fileId: FILE, pageId: PAGE });
@@ -227,23 +227,43 @@ test("an inline reply passes the window through and maps circle to ellipse", asy
         pageId: string;
         rootId: string;
         total: number;
+        windows: number;
         truncated: boolean;
-        nextCursor: string;
+        nextCursor?: string;
         shapes: Array<{ id: string; type: string }>;
     };
     assert.equal(body.revn, 7);
     assert.equal(body.pageId, PAGE);
     assert.equal(body.rootId, ROOT);
     assert.equal(body.total, 7);
-    assert.equal(body.truncated, true);
-    assert.equal(body.nextCursor, "cursor-2");
+    assert.equal(body.windows, 3);
+    assert.equal(body.truncated, false);
+    assert.equal(body.nextCursor, undefined);
     assert.deepEqual(
         body.shapes.map((shape) => [shape.id, shape.type]),
-        [
-            [idOf(0), "ellipse"],
-            [idOf(1), "rect"],
-            [idOf(2), "rect"],
-        ]
+        [0, 1, 2, 3, 4, 5, 6].map((n) => [idOf(n), n === 0 ? "ellipse" : "rect"])
+    );
+    assert.deepEqual(
+        paramsOf(backend.calls).map((params) => (params as { cursor?: string }).cursor),
+        [undefined, "cursor-2", "cursor-3"]
+    );
+});
+
+test("limit caps the shapes of a reply and the window limit shrinks as shapes are read", async () => {
+    const { backend, tool } = harness();
+    servePage(
+        backend,
+        Array.from({ length: 10 }, (_, n) => sizedShape(n, 300)),
+        { perWindow: 3 }
+    );
+    const response = await tool.execute({ fileId: FILE, pageId: PAGE, limit: 4 });
+    const body = JSON.parse(textOf(response)) as { shapes: unknown[]; nextCursor: string; windows: number };
+    assert.equal(body.shapes.length, 4);
+    assert.equal(body.windows, 2);
+    assert.equal(body.nextCursor, "c4");
+    assert.deepEqual(
+        paramsOf(backend.calls).map((params) => (params as { limit: number }).limit),
+        [4, 1]
     );
 });
 
@@ -291,25 +311,25 @@ test("filePath walks the cursor from the start, with the large file window", asy
         answerWalk(backend);
         await tool.execute({ fileId: FILE, pageId: PAGE, filePath: path.join(dir, "walk.json") });
         assert.deepEqual(paramsOf(backend.calls), [
-            { fileId: FILE, pageId: PAGE, limit: 5000, maxBytes: 1_000_000 },
-            { fileId: FILE, pageId: PAGE, limit: 5000, maxBytes: 1_000_000, cursor: "cursor-2" },
-            { fileId: FILE, pageId: PAGE, limit: 5000, maxBytes: 1_000_000, cursor: "cursor-3" },
+            { fileId: FILE, pageId: PAGE, limit: 5000, maxJsonBytes: 4_000_000 },
+            { fileId: FILE, pageId: PAGE, limit: 5000, maxJsonBytes: 4_000_000, cursor: "cursor-2" },
+            { fileId: FILE, pageId: PAGE, limit: 5000, maxJsonBytes: 4_000_000, cursor: "cursor-3" },
         ]);
     });
 });
 
-test("filePath ignores the caller's limit: every window is the large file window", async () => {
+test("filePath ignores the caller's limit: every window is the large file window of 4 MB", async () => {
     await withExportDir(async (dir) => {
         const { backend, tool } = harness();
         answerWalk(backend);
         await tool.execute({ fileId: FILE, pageId: PAGE, limit: 50, filePath: path.join(dir, "limited.json") });
         assert.deepEqual(
-            paramsOf(backend.calls).map((params) => (params as { limit: number; maxBytes: number }).limit),
+            paramsOf(backend.calls).map((params) => (params as { limit: number }).limit),
             [5000, 5000, 5000]
         );
         assert.deepEqual(
-            paramsOf(backend.calls).map((params) => (params as { maxBytes: number }).maxBytes),
-            [1_000_000, 1_000_000, 1_000_000]
+            paramsOf(backend.calls).map((params) => (params as { maxJsonBytes: number }).maxJsonBytes),
+            [4_000_000, 4_000_000, 4_000_000]
         );
     });
 });
@@ -466,168 +486,922 @@ test("a cursor is refused together with filePath", async () => {
 });
 
 /**
- * Runs a test with PENPOT_MCP_MAX_TOOL_RESPONSE_KB set to the given value, restoring the previous value afterwards.
+ * Puts a value back into the environment, or removes the variable when there was none.
  *
- * @param kilobytes - the response cap to set, as the environment text
- * @param body - the test body
+ * @param name - the variable
+ * @param previous - the value it had, or undefined
  */
-async function withCap(kilobytes: string, body: () => Promise<void>): Promise<void> {
-    const previous = process.env[CAP_VARIABLE];
-    process.env[CAP_VARIABLE] = kilobytes;
-    try {
-        await body();
-    } finally {
-        if (previous === undefined) {
-            delete process.env[CAP_VARIABLE];
-        } else {
-            process.env[CAP_VARIABLE] = previous;
-        }
+function restore(name: string, previous: string | undefined): void {
+    if (previous === undefined) {
+        delete process.env[name];
+    } else {
+        process.env[name] = previous;
     }
 }
 
 /**
- * A shape with a 3000-character content, which is larger than a 2 kB response cap by itself.
+ * Runs a test with PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB set to the given value, restoring the previous value after.
  *
- * @param n - position of the shape, which also names it
+ * @param kilobytes - the cap to set, as the environment text
+ * @param body - the test body
  */
-function bigShapeOf(n: number) {
-    return { ...shapeOf(n, "path"), content: "x".repeat(3000) };
+async function withSubtreeCap(kilobytes: string, body: () => Promise<void>): Promise<void> {
+    const previous = process.env[SUBTREE_CAP_VARIABLE];
+    process.env[SUBTREE_CAP_VARIABLE] = kilobytes;
+    try {
+        await body();
+    } finally {
+        restore(SUBTREE_CAP_VARIABLE, previous);
+    }
 }
 
-test("an inline window too large for the cap is cut to the shapes that fit, and keeps nextCursor", async () => {
-    await withCap("2", async () => {
-        const { backend, tool } = harness();
-        backend.respond(COMMAND, (params: object) => {
-            if ((params as { limit: number }).limit === 2) {
-                return {
-                    revn: 7,
-                    pageId: PAGE,
-                    rootId: ROOT,
-                    total: 7,
-                    shapes: [shapeOf(0), shapeOf(1)],
-                    truncated: true,
-                    nextCursor: "cursor-2",
-                };
+/** Defaults that the fake backend lists for a compact page, as the real one lists them. */
+const FAKE_DEFAULTS = { hidden: false, blocked: false, opacity: 1 };
+
+/**
+ * Returns a deterministic filler text.
+ *
+ * @param seed - decides the text
+ * @param length - number of characters
+ * @param noisy - true for text that hardly compresses, false for a repeating text
+ */
+function filler(seed: number, length: number, noisy: boolean): string {
+    if (!noisy) {
+        return "abcdef".repeat(Math.ceil(length / 6)).slice(0, length);
+    }
+    let state = seed * 2654435761 + 12345;
+    let text = "";
+    while (text.length < length) {
+        state = (state * 1103515245 + 12345) % 2147483648;
+        text += (state % 36).toString(36);
+    }
+    return text;
+}
+
+/**
+ * A shape of the fake page whose JSON text is about the given size.
+ *
+ * @param n - position of the shape, which also names it
+ * @param bytes - the size of its JSON text, at least 200
+ * @param noisy - whether its filler hardly compresses
+ */
+function sizedShape(n: number, bytes: number, noisy = false): Record<string, unknown> {
+    const base: Record<string, unknown> = {
+        id: idOf(n),
+        type: n % 5 === 0 ? "circle" : "rect",
+        name: `Shape ${n}`,
+        parentId: ROOT,
+        frameId: ROOT,
+        hidden: false,
+        blocked: false,
+        opacity: 1,
+        rotation: null,
+        content: "",
+    };
+    const padding = Math.max(0, bytes - Buffer.byteLength(JSON.stringify(base), "utf8"));
+    return { ...base, content: filler(n, padding, noisy) };
+}
+
+/**
+ * A page of shapes whose sizes run from 200 bytes to 40 kB, in a fixed pseudo-random order.
+ *
+ * @param count - number of shapes
+ * @param noisy - whether the fillers hardly compress
+ */
+function variedPage(count: number, noisy = false): Array<Record<string, unknown>> {
+    return Array.from({ length: count }, (_, n) => sizedShape(n, 200 + ((n * 7919) % 39_800), noisy));
+}
+
+/**
+ * Drops the keys that a compact shape leaves out: the null values and the defaults.
+ *
+ * @param shape - the full shape
+ */
+function compactOf(shape: Record<string, unknown>): Record<string, unknown> {
+    const defaults = FAKE_DEFAULTS as Record<string, unknown>;
+    return Object.fromEntries(
+        Object.entries(shape).filter(([key, value]) => value !== null && !(key in defaults && defaults[key] === value))
+    );
+}
+
+/** What the fake page does that the real backend does not, to reach cases that need it. */
+interface PageFaults {
+    /** Most shapes of one window, whatever the limit says. */
+    perWindow?: number;
+    /** Make windows as large as the limit allows, ignoring the byte budget (a backend that counts wrongly). */
+    ignoreBytes?: boolean;
+    /** Answer stale for this shape index as a cursor. */
+    staleAt?: number;
+    /** Answer this revision for the windows after the first. */
+    laterRevn?: number;
+}
+
+/**
+ * Makes the backend serve a page from an array of shapes, with windows sized as the real backend sizes them: the
+ * JSON array of the window stays within maxJsonBytes, and a window always holds a shape. Cursors are `c<index>`.
+ *
+ * @param backend - the fake backend to answer on
+ * @param shapes - the shapes of the page, in walk order
+ * @param faults - the ways in which the fake page misbehaves
+ */
+function servePage(backend: FakePenpotBackend, shapes: Array<Record<string, unknown>>, faults: PageFaults = {}): void {
+    backend.respond(COMMAND, (params: object) => {
+        const asked = params as { cursor?: string; limit: number; maxJsonBytes: number; compact?: boolean };
+        const start = asked.cursor === undefined ? 0 : Number(asked.cursor.slice(1));
+        if (faults.staleAt === start && start > 0) {
+            throw staleError();
+        }
+        const source = asked.compact === true ? shapes.map(compactOf) : shapes;
+        const most = Math.min(asked.limit, faults.perWindow ?? Number.POSITIVE_INFINITY);
+        let end = start;
+        let size = 1;
+        while (end < source.length && end - start < most) {
+            const bytes = Buffer.byteLength(JSON.stringify(source[end]), "utf8") + 1;
+            if (faults.ignoreBytes !== true && end > start && size + bytes > asked.maxJsonBytes) {
+                break;
             }
-            return {
-                revn: 7,
-                pageId: PAGE,
-                rootId: ROOT,
-                total: 7,
-                shapes: [shapeOf(0), shapeOf(1), bigShapeOf(2)],
-                truncated: true,
-                nextCursor: "cursor-3",
-            };
-        });
-        const response = await tool.execute({ fileId: FILE, pageId: PAGE });
+            size += bytes;
+            end += 1;
+        }
+        const more = end < source.length;
+        return {
+            revn: start > 0 && faults.laterRevn !== undefined ? faults.laterRevn : 7,
+            pageId: PAGE,
+            rootId: ROOT,
+            total: source.length,
+            ...(asked.compact === true ? { compact: true, defaults: FAKE_DEFAULTS } : {}),
+            shapes: source.slice(start, end),
+            truncated: more,
+            ...(more ? { nextCursor: `c${end}` } : {}),
+        };
+    });
+}
+
+/** What one reply of a walk holds, as the tests read it. */
+interface Reply {
+    revn: number;
+    total: number;
+    windows: number;
+    compact?: boolean;
+    defaults?: Record<string, unknown>;
+    shapes: Array<Record<string, unknown>> | { encoding: string; bytes: number; count: number; data: string };
+    truncated: boolean;
+    nextCursor?: string;
+}
+
+/** The result of a whole walk with tool calls. */
+interface Walk {
+    /** Every reply, parsed. */
+    replies: Reply[];
+    /** The size of every reply as sent, in bytes. */
+    sizes: number[];
+    /** Every shape, in order, with the gzip form decoded. */
+    shapes: Array<Record<string, unknown>>;
+}
+
+/**
+ * Decodes the shapes of a reply, plain or gzip-base64.
+ *
+ * @param shapes - the shapes field of a reply
+ */
+function decodedShapes(shapes: Reply["shapes"]): Array<Record<string, unknown>> {
+    if (Array.isArray(shapes)) {
+        return shapes;
+    }
+    return JSON.parse(gunzipSync(Buffer.from(shapes.data, "base64")).toString("utf8")) as Array<
+        Record<string, unknown>
+    >;
+}
+
+/**
+ * Walks a page with tool calls, the way a client does: call, then call again with nextCursor until there is none.
+ *
+ * @param tool - the tool
+ * @param args - the arguments of the first call
+ * @param maxCalls - the walk fails when it takes more calls
+ */
+async function walkPage(tool: ExportSubtreeTool, args: Record<string, unknown> = {}, maxCalls = 2000): Promise<Walk> {
+    const walk: Walk = { replies: [], sizes: [], shapes: [] };
+    let cursor: string | undefined;
+    do {
+        assert.ok(walk.replies.length < maxCalls, "the walk does not end");
+        const response = await tool.execute({ fileId: FILE, pageId: PAGE, ...args, cursor });
         assert.notEqual(response.isError, true, textOf(response));
-        const body = JSON.parse(textOf(response)) as { shapes: Array<{ id: string }>; nextCursor: string };
-        assert.deepEqual(
-            body.shapes.map((shape) => shape.id),
-            [idOf(0), idOf(1)]
+        const text = textOf(response);
+        const reply = JSON.parse(text) as Reply;
+        assert.equal("partial" in reply, false, "a reply is never cut");
+        walk.replies.push(reply);
+        walk.sizes.push(Buffer.byteLength(text, "utf8"));
+        walk.shapes.push(...decodedShapes(reply.shapes));
+        // a reply never lacks a cursor while shapes remain
+        assert.equal(reply.truncated, reply.nextCursor !== undefined);
+        assert.equal(reply.truncated || walk.shapes.length === reply.total, true);
+        cursor = reply.nextCursor;
+    } while (cursor !== undefined);
+    return walk;
+}
+
+/**
+ * What a plain walk must return for a page: the shapes as the tools show them.
+ *
+ * @param shapes - the stored shapes
+ */
+function shownShapes(shapes: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+    return shapes.map((shape) => ({ ...shape, type: shape.type === "circle" ? "ellipse" : shape.type }));
+}
+
+test("a walk of shapes from 200 bytes to 40 kB under the default cap visits each shape once and never dead-ends", async (t) => {
+    const page = variedPage(300);
+    const { backend, tool } = harness();
+    servePage(backend, page);
+    const walk = await walkPage(tool);
+    assert.deepEqual(walk.shapes, shownShapes(page));
+    assert.equal(
+        walk.sizes.every((size) => size <= 100_000),
+        true
+    );
+    // a reply is filled: all but the last hold more than half the cap
+    assert.equal(
+        walk.sizes.slice(0, -1).every((size) => size > 50_000),
+        true
+    );
+    t.diagnostic(`${page.length} shapes in ${walk.replies.length} calls under 100 kB`);
+});
+
+test("the same walk under a 1 MB cap takes far fewer calls", async (t) => {
+    const page = variedPage(300);
+    const small = harness();
+    servePage(small.backend, page);
+    const smallWalk = await walkPage(small.tool);
+    await withSubtreeCap("1000", async () => {
+        const { backend, tool } = harness();
+        servePage(backend, page);
+        const walk = await walkPage(tool);
+        assert.deepEqual(walk.shapes, shownShapes(page));
+        assert.equal(
+            walk.sizes.every((size) => size <= 1_000_000),
+            true
         );
-        assert.equal(body.nextCursor, "cursor-2");
-        assert.deepEqual(paramsOf(backend.calls), [
-            { fileId: FILE, pageId: PAGE, limit: 100, maxBytes: 1600 },
-            { fileId: FILE, pageId: PAGE, limit: 2, maxBytes: 1600 },
-        ]);
+        assert.equal(walk.replies.length * 8 <= smallWalk.replies.length, true);
+        t.diagnostic(`${smallWalk.replies.length} calls under 100 kB, ${walk.replies.length} calls under 1 MB`);
     });
 });
 
-test("a single shape too large for the cap comes back with its large attributes omitted", async () => {
-    await withCap("2", async () => {
+test("a call reads several backend windows and says how many", async () => {
+    const page = Array.from({ length: 10 }, (_, n) => sizedShape(n, 300));
+    const { backend, tool } = harness();
+    servePage(backend, page, { perWindow: 3 });
+    const response = await tool.execute({ fileId: FILE, pageId: PAGE });
+    const body = JSON.parse(textOf(response)) as Reply;
+    assert.equal(body.windows, 4);
+    assert.equal(body.truncated, false);
+    assert.deepEqual(
+        (body.shapes as Array<{ id: string }>).map((shape) => shape.id),
+        page.map((shape) => shape.id)
+    );
+    assert.deepEqual(
+        paramsOf(backend.calls).map((params) => (params as { cursor?: string }).cursor),
+        [undefined, "c3", "c6", "c9"]
+    );
+});
+
+test("a rate limit on a later window returns the windows held, with the cursor and a note", async () => {
+    const { backend, tool } = harness();
+    backend.respond(COMMAND, (params: object) => {
+        if ((params as { cursor?: string }).cursor === "cursor-2") {
+            throw new BackendRateLimitError(7);
+        }
+        return WINDOW_1;
+    });
+    const response = await tool.execute({ fileId: FILE, pageId: PAGE });
+    const body = JSON.parse(textOf(response)) as {
+        windows: number;
+        truncated: boolean;
+        nextCursor?: string;
+        note?: string;
+        shapes: Array<{ id: string }>;
+    };
+    assert.equal(body.windows, 1);
+    assert.equal(body.truncated, true);
+    assert.equal(body.nextCursor, "cursor-2");
+    assert.deepEqual(
+        body.shapes.map((shape) => shape.id),
+        [0, 1, 2].map(idOf)
+    );
+    assert.match(body.note ?? "", /rate limit stopped this call after 1 backend window/);
+    assert.match(body.note ?? "", /Wait about 7 s, then pass nextCursor as cursor/);
+});
+
+test("a rate limit on the first window fails the call with the rate-limit error", async () => {
+    const { backend, tool } = harness();
+    backend.respond(COMMAND, () => {
+        throw new BackendRateLimitError(undefined);
+    });
+    const response = await tool.execute({ fileId: FILE, pageId: PAGE });
+    assert.equal(response.isError, true);
+    assert.match(textOf(response), /backend rate limit reached, wait about 10 s and retry\. A cursor/);
+});
+
+test("a window above the cap is asked again with fewer shapes, and no reply is cut", async () => {
+    await withSubtreeCap("20", async () => {
+        const page = Array.from({ length: 40 }, (_, n) => sizedShape(n, 3000));
         const { backend, tool } = harness();
-        const big = { ...bigShapeOf(0), points: [1, 2] };
-        backend.respond(COMMAND, {
-            revn: 7,
-            pageId: PAGE,
-            rootId: ROOT,
-            total: 7,
-            shapes: [big],
-            truncated: true,
-            nextCursor: "cursor-1",
-        });
-        const response = await tool.execute({ fileId: FILE, pageId: PAGE });
-        assert.notEqual(response.isError, true, textOf(response));
-        const body = JSON.parse(textOf(response)) as {
-            shapes: Array<{ id: string; content: unknown; points: unknown }>;
-            oversize: Array<{ id: string; bytes: number; omitted: string[] }>;
-            note: string;
-            nextCursor: string;
+        servePage(backend, page, { ignoreBytes: true });
+        const first = await tool.execute({ fileId: FILE, pageId: PAGE });
+        const body = JSON.parse(textOf(first)) as Reply;
+        const ids = (body.shapes as Array<{ id: string }>).map((shape) => shape.id);
+        const limits = paramsOf(backend.calls).map((params) => (params as { limit: number }).limit);
+        assert.equal(limits[0], 5000);
+        assert.equal(limits[1] < 40, true);
+        assert.equal(limits[1], ids.length);
+        assert.equal(ids.length > 1, true);
+        assert.equal(Buffer.byteLength(textOf(first), "utf8") <= 20_000, true);
+        assert.equal(body.truncated, true);
+        assert.equal(body.nextCursor, `c${ids.length}`);
+        assert.deepEqual(
+            ids,
+            page.slice(0, ids.length).map((shape) => shape.id)
+        );
+        // the next call resumes at the right shape
+        const walk = await walkPage(tool);
+        assert.deepEqual(walk.shapes, shownShapes(page));
+        assert.equal(
+            walk.sizes.every((size) => size <= 20_000),
+            true
+        );
+    });
+});
+
+test("the adapter stops before a window that does not fit, with the cursor that resumes there", async () => {
+    await withSubtreeCap("20", async () => {
+        const page = [...Array.from({ length: 6 }, (_, n) => sizedShape(n, 1000)), sizedShape(6, 15_000)];
+        const { backend, tool } = harness();
+        servePage(backend, page, { perWindow: 3 });
+        const body = JSON.parse(textOf(await tool.execute({ fileId: FILE, pageId: PAGE }))) as Reply;
+        // the two windows of six shapes fit; the window that starts at the big shape would overflow the reply
+        assert.equal((body.shapes as unknown[]).length, 6);
+        assert.equal(body.nextCursor, "c6");
+        assert.equal(body.truncated, true);
+        const rest = JSON.parse(textOf(await tool.execute({ fileId: FILE, pageId: PAGE, cursor: "c6" }))) as Reply;
+        assert.deepEqual(
+            (rest.shapes as Array<{ id: string }>).map((shape) => shape.id),
+            [idOf(6)]
+        );
+        assert.equal(rest.truncated, false);
+    });
+});
+
+/** Random text of printable characters that hardly compresses: about 6.5 bits of each 8. */
+function noiseText(length: number): string {
+    const alphabet = "!#$%&()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_abcdefghijklmnopqrstuvwxyz{|}~";
+    return Array.from(randomBytes(length), (byte) => alphabet[byte % alphabet.length]).join("");
+}
+
+/** A page of small shapes with one of 300 kB at an index. */
+function pageWithBigShape(count: number, bigIndex: number): Array<Record<string, unknown>> {
+    return Array.from({ length: count }, (_, n) => sizedShape(n, n === bigIndex ? 300_000 : 500));
+}
+
+/**
+ * Checks a finished walk of a page that holds one shape above the cap: every other shape comes whole and once, in
+ * order; the big one comes once, cut, listed in `oversize`; and no reply is above the cap.
+ *
+ * @param walk - the walk
+ * @param expected - the shapes of the page as a plain walk shows them, compact or not
+ * @param bigIndex - position of the big shape
+ * @param cap - the cap of a reply, in bytes
+ */
+function assertBigShapeWalk(walk: Walk, expected: Array<Record<string, unknown>>, bigIndex: number, cap: number): void {
+    assert.equal(walk.shapes.length, expected.length, "every shape once");
+    walk.shapes.forEach((shape, n) => {
+        if (n === bigIndex) {
+            assert.equal(shape.id, expected[n].id);
+            assert.deepEqual(shape.content, { omitted: true, bytes: JSON.stringify(expected[n].content).length });
+        } else {
+            assert.deepEqual(shape, expected[n]);
+        }
+    });
+    assert.equal(
+        walk.sizes.every((size) => size <= cap),
+        true
+    );
+    const cut = walk.replies.filter((reply) => "oversize" in reply);
+    assert.equal(cut.length, 1, "one reply carries the cut shape");
+    const reply = cut[0] as Reply & { oversize: Array<{ id: string; bytes: number; omitted: string[] }>; note: string };
+    assert.equal(reply.oversize.length, 1);
+    assert.equal(reply.oversize[0].id, idOf(bigIndex));
+    assert.equal(reply.oversize[0].bytes, Buffer.byteLength(JSON.stringify(expected[bigIndex]), "utf8"));
+    assert.deepEqual(reply.oversize[0].omitted, ["content"]);
+    assert.match(reply.note, /PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB/);
+    assert.match(reply.note, /filePath/);
+    assert.equal(reply.nextCursor, `c${bigIndex + 1}`, "the cursor is right after the big shape");
+    assert.equal(decodedShapes(reply.shapes).length > 0, true);
+    assert.equal(walk.replies[walk.replies.length - 1].truncated, false, "the walk ends");
+}
+
+test("a walk across a shape above the cap visits every other shape once, and returns that one cut", async () => {
+    const page = pageWithBigShape(40, 20);
+    const { backend, tool } = harness();
+    servePage(backend, page);
+    const walk = await walkPage(tool);
+    assertBigShapeWalk(walk, shownShapes(page), 20, 100_000);
+});
+
+test("a shape above the cap is cut the same way in a compact walk", async () => {
+    const page = pageWithBigShape(40, 20);
+    const { backend, tool } = harness();
+    servePage(backend, page);
+    const walk = await walkPage(tool, { compact: true });
+    assertBigShapeWalk(walk, shownShapes(page.map(compactOf)), 20, 100_000);
+});
+
+test("a shape above the cap is cut the same way in a gzip-base64 walk, with the notice left plain", async () => {
+    const page = pageWithBigShape(40, 20);
+    const { backend, tool } = harness();
+    servePage(backend, page);
+    // random filler does not compress, so the shape is above the cap as sent, too
+    page[20] = { ...sizedShape(20, 500), content: randomBytes(150_000).toString("hex") };
+    const walk = await walkPage(tool, { encoding: "gzip-base64" });
+    assertBigShapeWalk(walk, shownShapes(page), 20, 100_000);
+    const cut = walk.replies.find((reply) => "oversize" in reply) as Reply;
+    assert.equal((cut.shapes as { encoding: string }).encoding, "gzip-base64", "the cut shape is inside the encoding");
+});
+
+test("a cut shape whose rest does not compress still fits the cap in gzip mode, and the walk ends", async () => {
+    const page = pageWithBigShape(40, 20);
+    // after content is cut, 95 kB of incompressible text is left: it fits as plain text, but its base64 gzip is above the 100 kB cap
+    page[20] = {
+        ...sizedShape(20, 500),
+        content: randomBytes(150_000).toString("hex"),
+        blob: noiseText(95_000),
+    };
+    const { backend, tool } = harness();
+    servePage(backend, page);
+    const walk = await walkPage(tool, { encoding: "gzip-base64" });
+    assert.equal(walk.shapes.length, 40);
+    assert.equal(
+        walk.sizes.every((size) => size <= 100_000),
+        true
+    );
+    const cut = walk.replies.filter((reply) => "oversize" in reply) as Array<
+        Reply & { oversize: Array<{ id: string; omitted: string[] }> }
+    >;
+    assert.equal(cut.length, 1);
+    assert.equal(cut[0].oversize[0].id, idOf(20));
+    assert.equal(cut[0].oversize[0].omitted.includes("blob"), true);
+    assert.equal(cut[0].nextCursor, "c21");
+    assert.equal(walk.replies[walk.replies.length - 1].truncated, false);
+});
+
+test("a shape that the raised cap fits comes whole, with no notice", async () => {
+    await withSubtreeCap("1000", async () => {
+        const page = pageWithBigShape(40, 20);
+        const { backend, tool } = harness();
+        servePage(backend, page);
+        const walk = await walkPage(tool);
+        assert.deepEqual(walk.shapes, shownShapes(page));
+        assert.equal(
+            walk.replies.some((reply) => "oversize" in reply),
+            false
+        );
+    });
+});
+
+test("a shape above the cap that starts the walk comes back cut with the cursor after it", async () => {
+    await withSubtreeCap("20", async () => {
+        const { backend, tool } = harness();
+        servePage(backend, [sizedShape(0, 30_000), sizedShape(1, 500)]);
+        const body = JSON.parse(textOf(await tool.execute({ fileId: FILE, pageId: PAGE }))) as Reply & {
+            oversize: Array<{ id: string }>;
         };
-        assert.deepEqual(body.shapes[0].content, { omitted: true, bytes: 3002 });
-        assert.deepEqual(body.shapes[0].points, [1, 2]);
-        assert.deepEqual(body.oversize, [
-            { id: idOf(0), bytes: Buffer.byteLength(JSON.stringify(big)), omitted: ["content"] },
-        ]);
-        assert.match(body.note, /filePath/);
-        assert.match(body.note, /get_shapes/);
-        assert.equal(body.nextCursor, "cursor-1");
+        assert.equal(body.oversize[0].id, idOf(0));
+        assert.equal((body.shapes as Array<{ id: string }>).length, 1);
+        assert.equal(body.nextCursor, "c1");
+        assert.equal(body.truncated, true);
         assert.equal(paramsOf(backend.calls).length, 1);
     });
 });
 
-test("when shapes are too large together, the first one comes back alone from a window of one", async () => {
-    await withCap("2", async () => {
+test("a shape above the cap that is in a window of several is asked for alone, so the cursor is right after it", async () => {
+    await withSubtreeCap("20", async () => {
         const { backend, tool } = harness();
-        backend.respond(COMMAND, (params: object) => {
-            if ((params as { limit: number }).limit === 1) {
-                return {
-                    revn: 7,
-                    pageId: PAGE,
-                    rootId: ROOT,
-                    total: 7,
-                    shapes: [bigShapeOf(0)],
-                    truncated: true,
-                    nextCursor: "cursor-1",
-                };
-            }
-            return {
-                revn: 7,
-                pageId: PAGE,
-                rootId: ROOT,
-                total: 7,
-                shapes: [bigShapeOf(0), bigShapeOf(1)],
-                truncated: true,
-                nextCursor: "cursor-2",
-            };
-        });
-        const response = await tool.execute({ fileId: FILE, pageId: PAGE });
-        assert.notEqual(response.isError, true, textOf(response));
-        const body = JSON.parse(textOf(response)) as { shapes: Array<{ id: string }>; nextCursor: string };
-        assert.deepEqual(
-            body.shapes.map((shape) => shape.id),
-            [idOf(0)]
-        );
-        assert.equal(body.nextCursor, "cursor-1");
+        servePage(backend, [sizedShape(0, 30_000), sizedShape(1, 500)], { ignoreBytes: true });
+        const body = JSON.parse(textOf(await tool.execute({ fileId: FILE, pageId: PAGE }))) as Reply;
+        assert.equal(body.nextCursor, "c1");
         assert.deepEqual(
             paramsOf(backend.calls).map((params) => (params as { limit: number }).limit),
-            [100, 1]
+            [5000, 1]
         );
     });
 });
 
-test("trimming stops as soon as the reply fits, so a small large attribute is kept", async () => {
-    await withCap("2", async () => {
+test("a first window that is asked for again and comes from a newer revision gives its own head, never a mix", async () => {
+    await withSubtreeCap("20", async () => {
         const { backend, tool } = harness();
-        const shape = { ...shapeOf(0, "path"), content: "x".repeat(1500), positionData: "p".repeat(600) };
-        backend.respond(COMMAND, {
-            revn: 7,
-            pageId: PAGE,
-            rootId: ROOT,
-            total: 7,
-            shapes: [shape],
-            truncated: true,
-            nextCursor: "cursor-1",
+        let calls = 0;
+        backend.respond(COMMAND, (params: object) => {
+            calls += 1;
+            const limit = (params as { limit: number }).limit;
+            const newer = calls > 1;
+            const shapes = Array.from({ length: Math.min(limit, 8) }, (_, n) => sizedShape(n, 3000));
+            return {
+                revn: newer ? 8 : 7,
+                pageId: PAGE,
+                rootId: ROOT,
+                total: newer ? 9 : 8,
+                shapes,
+                truncated: true,
+                nextCursor: `c${shapes.length}`,
+            };
         });
-        const response = await tool.execute({ fileId: FILE, pageId: PAGE });
-        const body = JSON.parse(textOf(response)) as {
-            shapes: Array<{ positionData: unknown }>;
-            oversize: Array<{ omitted: string[] }>;
-        };
-        assert.equal(body.shapes[0].positionData, "p".repeat(600));
-        assert.deepEqual(body.oversize[0].omitted, ["content"]);
+        const body = JSON.parse(textOf(await tool.execute({ fileId: FILE, pageId: PAGE, limit: 8 }))) as Reply;
+        assert.equal(body.revn, 8);
+        assert.equal(body.total, 9);
     });
+});
+
+test("a stale cursor after some windows returns what was read, and the next call is told it is stale", async () => {
+    const page = Array.from({ length: 9 }, (_, n) => sizedShape(n, 300));
+    const { backend, tool } = harness();
+    servePage(backend, page, { perWindow: 3, staleAt: 6 });
+    const body = JSON.parse(textOf(await tool.execute({ fileId: FILE, pageId: PAGE }))) as Reply;
+    assert.equal((body.shapes as unknown[]).length, 6);
+    assert.equal(body.nextCursor, "c6");
+    const next = await tool.execute({ fileId: FILE, pageId: PAGE, cursor: "c6" });
+    assert.equal(next.isError, true);
+});
+
+test("a stale cursor after some windows adds a note: the page changed, the cursor is stale, start again", async () => {
+    const page = Array.from({ length: 9 }, (_, n) => sizedShape(n, 300));
+    const { backend, tool } = harness();
+    servePage(backend, page, { perWindow: 3, staleAt: 6 });
+    const body = JSON.parse(textOf(await tool.execute({ fileId: FILE, pageId: PAGE }))) as Reply & { note?: string };
+    assert.equal(body.nextCursor, "c6");
+    assert.match(body.note ?? "", /page changed \(its revn moved\) while this call read it/);
+    assert.match(body.note ?? "", /from before the change/);
+    assert.match(body.note ?? "", /refuse nextCursor as stale\. Start the walk again without a cursor\./);
+});
+
+test("a one-window reply at an exact fit plus a note is returned, with the note only when it fits", async () => {
+    const { tool } = harness();
+    const inner = tool as unknown as {
+        capBytes: number;
+        finishReply: (
+            head: unknown,
+            windows: unknown[],
+            gzip: boolean,
+            note?: string
+        ) => Promise<{ content: Array<{ text: string }> }>;
+    };
+    const head = { revn: 7, pageId: PAGE, rootId: ROOT, total: 1, compact: false, defaults: undefined };
+    const windowOf = (pad: number): unknown => ({
+        raw: {},
+        shapes: [{ id: "a", content: "x".repeat(pad) }],
+        cost: 0,
+        plainBytes: 0,
+        nextCursor: "c1",
+    });
+    const note = "The rate limit stopped this call after 1 backend window. Wait about 10 s, then pass nextCursor.";
+    // pad the one shape until the reply without a note is exactly the cap
+    const bare = await inner.finishReply(head, [windowOf(0)], false);
+    const pad = inner.capBytes - Buffer.byteLength(bare.content[0].text, "utf8");
+    const exact = await inner.finishReply(head, [windowOf(pad)], false, note);
+    const exactBody = JSON.parse(exact.content[0].text) as { shapes: unknown[]; note?: string };
+    assert.equal(exactBody.shapes.length, 1);
+    assert.equal(exactBody.note, undefined, "no room for the note: the window is sent without it");
+    assert.equal(Buffer.byteLength(exact.content[0].text, "utf8"), inner.capBytes);
+    const roomy = await inner.finishReply(head, [windowOf(pad - 500)], false, note);
+    assert.equal((JSON.parse(roomy.content[0].text) as { note?: string }).note, note);
+});
+
+test("a window of another revision is not mixed into the reply", async () => {
+    const page = Array.from({ length: 9 }, (_, n) => sizedShape(n, 300));
+    const { backend, tool } = harness();
+    servePage(backend, page, { perWindow: 3, laterRevn: 8 });
+    const body = JSON.parse(textOf(await tool.execute({ fileId: FILE, pageId: PAGE }))) as Reply;
+    assert.equal(body.revn, 7);
+    assert.equal((body.shapes as unknown[]).length, 3);
+    assert.equal(body.nextCursor, "c3");
+});
+
+test("a backend that repeats a cursor fails the call", async () => {
+    const { backend, tool } = harness();
+    backend.respond(COMMAND, (params: object) => ({
+        ...WINDOW_1,
+        nextCursor: (params as { cursor?: string }).cursor ?? "same",
+    }));
+    const response = await tool.execute({ fileId: FILE, pageId: PAGE, cursor: "same" });
+    assert.equal(response.isError, true);
+    assert.match(textOf(response), /repeated a cursor/);
+});
+
+test("the cap of export_subtree is its own variable, which defaults to the shared cap", () => {
+    assert.equal(ExportSubtreeTool.readCapBytes({}), 100_000);
+    assert.equal(ExportSubtreeTool.readCapBytes({ PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB: "" }), 100_000);
+    assert.equal(ExportSubtreeTool.readCapBytes({ PENPOT_MCP_MAX_TOOL_RESPONSE_KB: "250" }), 250_000);
+    assert.equal(ExportSubtreeTool.readCapBytes({ PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB: "1000" }), 1_000_000);
+    assert.equal(ExportSubtreeTool.readCapBytes({ PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB: "10000" }), 10_000_000);
+    assert.equal(
+        ExportSubtreeTool.readCapBytes({
+            PENPOT_MCP_MAX_TOOL_RESPONSE_KB: "250",
+            PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB: "1000",
+        }),
+        1_000_000
+    );
+    // the shared cap of the other tools does not follow it
+    assert.equal(
+        BackendTool.readMaxResponseBytes({ PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB: "1000" }),
+        BackendTool.MAX_RESPONSE_BYTES
+    );
+});
+
+test("a cap that is not a whole number of kilobytes from 1 to 10000 fails the tool at start", () => {
+    for (const raw of ["0", "-1", "10001", "1.5", "abc"]) {
+        assert.throws(
+            () => ExportSubtreeTool.readCapBytes({ PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB: raw }),
+            /PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB must be a whole number of kilobytes from 1 to 10000/,
+            raw
+        );
+    }
+    const previous = process.env[SUBTREE_CAP_VARIABLE];
+    process.env[SUBTREE_CAP_VARIABLE] = "10001";
+    try {
+        assert.throws(() => harness(), /PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB/);
+    } finally {
+        restore(SUBTREE_CAP_VARIABLE, previous);
+    }
+});
+
+test("a raised cap is the cap of the reply: a 1 MB reply holds what 100 kB cannot", async () => {
+    await withSubtreeCap("1000", async () => {
+        const page = Array.from({ length: 30 }, (_, n) => sizedShape(n, 20_000));
+        const { backend, tool } = harness();
+        servePage(backend, page);
+        const body = JSON.parse(textOf(await tool.execute({ fileId: FILE, pageId: PAGE }))) as Reply;
+        assert.equal((body.shapes as unknown[]).length, 30);
+        assert.equal(body.truncated, false);
+    });
+});
+
+test("compact forwards the option, lists the defaults once, and restores to the full shapes", async () => {
+    const page = variedPage(40);
+    const { backend, tool } = harness();
+    servePage(backend, page);
+    const walk = await walkPage(tool, { compact: true });
+    assert.equal(
+        walk.replies.every((reply) => reply.compact === true),
+        true
+    );
+    assert.equal(
+        walk.replies.every((reply) => JSON.stringify(reply.defaults) === JSON.stringify(FAKE_DEFAULTS)),
+        true
+    );
+    assert.equal(
+        paramsOf(backend.calls).every((params) => (params as { compact?: boolean }).compact === true),
+        true
+    );
+    // no null and no default is left in a compact shape
+    for (const shape of walk.shapes) {
+        assert.equal("rotation" in shape, false);
+        assert.equal("hidden" in shape, false);
+        assert.equal("opacity" in shape, false);
+        assert.equal(typeof shape.type, "string");
+    }
+    // restoring with the listed defaults gives the full shape, but for its null keys
+    const restored = walk.shapes.map((shape) => ({ ...(walk.replies[0].defaults ?? {}), ...shape }));
+    const full = shownShapes(page).map((shape) =>
+        Object.fromEntries(Object.entries(shape).filter(([, value]) => value !== null))
+    );
+    assert.deepEqual(restored, full);
+    // a compact walk sends fewer bytes than a full one
+    const plain = harness();
+    servePage(plain.backend, page);
+    const sum = (sizes: number[]): number => sizes.reduce((total, size) => total + size, 0);
+    assert.equal(sum(walk.sizes) < sum((await walkPage(plain.tool)).sizes), true);
+    // a plain reply says nothing of compact
+    const plainReply = JSON.parse(textOf(await plain.tool.execute({ fileId: FILE, pageId: PAGE, limit: 1 }))) as Reply;
+    assert.equal("compact" in plainReply, false);
+    assert.equal("defaults" in plainReply, false);
+});
+
+test("gzip-base64 decodes to the same shapes as the plain reply, and says bytes and count", async () => {
+    const page = variedPage(20);
+    const plain = harness();
+    servePage(plain.backend, page);
+    const plainWalk = await walkPage(plain.tool);
+    const { backend, tool } = harness();
+    servePage(backend, page);
+    const walk = await walkPage(tool, { encoding: "gzip-base64" });
+    assert.deepEqual(walk.shapes, plainWalk.shapes);
+    for (const reply of walk.replies) {
+        const packed = reply.shapes as { encoding: string; bytes: number; count: number; data: string };
+        assert.equal(packed.encoding, "gzip-base64");
+        const text = gunzipSync(Buffer.from(packed.data, "base64")).toString("utf8");
+        assert.equal(packed.bytes, Buffer.byteLength(text, "utf8"));
+        assert.equal(packed.count, (JSON.parse(text) as unknown[]).length);
+        // the head fields stay plain
+        assert.equal(reply.total, 20);
+        assert.equal(reply.revn, 7);
+    }
+    assert.equal(walk.replies.length < plainWalk.replies.length, true);
+});
+
+test("the cap applies to a gzip-base64 reply as sent, and a walk of it never dead-ends", async () => {
+    await withSubtreeCap("20", async () => {
+        const page = Array.from({ length: 60 }, (_, n) => sizedShape(n, 200 + ((n * 7919) % 6_000), true));
+        const { backend, tool } = harness();
+        servePage(backend, page);
+        const walk = await walkPage(tool, { encoding: "gzip-base64" });
+        assert.deepEqual(walk.shapes, shownShapes(page));
+        assert.equal(
+            walk.sizes.every((size) => size <= 20_000),
+            true
+        );
+        assert.equal(walk.replies.length > 1, true);
+        // replies are filled: a call reads several windows until the compressed text fills the cap
+        assert.equal(
+            walk.sizes.slice(0, -1).every((size) => size > 10_000),
+            true
+        );
+    });
+});
+
+test("a call gathers at most 16 MB of plain data under a raised cap with gzip, and the walk still ends", async () => {
+    await withSubtreeCap("10000", async () => {
+        // 40 MB of shapes that compress to almost nothing: the cap would let one call hold all of it
+        const page = Array.from({ length: 8000 }, (_, n) => sizedShape(n, 5000));
+        const { backend, tool } = harness();
+        servePage(backend, page);
+        const walk = await walkPage(tool, { encoding: "gzip-base64" });
+        assert.equal(walk.shapes.length, page.length);
+        assert.equal(walk.shapes[7999].id, idOf(7999));
+        const sizes = walk.replies.map((reply) => (reply.shapes as { bytes: number }).bytes);
+        assert.equal(
+            sizes.every((bytes) => bytes <= 16 * 1024 * 1024),
+            true,
+            `plain bytes per call ${sizes.join(", ")}`
+        );
+        assert.equal(walk.replies.length >= 3, true);
+    });
+});
+
+test("a gzip call compresses each window at most twice, and the reply round-trips", async (t) => {
+    await withSubtreeCap("20", async () => {
+        const page = Array.from({ length: 60 }, (_, n) => sizedShape(n, 200 + ((n * 7919) % 6_000), true));
+        const { backend, tool } = harness();
+        servePage(backend, page);
+        const runs: number[] = [];
+        const target = tool as unknown as { compress: (text: string) => Promise<Buffer> };
+        const real = target.compress.bind(tool);
+        target.compress = (text: string) => {
+            runs.push(text.length);
+            return real(text);
+        };
+        const walk = await walkPage(tool, { encoding: "gzip-base64" });
+        assert.deepEqual(walk.shapes, shownShapes(page));
+        const windowsRead = paramsOf(backend.calls).length;
+        // one compression of the first window and one of the reply, for each call; never one per window, nor a
+        // search of compressions to find what fits
+        assert.equal(runs.length <= 2 * windowsRead, true, `${runs.length} compressions for ${windowsRead} windows`);
+        t.diagnostic(`${runs.length} compressions, ${windowsRead} windows, ${walk.replies.length} calls`);
+    });
+});
+
+test("windowBytesFor keeps a window within the backend response cap, with a floor", () => {
+    assert.equal(ExportSubtreeTool.windowBytesFor(8), 4_000_000);
+    assert.equal(ExportSubtreeTool.windowBytesFor(2), 1_048_576);
+    assert.equal(ExportSubtreeTool.windowBytesFor(0.01), 64_000);
+});
+
+test("a file walk asks for windows that fit PENPOT_MCP_BACKEND_MAX_RESPONSE_MB", async () => {
+    const previous = process.env.PENPOT_MCP_BACKEND_MAX_RESPONSE_MB;
+    process.env.PENPOT_MCP_BACKEND_MAX_RESPONSE_MB = "2";
+    try {
+        await withExportDir(async (dir) => {
+            const { backend, tool } = harness();
+            answerWalk(backend);
+            await tool.execute({ fileId: FILE, pageId: PAGE, filePath: path.join(dir, "out.json") });
+            const asked = paramsOf(backend.calls).map((params) => (params as { maxJsonBytes: number }).maxJsonBytes);
+            assert.deepEqual(asked, [1_048_576, 1_048_576, 1_048_576]);
+        });
+    } finally {
+        restore("PENPOT_MCP_BACKEND_MAX_RESPONSE_MB", previous);
+    }
+});
+
+test("compact and gzip-base64 work together", async () => {
+    const page = variedPage(40);
+    const { backend, tool } = harness();
+    servePage(backend, page);
+    const walk = await walkPage(tool, { compact: true, encoding: "gzip-base64" });
+    assert.equal(
+        walk.replies.every((reply) => reply.compact === true),
+        true
+    );
+    const compactWalk = await walkPage(tool, { compact: true });
+    assert.deepEqual(walk.shapes, compactWalk.shapes);
+    assert.equal(
+        walk.shapes.every((shape) => !("rotation" in shape) && !("hidden" in shape)),
+        true
+    );
+});
+
+test("compact keeps the type and key names of the plain form", async () => {
+    const page = variedPage(10);
+    const plain = harness();
+    servePage(plain.backend, page);
+    const compact = harness();
+    servePage(compact.backend, page);
+    const plainShapes = (await walkPage(plain.tool)).shapes;
+    const compactShapes = (await walkPage(compact.tool, { compact: true })).shapes;
+    for (let n = 0; n < page.length; n++) {
+        assert.equal(compactShapes[n].type, plainShapes[n].type);
+        assert.equal(
+            Object.keys(compactShapes[n]).every((key) => key in plainShapes[n]),
+            true
+        );
+    }
+    assert.equal(compactShapes[0].type, "ellipse");
+});
+
+test("filePath writes every shape once with the large windows, and a walk of it takes fewer windows", async (t) => {
+    await withExportDir(async (dir) => {
+        const page = variedPage(300);
+        const { backend, tool } = harness();
+        servePage(backend, page);
+        const file = path.join(dir, "page.json");
+        const response = await tool.execute({ fileId: FILE, pageId: PAGE, filePath: file });
+        assert.notEqual(response.isError, true, textOf(response));
+        const document = JSON.parse(fs.readFileSync(file, "utf8")) as { shapes: unknown[]; total: number };
+        assert.deepEqual(document.shapes, shownShapes(page));
+        assert.equal(document.total, 300);
+        const params = paramsOf(backend.calls) as Array<{ limit: number; maxJsonBytes: number }>;
+        assert.equal(
+            params.every((p) => p.limit === 5000 && p.maxJsonBytes === 4_000_000),
+            true
+        );
+        const reply = JSON.parse(textOf(response)) as { windows: number };
+        assert.equal(reply.windows, params.length);
+        t.diagnostic(`${page.length} shapes written in ${reply.windows} windows of up to 4 MB`);
+        assert.equal(reply.windows <= 2, true);
+    });
+});
+
+test("filePath with compact writes compact shapes and the defaults, and refuses an encoding", async () => {
+    await withExportDir(async (dir) => {
+        const page = variedPage(20);
+        const { backend, tool } = harness();
+        servePage(backend, page);
+        const file = path.join(dir, "compact.json");
+        const response = await tool.execute({ fileId: FILE, pageId: PAGE, filePath: file, compact: true });
+        assert.notEqual(response.isError, true, textOf(response));
+        const document = JSON.parse(fs.readFileSync(file, "utf8")) as {
+            compact: boolean;
+            defaults: unknown;
+            shapes: Array<Record<string, unknown>>;
+        };
+        assert.equal(document.compact, true);
+        assert.deepEqual(document.defaults, FAKE_DEFAULTS);
+        assert.deepEqual(document.shapes, shownShapes(page.map(compactOf)));
+
+        const refused = await tool.execute({
+            fileId: FILE,
+            pageId: PAGE,
+            filePath: path.join(dir, "gzip.json"),
+            encoding: "gzip-base64",
+        });
+        assert.equal(refused.isError, true);
+        assert.match(textOf(refused), /encoding cannot be used with filePath/);
+        assert.equal(fs.existsSync(path.join(dir, "gzip.json")), false);
+    });
+});
+
+test("in multi-user mode filePath is refused and compact and gzip-base64 still work", async () => {
+    await withExportDir(async (dir) => {
+        const page = variedPage(10);
+        const { backend, tool } = harness(false);
+        servePage(backend, page);
+        const refused = await tool.execute({ fileId: FILE, pageId: PAGE, filePath: path.join(dir, "no.json") });
+        assert.equal(refused.isError, true);
+        assert.match(textOf(refused), /File paths are off/);
+        const walk = await walkPage(tool, { compact: true, encoding: "gzip-base64" });
+        assert.equal(walk.shapes.length, 10);
+    });
+});
+
+test("the tool description says what compact and encoding are for", () => {
+    const { tool } = harness();
+    const description = tool.getToolDescription();
+    assert.match(description, /compact: true/);
+    assert.match(description, /a model should not ask for it/);
+    assert.match(description, /nextCursor whenever shapes remain/);
+});
+
+test("the description of compact says what is left out, and does not call strokes a default of a missing key", () => {
+    const description = (ExportSubtreeArgs.schema.compact.description ?? "") as string;
+    assert.match(description, /top-level keys/);
+    assert.match(description, /strokeAlignment is left out when it is center/);
+    assert.doesNotMatch(description, /a key that is absent has that default/);
 });
 
 test("a file name with a colon after the drive letter, or a character Windows refuses, is refused", async () => {

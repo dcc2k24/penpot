@@ -15,7 +15,9 @@
    [app.common.types.shape.interactions :as ctsi]
    [app.common.types.shape.layout :as ctl]
    [app.common.types.typography :as cty]
-   [clojure.string :as str]))
+   [app.common.uuid :as uuid]
+   [clojure.string :as str]
+   [clojure.walk :as walk]))
 
 ;; Schemas
 (def schema:ref
@@ -184,6 +186,7 @@
   {:id "the op that creates the shape"
    :type "the op that creates the shape"
    :parent-id "move_shapes"
+   :page-id "the page-id of the operation"
    :frame-id "move_shapes"
    :shapes "move_shapes or reorder"
    :component-id "instantiate_component or swap_component"
@@ -193,10 +196,10 @@
    :shape-ref "instantiate_component or detach"
    :applied-tokens "apply_token or unapply_token"
    :position-data "set_text or set_text_style"
-   :selrect "update_shape"
-   :points "update_shape"
-   :transform "update_shape"
-   :transform-inverse "update_shape"
+   :selrect "x, y, width, height and rotation in update_shape"
+   :points "x, y, width, height and rotation in update_shape"
+   :transform "x, y, width, height and rotation in update_shape"
+   :transform-inverse "x, y, width, height and rotation in update_shape"
    :layout "set_flex_layout or set_grid_layout"
    :layout-gap "set_flex_layout"
    :layout-gap-type "set_flex_layout"
@@ -349,15 +352,84 @@
              {}
              props))
 
-(defn- decode-props
-  "Decodes and checks the `props` of a create or update op. A structural key
-  is refused first, and the hint names the op that sets it."
-  [props]
+(def ^:private flip-keys
+  "The keys of a mirrored shape. A flip changes the transform and the points
+  of the shape, so the flag alone leaves an inconsistent shape. No op sets a
+  flip."
+  #{:flip-x :flip-y})
+
+(defn- check-settable-keys
+  "Refuses the keys of `props` that cannot be set alone. A structural key is
+  refused with the op that sets it. A flip is refused everywhere. `rotation`
+  is refused on a create op, which sets no transform: `update_shape` turns the
+  shape through its modifiers."
+  [op-name props]
   (when-let [k (some structural-prop-keys (keys props))]
     (raise-invalid (str "props cannot set the structural key " k
                         "; use " (get structural-prop-hints k) " instead")))
-  (or (decode-known-props props)
-      (decode-checked "props" schema:props props)))
+  (when-let [k (some flip-keys (keys props))]
+    (raise-invalid (str "props cannot set " k
+                        ": a flip cannot be set through this operation")))
+  (when (and (contains? props :rotation)
+             (some-> op-name (str/starts-with? "create_")))
+    (raise-invalid (str "props cannot set :rotation on " op-name
+                        ": a create op sets no transform; create the shape, "
+                        "then turn it with update_shape"))))
+
+(defn- fill-shadow-ids
+  "Gives each shadow of `props` that has no id a fresh one from `new-id-fn`,
+  as the workspace does when it adds a shadow. A shadow list that is not a
+  vector of maps is left as it is, for the schema to refuse."
+  [props new-id-fn]
+  (cond-> props
+    (sequential? (:shadow props))
+    (update :shadow (fn [shadows]
+                      (mapv #(if (and (map? %) (nil? (:id %)))
+                               (assoc % :id (new-id-fn))
+                               %)
+                            shadows)))))
+
+(defn- dedupe-messages
+  "`errors` with the repeated messages of each list kept once. The schema of a
+  key is an `:or` over the shape types that declare it, so one fault is
+  reported once for each type."
+  [errors]
+  (walk/postwalk (fn [node]
+                   (if (and (vector? node) (seq node) (every? string? node))
+                     (vec (distinct node))
+                     node))
+                 errors))
+
+(defn- explain-prop
+  "Raises the refusal of the value of the key `k` of `props`, with the path to
+  it: `props.<key>`, then the errors of the decoded value. An unknown key is
+  named by the closed schema of `props`."
+  [props k]
+  (if-let [{:keys [decode]} (get prop-coders k)]
+    (let [schema  (sm/schema (some (fn [[key _ schema]] (when (= k key) schema))
+                                   (sm/children schema:props)))
+          errors  (-> (sm/explain schema (decode (get props k)))
+                      (sm/simplify)
+                      (dedupe-messages))]
+      (raise-invalid (str "props." (name k) " is invalid: " (pr-str errors))))
+    (decode-checked "props" schema:props props)))
+
+(defn- decode-props
+  "Decodes and checks the `props` of a create or update op. The keys that
+  cannot be set are refused first, and the hint names the op that sets them.
+  A shadow without an id gets one. A key that does not match its schema is
+  named, with its path."
+  [op-name props new-id-fn]
+  (check-settable-keys op-name props)
+  (let [props (fill-shadow-ids props new-id-fn)]
+    (or (decode-known-props props)
+        (let [bad (some (fn [[k v]]
+                          (let [coder (get prop-coders k)]
+                            (when (or (nil? coder)
+                                      (not ((:validate coder) ((:decode coder) v))))
+                              k)))
+                        props)]
+          (explain-prop props bad)))))
 
 (defn props-keys-of-type
   "The keys that `props` may set on a shape of `type`."
@@ -377,20 +449,23 @@
 (defn decode-op-values
   "Decodes the JSON-style map params of `op` and checks them against their
   schemas. Colors and typographies are checked by their ops, since an update
-  merges them with the stored value first."
-  [op]
-  (cond-> op
-    (some? (:props op))
-    (update :props decode-props)
+  merges them with the stored value first. `new-id-fn` makes the ids of the
+  shadows that come without one (default `uuid/next`)."
+  ([op]
+   (decode-op-values op uuid/next))
+  ([op new-id-fn]
+   (cond-> op
+     (some? (:props op))
+     (update :props #(decode-props (:op op) % new-id-fn))
 
-    (some? (:interaction op))
-    (update :interaction #(decode-checked "interaction" schema:interaction %))
+     (some? (:interaction op))
+     (update :interaction #(decode-checked "interaction" schema:interaction %))
 
-    (some? (:grids op))
-    (update :grids #(decode-checked "grids" schema:grids %))
+     (some? (:grids op))
+     (update :grids #(decode-checked "grids" schema:grids %))
 
-    (some? (:fills op))
-    (update :fills #(decode-checked "fills" schema:fills %))
+     (some? (:fills op))
+     (update :fills #(decode-checked "fills" schema:fills %))
 
-    (some? (get-in op [:attrs :fills]))
-    (update-in [:attrs :fills] #(decode-checked "fills" schema:fills %))))
+     (some? (get-in op [:attrs :fills]))
+     (update-in [:attrs :fills] #(decode-checked "fills" schema:fills %)))))

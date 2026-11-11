@@ -40,14 +40,21 @@ export class WriteOptions {
             .describe(
                 "Client-chosen UUID that names this write. A retry of the same write must reuse this requestId: " +
                     "the server then answers alreadyApplied true for a repeat within an hour instead of applying " +
-                    "the write twice. Without one, the server makes a new id for this call, so a retried call " +
-                    "is not recognised."
+                    "the write twice, and it returns the createdIds and opResults of the first answer. Without " +
+                    "one, the server makes a new id for this call, so a retried call is not recognised."
             ),
     };
 
     /** Note added to a write result that an earlier call with the same requestId already applied. */
     private static readonly ALREADY_APPLIED_NOTE =
         "This write was already applied by an earlier call with the same requestId. This call changed nothing.";
+
+    /** Sentence added to the note when the result carries the ids and results of the first answer. */
+    private static readonly FIRST_ANSWER_NOTE = " createdIds and opResults are those of the first answer.";
+
+    /** Sentence added to the note when the server had to cut the ids and results it kept. */
+    private static readonly CUT_NOTE =
+        " The first answer was too large to keep whole, so those lists are cut: read the file for the rest.";
 
     /**
      * Copies the write options that are set into backend command parameters, and always names the write.
@@ -82,7 +89,8 @@ export class WriteOptions {
      * Adds a note to a write result that the backend marked as already applied.
      *
      * The backend result already carries `alreadyApplied`; the note tells the agent that nothing changed in this
-     * call. Other results are returned as they are.
+     * call, and that `createdIds` and `opResults` are those of the first answer (cut when `replayTruncated`). Other
+     * results are returned as they are.
      *
      * @param result - the backend result of the write
      * @returns the result, with `alreadyApplied` and a note when the backend said the write was already applied
@@ -95,7 +103,12 @@ export class WriteOptions {
         if (record.alreadyApplied !== true) {
             return result;
         }
-        return { ...record, alreadyApplied: true, note: WriteOptions.ALREADY_APPLIED_NOTE };
+        const keptReply = record.createdIds !== undefined || record.opResults !== undefined;
+        const note =
+            WriteOptions.ALREADY_APPLIED_NOTE +
+            (keptReply ? WriteOptions.FIRST_ANSWER_NOTE : "") +
+            (record.replayTruncated === true ? WriteOptions.CUT_NOTE : "");
+        return { ...record, alreadyApplied: true, note };
     }
 
     /** Names of the write options that are copied as they are. The requestId is set by {@link toParams}. */

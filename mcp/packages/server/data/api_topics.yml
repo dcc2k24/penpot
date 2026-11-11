@@ -27,9 +27,13 @@ Geometry:
         `transform` maps the `selrect` to the `points`. It works about the centre of the shape. `transformInverse` is its inverse.
         A shape that is neither rotated nor flipped has the identity for both. A flipped shape has a mirror in `transform`.
 
-        To draw a shape, draw its unrotated rectangle through `translate(centre) · transform · translate(-centre)`.
-        `export_subtree` gives this product as `worldMatrix` for each shape, with the values `a` to `f` in SVG order. A shape
-        without `selrect` has no `worldMatrix`.
+        `worldMatrix` is the matrix that maps the four corners of the `selrect` (top-left, top-right, bottom-right, bottom-left)
+        onto the four `points`, in that order. To draw a shape, draw its unrotated rectangle through it. `export_subtree` gives
+        it for each shape, with the values `a` to `f` in SVG order. When the `transform` agrees with the `points`, it equals
+        `translate(centre) · transform · translate(-centre)`. For a flipped group it can differ from the stored `transform`: an
+        import can leave the `transform` at the identity while the `points` are mirrored. When a shape has no four `points`, its
+        box has no width or no height, or its `points` are degenerate (two or more coincide, or all lie on one line),
+        `worldMatrix` is that product. A shape without `selrect` has no `worldMatrix`.
 
         The `content` of a path or a boolean is a string of absolute SVG commands `M`, `L`, `C` and `Z`, for example
         `M10.0,20.0L110.0,20.0C...Z`. Its points are in page space with `transform` already applied. Do not apply `transform` to
@@ -107,7 +111,7 @@ Geometry:
       generator: |-
         To place shapes in another program, read a board with `export_subtree`, with `rootId` set to the board's id.
 
-        1. Read every window. Pass `nextCursor` as `cursor` while `truncated` is true.
+        1. Read every reply. Pass `nextCursor` as `cursor` while `truncated` is true.
         2. Place each shape with its `worldMatrix`. A path and a boolean are the exception. Their `content` is already in page
            space, so draw it without `transform` and without `worldMatrix`. Use `points` for their box.
         3. Paint each shape with its `fills`. For each stroke, use `strokeAlignment` and the side widths.
@@ -125,3 +129,11 @@ Geometry:
         - In `positionData`, `fontSize`, `letterSpacing` and the other font values are strings, such as `"14px"`.
         - `text` in `positionData` is not case-transformed. Apply `textTransform` yourself.
         - `x1`, `y1`, `x2` and `y2` in a run come from the browser's layout. They do not move with the shape, so ignore them.
+
+        The tools show some names in a form that differs from the stored file. A generator ported from a binfile must map them.
+
+        | Stored in the file | Shown by the tools | Notes |
+        |---|---|---|
+        | shape type `circle` | `ellipse` | `find_shapes` accepts `ellipse` or `circle` as `type`. The create op is `create_ellipse`. |
+        | shape type `frame` (a board) | `frame` | `find_shapes` accepts `board` or `frame` as `type`. The create op is `create_board`. |
+        | kebab-case attribute keys, such as `fill-color` | camelCase keys, such as `fillColor` | Every read tool and every write tool. |

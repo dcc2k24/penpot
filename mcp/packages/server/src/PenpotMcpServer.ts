@@ -1041,7 +1041,9 @@ export class PenpotMcpServer {
      * Builds the progress reporter of a request, when the client sent a progress token.
      *
      * The reporter sends `notifications/progress` with that token, so a long tool keeps the connection alive
-     * and shows progress. Without a token the client asked for no progress, and the result is undefined.
+     * and shows progress. Without a token the client asked for no progress, and the result is undefined. The
+     * protocol asks for progress that rises with each notification, so the reporter drops one that is not above the
+     * last it sent for the request.
      *
      * @param ctx - the request context that the SDK passes to the tool callback
      * @returns the reporter, or undefined when the request carries no progress token
@@ -1051,8 +1053,14 @@ export class PenpotMcpServer {
         if (progressToken === undefined) {
             return undefined;
         }
-        return (progress, total, message) =>
-            ctx.mcpReq.notify({
+        // progress must rise with each notification of a request: one that does not is not sent
+        let last = Number.NEGATIVE_INFINITY;
+        return (progress, total, message) => {
+            if (!(progress > last)) {
+                return Promise.resolve();
+            }
+            last = progress;
+            return ctx.mcpReq.notify({
                 method: "notifications/progress",
                 params: {
                     progressToken,
@@ -1061,6 +1069,7 @@ export class PenpotMcpServer {
                     ...(message !== undefined ? { message } : {}),
                 },
             });
+        };
     }
 
     async start(): Promise<void> {

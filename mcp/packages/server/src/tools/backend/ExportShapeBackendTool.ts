@@ -59,6 +59,12 @@ const SHAPE_READ_ROUNDS = 50;
 const CACHE_NOTE =
     "These renders are kept for up to 15 minutes; after the font is fixed, pass refresh: true to render again.";
 
+/**
+ * Time between two progress notifications while one chunk request is in flight, in milliseconds. A chunk of many
+ * shapes can take half a minute, and a client that waits for progress would otherwise hear nothing.
+ */
+const HEARTBEAT_MS = 5_000;
+
 /** Room that an inline reply keeps free: when less is left, the total is full and no further chunk is sent. */
 const INLINE_HEADROOM_BYTES = 256 * 1024;
 
@@ -802,7 +808,11 @@ export class ExportShapeBackendTool extends BackendTool<ExportShapeBackendArgs> 
                 }
             }
             if (uncached.length > 0) {
-                await this.renderChunk(plan, uncached, state, (id, outcome) => {
+                const position = {
+                    index: start / this.services.exportBatchSize + 1,
+                    count: Math.ceil(ids.length / this.services.exportBatchSize),
+                };
+                await this.renderChunk(plan, uncached, state, position, (id, outcome) => {
                     if (outcome.kind === "file") {
                         record(
                             id,
@@ -898,19 +908,23 @@ export class ExportShapeBackendTool extends BackendTool<ExportShapeBackendArgs> 
      * @param plan - the file, the page, the output and the revision of the render
      * @param chunk - the uncached shape ids of the chunk, in order
      * @param state - the state of the call
+     * @param position - which chunk of the call this is, and how many chunks the call has, for the heartbeat
      * @param onOutcome - receives the outcome of each shape, once it is known
      */
     private async renderChunk(
         plan: RenderPlan,
         chunk: string[],
         state: CallState,
+        position: ChunkPosition,
         onOutcome: (id: string, outcome: ChunkOutcome) => void
     ): Promise<void> {
         const exporter = this.services.exporter;
         let exporterRefused = false;
         if (!state.singles && chunk.length > 1 && !BatchRefusals.refusesBatches(exporter, this.now())) {
             try {
-                const files = await this.renderBatch(plan, chunk);
+                const files = await this.withHeartbeat(state, position, chunk.length, () =>
+                    this.renderBatch(plan, chunk)
+                );
                 const resolved = chunk.map((id) => {
                     const file = files.get(id);
                     if (file === undefined) {
@@ -985,6 +999,60 @@ export class ExportShapeBackendTool extends BackendTool<ExportShapeBackendArgs> 
             BatchRefusals.refuse(exporter, this.now());
         }
     }
+    /**
+     * Returns the progress of the next heartbeat: the shapes finished so far plus n / (n + 1), where n counts the
+     * heartbeats since a shape last finished. Each value is above the one before and below the finished count plus
+     * one, so progress rises with every notification, as the protocol asks, and a shape that finishes next is
+     * still above it.
+     *
+     * @param state - the state of the call; its heartbeat count is updated
+     */
+    private static heartbeatProgress(state: CallState): number {
+        if (state.done !== state.heartbeatDone) {
+            state.heartbeatDone = state.done;
+            state.heartbeatTicks = 0;
+        }
+        state.heartbeatTicks += 1;
+        return state.done + state.heartbeatTicks / (state.heartbeatTicks + 1);
+    }
+
+    /**
+     * Runs a chunk request and, while it is in flight, sends a progress notification every HEARTBEAT_MS. The
+     * progress of a heartbeat is above the shapes finished so far and below the next one (see
+     * {@link heartbeatProgress}), and its message says which chunk is rendering.
+     * The timer stops when the request returns or fails, so nothing is sent after the tool's reply. A call with no
+     * progress token sends nothing.
+     *
+     * @param state - the state of the call, which holds the shapes finished so far
+     * @param position - which chunk of the call this is, and how many chunks the call has
+     * @param size - the number of shapes in the chunk
+     * @param request - the chunk request
+     * @returns the value of the request
+     */
+    private async withHeartbeat<T>(
+        state: CallState,
+        position: ChunkPosition,
+        size: number,
+        request: () => Promise<T>
+    ): Promise<T> {
+        // the reporter is taken now, so that a timer callback needs no call context of its own
+        const progress = CallContext.current()?.progress;
+        if (progress === undefined) {
+            return request();
+        }
+        const message = `Rendering chunk ${position.index} of ${position.count} (${size} shapes).`;
+        const timer = setInterval(() => {
+            // a notification that fails must not fail the call that sends it
+            progress(ExportShapeBackendTool.heartbeatProgress(state), state.total, message)?.catch(() => undefined);
+        }, HEARTBEAT_MS);
+        timer.unref();
+        try {
+            return await request();
+        } finally {
+            clearInterval(timer);
+        }
+    }
+
     /**
      * Decides what a failed batch request means for the call.
      *
@@ -1473,6 +1541,8 @@ export class ExportShapeBackendTool extends BackendTool<ExportShapeBackendArgs> 
             inlineBytes: 0,
             inlineFull: false,
             done: 0,
+            heartbeatDone: 0,
+            heartbeatTicks: 0,
             total,
             renderedTotal: 0,
             cachedTotal: 0,
@@ -2010,12 +2080,24 @@ interface CallState {
     inlineFull: boolean;
     /** Steps reported so far. */
     done: number;
+    /** The value of `done` at the last heartbeat. */
+    heartbeatDone: number;
+    /** Heartbeats sent since `done` last changed. */
+    heartbeatTicks: number;
     /** Steps of the call, for progress. */
     total: number;
     /** Shapes rendered by the call, not taken from the cache. */
     renderedTotal: number;
     /** Shapes taken from the cache. */
     cachedTotal: number;
+}
+
+/** Which chunk of a call is rendering, and how many chunks the call has. */
+interface ChunkPosition {
+    /** Number of the chunk, from 1. */
+    index: number;
+    /** Number of chunks in the call. */
+    count: number;
 }
 
 /** The outcome of one shape of a chunk, before it is delivered. */

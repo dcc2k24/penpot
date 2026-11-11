@@ -23,6 +23,7 @@
    [app.features.fdata :as fdata]
    [app.msgbus :as mbus]
    [app.rpc :as-alias rpc]
+   [app.rpc.commands.files :as files]
    [app.rpc.commands.files-update :as files-update]
    [app.rpc.commands.mcp :as mcp]
    [app.rpc.commands.mcp-write :as mcp-write]
@@ -990,3 +991,179 @@
     (t/is (not (str/includes? replay-plan "Seq Scan on file_change")))
     (t/is (str/includes? label-plan "file_change__file_id__created_at__labelled__idx"))
     (t/is (not (str/includes? label-plan "Seq Scan on file_change")))))
+
+;; --- REPLAY KEEPS THE REPLY DATA
+
+(defn- create-op
+  [page-id handle]
+  {:op "create_rect" :page-id page-id :id handle
+   :x 0 :y 0 :width 10 :height 10})
+
+(t/deftest replay-returns-the-created-ids-of-the-first-answer
+  (let [{:keys [profile file-id page-id]} (create-fixture)
+        request (uuid/next)
+        args    {:file-id file-id
+                 :request-id request
+                 :operations [(create-op page-id "$tmp:a") (create-op page-id "$tmp:b")]}
+        first   (call! profile :mcp-apply-operations args)
+        objs1   (object-count file-id page-id)
+        replay  (call! profile :mcp-apply-operations args)]
+    (t/is (nil? (:error first)))
+    (t/is (= 2 (count (:created-ids (:result first)))))
+    (t/is (nil? (:error replay)))
+    (t/is (true? (:already-applied (:result replay))))
+    (t/is (= (:created-ids (:result first)) (:created-ids (:result replay))))
+    (t/is (not (contains? (:result replay) :replay-truncated)))
+    (t/is (= objs1 (object-count file-id page-id)))))
+
+(t/deftest replay-of-a-call-without-handles-returns-an-empty-map
+  (let [{:keys [profile file-id]} (create-fixture)
+        request (uuid/next)
+        args    {:file-id file-id
+                 :request-id request
+                 :operations [{:op "create_page" :name "Two"}]}
+        _       (call! profile :mcp-apply-operations args)
+        replay  (call! profile :mcp-apply-operations args)]
+    (t/is (true? (:already-applied (:result replay))))
+    (t/is (= {} (:created-ids (:result replay))))))
+
+(t/deftest replay-of-a-split-write-returns-the-created-ids-of-every-batch
+  (let [{:keys [profile file-id page-id]} (create-fixture)
+        request (uuid/next)
+        args    {:file-id file-id
+                 :request-id request
+                 :allow-split true
+                 :snapshot false
+                 :operations (split-ops page-id)}
+        first   (call! profile :mcp-apply-operations args)
+        rows    (count (file-changes file-id))
+        replay  (call! profile :mcp-apply-operations args)]
+    (t/is (nil? (:error first)))
+    (t/is (= 2 (:commits (:result first))))
+    (t/is (= 302 (count (:created-ids (:result first)))))
+    (t/is (true? (:already-applied (:result replay))))
+    (t/is (= (:created-ids (:result first)) (:created-ids (:result replay))))
+    ;; Only the first change row of the call keeps the reply
+    (t/is (= 1 (count (th/db-exec! ["SELECT id FROM file_change
+                                      WHERE file_id = ? AND mcp_reply IS NOT NULL
+                                        AND changes IS NOT NULL AND label IS NULL"
+                                    file-id]))))
+    (t/is (= rows (count (file-changes file-id))))))
+
+(t/deftest replay-with-another-payload-is-a-new-write
+  (let [{:keys [profile file-id page-id]} (create-fixture)
+        request (uuid/next)
+        first   (call! profile :mcp-apply-operations
+                       {:file-id file-id :request-id request
+                        :operations [(create-op page-id "$tmp:a")]})
+        objs1   (object-count file-id page-id)
+        other   (call! profile :mcp-apply-operations
+                       {:file-id file-id :request-id request
+                        :operations [(create-op page-id "$tmp:a")
+                                     (create-op page-id "$tmp:b")]})]
+    (t/is (nil? (:error other)))
+    (t/is (not (:already-applied (:result other))))
+    (t/is (= 2 (count (:created-ids (:result other)))))
+    (t/is (not= (get (:created-ids (:result first)) "$tmp:a")
+                (get (:created-ids (:result other)) "$tmp:a")))
+    (t/is (= (+ objs1 2) (object-count file-id page-id)))))
+
+(t/deftest replay-cuts-a-reply-above-the-entry-cap-and-says-so
+  (let [{:keys [profile file-id page-id]} (create-fixture)
+        request (uuid/next)
+        args    {:file-id file-id
+                 :request-id request
+                 :operations (mapv #(create-op page-id (str "$tmp:r" %)) (range 5))}
+        first   (with-redefs-fn {#'mcp-write/replay-max-entries 3}
+                  #(call! profile :mcp-apply-operations args))
+        replay  (call! profile :mcp-apply-operations args)]
+    (t/is (= 5 (count (:created-ids (:result first)))))
+    (t/is (true? (:already-applied (:result replay))))
+    (t/is (= 3 (count (:created-ids (:result replay)))))
+    (t/is (true? (:replay-truncated (:result replay))))
+    (t/is (every? (fn [[k v]] (= v (get (:created-ids (:result first)) k)))
+                  (:created-ids (:result replay))))))
+
+(t/deftest replay-of-a-record-without-a-kept-reply-answers-as-before
+  (let [{:keys [profile file-id page-id]} (create-fixture)
+        request (uuid/next)
+        args    {:file-id file-id
+                 :request-id request
+                 :operations [(create-op page-id "$tmp:a")]}
+        _       (call! profile :mcp-apply-operations args)
+        _       (th/db-exec! ["UPDATE file_change SET mcp_reply = NULL WHERE file_id = ?" file-id])
+        replay  (call! profile :mcp-apply-operations args)]
+    (t/is (true? (:already-applied (:result replay))))
+    (t/is (not (contains? (:result replay) :created-ids)))))
+
+(t/deftest reply-is-kept-in-mcp-reply-and-never-in-data
+  (let [{:keys [profile file-id page-id]} (create-fixture)
+        _    (call! profile :mcp-apply-operations
+                    {:file-id file-id
+                     :request-id (uuid/next)
+                     :operations [(create-op page-id "$tmp:a")]})
+        rows (th/db-exec! ["SELECT (data IS NOT NULL) AS has_data,
+                                   (mcp_reply IS NOT NULL) AS has_reply
+                              FROM file_change WHERE file_id = ?" file-id])]
+    (t/is (seq rows))
+    (t/is (not-any? :has-data rows))
+    (t/is (= 1 (count (filter :has-reply rows))))))
+
+(t/deftest restoring-a-file-keeps-the-expiry-of-the-reply-row
+  (let [{:keys [profile file-id page-id]} (create-fixture)
+        args {:file-id file-id
+              :request-id (uuid/next)
+              :operations [(create-op page-id "$tmp:a")]}
+        _    (call! profile :mcp-apply-operations args)
+        ;; The snapshot row of the call has a label: the restore keeps it, as it
+        ;; keeps every labelled row. The revision rows have none.
+        sql  "SELECT id, deleted_at, (data IS NOT NULL) AS has_data,
+                     (mcp_reply IS NOT NULL) AS has_reply
+                FROM file_change WHERE file_id = ? AND label IS NULL"
+        before (th/db-exec! [sql file-id])
+        _      (db/tx-run! th/*system*
+                           (fn [{:keys [::db/conn]}]
+                             (#'files/restore-files conn [file-id])))
+        after  (th/db-exec! [sql file-id])]
+    (t/is (some :has-reply after))
+    (t/is (every? #(some? (:deleted-at %)) after))
+    (t/is (not-any? :has-data after))
+    (t/is (= (set (map (juxt :id :deleted-at) before))
+             (set (map (juxt :id :deleted-at) after))))))
+
+(t/deftest replay-reply-is-bounded
+  (let [ids       (into {} (map (fn [i] [(str "$tmp:shape-number-" i) (uuid/next)])) (range 10000))
+        extra     {:created-ids ids}
+        bytes     (#'mcp-write/replay-reply extra)
+        reply     (blob/decode bytes)
+        more      (into ids (map (fn [i] [(str "$tmp:more-" i) (uuid/next)])) (range 500))
+        capped    (blob/decode (#'mcp-write/replay-reply {:created-ids more}))
+        ;; Random text does not compress (`uuid/next` ids do: they share a
+        ;; prefix), so the encoded reply passes 1 MiB
+        results   (vec (repeatedly 2000 (fn [] {:font "x" :text (apply str (repeatedly 100 #(str (random-uuid))))})))
+        big       (#'mcp-write/replay-reply {:created-ids {"$tmp:a" (uuid/next)} :op-results results})
+        big-reply (blob/decode big)]
+    ;; The whole map of 10,000 handles fits the byte cap
+    (println "replay record, 10,000 handles:" (alength ^bytes bytes) "bytes")
+    (t/is (<= (alength ^bytes bytes) (* 1024 1024)))
+    (t/is (= ids (:created-ids reply)))
+    (t/is (not (contains? reply :replay-truncated)))
+    ;; Above 10,000 entries the list is cut and flagged
+    (t/is (= 10000 (count (:created-ids capped))))
+    (t/is (true? (:replay-truncated capped)))
+    ;; A reply above the byte cap loses its op-results first
+    (t/is (<= (alength ^bytes big) (* 1024 1024)))
+    (t/is (not (contains? big-reply :op-results)))
+    (t/is (= 1 (count (:created-ids big-reply))))
+    (t/is (true? (:replay-truncated big-reply)))
+    ;; A call that returns nothing keeps nothing
+    (t/is (nil? (#'mcp-write/replay-reply {})))))
+
+(t/deftest replay-reply-halves-the-ids-until-the-record-fits
+  (let [ids   (into {} (map (fn [i] [(str "$tmp:" i) (uuid/next)])) (range 1000))
+        bytes (with-redefs-fn {#'mcp-write/replay-max-bytes 4000}
+                #(#'mcp-write/replay-reply {:created-ids ids}))
+        reply (blob/decode bytes)]
+    (t/is (<= (alength ^bytes bytes) 4000))
+    (t/is (< 0 (count (:created-ids reply)) 1000))
+    (t/is (true? (:replay-truncated reply)))))
