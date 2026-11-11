@@ -49,14 +49,18 @@ export class McpLoadClient {
      *
      * @param name - tool name, for example apply_operations
      * @param args - tool arguments, already substituted
+     * @param timeoutMs - longest wait for the reply, in milliseconds. Left out, the SDK default of 60 s applies.
      */
-    async callTool(name: string, args: Record<string, unknown>): Promise<ToolCallOutcome> {
+    async callTool(name: string, args: Record<string, unknown>, timeoutMs?: number): Promise<ToolCallOutcome> {
         if (!this.client) {
             throw new Error("callTool was called before connect");
         }
         const started = performance.now();
         try {
-            const result = await this.client.callTool({ name, arguments: args });
+            const result = await this.client.callTool(
+                { name, arguments: args },
+                timeoutMs === undefined ? undefined : { timeout: timeoutMs }
+            );
             const durationMs = performance.now() - started;
             const text = McpLoadClient.textOf(result);
             // servers that predate isError report failures only as this text prefix

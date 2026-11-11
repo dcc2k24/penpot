@@ -98,6 +98,8 @@ describe("bundled fixtures", () => {
             "c5-large-readers",
             "c6-linked-library",
             "c7-shared-profile",
+            "c8-export-heavy",
+            "c8-export-heavy-reads",
             "s1-create-pages",
             "s2-reduced-shapes",
             "s3-tokens",
