@@ -1635,3 +1635,439 @@ test("export_subtree describes what the content of a path and of a text is", () 
     assert.match(description, /A path's or boolean's content is an SVG path string in page space/);
     assert.match(description, /a text's content is its tree of paragraphs/);
 });
+
+const REQUEST_MAX_VARIABLE = "PENPOT_MCP_SUBTREE_MAX_REQUEST_KB";
+
+/**
+ * Runs a test with PENPOT_MCP_SUBTREE_MAX_REQUEST_KB set, restoring the previous value after.
+ *
+ * @param kilobytes - the server maximum to set, as the environment text
+ * @param body - the test body
+ */
+async function withRequestMax(kilobytes: string, body: () => Promise<void>): Promise<void> {
+    const previous = process.env[REQUEST_MAX_VARIABLE];
+    process.env[REQUEST_MAX_VARIABLE] = kilobytes;
+    try {
+        await body();
+    } finally {
+        restore(REQUEST_MAX_VARIABLE, previous);
+    }
+}
+
+/**
+ * A page of noisy shapes of 20 kB each, which compress to about two thirds: the default 100 kB cap cannot hold
+ * it in one reply and 1 MB can.
+ *
+ * @param count - number of shapes
+ */
+function noisyPage(count = 40): Array<Record<string, unknown>> {
+    return Array.from({ length: count }, (_, n) => ({
+        ...sizedShape(n, 300),
+        content: randomBytes(10_000).toString("hex"),
+    }));
+}
+
+test("the schema accepts maxResponseKb from 1 to 10000 and refuses values outside them", () => {
+    const schema = z.object(ExportSubtreeArgs.schema);
+    const parse = (maxResponseKb: unknown) => schema.safeParse({ fileId: FILE, pageId: PAGE, maxResponseKb }).success;
+    assert.equal(parse(1), true);
+    assert.equal(parse(1000), true);
+    assert.equal(parse(10000), true);
+    assert.equal(parse(0), false);
+    assert.equal(parse(10001), false);
+    assert.equal(parse(1.5), false);
+    assert.equal(parse("1000"), false);
+    assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE }).success, true);
+});
+
+test("maxResponseKb with gzip-base64 is the cap of the reply: fewer calls, each within it, every shape once", async (t) => {
+    const page = noisyPage();
+    const small = harness();
+    servePage(small.backend, page);
+    const defaultWalk = await walkPage(small.tool, { encoding: "gzip-base64" });
+    const { backend, tool } = harness();
+    servePage(backend, page);
+    const walk = await walkPage(tool, { encoding: "gzip-base64", maxResponseKb: 1000 });
+    assert.deepEqual(walk.shapes, shownShapes(page));
+    assert.equal(
+        walk.sizes.every((size) => size <= 1_000_000),
+        true
+    );
+    assert.equal(
+        walk.sizes.some((size) => size > 100_000),
+        true,
+        "a reply is larger than the default cap"
+    );
+    assert.equal(walk.replies.length * 4 <= defaultWalk.replies.length, true);
+    t.diagnostic(`${defaultWalk.replies.length} calls at the default cap, ${walk.replies.length} at 1000 kB`);
+});
+
+test("maxResponseKb can also ask for less than the default cap", async () => {
+    const page = noisyPage(20);
+    const { backend, tool } = harness();
+    servePage(backend, page);
+    const walk = await walkPage(tool, { encoding: "gzip-base64", maxResponseKb: 30 });
+    assert.deepEqual(walk.shapes, shownShapes(page));
+    assert.equal(
+        walk.sizes.every((size) => size <= 30_000),
+        true
+    );
+    assert.equal(walk.replies.length > 1, true);
+});
+
+test("maxResponseKb replaces PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB for that call only", async () => {
+    await withSubtreeCap("20", async () => {
+        const page = noisyPage(20);
+        const { backend, tool } = harness();
+        servePage(backend, page);
+        const raised = await walkPage(tool, { encoding: "gzip-base64", maxResponseKb: 1000 });
+        assert.equal(raised.replies.length, 1);
+        const plain = await walkPage(tool, { encoding: "gzip-base64" });
+        assert.equal(
+            plain.sizes.every((size) => size <= 20_000),
+            true
+        );
+        assert.equal(plain.replies.length > 1, true);
+    });
+});
+
+test("maxResponseKb without encoding is refused before any window is read, and says why", async () => {
+    const { backend, tool } = harness();
+    servePage(backend, noisyPage(3));
+    const response = await tool.execute({ fileId: FILE, pageId: PAGE, maxResponseKb: 1000 });
+    assert.equal(response.isError, true);
+    assert.match(
+        textOf(response),
+        /maxResponseKb can only be used with encoding "gzip-base64": it is for scripts, and a model client keeps the default cap\./
+    );
+    assert.equal(paramsOf(backend.calls).length, 0);
+});
+
+test("maxResponseKb with filePath is refused before any window is read", async () => {
+    const { backend, tool } = harness();
+    servePage(backend, noisyPage(3));
+    const response = await tool.execute({
+        fileId: FILE,
+        pageId: PAGE,
+        filePath: path.join(os.tmpdir(), "never.json"),
+        encoding: "gzip-base64",
+        maxResponseKb: 1000,
+    });
+    assert.equal(response.isError, true);
+    assert.match(textOf(response), /maxResponseKb cannot be used with filePath/);
+    assert.equal(paramsOf(backend.calls).length, 0);
+});
+
+test("maxResponseKb above the server maximum is refused naming the limit, at the default and at a set maximum", async () => {
+    const { backend, tool } = harness();
+    servePage(backend, noisyPage(3));
+    const response = await tool.execute({
+        fileId: FILE,
+        pageId: PAGE,
+        encoding: "gzip-base64",
+        maxResponseKb: 2001,
+    });
+    assert.equal(response.isError, true);
+    assert.match(
+        textOf(response),
+        /maxResponseKb 2001 is above the server maximum of 2000 kB \(PENPOT_MCP_SUBTREE_MAX_REQUEST_KB\)\./
+    );
+    assert.equal(paramsOf(backend.calls).length, 0);
+    // exactly the maximum is accepted
+    const ok = await tool.execute({ fileId: FILE, pageId: PAGE, encoding: "gzip-base64", maxResponseKb: 2000 });
+    assert.notEqual(ok.isError, true, textOf(ok));
+    await withRequestMax("500", async () => {
+        const low = harness();
+        servePage(low.backend, noisyPage(3));
+        const refused = await low.tool.execute({
+            fileId: FILE,
+            pageId: PAGE,
+            encoding: "gzip-base64",
+            maxResponseKb: 501,
+        });
+        assert.equal(refused.isError, true);
+        assert.match(textOf(refused), /above the server maximum of 500 kB/);
+        const accepted = await low.tool.execute({
+            fileId: FILE,
+            pageId: PAGE,
+            encoding: "gzip-base64",
+            maxResponseKb: 500,
+        });
+        assert.notEqual(accepted.isError, true, textOf(accepted));
+    });
+});
+
+test("without maxResponseKb the replies are what they were: the default cap, same as asking for 100", async () => {
+    const page = noisyPage();
+    const first = harness();
+    servePage(first.backend, page);
+    const second = harness();
+    servePage(second.backend, page);
+    const absent = await walkPage(first.tool, { encoding: "gzip-base64" });
+    const explicit = await walkPage(second.tool, { encoding: "gzip-base64", maxResponseKb: 100 });
+    assert.equal(
+        absent.sizes.every((size) => size <= 100_000),
+        true
+    );
+    assert.deepEqual(
+        absent.replies.map((reply) => reply.nextCursor),
+        explicit.replies.map((reply) => reply.nextCursor)
+    );
+    assert.deepEqual(absent.sizes, explicit.sizes);
+});
+
+test("a raised cap keeps the guarantees: the 16 MB gather limit, never cut, a cursor while shapes remain", async () => {
+    await withRequestMax("10000", async () => {
+        const page = Array.from({ length: 8000 }, (_, n) => sizedShape(n, 5000));
+        const { backend, tool } = harness();
+        servePage(backend, page);
+        const walk = await walkPage(tool, { encoding: "gzip-base64", maxResponseKb: 10000 });
+        assert.equal(walk.shapes.length, page.length);
+        const sizes = walk.replies.map((reply) => (reply.shapes as { bytes: number }).bytes);
+        assert.equal(
+            sizes.every((bytes) => bytes <= 16 * 1024 * 1024),
+            true,
+            `plain bytes per call ${sizes.join(", ")}`
+        );
+        assert.equal(walk.replies.length >= 3, true);
+    });
+});
+
+test("a raised cap keeps the rate-limit partial reply, with the cursor and a note", async () => {
+    const { backend, tool } = harness();
+    backend.respond(COMMAND, (params: object) => {
+        if ((params as { cursor?: string }).cursor === "cursor-2") {
+            throw new BackendRateLimitError(7);
+        }
+        return WINDOW_1;
+    });
+    const response = await tool.execute({
+        fileId: FILE,
+        pageId: PAGE,
+        encoding: "gzip-base64",
+        maxResponseKb: 1000,
+    });
+    const body = JSON.parse(textOf(response)) as Reply & { note?: string };
+    assert.equal(body.windows, 1);
+    assert.equal(body.truncated, true);
+    assert.equal(body.nextCursor, "cursor-2");
+    assert.deepEqual(
+        decodedShapes(body.shapes).map((shape) => shape.id),
+        [0, 1, 2].map(idOf)
+    );
+    assert.match(body.note ?? "", /rate limit stopped this call after 1 backend window/);
+});
+
+test("a shape above a raised cap is still cut and listed, and the walk goes on after it", async () => {
+    const page = [
+        sizedShape(0, 300),
+        { ...sizedShape(1, 300), content: randomBytes(40_000).toString("hex") },
+        sizedShape(2, 300),
+    ];
+    const { backend, tool } = harness();
+    servePage(backend, page);
+    const walk = await walkPage(tool, { encoding: "gzip-base64", maxResponseKb: 20 });
+    assert.deepEqual(
+        walk.shapes.map((shape) => shape.id),
+        [idOf(0), idOf(1), idOf(2)]
+    );
+    assert.match(JSON.stringify(walk.replies), /oversize/);
+});
+
+test("PENPOT_MCP_SUBTREE_MAX_REQUEST_KB defaults to 2000 and accepts whole kilobytes from 1 to 10000", () => {
+    assert.equal(ExportSubtreeTool.readRequestMaxBytes({}), 2_000_000);
+    assert.equal(ExportSubtreeTool.readRequestMaxBytes({ PENPOT_MCP_SUBTREE_MAX_REQUEST_KB: "" }), 2_000_000);
+    assert.equal(ExportSubtreeTool.readRequestMaxBytes({ PENPOT_MCP_SUBTREE_MAX_REQUEST_KB: "1" }), 1_000);
+    assert.equal(ExportSubtreeTool.readRequestMaxBytes({ PENPOT_MCP_SUBTREE_MAX_REQUEST_KB: "10000" }), 10_000_000);
+    // it does not follow the other caps
+    assert.equal(
+        ExportSubtreeTool.readRequestMaxBytes({
+            PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB: "50",
+            PENPOT_MCP_MAX_TOOL_RESPONSE_KB: "50",
+        }),
+        2_000_000
+    );
+});
+
+test("a server maximum outside 1 to 10000 fails the tool at start, naming the variable", () => {
+    for (const raw of ["0", "-1", "10001", "1.5", "abc"]) {
+        assert.throws(
+            () => ExportSubtreeTool.readRequestMaxBytes({ PENPOT_MCP_SUBTREE_MAX_REQUEST_KB: raw }),
+            /PENPOT_MCP_SUBTREE_MAX_REQUEST_KB must be a whole number of kilobytes from 1 to 10000/,
+            raw
+        );
+    }
+    const previous = process.env[REQUEST_MAX_VARIABLE];
+    process.env[REQUEST_MAX_VARIABLE] = "10001";
+    try {
+        assert.throws(() => harness(), /PENPOT_MCP_SUBTREE_MAX_REQUEST_KB/);
+    } finally {
+        restore(REQUEST_MAX_VARIABLE, previous);
+    }
+});
+
+test("the description and the schema say maxResponseKb is for scripts, needs gzip-base64 and has a server maximum", () => {
+    const { tool } = harness();
+    const description = tool.getToolDescription();
+    assert.match(description, /maxResponseKb/);
+    assert.match(description, /PENPOT_MCP_SUBTREE_MAX_REQUEST_KB/);
+    const text = ExportSubtreeArgs.schema.maxResponseKb.description ?? "";
+    assert.match(text, /For scripts only/);
+    assert.match(text, /gzip-base64/);
+    assert.match(text, /PENPOT_MCP_SUBTREE_MAX_REQUEST_KB/);
+});
+
+test("a raised cap is filled when the shapes compress several times: a call reads more than one window", async (t) => {
+    // 20 kB shapes of which 6 kB is hex noise: about 1 byte of reply for 5 of JSON
+    const page: Array<Record<string, unknown>> = Array.from({ length: 1200 }, (_, n) => ({
+        ...sizedShape(n, 300),
+        content: randomBytes(3000).toString("hex") + filler(n, 14_000, false),
+    }));
+    const { backend, tool } = harness();
+    servePage(backend, page);
+    const walk = await walkPage(tool, { encoding: "gzip-base64", maxResponseKb: 1000 });
+    assert.equal(walk.shapes.length, page.length);
+    assert.deepEqual(
+        walk.shapes.map((shape) => shape.id),
+        page.map((shape) => shape.id)
+    );
+    assert.equal(
+        walk.sizes.every((size) => size <= 1_000_000),
+        true
+    );
+    const first = walk.replies[0];
+    assert.equal(first.windows > 1, true, `the first reply read ${first.windows} window`);
+    const plainPerReply = (walk.replies[0].shapes as { bytes: number }).bytes;
+    const ratio = plainPerReply / walk.sizes[0];
+    assert.equal(ratio > 3.5, true, `test data compresses ${ratio} times`);
+    // every reply but the last is more than three quarters full
+    assert.equal(
+        walk.sizes.slice(0, -1).every((size) => size > 750_000),
+        true,
+        `reply sizes ${walk.sizes.join(", ")}`
+    );
+    t.diagnostic(
+        `windows ${walk.replies.map((r) => r.windows).join(",")} ratio ${ratio.toFixed(1)}; ${walk.replies.length} calls, replies of ${walk.sizes.slice(0, 3).join(", ")} bytes`
+    );
+});
+
+test("plain default packing is pinned to the numbers it had before maxResponseKb: 72 calls, fixed sizes and cursors", async () => {
+    // measured on the code before the parameter was added; plain mode asks for the room as it is (ratio 1)
+    const { backend, tool } = harness();
+    servePage(backend, variedPage(300));
+    const walk = await walkPage(tool);
+    assert.equal(walk.replies.length, 72);
+    assert.equal(paramsOf(backend.calls).length, 145);
+    assert.deepEqual(
+        walk.sizes.slice(0, 12),
+        [80421, 87475, 94780, 94579, 77711, 85016, 92320, 99624, 68361, 82556, 89860, 97164]
+    );
+    assert.equal(walk.sizes[walk.sizes.length - 1], 31804);
+    assert.equal(
+        walk.sizes.reduce((sum, size) => sum + size, 0),
+        6_194_329
+    );
+    assert.equal(
+        walk.replies.reduce((sum, reply) => sum + reply.windows, 0),
+        83
+    );
+    assert.deepEqual(
+        walk.replies.slice(0, 12).map((reply) => reply.nextCursor),
+        ["c5", "c9", "c13", "c16", "c20", "c24", "c28", "c32", "c35", "c39", "c43", "c47"]
+    );
+    assert.equal(walk.replies[walk.replies.length - 2].nextCursor, "c298");
+    assert.equal(walk.replies[walk.replies.length - 1].nextCursor, undefined);
+});
+
+test("gzip default packing (no maxResponseKb) is the improved packing: later windows are asked for what fits with the margin", async () => {
+    const page = Array.from({ length: 300 }, (_, n) => ({
+        ...sizedShape(n, 300),
+        content: randomBytes(3000).toString("hex") + filler(n, 14_000, false),
+    }));
+    const { backend, tool } = harness();
+    servePage(backend, page);
+    const walk = await walkPage(tool, { encoding: "gzip-base64" });
+    assert.equal(walk.shapes.length, 300);
+    assert.equal(
+        walk.sizes.every((size) => size <= 100_000),
+        true
+    );
+    assert.equal(walk.replies[0].windows > 1, true);
+});
+
+test("the advice to raise the cap names maxResponseKb and the server maximum when the call set it", async () => {
+    const page = [sizedShape(0, 300), { ...sizedShape(1, 300), content: randomBytes(40_000).toString("hex") }];
+    const { backend, tool } = harness();
+    servePage(backend, page);
+    const walk = await walkPage(tool, { encoding: "gzip-base64", maxResponseKb: 20 });
+    const cut = walk.replies.find((reply) => "oversize" in reply) as unknown as Reply & { note: string };
+    assert.match(
+        cut.note,
+        /Raise maxResponseKb \(up to the server maximum of 2000 kB, PENPOT_MCP_SUBTREE_MAX_REQUEST_KB\)/
+    );
+    assert.doesNotMatch(cut.note, /PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB/);
+    // without the parameter the advice is the old one
+    const plain = harness();
+    servePage(plain.backend, page);
+    let walkPlain: Walk | undefined;
+    await withSubtreeCap("20", async () => {
+        const again = harness();
+        servePage(again.backend, page);
+        walkPlain = await walkPage(again.tool, { encoding: "gzip-base64" });
+    });
+    const cutPlain = (walkPlain as Walk).replies.find((reply) => "oversize" in reply) as unknown as Reply & {
+        note: string;
+    };
+    assert.match(cutPlain.note, /Raise PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB \(up to 10000\)/);
+    assert.doesNotMatch(cutPlain.note, /maxResponseKb/);
+});
+
+test("the error of a shape that cannot fit even cut names maxResponseKb for a call that set it", async () => {
+    const huge = { ...sizedShape(1, 300) };
+    for (let n = 0; n < 4000; n++) {
+        huge[`key${n}`] = randomBytes(6).toString("hex");
+    }
+    const { backend, tool } = harness();
+    servePage(backend, [huge]);
+    const asked = await tool.execute({ fileId: FILE, pageId: PAGE, encoding: "gzip-base64", maxResponseKb: 1 });
+    assert.equal(asked.isError, true);
+    assert.match(textOf(asked), /Raise maxResponseKb \(up to the server maximum of 2000 kB/);
+    assert.doesNotMatch(textOf(asked), /PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB/);
+});
+
+test("maxResponseKb with filePath is refused with the filePath message, with or without encoding", async () => {
+    const { backend, tool } = harness();
+    servePage(backend, noisyPage(3));
+    for (const encoding of [undefined, "gzip-base64"]) {
+        const response = await tool.execute({
+            fileId: FILE,
+            pageId: PAGE,
+            filePath: path.join(os.tmpdir(), "never.json"),
+            maxResponseKb: 1000,
+            ...(encoding === undefined ? {} : { encoding }),
+        });
+        assert.equal(response.isError, true);
+        assert.match(textOf(response), /maxResponseKb cannot be used with filePath/, String(encoding));
+    }
+});
+
+test("a server maximum below the default reply cap fails the tool at start; an unset one follows a raised default cap", async () => {
+    // set below the default cap of 100 kB: refused
+    assert.throws(
+        () => ExportSubtreeTool.readRequestMaxBytes({ PENPOT_MCP_SUBTREE_MAX_REQUEST_KB: "50" }, 100_000),
+        /PENPOT_MCP_SUBTREE_MAX_REQUEST_KB \(50 kB\) must not be below the default reply cap of 100 kB/
+    );
+    assert.equal(ExportSubtreeTool.readRequestMaxBytes({ PENPOT_MCP_SUBTREE_MAX_REQUEST_KB: "100" }, 100_000), 100_000);
+    // unset: 2000 kB, or the default cap when that is larger
+    assert.equal(ExportSubtreeTool.readRequestMaxBytes({}, 100_000), 2_000_000);
+    assert.equal(ExportSubtreeTool.readRequestMaxBytes({}, 5_000_000), 5_000_000);
+    // through the constructor and the environment
+    await withSubtreeCap("300", async () => {
+        await withRequestMax("200", async () => {
+            assert.throws(() => harness(), /must not be below the default reply cap of 300 kB/);
+        });
+        await withRequestMax("300", async () => {
+            assert.doesNotThrow(() => harness());
+        });
+    });
+});

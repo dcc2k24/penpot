@@ -84,6 +84,14 @@ const GZIP_RATIO_GUESS = 3;
 /** Name of the encoding that compresses the shapes of a reply. */
 const GZIP_ENCODING = "gzip-base64";
 
+/** The response cap of one call, and whether the caller asked for it with maxResponseKb. */
+interface CallCap {
+    /** Cap in bytes. */
+    bytes: number;
+    /** True when the cap is the maxResponseKb of the call, so advice about the cap names that parameter. */
+    asked: boolean;
+}
+
 /** Size of one window as the backend is asked for it. */
 interface WindowSize {
     /** Most shapes in the window. */
@@ -159,6 +167,20 @@ export class ExportSubtreeArgs {
                     "the number of shapes. The other fields stay plain, and the cap applies to the reply as sent. " +
                     "Inline mode only: it is refused with filePath."
             ),
+        maxResponseKb: z
+            .number()
+            .int()
+            .min(1)
+            .max(10_000)
+            .optional()
+            .describe(
+                "For scripts only: a model should not ask for it. The most kilobytes this one reply may take, " +
+                    "in place of the default cap of the server, so that a script reads a page in fewer calls. " +
+                    "Allowed only with encoding gzip-base64, and up to the server maximum " +
+                    "(PENPOT_MCP_SUBTREE_MAX_REQUEST_KB; default 2000, or the default reply cap if that is larger): a larger value is " +
+                    "refused. Leave it out and the server's cap applies, as before. Inline mode only: it is " +
+                    "refused with filePath."
+            ),
     };
 
     fileId!: string;
@@ -178,6 +200,8 @@ export class ExportSubtreeArgs {
     compact?: boolean;
 
     encoding?: typeof GZIP_ENCODING;
+
+    maxResponseKb?: number;
 }
 
 /** One window of the walk, as the backend answers it. */
@@ -292,8 +316,17 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
     /** Environment variable that sets the response cap of this tool, in kilobytes. */
     public static readonly CAP_VARIABLE = "PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB";
 
+    /** Environment variable that sets the largest cap a call may ask for with maxResponseKb, in kilobytes. */
+    public static readonly REQUEST_MAX_VARIABLE = "PENPOT_MCP_SUBTREE_MAX_REQUEST_KB";
+
+    /** Largest cap a call may ask for when PENPOT_MCP_SUBTREE_MAX_REQUEST_KB is unset, in bytes. */
+    private static readonly DEFAULT_REQUEST_MAX_BYTES = 2_000_000;
+
     /** Response cap of this tool, in bytes. */
     private readonly capBytes: number;
+
+    /** Largest cap that one call may ask for with maxResponseKb, in bytes. */
+    private readonly requestMaxBytes: number;
 
     /**
      * Most bytes of JSON text that one window asks for: the largest the backend takes, or less when the backend
@@ -306,11 +339,13 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
      *
      * @param mcpServer - the MCP server instance
      * @param services - backend, rate limiter and write queue shared by all backend tools
-     * @throws Error when PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB is set and is not a whole number of kilobytes from 1 to 10000
+     * @throws Error when PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB or PENPOT_MCP_SUBTREE_MAX_REQUEST_KB is set and is not a
+     *   whole number of kilobytes from 1 to 10000, or PENPOT_MCP_SUBTREE_MAX_REQUEST_KB is below the default reply cap
      */
     constructor(mcpServer: PenpotMcpServer, services: BackendServices) {
         super(mcpServer, ExportSubtreeArgs.schema, services);
         this.capBytes = ExportSubtreeTool.readCapBytes(process.env);
+        this.requestMaxBytes = ExportSubtreeTool.readRequestMaxBytes(process.env, this.capBytes);
         this.windowBytes = ExportSubtreeTool.windowBytesFor(BackendSettings.readMaxResponseMb(process.env));
     }
 
@@ -335,6 +370,53 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
      */
     public static readCapBytes(env: NodeJS.ProcessEnv): number {
         return BackendTool.readCapBytes(env, ExportSubtreeTool.CAP_VARIABLE, BackendTool.readMaxResponseBytes(env));
+    }
+
+    /**
+     * Reads the largest cap that a call may ask for with maxResponseKb: PENPOT_MCP_SUBTREE_MAX_REQUEST_KB, or 2000 kB
+     * when it is unset (or the default reply cap when that is larger). A maximum that is set below the default reply
+     * cap is refused, so that a script that asks for the default size is never turned away.
+     *
+     * @param env - environment to read; the process environment in production
+     * @param defaultCapBytes - the default reply cap in bytes, which the maximum may not be below; 0 for none
+     * @returns the largest cap in bytes
+     * @throws Error when the setting is not a whole number of kilobytes from 1 to 10000, or is below the default cap
+     */
+    public static readRequestMaxBytes(env: NodeJS.ProcessEnv, defaultCapBytes = 0): number {
+        const maximum = BackendTool.readCapBytes(
+            env,
+            ExportSubtreeTool.REQUEST_MAX_VARIABLE,
+            Math.max(ExportSubtreeTool.DEFAULT_REQUEST_MAX_BYTES, defaultCapBytes)
+        );
+        if (maximum < defaultCapBytes) {
+            throw new Error(
+                `${ExportSubtreeTool.REQUEST_MAX_VARIABLE} (${maximum / 1_000} kB) must not be below the default ` +
+                    `reply cap of ${defaultCapBytes / 1_000} kB (${ExportSubtreeTool.CAP_VARIABLE}), so that a ` +
+                    "script can always ask for the default size."
+            );
+        }
+        return maximum;
+    }
+
+    /**
+     * Returns the advice to raise the cap, in the words that fit how the cap of the call was set.
+     *
+     * @param cap - the cap of the call
+     * @param server - the advice when the cap is the cap of the server
+     */
+    /** Whether the call already asked for the server maximum, so a larger cap cannot be asked for. */
+    private atServerMax(cap: CallCap): boolean {
+        return cap.asked && cap.bytes >= this.requestMaxBytes;
+    }
+
+    private raiseAdvice(cap: CallCap, server: string): string {
+        if (!cap.asked) {
+            return server;
+        }
+        return (
+            `maxResponseKb (up to the server maximum of ${this.requestMaxBytes / 1_000} kB, ` +
+            `${ExportSubtreeTool.REQUEST_MAX_VARIABLE})`
+        );
     }
 
     /**
@@ -370,7 +452,10 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
             "to get the whole shape. " +
             "With compact: true each shape leaves out its null keys and its default values, and the reply lists the " +
             "defaults once. For scripts there is also encoding gzip-base64 (the shapes come as a base64 gzip " +
-            "text); a model should not ask for it. ";
+            "text); a model should not ask for it. " +
+            "A script can also pass maxResponseKb (with gzip-base64 only) to raise the cap of one call, up to the " +
+            "server maximum PENPOT_MCP_SUBTREE_MAX_REQUEST_KB, to read a page in fewer calls; a model should not " +
+            "ask for it either. ";
         if (this.mcpServer.isFileSystemAccessEnabled()) {
             description +=
                 "With filePath the tool reads every window and writes one JSON file, " +
@@ -393,12 +478,15 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
      *
      * @param args - the validated tool arguments
      * @param userToken - the MCP token of the request
-     * @throws Error when filePath is refused, the path is not allowed, a cursor or an encoding comes with filePath, or
-     *   the walk fails
+     * @throws Error when filePath is refused, the path is not allowed, a cursor, an encoding or maxResponseKb comes
+     *   with filePath, maxResponseKb comes without gzip-base64 or above the server maximum, or the walk fails
      */
     protected async executeBackend(args: ExportSubtreeArgs, userToken: string): Promise<ToolResponse> {
+        if (args.filePath !== undefined && args.maxResponseKb !== undefined) {
+            throw new Error("maxResponseKb cannot be used with filePath: a file holds the whole subtree.");
+        }
         if (args.filePath === undefined) {
-            return this.inlineReply(args, userToken);
+            return this.inlineReply(args, userToken, this.capOf(args));
         }
         this.checkFilePath(args.filePath, args.overwrite === true);
         if (args.cursor !== undefined) {
@@ -411,6 +499,33 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
         }
         const result = await this.writeFile(args, userToken, args.filePath, args.overwrite === true);
         return this.jsonResponse(result);
+    }
+
+    /**
+     * Returns the response cap of one call: maxResponseKb when it is given, else the cap of the server.
+     *
+     * @param args - the validated tool arguments
+     * @returns the cap
+     * @throws Error when maxResponseKb comes without gzip-base64, or is above the server maximum
+     */
+    private capOf(args: ExportSubtreeArgs): CallCap {
+        if (args.maxResponseKb === undefined) {
+            return { bytes: this.capBytes, asked: false };
+        }
+        if (args.encoding !== GZIP_ENCODING) {
+            throw new Error(
+                `maxResponseKb can only be used with encoding "${GZIP_ENCODING}": it is for scripts, and a model ` +
+                    "client keeps the default cap."
+            );
+        }
+        const asked = args.maxResponseKb * 1_000;
+        if (asked > this.requestMaxBytes) {
+            throw new Error(
+                `maxResponseKb ${args.maxResponseKb} is above the server maximum of ` +
+                    `${this.requestMaxBytes / 1_000} kB (${ExportSubtreeTool.REQUEST_MAX_VARIABLE}).`
+            );
+        }
+        return { bytes: asked, asked: true };
     }
 
     /**
@@ -434,14 +549,15 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
      *
      * @param args - the validated tool arguments
      * @param userToken - the MCP token of the request
+     * @param cap - the response cap of this call
      * @throws Error when a shape cannot fit even cut, or a window fails
      */
-    private async inlineReply(args: ExportSubtreeArgs, userToken: string): Promise<ToolResponse> {
+    private async inlineReply(args: ExportSubtreeArgs, userToken: string, cap: CallCap): Promise<ToolResponse> {
         const gzip = args.encoding === GZIP_ENCODING;
         const limit = args.limit ?? MAX_LIMIT;
         const windows: ReadWindow[] = [];
         let head: ReplyHead | undefined;
-        let budget = this.capBytes - HEAD_RESERVE_BYTES;
+        let budget = cap.bytes - HEAD_RESERVE_BYTES;
         let used = 0;
         let plain = 0;
         let count = 0;
@@ -455,7 +571,12 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
             const ratio = used > 0 ? plain / used : GZIP_RATIO_GUESS;
             const size = {
                 limit: limit - count,
-                maxJsonBytes: this.askBytes(budget - used, gzip ? ratio : 1, MAX_PLAIN_BYTES_PER_CALL - plain),
+                maxJsonBytes: this.askBytes(
+                    budget - used,
+                    // a later window is costed with the margin, so it is asked for what fits with the margin
+                    gzip ? (used > 0 ? ratio / GZIP_ESTIMATE_MARGIN : ratio) : 1,
+                    MAX_PLAIN_BYTES_PER_CALL - plain
+                ),
             };
             let window: ReadWindow;
             try {
@@ -474,7 +595,7 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
                 throw error;
             }
             if (head === undefined) {
-                budget = this.capBytes - this.headBytes(ExportSubtreeTool.headOf(window.raw), window.nextCursor, gzip);
+                budget = cap.bytes - this.headBytes(ExportSubtreeTool.headOf(window.raw), window.nextCursor, gzip);
                 const fitted = await this.fitFirstWindow(
                     userToken,
                     args,
@@ -482,7 +603,8 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
                     ExportSubtreeTool.headOf(window.raw),
                     window,
                     budget,
-                    gzip
+                    gzip,
+                    cap
                 );
                 head = fitted.head;
                 window = fitted.window;
@@ -516,7 +638,7 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
                 break;
             }
         }
-        return this.finishReply(head, windows, gzip, limitNote);
+        return this.finishReply(head, windows, gzip, limitNote, cap);
     }
 
     /**
@@ -561,6 +683,7 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
      * @param first - the first window, as the backend answered it
      * @param budget - the bytes that the shapes may take in the reply
      * @param gzip - whether the shapes are compressed
+     * @param cap - the response cap of this call
      * @returns the window that fits, and the head of the answer it came from
      * @throws Error when a shape cannot fit even cut, or the window will not fit after a few tries
      */
@@ -571,7 +694,8 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
         head: ReplyHead,
         first: ReadWindow,
         budget: number,
-        gzip: boolean
+        gzip: boolean,
+        cap: CallCap
     ): Promise<{ window: ReadWindow; head: ReplyHead }> {
         let window = first;
         let current = head;
@@ -590,12 +714,14 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
                 if (window.cost <= budget) {
                     return { window, head: current };
                 }
-                return { window: await this.trimmedWindow(current, window, gzip), head: current };
+                return { window: await this.trimmedWindow(current, window, gzip, cap), head: current };
             }
         }
+        const advice = this.atServerMax(cap)
+            ? `The window does not fit even at the server maximum of ${this.requestMaxBytes / 1_000} kB.`
+            : `Raise ${this.raiseAdvice(cap, ExportSubtreeTool.CAP_VARIABLE)}, or read the shapes with get_shapes and fields.`;
         throw new Error(
-            `A window would not fit the response cap of ${this.capBytes} bytes after ${MAX_SHRINKS} tries. ` +
-                `Raise ${ExportSubtreeTool.CAP_VARIABLE}, or read the shapes with get_shapes and fields.`
+            `A window would not fit the response cap of ${cap.bytes} bytes after ${MAX_SHRINKS} tries. ${advice}`
         );
     }
 
@@ -624,13 +750,15 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
      * @param gzip - whether the shapes are compressed
      * @param limitNote - note to add when the rate limit or a stale cursor cut the call, or undefined. A reply of
      *   one window that fits only without the note is sent without it: the note never makes the call fail.
+     * @param cap - the response cap of this call; the cap of the server by default
      * @throws Error when one window alone does not fit
      */
     private async finishReply(
         head: ReplyHead | undefined,
         windows: ReadWindow[],
         gzip: boolean,
-        limitNote?: string
+        limitNote?: string,
+        cap: CallCap = { bytes: this.capBytes, asked: false }
     ): Promise<ToolResponse> {
         if (head === undefined || windows.length === 0) {
             throw new Error("The backend answered no window.");
@@ -644,11 +772,11 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
                     head,
                     held,
                     gzip ? await this.packed(shapes) : shapes,
-                    ExportSubtreeTool.withLimitNote(this.noteOf(held), note)
+                    ExportSubtreeTool.withLimitNote(this.noteOf(held, cap), note)
                 )
             );
             const bytes = Buffer.byteLength(text, "utf8");
-            if (bytes <= this.capBytes) {
+            if (bytes <= cap.bytes) {
                 return new TextResponse(text);
             }
             if (held.length === 1 && note !== undefined) {
@@ -656,10 +784,10 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
                 continue;
             }
             if (held.length === 1) {
-                throw this.oversizeError(held[0].shapes[0]);
+                throw this.oversizeError(held[0].shapes[0], cap);
             }
             held = gzip
-                ? ExportSubtreeTool.leadingWindows(held, (this.capBytes * GZIP_FIT_SHARE) / bytes)
+                ? ExportSubtreeTool.leadingWindows(held, (cap.bytes * GZIP_FIT_SHARE) / bytes)
                 : held.slice(0, -1);
         }
     }
@@ -731,19 +859,25 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
      * Returns the `oversize` list and the note of a reply that holds a cut shape, or undefined.
      *
      * @param windows - the windows of the reply
+     * @param cap - the response cap of this call
      */
-    private noteOf(windows: ReadWindow[]): { oversize: unknown[]; note: string } | undefined {
+    private noteOf(windows: ReadWindow[], cap: CallCap): { oversize: unknown[]; note: string } | undefined {
         const oversize = windows.flatMap((window) => (window.oversize === undefined ? [] : [window.oversize]));
         if (oversize.length === 0) {
             return undefined;
         }
-        const way = this.mcpServer.isFileSystemAccessEnabled()
-            ? "Raise PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB (up to 10000), or write the subtree to a file with filePath."
-            : "Raise PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB (up to 10000).";
+        const raise = this.raiseAdvice(cap, "PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB (up to 10000)");
+        const files = this.mcpServer.isFileSystemAccessEnabled();
+        const way = this.atServerMax(cap)
+            ? `The shape does not fit even at the server maximum of ${this.requestMaxBytes / 1_000} kB.` +
+              (files ? " Write the subtree to a file with filePath." : "")
+            : files
+              ? `Raise ${raise}, or write the subtree to a file with filePath.`
+              : `Raise ${raise}.`;
         return {
             oversize,
             note:
-                `A shape is larger than the response cap of ${this.capBytes} bytes, so its large attributes are ` +
+                `A shape is larger than the response cap of ${cap.bytes} bytes, so its large attributes are ` +
                 `shown as omitted; nextCursor continues after it. To get the whole shape: ${way}`,
         };
     }
@@ -881,12 +1015,13 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
      * @param head - the fields of the reply
      * @param window - the window that holds the shape, and only it
      * @param gzip - whether the shapes are compressed
+     * @param cap - the response cap of this call
      * @throws Error when the shape does not fit even with every attribute but its id and type cut
      */
-    private async trimmedWindow(head: ReplyHead, window: ReadWindow, gzip: boolean): Promise<ReadWindow> {
+    private async trimmedWindow(head: ReplyHead, window: ReadWindow, gzip: boolean, cap: CallCap): Promise<ReadWindow> {
         const shape = window.shapes[0];
         if (!isRecord(shape)) {
-            throw this.oversizeError(shape);
+            throw this.oversizeError(shape, cap);
         }
         const bytes = jsonBytes(shape);
         const trimmed: Record<string, unknown> = { ...shape };
@@ -902,8 +1037,8 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
         const fits = async (): Promise<boolean> => {
             const built = build();
             const field = gzip ? await this.packed([trimmed]) : [trimmed];
-            const reply = ExportSubtreeTool.replyOf(head, [built], field, this.noteOf([built]));
-            return jsonBytes(reply) <= this.capBytes;
+            const reply = ExportSubtreeTool.replyOf(head, [built], field, this.noteOf([built], cap));
+            return jsonBytes(reply) <= cap.bytes;
         };
         for (const key of ExportSubtreeTool.trimOrder(shape)) {
             if (await fits()) {
@@ -914,7 +1049,7 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
         }
         // with every value cut, only the id, the type and the markers are left, which fits any sane cap
         if (!(await fits())) {
-            throw this.oversizeError(shape);
+            throw this.oversizeError(shape, cap);
         }
         return build();
     }
@@ -944,13 +1079,16 @@ export class ExportSubtreeTool extends BackendTool<ExportSubtreeArgs> {
      * Builds the error of one shape that does not fit the response cap even with its large attributes cut.
      *
      * @param shape - the shape, in the caller's form
+     * @param cap - the response cap of this call
      */
-    private oversizeError(shape: unknown): Error {
+    private oversizeError(shape: unknown, cap: CallCap): Error {
         const id = isRecord(shape) ? shape.id : undefined;
         return new Error(
             `Shape ${String(id)} is ${jsonBytes(shape)} bytes of JSON and does not fit the response cap of ` +
-                `${this.capBytes} bytes even with its large attributes cut. Raise ` +
-                `${ExportSubtreeTool.CAP_VARIABLE} (in kilobytes, up to 10000).`
+                `${cap.bytes} bytes even with its large attributes cut. ` +
+                (this.atServerMax(cap)
+                    ? `It does not fit even at the server maximum of ${this.requestMaxBytes / 1_000} kB.`
+                    : `Raise ${this.raiseAdvice(cap, `${ExportSubtreeTool.CAP_VARIABLE} (in kilobytes, up to 10000)`)}.`)
         );
     }
 

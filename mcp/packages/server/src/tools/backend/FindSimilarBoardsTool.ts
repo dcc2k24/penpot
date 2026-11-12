@@ -108,6 +108,8 @@ export class FindSimilarBoardsTool extends BackendTool<FindSimilarBoardsArgs> {
             "200 px on a side are never boards. When no size repeats, it falls back to the frames at depth 1. " +
             "A frame up to a quarter taller than a standard screen is a wrapper, not a board, when most such frames hold " +
             "exactly one frame of the exact standard size and the same width: the screens inside are the boards. " +
+            "A frame size is also a wrapper when at least 90% of its frames each hold exactly one screen, of any exact standard size, as a direct child, centred with equal gaps on opposite sides (within 2 px) of at most 200 px; the size appears in otherSizes with relation wrapper, and a class below 90% is reported outside. " +
+            "Standard sizes are always kept. Loose boards that are clearly not screens are dropped: a frame larger than the screens in both directions with at least 4 times the area of the largest screen class (a section); a frame that holds exactly one loose board with a wrapper margin; a non-portrait frame that holds, or sits in, a frame of its own size (an annotation and its widget) and is under half the smallest screen class. An overlay (a sibling frame of a screen inside its wrapper, with at least half of its own area over that screen) is not a board. " +
             "Mode depth takes the visible frames up to depth levels below the page root; depth or boardNameRegex " +
             "alone chooses boards by hand. " +
             "selection says what was selected: mode, depth, fallback (true when auto fell back), basis " +
@@ -126,7 +128,9 @@ export class FindSimilarBoardsTool extends BackendTool<FindSimilarBoardsArgs> {
             "A screen that holds a frame of its own size counts that frame too, so it is close to, but not an exact copy of, the same screen without the frame. " +
             "Each group has boards (id, name, path and shapeCount), similarity (1 for exact copies, otherwise the " +
             "lowest similarity between linked boards) and exact (true when every board in the group is the same). " +
-            "Only groups of two or more boards are listed, largest first. " +
+            "Only groups of two or more boards are listed, largest first. A group whose boards have overlays (a board or group laid " +
+            "over a screen beside it in the same wrapper, see lint_page sibling-overlay) also has overlays, a list of " +
+            "boardId and shapeId, so copies that differ only by such a panel can be told apart; a timed-out overlay scan sets truncated. " +
             "Run it before generating code from a page, so that repeated boards are built once. " +
             "boards is the number of boards compared, and compared the number of pairs whose similarity was " +
             "computed. " +

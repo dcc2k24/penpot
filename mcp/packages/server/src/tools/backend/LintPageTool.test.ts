@@ -115,6 +115,7 @@ test("the lint_page schema refuses values outside the bounds and unknown rules",
         assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, minOverflow }).success, false);
     }
     assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, rules: ["scroll-candidate"] }).success, true);
+    assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, rules: ["sibling-overlay"] }).success, true);
     assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, rules: Array(9).fill("empty-board") }).success, true);
     assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, rules: Array(10).fill("empty-board") }).success, false);
     assert.equal(schema.safeParse({ fileId: FILE, pageId: PAGE, minShapes: 0 }).success, true);
@@ -194,6 +195,8 @@ test("lint_page describes scroll-candidate and the one-call fix", () => {
     assert.match(description, /suggested \(vertical, horizontal or both\) and inComponentCopy/);
     assert.match(description, /set overflowScroll on the main component/);
     assert.match(description, /one apply_operations call with an update_shape operation per frame/);
+    assert.match(description, /sibling-overlay \(mode auto only/);
+    assert.match(description, /detail coveredFraction and overlayBox/);
 });
 
 test("lint_page passes the selection, the chrome components and scroll-candidate findings through", async () => {

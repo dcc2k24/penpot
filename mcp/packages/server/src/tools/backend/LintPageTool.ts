@@ -56,6 +56,7 @@ export class LintPageArgs {
                     "scroll-hidden-control",
                     "off-board-control",
                     "scroll-candidate",
+                    "sibling-overlay",
                 ])
             )
             .min(1)
@@ -63,7 +64,7 @@ export class LintPageArgs {
             .optional()
             .describe(
                 "Rules to run (1 to 9 of: empty-board, instance-only-board, clipped-control, invisible-control, " +
-                    "scroll-hidden-control, off-board-control, scroll-candidate). Default: all of them."
+                    "scroll-hidden-control, off-board-control, scroll-candidate, sibling-overlay). Default: all of them."
             ),
         tolerance: z
             .number()
@@ -164,6 +165,8 @@ export class LintPageTool extends BackendTool<LintPageArgs> {
             "back to the frames at depth 1. " +
             "A frame up to a quarter taller than a standard screen is a wrapper, not a board, when most such frames hold " +
             "exactly one frame of the exact standard size and the same width: the screens inside are the boards. " +
+            "A frame size is also a wrapper when at least 90% of its frames each hold exactly one screen, of any exact standard size, as a direct child, centred with equal gaps on opposite sides (within 2 px) of at most 200 px; the size appears in otherSizes with relation wrapper, and a class below 90% is reported outside. " +
+            "Standard sizes are always kept. Loose boards that are clearly not screens are dropped: a frame larger than the screens in both directions with at least 4 times the area of the largest screen class (a section); a frame that holds exactly one loose board with a wrapper margin; a non-portrait frame that holds, or sits in, a frame of its own size (an annotation and its widget) and is under half the smallest screen class. An overlay (a sibling frame of a screen inside its wrapper, with at least half of its own area over that screen) is not a board. " +
             "Mode depth takes the visible frames up to depth levels below the page root; depth or boardNameRegex " +
             "alone chooses boards by hand. " +
             "selection says what was selected: mode, depth, fallback (true when auto fell back), basis " +
@@ -205,7 +208,9 @@ export class LintPageTool extends BackendTool<LintPageArgs> {
             "scroll-candidate (a frame that clips its content, has no overflowScroll, and has visible children " +
             "that reach past its right or bottom edge by at least minOverflow pixels and more " +
             "than tolerance; detail overflow with right and bottom, suggested (vertical, horizontal or both) and " +
-            "inComponentCopy). A background that covers the frame on both axes does not count. " +
+            "inComponentCopy); sibling-overlay (mode auto only: a board or group of any size that is not a screen and lies over a screen " +
+            "as its sibling in the same wrapper, covering at least half of its own area, not a component instance; a section child over a screen is not found; boardId is the covered screen, " +
+            "shapeId the overlay, detail coveredFraction and overlayBox). A background that covers the frame on both axes does not count. " +
             "For a frame with inComponentCopy true, set overflowScroll on the main component, because a write " +
             "on the copy is an override. " +
             "To apply the suggestions, send one apply_operations call with an update_shape operation per frame, " +

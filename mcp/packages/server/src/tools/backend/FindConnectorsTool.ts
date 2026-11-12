@@ -136,7 +136,10 @@ export class FindConnectorsTool extends BackendTool<FindConnectorsArgs> {
             "with no depth, boardNameRegex or mode, mode auto finds them by size; depth takes the frames up to that " +
             "level. A frame up to a quarter taller than a standard screen is a wrapper, not a board, when most such " +
             "frames hold exactly one frame of the exact standard size and the same width: the screens inside are " +
-            "the boards. selection says what was selected; nestedSameSize counts the boards that sit in a chain of frames of their own size; the board of a chain is the frame that matches boardNameRegex, else the one named like the unwrapped boards of that size, else the outermost. When it is present, deeperBoards counts the visible frames " +
+            "the boards. A frame size is also a wrapper when at least 90% of its frames each hold exactly one screen, of any exact standard size, as a direct child, centred with equal gaps on opposite sides (within 2 px) of at most 200 px. " +
+            "For the ends of a connector a screen's wrapper is looser: its parent frame when that frame holds only that screen, centred within 2 px with gaps up to 400 px. An end within maxDistance of the wrapper, or of one of the screen's overlays, is a candidate for the screen, and the nearest screen by true distance wins. distance is measured to the screen and may exceed maxDistance. " +
+            "Direction is read only from heads: arrow caps on strokes, a head shape on the path, or a head grouped with the line. Bare bars and unions of rectangles read none by design; designers who want machine-readable flows should use line-arrow caps or prototype links. " +
+            "selection says what was selected; nestedSameSize counts the boards that sit in a chain of frames of their own size; the board of a chain is the frame that matches boardNameRegex, else the one named like the unwrapped boards of that size, else the outermost. When it is present, deeperBoards counts the visible frames " +
             "below the selected boards. " +
             "An end snaps to the nearest frame and reports it (boardId, boardName). Its screen is found apart " +
             "from that frame: the nearest screen or loose frame (a visible frame outside every screen, such as a " +
