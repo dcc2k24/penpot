@@ -784,6 +784,131 @@
                (map #(apply-affine m %) [[10 20] [110 20] [110 70] [10 70]])
                [[110 20] [10 20] [10 70] [110 70]]))))))
 
+(defn- map-rect
+  "A selrect of exactly `w` by `h`, zero allowed: `grc/make-rect` would raise
+  a zero side to 0.01, and a file can store the zero."
+  [x y w h]
+  (grc/map->Rect {:x x :y y :width w :height h :x1 x :y1 y :x2 (+ x w) :y2 (+ y h)}))
+
+(defn- selrect-points
+  "The four corners of the box `x y w h` as points, mapped by `f`."
+  [x y w h f]
+  (mapv (fn [[px py]] (let [[qx qy] (f px py)] (gpt/point qx qy)))
+        [[x y] [(+ x w) y] [(+ x w) (+ y h)] [x (+ y h)]]))
+
+(defn- bounds
+  "The selrect of the points `pts`, as the bounding box."
+  [pts]
+  (let [xs (map :x pts) ys (map :y pts)
+        x  (apply min xs) y (apply min ys)]
+    (map-rect x y (- (apply max xs) x) (- (apply max ys) y))))
+
+(t/deftest get-world-matrix-of-degenerate-boxes-maps-the-selrect-onto-the-points
+  (doseq [[w h] [[0 1] [1 0] [0 0.01] [300 0.01] [0.01 300]]
+          [x y] [[-75820 -57769] [-55998 -58148.1429] [10 20]]
+          rot?  [false true]]
+    (let [c  (gmt/matrix 1 0 0 1 0 0)
+          tm (if rot? (gmt/matrix 0 1 -1 0 0 0) c)
+          cx (+ x (/ w 2.0)) cy (+ y (/ h 2.0))
+          f  (fn [px py] [(+ cx (* (:a tm) (- px cx)) (* (:c tm) (- py cy)))
+                          (+ cy (* (:b tm) (- px cx)) (* (:d tm) (- py cy)))])
+          pts (selrect-points x y w h f)
+          shape {:selrect (map-rect x y w h) :points pts :transform tm}
+          m  (subtree/get-world-matrix shape)
+          msg (pr-str [w h x y rot?])]
+      (t/is (same-points-in-order?
+             (map (fn [[px py]] (apply-affine m [px py]))
+                  [[x y] [(+ x w) y] [(+ x w) (+ y h)] [x (+ y h)]])
+             (point-pairs shape))
+            msg)
+      (when-not rot?
+        ;; a plain shape is exactly the identity, with no float noise
+        (t/is (same-matrix? m (gmt/matrix)) msg)))))
+
+(t/deftest get-world-matrix-of-a-plain-shape-at-large-coordinates-is-exact
+  (doseq [[x y w h] [[-55998 -58148.1429 319 0.01] [-55998 -58073.2857 319 0.01]
+                     [-56000 -56000 100 50] [-75820 -57769 0 1]]]
+    (let [shape {:selrect (map-rect x y w h)
+                 :points (selrect-points x y w h (fn [px py] [px py]))
+                 :transform (gmt/matrix)}
+          m (subtree/get-world-matrix shape)]
+      (t/is (same-matrix? m (gmt/matrix)) (pr-str [x y w h])))))
+
+(t/deftest subtree-world-matrix-of-flat-children-in-flipped-and-plain-groups
+  (let [{:keys [profile file-id page1 board1]} (create-fixture)
+        plain [[10 20] [110 20] [110 70] [10 70]]]
+    (doseq [[flip-x flip-y corners-in] (cons [false false plain] flipped-group-cases)
+            kind [:frame :path]
+            [w h] [[0 1] [1 0]]
+            honest? [true false]]
+      (let [{:keys [group]} (add-flipped-group! profile file-id page1 board1 flip-x flip-y corners-in)
+            sx  (if flip-x -1 1)
+            sy  (if flip-y -1 1)
+            ;; the flip of the group about its centre (60, 45)
+            f   (fn [px py] [(+ 60 (* sx (- px 60))) (+ 45 (* sy (- py 45)))])
+            pts (selrect-points 30 30 w h f)
+            tm  (if honest? (gmt/matrix sx 0 0 sy 0 0) (gmt/matrix))
+            id  (uuid/next)
+            _   (apply-changes!
+                 profile file-id
+                 [(add-obj page1 id group board1
+                           (cond-> {:type kind :name "Flat" :selrect (bounds pts)
+                                    :points pts :transform tm :transform-inverse tm}
+                             (= kind :frame) (assoc :x 30 :y 30 :width w :height h)
+                             (= kind :path) (assoc :content path-content)))])
+            shape (shape-of profile file-id page1 group id)
+            msg   (pr-str [kind w h flip-x flip-y honest?])]
+        (t/is (some? shape) msg)
+        (t/is (same-points-in-order? (corners shape) (point-pairs shape)) msg)))))
+
+(defn- pts
+  [coords]
+  (mapv (fn [[x y]] (gpt/point x y)) coords))
+
+(t/deftest get-world-matrix-of-the-real-divider-shapes-is-the-identity
+  ;; read from the real page (file 346a1245, page c54dcb4e): selrect and
+  ;; points of a plain, unrotated shape, in page coordinates near -56000 and
+  ;; -76000. The first one came out 2.18 px off, the others 0.01 px off.
+  (doseq [[label x y w h]
+          [["VerticalDivider frame, 0.01 x 1" -75820 -57769 0.01 1]
+           ["VerticalDivider path, 0.01 x 88" -76330.3359375 -57927 0.01 88]
+           ["Horizontal Divider frame, 319 x 0.01" -55998 -58148.1429 319 0.01]]]
+    (let [shape {:selrect   (map-rect x y w h)
+                 :points    (pts [[x y] [(+ x w) y] [(+ x w) (+ y h)] [x (+ y h)]])
+                 :transform (gmt/matrix)
+                 :rotation  0}
+          m     (subtree/get-world-matrix shape)]
+      (t/is (same-matrix? m (gmt/matrix)) label)
+      (t/is (same-points-in-order?
+             (map #(apply-affine m %) [[x y] [(+ x w) y] [(+ x w) (+ y h)] [x (+ y h)]])
+             (point-pairs shape))
+            label))))
+
+(t/deftest get-world-matrix-is-never-worse-than-the-fit-or-the-stored-matrix
+  (t/testing "a solid box mirrored on x, one point 0.02 px off, identity transform"
+    (let [mirrored [[110 20] [10 20] [10.02 70] [110 70]]
+          shape    {:selrect (map-rect 10 20 100 50)
+                    :points (pts mirrored)
+                    :transform (gmt/matrix)}
+          m        (subtree/get-world-matrix shape)]
+      (doseq [[[x y] [tx ty]] (map vector [[10 20] [110 20] [110 70] [10 70]] mirrored)]
+        (let [[mx my] (apply-affine m [x y])]
+          (t/is (< (Math/hypot (- mx tx) (- my ty)) 0.05)))))))
+
+(t/deftest get-world-matrix-reads-a-selrect-with-only-x1-y1-x2-y2
+  (let [sel   (grc/map->Rect {:x1 10 :y1 20 :x2 110 :y2 70})
+        bare  {:x1 10 :y1 20 :x2 110 :y2 70}
+        four  (pts [[10 20] [110 20] [110 70] [10 70]])]
+    (doseq [s [bare (into {} sel)]]
+      (t/is (same-matrix? (gmt/matrix)
+                          (subtree/get-world-matrix {:selrect s :points four
+                                                     :transform (gmt/matrix)}))))
+    (t/is (same-matrix? (gmt/matrix)
+                        (subtree/get-world-matrix
+                         {:selrect {:x1 10 :y1 20 :x2 10.01 :y2 21}
+                          :points (pts [[10 20] [10.01 20] [10.01 21] [10 21]])
+                          :transform (gmt/matrix)})))))
+
 (def ^:private property-cases
   "How many random shapes the property test draws."
   300)

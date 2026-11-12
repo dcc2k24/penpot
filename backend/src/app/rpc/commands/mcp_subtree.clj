@@ -10,6 +10,8 @@
   `mcp/docs/backend-mode-contract.md`."
   (:require
    [app.common.exceptions :as ex]
+   [app.common.geom.matrix :as gmt]
+   [app.common.geom.rect :as grc]
    [app.common.geom.shapes :as gsh]
    [app.common.geom.shapes.transforms :as gtr]
    [app.common.json :as json]
@@ -159,33 +161,133 @@
              [file-id page-id version root-id]
              (fn [_] (get-walk-entries objects root-id))))
 
+;; Tolerances of `get-world-matrix`, in px except the determinant.
 (def ^:private min-matrix-determinant
   "A derived world matrix whose determinant is smaller than this in absolute
   value is singular: the points it came from are degenerate."
   1e-9)
 
+(def ^:private min-box-side
+  "A selrect side below this is degenerate: the fit from the points is
+  ill-conditioned along that side (a 0.01 high frame near y = -58000 already
+  moves its translation by 0.01 px)."
+  0.05)
+
+(def ^:private max-fit-residual
+  "A fit that leaves a corner further than this from its point is not used."
+  0.01)
+
+(def ^:private snap-distance
+  "When the fitted and the stored matrices move every selrect corner by less
+  than this, the stored one is returned, so plain shapes carry no float noise."
+  0.05)
+
+(defn- apply-matrix
+  [m x y]
+  [(+ (* (:a m) x) (* (:c m) y) (:e m))
+   (+ (* (:b m) x) (* (:d m) y) (:f m))])
+
+(defn- then-matrix
+  "The matrix that applies `s` first and `m` after it."
+  [m s]
+  (gmt/matrix (+ (* (:a m) (:a s)) (* (:c m) (:b s)))
+              (+ (* (:b m) (:a s)) (* (:d m) (:b s)))
+              (+ (* (:a m) (:c s)) (* (:c m) (:d s)))
+              (+ (* (:b m) (:c s)) (* (:d m) (:d s)))
+              (+ (* (:a m) (:e s)) (* (:c m) (:f s)) (:e m))
+              (+ (* (:b m) (:e s)) (* (:d m) (:f s)) (:f m))))
+
+(defn- selrect-corners
+  [selrect]
+  (let [x (double (:x selrect))
+        y (double (:y selrect))
+        w (double (:width selrect))
+        h (double (:height selrect))]
+    [[x y] [(+ x w) y] [(+ x w) (+ y h)] [x (+ y h)]]))
+
+(defn- corner-distance
+  "The largest distance between the selrect corners of `selrect` mapped
+  through `m` and the `targets`, a vector of four `[x y]`."
+  [m selrect targets]
+  (reduce max 0.0
+          (map (fn [[x y] [tx ty]]
+                 (let [[mx my] (apply-matrix m x y)]
+                   (Math/hypot (- mx tx) (- my ty))))
+               (selrect-corners selrect)
+               targets)))
+
+(defn- full-selrect
+  "The rect of `selrect` with all of x, y, width, height, x1, y1, x2 and y2: a
+  selrect map may hold only one of the two forms."
+  [selrect]
+  (let [x1 (double (or (:x1 selrect) (:x selrect)))
+        y1 (double (or (:y1 selrect) (:y selrect)))
+        w  (double (or (:width selrect)  (- (double (:x2 selrect)) x1)))
+        h  (double (or (:height selrect) (- (double (:y2 selrect)) y1)))]
+    (grc/map->Rect {:x x1 :y y1 :width w :height h
+                    :x1 x1 :y1 y1 :x2 (+ x1 w) :y2 (+ y1 h)})))
+
 (defn get-world-matrix
   "The affine matrix that maps the four corners of the selrect of `shape`
   (top-left, top-right, bottom-right, bottom-left) onto its four `points`
-  (index 0 to 3), in page space. It is derived from the points, so it holds
-  for a flipped group that kept an identity `:transform` with mirrored
-  points (an import does this). When the shape has no selrect, no four
-  points, a selrect of zero width or height, the derivation gives no
-  matrix, or the derived matrix is singular (its determinant is 0 within
-  `min-matrix-determinant`: two or more points coincide, or all lie on one
-  line), it is the matrix of the stored `:transform` about the centre of the
-  selrect. The two agree whenever the `:transform` agrees with the points."
+  (index 0 to 3), in page space.
+
+  It is fitted to the points, so it holds for a flipped group that kept an
+  identity `:transform` with mirrored points (an import does this). The fit
+  is used when both sides of the selrect are `min-box-side` or more, the
+  matrix is not singular, and no corner is further than `max-fit-residual`
+  from its point. When the fitted matrix and the one of the stored
+  `:transform` about the centre of the selrect agree within `snap-distance`
+  the stored one is returned, exactly.
+
+  Otherwise (no selrect, not four points, a degenerate box, a bad fit) the
+  result is the candidate whose selrect corners land nearest to the points,
+  the first of these on a tie: the stored matrix; the fitted one, when the
+  box is solid and the fit is not singular; and, for a degenerate box or a
+  usable fit, the stored matrix mirrored about the centre of the selrect on
+  x, on y and on both. A mirrored ancestor mirrors the points of a flat
+  shape, and a flat shape cannot be fitted. So the result is never worse
+  than the best of these. A solid box whose points are degenerate gets the
+  stored matrix."
   [shape]
-  (let [selrect (:selrect shape)
-        points  (:points shape)
-        derived (when (and (some? selrect) (= 4 (count points)))
-                  (gtr/transform-points-matrix selrect points))]
-    (if (and (some? derived)
-             (>= (Math/abs (double (- (* (:a derived) (:d derived))
-                                      (* (:b derived) (:c derived)))))
-                 min-matrix-determinant))
-      derived
-      (gsh/transform-matrix shape))))
+  (let [selrect (some-> (:selrect shape) full-selrect)
+        shape   (cond-> shape (some? selrect) (assoc :selrect selrect))
+        stored  (gsh/transform-matrix shape)
+        points  (:points shape)]
+    (if-not (and (some? selrect) (= 4 (count points)))
+      stored
+      (let [targets (mapv (fn [p] [(double (:x p)) (double (:y p))]) points)
+            dist    (fn [m] (corner-distance m selrect targets))
+            solid?  (and (>= (:width selrect) min-box-side)
+                         (>= (:height selrect) min-box-side))
+            fitted  (when solid?
+                      (let [m (gtr/transform-points-matrix selrect points)]
+                        (when (and (some? m)
+                                   (>= (Math/abs (double (- (* (:a m) (:d m))
+                                                            (* (:b m) (:c m)))))
+                                       min-matrix-determinant))
+                          m)))]
+        (if (and (some? fitted) (<= (dist fitted) max-fit-residual))
+          (let [moved (map (fn [[x y]]
+                             (let [[ax ay] (apply-matrix fitted x y)
+                                   [bx by] (apply-matrix stored x y)]
+                               (Math/hypot (- ax bx) (- ay by))))
+                           (selrect-corners selrect))]
+            (if (< (reduce max 0.0 moved) snap-distance) stored fitted))
+          (let [cx      (+ (:x selrect) (/ (:width selrect) 2.0))
+                cy      (+ (:y selrect) (/ (:height selrect) 2.0))
+                flip    (fn [sx sy]
+                          (then-matrix stored
+                                       (gmt/matrix sx 0 0 sy
+                                                   (if (neg? sx) (* 2 cx) 0)
+                                                   (if (neg? sy) (* 2 cy) 0))))
+                options (concat [stored]
+                                (when (some? fitted) [fitted])
+                                (when (or (not solid?) (some? fitted))
+                                  [(flip -1 1) (flip 1 -1) (flip -1 -1)]))]
+            (reduce (fn [best m]
+                      (if (< (dist m) (- (dist best) 1e-9)) m best))
+                    options)))))))
 
 (defn- get-walk-shape
   "The map that `get-mcp-subtree` returns for the walk entry `[depth id]`
