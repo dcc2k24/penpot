@@ -364,13 +364,23 @@ Each shape carries:
 - `characters` for a text shape;
 - `depth` (0 for the first level of the walk) and `index` (its place in the whole walk, from 0);
 - `world-matrix` `{a, b, c, d, e, f}` when the shape has a `selrect`: the affine matrix that maps the four corners of
-  the `selrect` (top-left, top-right, bottom-right, bottom-left) onto the four `points` (index 0 to 3), in order. When
-  the `transform` agrees with the `points`, it equals the `transform` applied about the centre of the `selrect`. For a
-  flipped group it can differ from the stored `transform`: an import can keep an identity `transform` with mirrored
-  `points`, and the matrix follows the `points`. It is the stored `transform` about the centre when the shape has no
-  four `points`, when the `selrect` has no width or no height, when the derivation gives no matrix, or when the matrix
-  is singular because the `points` are degenerate (two or more coincide, or all lie on one line; its determinant is 0
-  within 1e-9) (`get-world-matrix`, built on `transform-points-matrix` of `app.common.geom.shapes.transforms`).
+  the `selrect` (top-left, top-right, bottom-right, bottom-left) onto the four `points` (index 0 to 3), in order. It is the
+  candidate whose corners land nearest to the `points`, as below. On ordinary data the result is within 0.01 px of the
+  `points` (measured on a page of 26,097 shapes), also for a shape with a zero or tiny side. A flat shape under a
+  rotation that no longer matches its stored `transform` has no correct candidate and can be off.
+  - The fit from the `points` (`transform-points-matrix` of `app.common.geom.shapes.transforms`) is used when both
+    sides of the `selrect` are at least 0.05 px (`min-box-side`), the matrix is not singular (its determinant is not 0
+    within 1e-9: two or more `points` coincide, or all lie on one line), and no corner is further than 0.01 px
+    (`max-fit-residual`) from its point. For a flipped group it can differ from the stored `transform`: an import can
+    keep an identity `transform` with mirrored `points`, and the matrix follows the `points`.
+  - When the fit and the stored `transform` about the centre of the `selrect` move every corner by less than 0.05 px
+    (`snap-distance`) of each other, the stored one is returned exactly, so plain shapes carry no float noise.
+  - Otherwise (a side under 0.05 px, a singular or bad fit) the result is the candidate whose `selrect` corners land
+    nearest to the `points`, the first of these on a tie: the stored `transform` about the centre; the fit, when the box
+    is solid and the fit is not singular; and, for a degenerate box or a usable fit, the stored one mirrored about the
+    centre on x, on y and on both. A mirrored ancestor mirrors the `points` of a flat shape, which cannot be fitted.
+  - A shape with no four `points` has the stored `transform` about the centre. A shape without `selrect` has no
+    `world-matrix`. The function is `get-world-matrix`.
 
 Result `{revn, pageId, rootId, total, shapes, truncated, nextCursor?}`, and `compact` and `defaults` with `compact`.
 `total` counts the whole walk.
@@ -471,8 +481,13 @@ holds no frame: it is a shape inside one leaf frame. It is not counted in `same-
 The screen of an end is found apart from its frame. The targets are the selected boards (the screens) and the loose
 frames: visible frames that are neither selected nor inside a selected board, such as a decision frame between screens.
 A frame that holds a selected board (a section, a journey group) is never a target. The end belongs to the nearest
-target within `max-distance`, by the distance of the snap (0 inside). On a tie a screen wins over a loose frame, then
-the smaller area, then walk order. A screen gives `screen-id` and `screen-name`. A loose frame, or no target within
+target within `max-distance`, by the distance of the snap (0 inside). A screen's wrapper here is its parent frame when that
+frame holds only that screen, centred within 2 px (`margin-tolerance`), with gaps up to 400 px (`max-centered-margin`).
+This is not the wrapper of the board selection (2.8e), which is stricter: at most 200 px and at least 90 % of a size
+class. An end within `max-distance` of the wrapper, or of one of the screen's overlays (step 8a), is a candidate for the
+screen, and the nearest screen by true distance wins. The overlays and the frames inside them are no targets. `distance`
+is measured to the screen and may exceed `max-distance`; when the end is not in a wrapper or overlay of the chosen
+screen, the reported `distance` can still be the snapped frame's distance. On a tie a screen wins over a loose frame, then the smaller area, then walk order. A screen gives `screen-id` and `screen-name`. A loose frame, or no target within
 reach, gives `non-screen` true and no screen keys. A grid over the targets keeps the look-up cheap on a page of many
 screens. The snap of an end to a frame reads a grid over the frames in the same way, and chooses as a plain loop over
 all frames would.
@@ -525,6 +540,10 @@ Direction. Each connector has `direction` and `confidence`.
   path as its flattened subpaths). The shaft is the child with the largest ratio of length to width (an open stroked
   path has at least its stroke width as width), and its width is `w`. Hull and extremity are taken over all children,
   and a tip on the shaft does not count. The result is as for an outline.
+
+Direction is read only from heads: arrow caps on strokes, a head shape on the path, or a head grouped with the line.
+Bare bars and unions of rectangles read `none` by design. Designers who want machine-readable flows should use
+`line-arrow` caps or prototype links.
 
 Result `{revn, pageId, scanned, connectors, total, selection, deeper-boards?, same-screen-skipped, non-screen-ends,
 truncated, next-offset?, timed-out?}`. `scanned` counts the candidates looked at. `selection` and `deeper-boards` are those of `select-boards`
@@ -626,7 +645,7 @@ tool adds a `note` to such a reply that says this.
 ### 2.8e `get-mcp-page-lint` (read)
 
 Params `{file-id, page-id, depth? (int 1 to 12), mode? (depth or auto), board-name-regex? (string, at most 200),
-min-shapes? (int 0 to 1000, default 3), rules? (vector of 1 to 9 rule names; default all seven), tolerance? (number 0
+min-shapes? (int 0 to 1000, default 3), rules? (vector of 1 to 9 rule names; default all eight), tolerance? (number 0
 to 100, default 0.5), min-overflow? (number 0 to 1000, default 8), limit? (int 1 to 2000, default 500), offset? (int 0 or more, default 0)}`.
 
 Boards. The selection is shared with `find-mcp-similar-boards` (section 2.8f) and is made by `app.rpc.mcp-boards`.
@@ -659,7 +678,12 @@ Boards. The selection is shared with `find-mcp-similar-boards` (section 2.8f) an
      (counted through all ancestors, so a wrapper around a wrapper around a screen holds that screen). An example is
      800 by 660 around 800 by 600 with a caption. A wrapper class is not chosen and hides no class inside it. A
      taller class that is not a wrapper class is a scrolling screen and stays: 390 by 2000 around 390 by 844 is 2.4
-     times as tall, so it is not a wrapper. A standard qualifying
+     times as tall, so it is not a wrapper. A frame size is also a wrapper class when at least 90 % (`wrapper-share`)
+     of its frames each hold exactly one screen, of any exact standard size, as a direct child, centred with equal gaps
+     on opposite sides (within 2 px, `margin-tolerance`) of at most 200 px (`max-wrapper-margin`). The class is not a
+     standard size and is larger than that screen in both directions (`wrapper-margin?`). The size appears in
+     `selection.otherSizes` with relation `wrapper`. A class that falls below 90 % is reported `outside`, but its
+     overlays are still found frame by frame (step 8a). A standard qualifying
      class goes when it lies inside another standard class (a panel of a standard size in a screen), or inside a class
      of any size that has more members (a dialog in the screens; a one-to-one wrapper around each screen has as many
      members and does not hide them). When at least one standard class is left,
@@ -684,7 +708,22 @@ Boards. The selection is shared with `find-mcp-similar-boards` (section 2.8f) an
      apply and the name filter then removes the board.
   8. Loose boards join: every candidate (so also at least 200 px on each side) that is neither above nor below a
      board, at a level not deeper than the shallowest board, with an area of at least 10 % of the area of the largest
-     screen class. A flat page of boards of mixed sizes then gives the frames at depth 1.
+     screen class. A flat page of boards of mixed sizes then gives the frames at depth 1. The boards of the automatic
+     selection are the screens. Standard sizes are always kept. Loose boards that are clearly not screens
+     (`not-a-screen?`) are dropped: a frame larger than the screen classes in both directions with at least 4 times
+     (`far-larger-ratio`) the area of the largest screen class (a section); a frame that holds exactly one loose board
+     with a wrapper margin; a non-portrait frame (under 1.5 times as tall as wide, `portrait-ratio`) that holds, or sits
+     in, a frame of its own size (an annotation and its widget) and is under half (`pair-area-ratio`) the area of the
+     smallest screen class. An empty section 2 to 3 times the screen area is still a board. The step checks the
+     deadline; past it the result is the fallback of step 9.
+  8a. Overlays are not boards. An overlay is a frame outside component instances that is a sibling of a screen inside
+     its wrapper (a frame strictly larger than the screen that holds that one screen with a wrapper margin, or a member
+     of a wrapper class, step 4a), is not a screen, and has at least 50 % (`overlay-min-share`) of its own area over that
+     screen, such as a "Verifying..." panel over a login screen. With several screens in one wrapper it belongs to the
+     screen it overlaps most (`find-overlays`). It is left out of the screen classes, the boards and the loose boards.
+     A class of a non-standard size, most of whose frames are not overlays, is kept. The map `{overlay-id screen-id}` is
+     the `overlays` of `select-boards`, and the wrapper frames are its `wrapper-ids` (mode `auto` only; mode `depth` has
+     none), which `sibling-overlay` of `lint_page`, `find-mcp-similar-boards` and `find-mcp-connectors` read.
   9. When nothing is selected, the boards are the visible frames at depth 1, `selection.fallback` is true and
      `selection.basis` is `depth-fallback`.
 - Known results of the structural rules (basis `structure`, that is, screens of a non-standard size): equal-sized
@@ -773,6 +812,15 @@ Rules:
   bottom}, suggested, inComponentCopy}`: the overflow in raw px, `suggested` `vertical` (bottom only), `horizontal`
   (right only) or `both`, and `inComponentCopy` true when the frame is, or lies inside, a component copy. Writing
   `overflowScroll` there makes an override, so set it on the main component. The finding's shape is the frame.
+- `sibling-overlay` (mode `auto` only): a visible board or group, of any size, that is not a screen, is a child of a
+  wrapper (as the automatic board selection recognises it, `wrapper-ids`) next to a screen, is not a component instance
+  or inside one, and has at least 50 % (`overlay-min-share`) of its own area over that screen (the one it overlaps
+  most). One finding for each overlay: `boardId` is the covered screen, `shapeId` and `shapeName` the overlay. Detail
+  `{coveredFraction, overlayBox {x, y, width, height}}`, with three decimals. Hidden overlays are not reported; mode
+  `depth` reports none. It is in the default rule set, is counted in `counts` and `total`, and is paged by `offset`.
+  The scan stops at the 5 s budget (`timedOut`). Out of scope: a shape that is not a sibling of the screen inside its
+  wrapper (a section child laid over a screen, any shape in a section that holds screens directly), and a shape inside
+  the screen (`find-sibling-overlays`).
 
 `tolerance` keeps rounding noise out of the edge tests. `invisible-control` and `clipped-control` work on the share of
 the control's area that stays visible, so the tolerance shrinks the control's box by `tolerance` px on each side before
@@ -805,7 +853,7 @@ variant set counts once: `id` is then the variant container and `variants` the n
 scan, left out when 1) and the number of boards that hold it; it is empty when there is none or `instance-only-board` was not asked, and then the rule
 reports nothing.
 Each finding is `{rule, boardId, boardName, shapeId?, shapeName?, path?, detail}`. The `empty-board` and
-`instance-only-board` findings carry no shape keys. Findings come in board order, then walk order. `counts` holds one
+`instance-only-board` findings carry no shape keys. A `sibling-overlay` finding has the covered screen as `boardId` and the overlay as `shapeId`. Findings come in board order, then walk order. `counts` holds one
 total for each asked rule, over all findings of the scan, also when `limit` or `offset` cuts the list. `total` is the
 sum of `counts`.
 
@@ -848,7 +896,9 @@ Result `{revn, pageId, boards, selection, deeperBoards?, skippedSmall, compared,
 boards compared. `selection` and `deeperBoards` are those of section 2.8e. `skippedSmall` is `{count, ids}`: the number
 of selected boards left out for having fewer than `min-shapes` visible descendants, and the ids of the first 50 of them
 in walk order. Every selected board is therefore compared or in `skippedSmall`, unless the scan was cut short
-(`truncated`). `compared` counts the pairs whose index was computed. Each group is `{similarity, exact, boards: [{id, name, path, shapeCount}]}`. Only groups
+(`truncated`). `compared` counts the pairs whose index was computed. Each group is `{similarity, exact, boards: [{id, name, path, shapeCount}], overlays?}`. A group whose boards have such overlays (the
+`sibling-overlay` shapes of section 2.8e) also has `overlays: [{boardId, shapeId}]`, one entry per overlay of a board of the
+group; the key is absent otherwise. A timed-out overlay scan sets `truncated`. Only groups
 of two or more boards come back. They sort by board count, largest first, then by similarity. At most `limit` groups
 come back.
 
@@ -1413,7 +1463,7 @@ the `get_shapes`, `get_page_tree` and `find_shapes` results and keeps `frame` fo
 | `get_page_tree {fileId, pageId, rootId?, depth?, fields?, limit?, cursor?}` | `get-mcp-page-tree`. `limit` defaults to 100 (1 to 5000). Layout children come in visual order. |
 | `get_shapes {fileId, pageId, ids, fields?, includeChildren?}` | `get-mcp-shapes`. Without `fields` the tool sends: `id name type parentId x y width height hidden shapes`. |
 | `find_shapes {...}` | `find-mcp-shapes`. `limit` defaults to 100 (1 to 1000). Type `ellipse` or `board` is sent as `circle` or `frame`. Matches show `ellipse` and `frame`. |
-| `export_subtree {fileId, pageId, rootId?, cursor?, limit?, filePath?, overwrite?, compact?, encoding?}` | `get-mcp-subtree` (section 2.8a). Inline: the adapter reads as many windows as fit the cap of the tool (`PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB`, section 4.6), each asked for the room left in the reply with `max-json-bytes`, and returns them as one reply (below). `limit` is 1 to 5000 shapes per reply, default 5000. With `filePath`, every window is read into one file (below). `compact` is passed on (section 2.8a). `encoding: "gzip-base64"` is for scripts (below). A whole-page walk costs many backend reads, and the backend rate limit can stop it (section 4.3). Shape types show as the other tools show them (`ellipse`, `frame`). A path's or boolean's `content` is an SVG path string in page space. A text's `content` is its tree of paragraphs. |
+| `export_subtree {fileId, pageId, rootId?, cursor?, limit?, filePath?, overwrite?, compact?, encoding?, maxResponseKb?}` | `get-mcp-subtree` (section 2.8a). Inline: the adapter reads as many windows as fit the cap of the tool (`PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB`, section 4.6), each asked for the room left in the reply with `max-json-bytes`, and returns them as one reply (below). `limit` is 1 to 5000 shapes per reply, default 5000. With `filePath`, every window is read into one file (below). `compact` is passed on (section 2.8a). `encoding: "gzip-base64"` is for scripts (below). `maxResponseKb` sets the reply cap of one call, for scripts (below). A whole-page walk costs many backend reads, and the backend rate limit can stop it (section 4.3). Shape types show as the other tools show them (`ellipse`, `frame`). A path's or boolean's `content` is an SVG path string in page space. A text's `content` is its tree of paragraphs. |
 | `get_interactions {fileId, pageId, limit?}` | `get-mcp-interactions` (section 2.8b). `limit` is 1 to 5000, default 1000. Shape types show as in `get_shapes`. |
 | `find_connectors {fileId, pageId, maxDistance?, withinId?, limit?, offset?, depth?, mode?, boardNameRegex?, includeSameScreen?}` | `find-mcp-connectors` (section 2.8c). `maxDistance` is 0 to 2000, default 64. `withinId` limits the scan to the shapes under one shape, and it must be on the page. `limit` is 1 to 2000, default 500. `offset` skips connectors, to page a long list (see the paging bullet in section 4.3). `depth` (1 to 12), `mode` (`depth` or `auto`) and `boardNameRegex` select the screens as `lint_page` does. `includeSameScreen` (default false) returns the connectors whose ends lie in one screen. |
 | `list_fonts {fileId, pageId?, rootIds?}` | `get-mcp-fonts` (section 2.8d). `rootIds` is 1 to 200 shape ids and needs `pageId`. Without `pageId` every page is read. At most 500 fonts come back. The reply passes through, with `pagesRead`, `pagesTotal` and the suggestion keys (`suggestedFontId` and the others). When `pagesRead` is below `pagesTotal` the adapter adds a `note`: call again with the same arguments, which goes on from the pages already read (kept 10 minutes, section 2.8d). |
@@ -1502,6 +1552,18 @@ failed walk removes the partial file and the folders the call created. In multi-
   compressed once and checked against the cap. Over it, whole trailing windows are left for the next call and the
   reply is compressed again, so the reply is never over the cap. Compression runs off the event loop. A call also
   gathers at most 16 MB of plain JSON text, whatever the encoding and the cap, and returns its cursor at that point.
+  With `gzip-base64` the later windows of a reply are sized so that the reply fills toward the cap: a window after the
+  first is asked for what fits at the measured ratio less a safety margin, so a default gzip call packs more shapes into
+  one reply.
+- `maxResponseKb` is for scripts. It is a whole number of kilobytes from 1 to 10000, and it is the reply cap for that
+  one call in place of the cap of the tool. It is allowed only with `encoding: "gzip-base64"` and only inline (not
+  with `filePath`). A call that leaves it out gets the cap of the tool, as before. It may not be above the server
+  maximum, `PENPOT_MCP_SUBTREE_MAX_REQUEST_KB` (section 4.6). A refused call fails the tool with one of these texts:
+  `maxResponseKb cannot be used with filePath: a file holds the whole subtree.`; `maxResponseKb can only be used with
+  encoding "gzip-base64": it is for scripts, and a model client keeps the default cap.`; `maxResponseKb N is above the
+  server maximum of M kB (PENPOT_MCP_SUBTREE_MAX_REQUEST_KB).` The advice in an `oversize` note or an error to raise the
+  cap names `maxResponseKb` and the server maximum when the call set it; when the call already asked for the server
+  maximum, it says that the shape does not fit even at the server maximum.
   It works with `compact`, in both modes.
 - Every write sends a `requestId`. The caller may name it. Otherwise the adapter makes a UUID for the call. A retry
   of the same write must reuse the `requestId`. The same id with another payload is a new write on the backend. A repeat that the backend already applied returns `alreadyApplied:
@@ -1698,7 +1760,8 @@ variable.
 | `PENPOT_MCP_ALLOW_QUERY_TOKEN` | `true` in bridge mode, `false` otherwise | Accepts `?userToken=`. When `true`, a warning is logged once per token. |
 | `PENPOT_MCP_MAX_BODY_MB` | `32` | Request body limit after authentication. Before it, the limit is 4 MB. |
 | `PENPOT_MCP_MAX_TOOL_RESPONSE_KB` | `100` | Cap on a tool reply (1 to 10000) |
-| `PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB` | the value of `PENPOT_MCP_MAX_TOOL_RESPONSE_KB` | Cap on an inline `export_subtree` reply, 1 to 10000 kB. Raise it for scripted clients that accept large replies: about 1000 or more. A model client's context will not hold such replies. |
+&
+| `PENPOT_MCP_SUBTREE_MAX_REQUEST_KB` | the larger of 2000 and the default reply cap | The largest `maxResponseKb` that one `export_subtree` call may ask for, whole kB from 1 to 10000. Set below the default reply cap it fails the tool at start, so that a script can always ask for the default size. |
 | `PENPOT_MCP_EXPORT_DIR` | `~/penpot-exports` | Export root for `export_shape` `filePath` |
 | `PENPOT_MCP_IMPORT_DIR` | `~/penpot-imports` | Import root for `filePath` arguments |
 | `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` | `0` in bridge mode, `4` in backend mode | Renders at once in one process against the backend; 0 means no limit |

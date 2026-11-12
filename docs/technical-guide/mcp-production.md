@@ -114,7 +114,8 @@ Limits and timeouts:
 | `PENPOT_MCP_BACKEND_TIMEOUT_S` | `55` | Timeout of each backend call |
 | `PENPOT_MCP_BACKEND_MAX_RESPONSE_MB` | `8` | Cap on one backend or exporter response |
 | `PENPOT_MCP_MAX_TOOL_RESPONSE_KB` | `100` | Cap on one tool answer. Longer answers are cut. |
-| `PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB` | the value above | Cap on one `export_subtree` answer, from 1 to 10000. That answer is never cut: it holds as many shapes as fit. Raise it for scripts that accept large answers, to 1000 or more; a model client's context will not hold such answers. |
+| `PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB` | the value above | Cap on one `export_subtree` answer, from 1 to 10000. That answer is never cut: it holds as many shapes as fit. Raise it for scripts that accept large answers, to 1000 or more; &
+| `PENPOT_MCP_SUBTREE_MAX_REQUEST_KB` | the larger of 2000 and the default reply cap | The largest `maxResponseKb` that one `export_subtree` call may ask for, whole kB from 1 to 10000. Set below the default reply cap it fails the tool at start. |
 | `PENPOT_MCP_MAX_BODY_MB` | `32` | Request body cap after the token check. Before it, 4 MB (contract 4.8). |
 | `PENPOT_MCP_EXPORT_SHAPE_MAX_PARALLEL_REQUESTS` | `4` in backend mode | Exports that run at once in one process. `0` means no limit. |
 | `PENPOT_MCP_EXPORT_TOTAL_PERMITS` | `4` | Renders that run at once across all adapters that share `PENPOT_MCP_REDIS_URI`. Each permit lasts at most 65 s. If Redis fails, each process uses its own cap. |

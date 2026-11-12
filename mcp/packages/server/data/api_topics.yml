@@ -27,13 +27,15 @@ Geometry:
         `transform` maps the `selrect` to the `points`. It works about the centre of the shape. `transformInverse` is its inverse.
         A shape that is neither rotated nor flipped has the identity for both. A flipped shape has a mirror in `transform`.
 
-        `worldMatrix` is the matrix that maps the four corners of the `selrect` (top-left, top-right, bottom-right, bottom-left)
-        onto the four `points`, in that order. To draw a shape, draw its unrotated rectangle through it. `export_subtree` gives
-        it for each shape, with the values `a` to `f` in SVG order. When the `transform` agrees with the `points`, it equals
-        `translate(centre) · transform · translate(-centre)`. For a flipped group it can differ from the stored `transform`: an
-        import can leave the `transform` at the identity while the `points` are mirrored. When a shape has no four `points`, its
-        box has no width or no height, or its `points` are degenerate (two or more coincide, or all lie on one line),
-        `worldMatrix` is that product. A shape without `selrect` has no `worldMatrix`.
+        `worldMatrix` maps the four corners of the `selrect` (top-left, top-right, bottom-right, bottom-left) onto the four
+        `points`, in that order. To draw a shape, draw its unrotated rectangle through it. `export_subtree` gives it for each
+        shape, with the values `a` to `f` in SVG order. It is the candidate whose `selrect` corners land nearest to the `points`:
+        the fit from the `points`, the `transform` about the centre, or, for a flat box (a side under 0.05 px), the `transform`
+        mirrored. The `transform` about the centre is `translate(centre) · transform · translate(-centre)`. When the fit and
+        that product agree within 0.05 px, the product is returned exactly. For a flipped group it can differ from the stored
+        `transform`: an import can leave the `transform` at the identity while the `points` are mirrored. On ordinary data the
+        result is within 0.01 px of the `points`. A flat shape under a rotation that no longer matches its `transform` can be
+        off. A shape without four `points` has the product. A shape without `selrect` has no `worldMatrix`.
 
         The `content` of a path or a boolean is a string of absolute SVG commands `M`, `L`, `C` and `Z`, for example
         `M10.0,20.0L110.0,20.0C...Z`. Its points are in page space with `transform` already applied. Do not apply `transform` to

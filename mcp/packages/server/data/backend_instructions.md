@@ -54,13 +54,21 @@ Write with `apply_operations`. Its operations use ids from the steps above.
   in `oversize` with its real size; `nextCursor` goes on after it, and the note says how to get the whole shape (the
   operator raises `PENPOT_MCP_SUBTREE_MAX_RESPONSE_KB`, or use `filePath`). `compact: true` drops null keys and the
   top-level keys that hold their default (`defaults` lists them), and `strokeAlignment` when it is `center` inside
-  each stroke. Do not ask for `encoding`: it is for scripts.
+  each stroke. Do not ask for `encoding` or `maxResponseKb`: they are for scripts. `maxResponseKb` (whole kilobytes, 1 to
+  10000) is the reply cap for that one call in place of the cap of the server; it is allowed only with
+  `encoding: "gzip-base64"` and only inline (not with `filePath`), and not above the server maximum.
 - `get_interactions` lists the flows and the prototype links of a page. `find_connectors` finds the arrows and lines
   that run between two screens, drawn as paths or as small groups of shapes. A group counts as one arrow only when it
   has a shaft and heads at its ends; a row of arrows in one group is read arrow by arrow. An arrow drawn inside a screen
   is found. A rounded or blunt head is read too, with `medium` confidence. A connector inside one screen is dropped
   (`includeSameScreen` returns it). An end in a frame that is no screen has `nonScreen`. `direction` says how the head
-  was found, and `confidence` how sure that is: read `none` as "unknown": take the direction then from other evidence, such as labels or the order of the screens. It selects screens as `lint_page`
+  was found, and `confidence` how sure that is: read `none` as "unknown": take the direction then from other evidence, such as labels or the order of the screens. Direction is read only from
+  heads: arrow caps on strokes, a head shape on the path, or a head grouped with the line. Bare bars and unions of
+  rectangles read `none` by design. Designers who want machine-readable flows should use `line-arrow` caps or prototype
+  links. A screen's wrapper here is its parent frame when that frame holds only that screen, centred
+  within 2 px with gaps up to 400 px (not the wrapper of the board selection, which is stricter). An end within
+  `maxDistance` of the wrapper, or of one of the screen's overlays, is a candidate for the screen, and the nearest screen
+  by true distance wins. `distance` is measured to the screen and may exceed `maxDistance`. It selects screens as `lint_page`
   does. On a large page, pass `withinId` to scan one part at a time.
 - Run `list_fonts` before an export or a code generation. A font that does not resolve renders with a fallback font.
   Such a font can carry `suggestedFontId`: a font of the same family that does resolve, often a team font uploaded under
@@ -72,16 +80,26 @@ Write with `apply_operations`. Its operations use ids from the steps above.
 - Run `lint_page` and `find_similar_boards` before you generate code from a page. Both find the screens by size. With
   no `depth`, `boardNameRegex` or `mode`, they first look for frames of a standard screen size (a phone, tablet,
   desktop or kiosk size) that occur at least three times, however deep they lie. If there are none, they use the
-  nesting of repeated frame sizes. Frames under 200 px on a side are never screens. `selection` in the reply says what
+  nesting of repeated frame sizes. Frames under 200 px on a side are never screens. Standard sizes are always kept. Loose
+  boards that are clearly not screens are dropped: a frame larger than the screens in both directions with at least 4
+  times the area of the largest screen class (a section); a frame that holds exactly one loose board with a wrapper
+  margin; a non-portrait frame that holds, or sits in, a frame of its own size (an annotation and its widget) and is
+  under half the smallest screen class. An empty section 2 to 3 times the screen area is still a board. An overlay (a
+  sibling frame of a screen inside its wrapper, with at least half of its own area over that screen) is not a board. `selection` in the reply says what
   was chosen, with `basis` (`standard-size`, `structure` or `depth-fallback`), and `otherSizes` lists up to 5 sizes
-  that repeat on the page but were not chosen. In mode `depth`, `deeperBoards` counts the repeated screen-sized frames
+  that repeat on the page but were not chosen. A frame size is also a wrapper when at least 90% of its frames each hold exactly one screen, of any exact standard size, as a direct child, centred with equal gaps on opposite sides (within 2 px) of at most 200 px; the size appears in `otherSizes` with relation `wrapper`, and a class below 90% is reported `outside`. In mode `depth`, `deeperBoards` counts the repeated screen-sized frames
   below the chosen boards: when it is not 0, call again without `depth`, or with a larger one. To choose boards by hand,
   pass `mode: "depth"` with a `depth` up to 12, or a `boardNameRegex`. `mode: "auto"` does not take `depth`.
 - `lint_page` finds empty boards, boards that hold only chrome (`instance-only-board`; chrome is the components that
   repeat in the same place across the screens and touch a screen edge or sit on most screens, such as a header, a
   footer or a side rail (a header that sits in different places is not chrome); the variants of a component count as one; `chromeComponents` lists them; an image, even a
   full-screen one, is content), and controls that are clipped or off their board. A control that its board hides, but that a
-  scrolling board brings into view, is `scroll-hidden-control`.
+  scrolling board brings into view, is `scroll-hidden-control`. `sibling-overlay` (mode auto only) is a visible board or group, of any size,
+  that is not a screen, is a child of a wrapper next to a screen, is not a component instance or inside one, and has at
+  least half of its own area over that screen (the one it overlaps most), such as a "Verifying..." panel over a login
+  screen. A shape that is not a sibling of the screen inside its wrapper (a section child laid over a screen) is not found. One finding for each overlay: `boardId` is the covered screen,
+  `shapeId` and `shapeName` the overlay, and the detail has `coveredFraction` and `overlayBox`. Hidden overlays are not
+  reported, and in mode `depth` the rule reports nothing.
 - `scroll-candidate` names a clipping frame without `overflowScroll` whose content reaches past its right or bottom
   edge (a track that starts left of the frame counts; a background that covers the frame on both axes does not), and
   suggests `vertical`, `horizontal` or `both`. To set them, send one `apply_operations` call with one
@@ -89,7 +107,8 @@ Write with `apply_operations`. Its operations use ids from the steps above.
   `[{"op": "update_shape", "pageId": "P", "id": "F1", "props": {"overflowScroll": "vertical"}}]`. A finding with
   `inComponentCopy` true is a copy: set the value on the main component instead, or it becomes an override.
 - `find_similar_boards` finds copies, so that each repeated board is built once. It compares only boards with at least
-  `minShapes` shapes; `skippedSmall` lists the others.
+  `minShapes` shapes; `skippedSmall` lists the others. A group whose boards have such overlays also has
+  `overlays: [{boardId, shapeId}]`; the key is absent otherwise.
 
 ## Writing with apply_operations
 
@@ -354,13 +373,15 @@ the sides.
 `transform` maps the `selrect` to the `points`. It works about the centre of the shape. `transformInverse` is its inverse.
 A shape that is neither rotated nor flipped has the identity for both. A flipped shape has a mirror in `transform`.
 
-`worldMatrix` is the matrix that maps the four corners of the `selrect` (top-left, top-right, bottom-right, bottom-left)
-onto the four `points`, in that order. To draw a shape, draw its unrotated rectangle through it. `export_subtree` gives
-it for each shape, with the values `a` to `f` in SVG order. When the `transform` agrees with the `points`, it equals
-`translate(centre) · transform · translate(-centre)`. For a flipped group it can differ from the stored `transform`: an
-import can leave the `transform` at the identity while the `points` are mirrored. When a shape has no four `points`, its
-box has no width or no height, or its `points` are degenerate (two or more coincide, or all lie on one line),
-`worldMatrix` is that product. A shape without `selrect` has no `worldMatrix`.
+`worldMatrix` maps the four corners of the `selrect` (top-left, top-right, bottom-right, bottom-left) onto the four
+`points`, in that order. To draw a shape, draw its unrotated rectangle through it. `export_subtree` gives it for each
+shape, with the values `a` to `f` in SVG order. It is the candidate whose `selrect` corners land nearest to the `points`:
+the fit from the `points`, the `transform` about the centre, or, for a flat box (a side under 0.05 px), the `transform`
+mirrored. The `transform` about the centre is `translate(centre) · transform · translate(-centre)`. When the fit and
+that product agree within 0.05 px, the product is returned exactly. For a flipped group it can differ from the stored
+`transform`: an import can leave the `transform` at the identity while the `points` are mirrored. On ordinary data the
+result is within 0.01 px of the `points`. A flat shape under a rotation that no longer matches its `transform` can be
+off. A shape without four `points` has the product. A shape without `selrect` has no `worldMatrix`.
 
 The `content` of a path or a boolean is a string of absolute SVG commands `M`, `L`, `C` and `Z`, for example
 `M10.0,20.0L110.0,20.0C...Z`. Its points are in page space with `transform` already applied. Do not apply `transform` to
