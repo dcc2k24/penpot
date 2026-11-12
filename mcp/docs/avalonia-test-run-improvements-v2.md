@@ -117,6 +117,23 @@ This is not a Penpot defect, but it follows from item 11:
 - Against the new renders, the app's median mismatch went from 0.315% to 0.753%, and its maximum from 1.289% to 1.557%. It still passes its gates (2% max, 1% median).
 - The fix is in `kam-platform-poc`: switch per-side strokes back on in `gen-axaml.mjs`, and re-render the references with the batch export.
 
+### N10. Overlays drawn beside the screen board are invisible to the tools
+
+- **What happened.** Each of the three Processing screens is a wrapper board (1000×800) that holds the dimmed login screen ("Parent", 800×600) and, as a sibling, a 480×460 board with the Spinner, an icon and "Verifying Biometrics / Proximity Card / PIN". The overlay lies fully over Parent but is not inside it. The app's extract took only "Parent" as each screen, so the overlay was never extracted, rendered or generated. The app shows three identical dimmed login screens, and the user sees a 3.6 s pause with no "Verifying PIN" spinner.
+- **Mostly our fault.** The extract convention (screen = the board named "Parent") was ours. The reference renders were made from the same boards, so every pixel check compared like with like and passed. The navigation map also misread the three screens as one timed sequence (1 → 2 → 3). In fact they are alternatives: FINGERPRINT → Biometrics, CARD → Proximity Card, PIN → PIN.
+- **Where the MCP could have caught it.** A scan of all 207 wrappers (`execute_code` with `rootIds`) found the pattern on exactly these 3 screens.
+  - `find_similar_boards` grouped Login and the three Processing boards at 0.989 similarity. That is a hint, but nothing says that the difference lies outside the compared boards.
+  - `lint_page` has no rule for it, and `boardNameRegex: "^Parent$"` hides the sibling completely.
+- **Fix.**
+  - Add a lint rule, `sibling-overlay`: a visible sibling board or group that overlaps a scanned board by most of its area. That is a modal or overlay drawn outside the screen, and it should be reported with the board it covers.
+  - In `find_similar_boards`, when boards selected by a regex have such siblings, say so in the reply.
+- **Fixed in the app (kam-platform-poc).**
+  - The extract appends such siblings to the screen. Only these 3 screens qualify. The 3 references now include the overlay.
+  - PIN, FINGERPRINT and CARD each go to their own Verifying screen, then to Success or Failure.
+  - Open rings inside a "Spinner" frame rotate.
+  - The PIN dots fill per digit.
+- **Also.** Penpot can't express the spinner's motion: there is no animation outside prototype transitions, and the design has no interactions. A generator has to infer "Spinner = rotate" from the name. A documented naming or annotation convention would help.
+
 ## Priorities
 
 | Item | Why | Size |
@@ -124,6 +141,7 @@ This is not a Penpot defect, but it follows from item 11:
 | N3. Suggest a matching team font in `list_fonts` | The real fix existed and nobody saw it. The first run shipped a stand-in font. | Small |
 | N4. `lint_page` and `find_similar_boards` depth defaults; `instance-only-board` false positives | With the defaults, both tools miss every screen on a typical journeys page. | Small |
 | N1 and N2. `worldMatrix` of flipped groups; the `circle`/`ellipse` rename | Silent errors in generated code | Small |
+| N10. `sibling-overlay` lint rule | Modals drawn beside the screen board are lost without any warning | Small |
 | N6. Connector direction and same-screen noise | Turns `find_connectors` into usable navigation evidence | Medium |
 | N7. `rootIds` load time | 25 s a call makes scripted reads impractical | Medium |
 | N8. Download URL for large subtrees | Bulk extracts through the MCP without a binfile | Medium |
