@@ -115,7 +115,7 @@
 (def ^:private lint-rules
   "The rules of `get-mcp-page-lint`, in the order of its counts."
   [:empty-board :instance-only-board :clipped-control :invisible-control
-   :scroll-hidden-control :off-board-control :scroll-candidate])
+   :scroll-hidden-control :off-board-control :scroll-candidate :sibling-overlay])
 
 (def ^:private control-rule-order
   "The rules a control can break, in the order they are reported: the
@@ -826,6 +826,141 @@
                                       :in-component-copy copy?})))))
       out)))
 
+;; --- SIBLING OVERLAYS
+
+(def ^:private overlay-cell
+  "Side in px of the cells of the grid that `find-sibling-overlays` indexes the
+  screens of a wrapper with."
+  512)
+
+(def ^:private overlay-max-cells
+  "A shape that spans more grid cells than this is tested against every
+  screen of its wrapper instead."
+  1024)
+
+(defn- grid-cells
+  "The grid cells `[cx cy]` that the box `b` touches, or nil when there are
+  more than `overlay-max-cells`."
+  [b]
+  (let [cx0 (long (Math/floor (/ (double (:x0 b)) overlay-cell)))
+        cx1 (long (Math/floor (/ (double (:x1 b)) overlay-cell)))
+        cy0 (long (Math/floor (/ (double (:y0 b)) overlay-cell)))
+        cy1 (long (Math/floor (/ (double (:y1 b)) overlay-cell)))]
+    (when (<= (* (inc (- cx1 cx0)) (inc (- cy1 cy0))) overlay-max-cells)
+      (for [cx (range cx0 (inc cx1))
+            cy (range cy0 (inc cy1))]
+        [cx cy]))))
+
+(defn find-sibling-overlays
+  "The overlays of the selected screens `screen-ids` as `{:overlays
+  {overlay-id screen-id} :timed-out? bool}`: the visible frames and groups,
+  of any size, that are children of the same parent as a screen, when that
+  parent is a wrapper (`wrapper-ids`: the wrapper frames the board selection
+  found, see `app.rpc.mcp-boards/select-boards`), are not selected, are not
+  and do not lie inside a component instance, and have at least
+  `boards/overlay-min-share` of their own area over a screen of that parent
+  (the one they overlap most). The screens of a wrapper are indexed in a grid,
+  so each child is tested against the screens near it only. A shape that is
+  not a sibling of a screen (a section child laid over a screen) is not
+  found. The scan stops at `deadline` (nanoTime), and then `:timed-out?` is
+  true. With no `wrapper-ids` (mode `depth`) the result is empty."
+  [objects screen-ids wrapper-ids deadline]
+  (let [selected (set screen-ids)
+        parents  (into []
+                       (comp (map #(get-in objects [% :parent-id]))
+                             (filter #(contains? wrapper-ids %))
+                             (distinct))
+                       screen-ids)]
+    (loop [parents parents
+           out     {}
+           n       0]
+      (if-let [parent-id (first parents)]
+        (let [children (get-visible-child-ids objects parent-id)
+              screens  (filterv #(and (contains? selected %)
+                                      (not (boards/in-component? objects (get objects %))))
+                                children)
+              boxes    (into {} (map (juxt identity #(get-box (get objects %)))) screens)
+              grid     (reduce (fn [g sid]
+                                 (reduce #(update %1 %2 (fnil conj []) sid) g (grid-cells (get boxes sid))))
+                               {}
+                               screens)
+              result
+              (loop [ids children
+                     out out
+                     n   n]
+                (cond
+                  (empty? ids)
+                  {:out out :n n}
+
+                  (and (zero? (mod n 256)) (>= (System/nanoTime) deadline))
+                  {:out out :n n :timed-out? true}
+
+                  :else
+                  (let [id    (first ids)
+                        shape (get objects id)
+                        out'  (if (and (seq screens)
+                                       (not (contains? selected id))
+                                       (contains? #{:frame :group} (:type shape))
+                                       (not (boards/in-component? objects shape)))
+                                (let [box   (get-box shape)
+                                      cells (grid-cells box)
+                                      near  (if cells
+                                              (distinct (mapcat #(get grid %) cells))
+                                              screens)
+                                      [share best] (reduce (fn [[bs b] sid]
+                                                             (let [sh (boards/overlap-share box (get boxes sid))]
+                                                               (if (> sh bs) [sh sid] [bs b])))
+                                                           [0 nil]
+                                                           near)]
+                                  (cond-> out
+                                    (and best (>= share boards/overlay-min-share))
+                                    (assoc id best)))
+                                out)]
+                    (recur (rest ids) out' (inc n)))))]
+          (if (:timed-out? result)
+            {:overlays (:out result) :timed-out? true}
+            (recur (rest parents) (:out result) (:n result))))
+        {:overlays out :timed-out? false}))))
+
+(defn get-covering-overlays
+  "The overlays of `overlays` (`{overlay-id screen-id}`, see
+  `find-sibling-overlays`) with their coverage, as `[{:overlay-id :screen-id
+  :fraction :box}]` ordered by position (top, left) and then by id.
+  `:fraction` is the share of the overlay box inside the screen box (see
+  `boards/overlap-share`), `:box` the overlay box (see `get-box`). Only
+  overlays at or over `boards/overlay-min-share` are kept. An overlay or
+  screen missing from `objects` is skipped."
+  [objects overlays]
+  (->> overlays
+       (keep (fn [[overlay-id screen-id]]
+               (let [overlay (get objects overlay-id)
+                     screen  (get objects screen-id)]
+                 (when (and overlay screen)
+                   (let [ob   (get-box overlay)
+                         frac (boards/overlap-share ob (get-box screen))]
+                     (when (>= frac boards/overlay-min-share)
+                       {:overlay-id overlay-id
+                        :screen-id  screen-id
+                        :fraction   frac
+                        :box        ob}))))))
+       (sort-by (fn [{:keys [box overlay-id]}] [(:y0 box) (:x0 box) (str overlay-id)]))
+       vec))
+
+(defn- get-overlay-findings
+  "The `sibling-overlay` findings of `board`: one for each entry of
+  `covering` (see `get-covering-overlays`) whose screen is `board`."
+  [objects board covering]
+  (into []
+        (comp (filter #(= (:id board) (:screen-id %)))
+              (map (fn [{:keys [overlay-id fraction box]}]
+                     (lint-finding objects board :sibling-overlay (get objects overlay-id)
+                                   {:covered-fraction (round3 fraction)
+                                    :overlay-box      {:x      (round3 (:x0 box))
+                                                       :y      (round3 (:y0 box))
+                                                       :width  (round3 (- (:x1 box) (:x0 box)))
+                                                       :height (round3 (- (:y1 box) (:y0 box)))}}))))
+        covering))
+
 ;; --- BOARD FINDINGS
 
 (defn get-board-findings
@@ -833,13 +968,14 @@
   `:min-shapes` is the fewest visible descendants a board may have without
   an `empty-board` finding; `:tolerance` the edge tolerance in px of the
   control and scroll rules; `:min-overflow` the overflow in px of
-  `scroll-candidate`; `:selected` the ids of all selected boards; `:chrome`
+  `scroll-candidate`; `:selected` the ids of all selected boards; `:covering` the covering
+  overlays of the scan (see `get-covering-overlays`); `:chrome`
   the chrome components `[{:id :component-ids}]` of the scan (see
   `get-chrome-components`), empty when there are none.
   A board that holds at least one chrome instance and no content outside
   chrome instances (see `get-board-content`) has an `instance-only-board`
   finding."
-  [objects board {:keys [asked min-shapes tolerance min-overflow selected chrome]}]
+  [objects board {:keys [asked min-shapes tolerance min-overflow selected chrome covering]}]
   (let [ids        (get-visible-descendant-ids objects (:id board))
         component? (boards/in-component? objects board)
         chrome-ids (into #{} (mapcat #(or (:component-ids %) [(:id %)])) chrome)
@@ -867,7 +1003,9 @@
                                      (or min-overflow default-min-overflow)
                                      (or tolerance 0))))
         (into (keep #(get-control-finding objects board selected asked tolerance (get objects %)))
-              ids))))
+              ids)
+        (into (when (contains? asked :sibling-overlay)
+                (get-overlay-findings objects board covering))))))
 
 (defn- count-lint-findings
   "How many findings each asked rule of `rules` has, keyed by rule name."
@@ -890,8 +1028,10 @@
   rules (0 when absent), `min-overflow` the overflow in px of
   `scroll-candidate`, `component-name` a function of a component id that
   answers its name, or nil, and `component-variant` a function of a component
-  id that answers the id of its variant container, or nil."
-  [objects ids {:keys [rules min-shapes deadline selected tolerance min-overflow component-name component-variant]}]
+  id that answers the id of its variant container, or nil. `overlays` is the
+  map `{overlay-id screen-id}` of `find-sibling-overlays`, for
+  `sibling-overlay`; nil or empty for none."
+  [objects ids {:keys [rules min-shapes deadline selected tolerance min-overflow component-name component-variant overlays]}]
   (let [found  (when (contains? rules :instance-only-board)
                  (get-chrome-components objects ids deadline component-name component-variant))
         chrome (or (:chrome found) [])
@@ -900,7 +1040,9 @@
                 :tolerance    (or tolerance 0)
                 :min-overflow min-overflow
                 :selected     selected
-                :chrome       chrome}
+                :chrome       chrome
+                :covering     (when (contains? rules :sibling-overlay)
+                                (get-covering-overlays objects overlays))}
         listed (into [] (comp (take max-chrome-components) (map #(dissoc % :component-ids))) chrome)]
     (loop [ids      ids
            findings []
@@ -1169,7 +1311,12 @@
   background that covers it on both axes) that reach past its right or bottom
   edge by at least
   `min-overflow` px and more than `tolerance` px; the detail suggests the
-  value to set). A control is a component instance with a
+  value to set), and `sibling-overlay` (mode `auto` only: a visible board or group, of any size,
+  that is not a screen, is a child of the same parent as a screen (its wrapper) and covers
+  at least 50 % of its own area over that screen, such as a panel drawn over
+  a screen; `board-id` is the covered screen, `shape-id` the overlay, the
+  detail has `covered-fraction` and `overlay-box`; the overlay is not a
+  board of the selection; mode `depth` reports none). A control is a component instance with a
   visible text, reported once under its innermost selected board. A
   `scroll-candidate` frame is reported once too. `empty-board` and
   `instance-only-board` skip a board that is, or lies inside, a component
@@ -1225,6 +1372,9 @@
                         deadline (+ (System/nanoTime) budget-ns)
                         asked    (set (or (:rules params) lint-rules))
                         selected (select-page-boards objects regex depth mode deadline)
+                        overlay-scan (when (contains? asked :sibling-overlay)
+                                       (find-sibling-overlays objects (:ids selected)
+                                                              (:wrapper-ids selected) deadline))
                         result   (get-lint-findings objects (:ids selected)
                                                     {:rules          asked
                                                      :min-shapes     (or min-shapes 3)
@@ -1232,6 +1382,7 @@
                                                      :min-overflow   (or min-overflow default-min-overflow)
                                                      :deadline       deadline
                                                      :selected       (set (:ids selected))
+                                                     :overlays       (:overlays overlay-scan)
                                                      :component-name #(get-in file [:data :components % :name])
                                                      :component-variant #(get-in file [:data :components % :variant-id])})
                         all      (:findings result)
@@ -1240,6 +1391,7 @@
                         start    (min total (or offset 0))
                         end      (min total (+ start (or limit 500)))
                         timed-out? (boolean (or (:timed-out? selected)
+                                                (:timed-out? overlay-scan)
                                                 (:truncated result)))]
                     [(cond-> {:revn              revn
                               :page-id           page-id
@@ -1284,7 +1436,10 @@
   `skipped-small` gives their count and their first 50 ids. The boards are
   selected as in `get-mcp-page-lint` (`depth`, `mode`, `board-name-regex`;
   `selection` in the reply, with `other-sizes` in mode `auto`, and
-  `deeper-boards` in mode `depth`). Five seconds at most."
+  `deeper-boards` in mode `depth`). A group whose boards have overlays (see
+  `sibling-overlay` of `get-mcp-page-lint`, mode `auto`) lists them as
+  `overlays: [{board-id, shape-id}]`, so copies that differ only by a panel
+  laid over them can be told apart. Five seconds at most."
   {::rpc/token-type "mcp"
    ::rpc/mcp-scope "mcp:read"
    ::climit/id [[:mcp-read/by-profile ::rpc/profile-id] [:mcp-read/global]
@@ -1302,12 +1457,16 @@
                         regex    (compile-board-regex board-name-regex)
                         deadline (+ (System/nanoTime) budget-ns)
                         selected (select-page-boards objects regex depth mode deadline)
+                        overlay-scan (find-sibling-overlays objects (:ids selected)
+                                                            (:wrapper-ids selected) deadline)
                         entries  (get-board-entries objects (:ids selected)
                                                     (or min-shapes 3) deadline)
                         similar  (find-similar-groups (:entries entries)
                                                       (or threshold 0.9) deadline)
                         ranked   (sort-by (juxt #(- (count (:boards %))) #(- (:similarity %)))
                                           (:groups similar))
+                        covering (group-by :screen-id
+                                           (get-covering-overlays objects (:overlays overlay-scan)))
                         limit    (or limit 100)]
                     [(cond-> {:revn          revn
                               :page-id       page-id
@@ -1317,12 +1476,19 @@
                                               :ids   (vec (take max-skipped-ids (:skipped entries)))}
                               :compared      (:compared similar)
                               :groups        (mapv (fn [group]
-                                                     {:similarity (:similarity group)
-                                                      :exact      (:exact group)
-                                                      :boards     (mapv #(select-keys % [:id :name :path :shape-count])
-                                                                        (:boards group))})
+                                                     (let [overlays (into []
+                                                                          (mapcat (fn [b]
+                                                                                    (map (fn [o] {:board-id (:id b) :shape-id (:overlay-id o)})
+                                                                                         (get covering (:id b)))))
+                                                                          (:boards group))]
+                                                       (cond-> {:similarity (:similarity group)
+                                                                :exact      (:exact group)
+                                                                :boards     (mapv #(select-keys % [:id :name :path :shape-count])
+                                                                                  (:boards group))}
+                                                         (seq overlays) (assoc :overlays overlays))))
                                                    (take limit ranked))
                               :truncated     (boolean (or (:timed-out? selected)
+                                                          (:timed-out? overlay-scan)
                                                           (:truncated entries)
                                                           (:timed-out? similar)
                                                           (> (count ranked) limit)))}

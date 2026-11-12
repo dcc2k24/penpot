@@ -994,6 +994,147 @@
     (t/is (= 0 (:same-screen-skipped (:result out))))
     (t/is (= 1 (:scanned (:result out))))))
 
+(defn- margin-wrappers-fixture
+  "Three wrappers of `w` by `h` (1000 by 800) at x 0, 2000 and 4000, each
+  around a screen of 800 by 600 at the offset `dx` `dy`. With `overlay?` each
+  wrapper also holds a panel of 480 by 460 over the right side of its screen,
+  sticking out of it by 80 px. With `neighbour?` a bare screen lies at x
+  `w` + 15, outside the first wrapper."
+  [dx dy & {:keys [w h overlay? neighbour?] :or {w 1000 h 800}}]
+  (let [{:keys [profile file-id page]} (create-file-with-page)
+        board (fn [id name parent x y w h]
+                (cond-> {:op "create_board" :page-id page :id (str "$tmp:" id) :name name
+                         :x x :y y :width w :height h}
+                  (some? parent) (assoc :parent-id (str "$tmp:" parent))))
+        ids   (apply-ops!
+               profile file-id
+               (vec (concat (mapcat (fn [i]
+                              (let [x (* i 2000)]
+                                (cond-> [(board (str "w" i) (str "Wrapper " i) nil x 0 w h)
+                                         (board (str "s" i) (str "Screen " i) (str "w" i)
+                                                (+ x dx) dy 800 600)]
+                                  overlay?
+                                  (conj (board (str "o" i) "Overlay" (str "w" i)
+                                               (+ x dx 400) (+ dy 100) 480 460)))))
+                            (range 3))
+                    (when neighbour?
+                      [(board "n" "Neighbour" nil (+ w 15) dy 800 600)]))))]
+    {:profile profile
+     :file-id file-id
+     :page    page
+     :w0      (get ids "$tmp:w0")
+     :s0      (get ids "$tmp:s0")
+     :s1      (get ids "$tmp:s1")
+     :s2      (get ids "$tmp:s2")
+     :n       (get ids "$tmp:n")}))
+
+(t/deftest an-end-on-a-wrapper-edge-snaps-to-the-screen-inside-it
+  (let [{:keys [profile file-id page s0 s1 s2]} (margin-wrappers-fixture 100 100)
+        _      (add-path profile file-id page "Link" "M 995 400 L 2005 400"
+                         :stroke (assoc solid-stroke :stroke-cap-end :line-arrow))
+        _      (add-path profile file-id page "Link 2" "M 2995 400 L 4005 400"
+                         :stroke solid-stroke)
+        out    (find-connectors profile file-id page)
+        result (:result out)
+        link   (by-name "Link" (:connectors result))
+        link2  (by-name "Link 2" (:connectors result))]
+    (t/is (nil? (:error out)))
+    (t/is (= 3 (get-in result [:selection :boards])))
+    (t/is (some #{{:width 1000 :height 800 :boards 3 :relation "wrapper"}}
+                (get-in result [:selection :other-sizes])))
+    (t/is (= 2 (count (:connectors result))))
+    (t/is (= s0 (get-in link [:from :screen-id])))
+    (t/is (= s1 (get-in link [:to :screen-id])))
+    (t/is (near? 95 (get-in link [:from :distance])) "measured to the screen edge")
+    (t/is (near? 95 (get-in link [:to :distance])))
+    (t/is (= s0 (get-in link [:from :board-id])) "the screen stands for the wrapper")
+    (t/is (not (contains? (:from link) :non-screen)))
+    (t/is (= s1 (get-in link2 [:from :screen-id])))
+    (t/is (= s2 (get-in link2 [:to :screen-id])))
+    (t/is (= 0 (:non-screen-ends result)))))
+
+(t/deftest an-end-far-from-a-wrapper-does-not-snap
+  (let [{:keys [profile file-id page]} (margin-wrappers-fixture 100 100)
+        _      (add-path profile file-id page "Lost" "M 1100 400 L 2005 400"
+                         :stroke solid-stroke)
+        result (:result (find-connectors profile file-id page :max-distance 64))
+        lost   (by-name "Lost" (:connectors result))]
+    (t/is (nil? lost) "an end 100 px from a wrapper is out of reach, so there is no connector")))
+
+(t/deftest an-uneven-margin-does-not-make-the-frame-a-wrapper-for-the-ends
+  (let [{:keys [profile file-id page]} (margin-wrappers-fixture 50 100)
+        _      (add-path profile file-id page "Link" "M 995 400 L 2005 400"
+                         :stroke solid-stroke)
+        result (:result (find-connectors profile file-id page))
+        link   (first (:connectors result))]
+    (t/is (some #{{:width 1000 :height 800 :boards 3 :relation "outside"}}
+                (get-in result [:selection :other-sizes])))
+    (t/is (nil? (get-in link [:from :screen-id])) "wrapper edge is 95 px from the screen")))
+
+(t/deftest an-end-snaps-through-a-wrapper-that-also-holds-an-overlay
+  ;; The real Processing wrappers: 1000 by 800, the screen and a 480 by 460
+  ;; panel beside it. The panel size is standard by the taller rule, so it was
+  ;; a class of its own and counted as a second screen in the wrapper.
+  (let [{:keys [profile file-id page s0 s1]} (margin-wrappers-fixture 100 100 :overlay? true)
+        _      (add-path profile file-id page "Link" "M 995 400 L 2005 400" :stroke solid-stroke)
+        result (:result (find-connectors profile file-id page))
+        link   (first (:connectors result))]
+    (t/is (= 3 (get-in result [:selection :boards])) "the overlays are not boards")
+    (t/is (= s0 (get-in link [:from :screen-id])))
+    (t/is (= s1 (get-in link [:to :screen-id])))
+    (t/is (= 0 (:non-screen-ends result)))))
+
+(t/deftest an-end-snaps-through-a-centered-wrapper-with-unequal-sides
+  ;; 1480 by 1000 around 800 by 600: 340 px left and right, 200 above and below.
+  (let [{:keys [profile file-id page s0 s1]} (margin-wrappers-fixture 340 200 :w 1480 :h 1000)
+        _      (add-path profile file-id page "Link" "M 1475 500 L 2005 500" :stroke solid-stroke)
+        result (:result (find-connectors profile file-id page))
+        link   (first (:connectors result))]
+    (t/is (= s0 (get-in link [:from :screen-id])))
+    (t/is (= s1 (get-in link [:to :screen-id])))
+    (t/is (near? 335 (get-in link [:from :distance])))))
+
+(t/deftest an-end-prefers-the-nearer-screen-over-the-screen-of-a-large-wrapper
+  ;; The end lies 5 px inside a 1480 by 1000 wrapper, 335 px from its screen,
+  ;; and 20 px from a bare screen outside the wrapper.
+  (let [{:keys [profile file-id page s1 n]} (margin-wrappers-fixture 340 200 :w 1480 :h 1000
+                                                                     :neighbour? true)
+        _      (add-path profile file-id page "Link" "M 1475 500 L 3000 500" :stroke solid-stroke)
+        result (:result (find-connectors profile file-id page))
+        link   (first (:connectors result))]
+    (t/is (= n (get-in link [:from :screen-id])))
+    (t/is (= s1 (get-in link [:to :screen-id])))))
+
+(t/deftest an-end-on-an-overlay-belongs-to-the-screen-it-covers
+  (let [{:keys [profile file-id page s0 s1]} (margin-wrappers-fixture 100 100 :overlay? true)
+        _      (add-path profile file-id page "Link" "M 950 400 L 2005 400" :stroke solid-stroke)
+        result (:result (find-connectors profile file-id page))
+        link   (first (:connectors result))]
+    (t/is (= 3 (get-in result [:selection :boards])))
+    (t/is (= s0 (get-in link [:from :screen-id])) "the panel is part of the screen")
+    (t/is (= s0 (get-in link [:from :board-id])))
+    (t/is (near? 50 (get-in link [:from :distance])) "measured to the screen")
+    (t/is (= s1 (get-in link [:to :screen-id])))
+    (t/is (= 0 (:non-screen-ends result)))))
+
+(defn- wrapper-board
+  [id name x1 y1 x2 y2 ancestors]
+  (proto/->Board id name (double x1) (double y1) (double x2) (double y2)
+                 (double (* (- x2 x1) (- y2 y1))) 1 ancestors))
+
+(t/deftest a-frame-holding-several-screens-is-not-a-wrapper
+  (let [frames  [(wrapper-board :c "Container" 0 0 2000 800 #{})
+                 (wrapper-board :a "A" 100 100 900 700 #{:c})
+                 (wrapper-board :b "B" 1100 100 1900 700 #{:c})
+                 (wrapper-board :d "Solo" 3000 0 4000 800 #{})
+                 (wrapper-board :e "E" 3100 100 3900 700 #{:d})]
+        objects {:c {:parent-id uuid/zero} :a {:parent-id :c} :b {:parent-id :c}
+                 :d {:parent-id uuid/zero} :e {:parent-id :d}}]
+    (t/is (= {} (#'proto/get-wrappers objects (subvec frames 0 3) #{:a :b}))
+          "two screens in one frame")
+    (t/is (= [:e] (keys (#'proto/get-wrappers objects frames #{:a :b :e})))
+          "a screen alone in a centered frame has it as wrapper")))
+
 (defn- journeys-fixture
   "Section A (0..1800 by 0..900) holds Screen A1 (x 50..850) with the nested
   frames Header A1 and Body A1, Screen A2 (x 900..1700) and three loose frames

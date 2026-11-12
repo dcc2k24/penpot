@@ -1713,7 +1713,7 @@
         many (lint profile file-id page-id {:rules (vec (repeat 9 :empty-board))})
         ten  (lint profile file-id page-id {:rules (vec (repeat 10 :empty-board))})]
     (t/is (= #{"empty-board" "instance-only-board" "clipped-control" "invisible-control"
-               "scroll-hidden-control" "off-board-control" "scroll-candidate"}
+               "scroll-hidden-control" "off-board-control" "scroll-candidate" "sibling-overlay"}
              (set (keys (:counts (:result out))))))
     (t/is (nil? (:error many)) "up to 9 rule names are accepted")
     (t/is (some? (:error ten)))))
@@ -2420,3 +2420,252 @@
     (t/is (= :invisible-control (rule-of out gone)))
     (t/is (== 0 (:visible-fraction (detail-of out gone))))
     (t/is (not (contains? (detail-of out gone) :raw-visible-fraction)) "no share, no key")))
+
+;; --- LINT: SIBLING OVERLAYS
+
+(defn- overlay-page!
+  "Writes one wrapper of 1000 by 800 for each entry of `specs`, 2000 px apart,
+  with a screen of 800 by 600 (100 px in) that holds three texts, and, when
+  the entry is `[w h dx dy attrs]`, a board of `w` by `h` beside the screen
+  in the wrapper at the offset `dx` `dy` from the wrapper corner. Returns
+  `{:screens [...] :overlays [... or nil]}`."
+  [profile file-id page-id specs]
+  (let [parts (vec (map-indexed
+                    (fn [i spec]
+                      (let [x       (* i 2000)
+                            wrapper (uuid/next)
+                            screen  (uuid/next)
+                            overlay (when spec (uuid/next))
+                            [w h dx dy attrs] spec]
+                        {:screen  screen
+                         :wrapper wrapper
+                         :overlay overlay
+                         :changes (concat
+                                   [(obj page-id wrapper uuid/zero uuid/zero :frame "Wrapper" x 0 1000 800 {})
+                                    (obj page-id screen wrapper wrapper :frame "Screen" (+ x 100) 100 800 600 {})]
+                                   (map-indexed (fn [j s]
+                                                  (obj page-id (uuid/next) screen screen :text s
+                                                       (+ x 120) (+ 120 (* j 20)) 80 20
+                                                       {:content (text-content s)}))
+                                                ["One" "Two" "Three"])
+                                   (when spec
+                                     [(obj page-id overlay wrapper wrapper :frame (str "Overlay " i)
+                                           (+ x dx) dy w h (or attrs {}))]))}))
+                    specs))]
+    (apply-changes! profile file-id (vec (mapcat :changes parts)))
+    {:screens  (mapv :screen parts)
+     :wrappers (mapv :wrapper parts)
+     :overlays (mapv :overlay parts)}))
+
+(t/deftest sibling-overlay-beside-its-screen-is-reported-with-the-covered-fraction
+  (let [{:keys [profile file-id page-id]} (new-file)
+        {:keys [screens overlays]} (overlay-page! profile file-id page-id
+                                                  [[400 300 300 200] nil nil])
+        out (lint profile file-id page-id {})
+        fs  (findings-of out :sibling-overlay)]
+    (t/is (nil? (:error out)))
+    (t/is (= 1 (count fs)))
+    (t/is (= (first screens) (:board-id (first fs))) "the covered screen")
+    (t/is (= (first overlays) (:shape-id (first fs))))
+    (t/is (= "Overlay 0" (:shape-name (first fs))))
+    (t/is (== 1.0 (:covered-fraction (:detail (first fs)))))
+    (t/is (= [300.0 200.0 400.0 300.0] (map (comp double (:overlay-box (:detail (first fs)))) [:x :y :width :height])))
+    (t/is (= 1 (get-in out [:result :counts "sibling-overlay"])))
+    (t/is (= 3 (get-in out [:result :selection :boards]))
+          "the overlay is not a board; the selection is the three screens")))
+
+(t/deftest sibling-overlay-needs-half-of-its-own-area-over-the-screen
+  (let [{:keys [profile file-id page-id]} (new-file)
+        ;; the screen ends at x 900 in the wrapper: 120 of 400 px, 30 %
+        _   (overlay-page! profile file-id page-id [[400 300 780 200] nil nil])
+        out (lint profile file-id page-id {})]
+    (t/is (empty? (findings-of out :sibling-overlay)))
+    (t/is (= 0 (get-in out [:result :counts "sibling-overlay"])))))
+
+(t/deftest sibling-overlay-at-half-is-reported
+  (let [{:keys [profile file-id page-id]} (new-file)
+        ;; 200 of 400 px over the screen, exactly 50 %
+        {:keys [overlays]} (overlay-page! profile file-id page-id [[400 300 700 200] nil nil])
+        fs (findings-of (lint profile file-id page-id {}) :sibling-overlay)]
+    (t/is (= [(first overlays)] (map :shape-id fs)))
+    (t/is (== 0.5 (:covered-fraction (:detail (first fs)))))))
+
+(t/deftest hidden-sibling-overlay-is-not-reported
+  (let [{:keys [profile file-id page-id]} (new-file)
+        _   (overlay-page! profile file-id page-id [[400 300 300 200 {:hidden true}] nil nil])
+        out (lint profile file-id page-id {})]
+    (t/is (empty? (findings-of out :sibling-overlay)))
+    (t/is (= 0 (get-in out [:result :counts "sibling-overlay"])))))
+
+(t/deftest board-inside-the-screen-is-not-a-sibling-overlay
+  (let [{:keys [profile file-id page-id]} (new-file)
+        {:keys [screens]} (overlay-page! profile file-id page-id [nil nil nil])
+        inner (uuid/next)
+        _     (apply-changes! profile file-id
+                              [(obj page-id inner (first screens) (first screens) :frame "Panel"
+                                    400 200 400 300 {})])
+        out   (lint profile file-id page-id {})]
+    (t/is (empty? (findings-of out :sibling-overlay)))))
+
+(t/deftest sibling-overlay-follows-the-rule-filter
+  (let [{:keys [profile file-id page-id]} (new-file)
+        {:keys [overlays]} (overlay-page! profile file-id page-id [[400 300 300 200] nil nil])
+        only  (lint profile file-id page-id {:rules [:sibling-overlay]})
+        other (lint profile file-id page-id {:rules [:empty-board]})]
+    (t/is (= [(first overlays)] (map :shape-id (:findings (:result only)))))
+    (t/is (= {"sibling-overlay" 1} (:counts (:result only))))
+    (t/is (= 1 (:total (:result only))))
+    (t/is (empty? (findings-of other :sibling-overlay)))
+    (t/is (not (contains? (:counts (:result other)) "sibling-overlay")))))
+
+(t/deftest sibling-overlay-findings-page-by-offset
+  (let [{:keys [profile file-id page-id]} (new-file)
+        {:keys [screens overlays]} (overlay-page! profile file-id page-id
+                                                  [[400 300 300 200] [410 300 300 200] [420 300 300 200]])
+        params {:rules [:sibling-overlay]}
+        page   (fn [offset] (:result (lint profile file-id page-id (assoc params :limit 2 :offset offset))))
+        p1     (page 0)
+        p2     (page 2)
+        whole  (:result (lint profile file-id page-id params))]
+    (t/is (= 3 (:total whole) (:total p1) (:total p2)))
+    (t/is (= overlays (map :shape-id (:findings whole))))
+    (t/is (= screens (map :board-id (:findings whole))))
+    (t/is (= [2 1] (map (comp count :findings) [p1 p2])))
+    (t/is (= 2 (:next-offset p1)))
+    (t/is (nil? (:next-offset p2)))
+    (t/is (= (:findings whole) (concat (:findings p1) (:findings p2))))))
+
+(t/deftest similar-boards-list-the-overlays-of-their-screens
+  (let [{:keys [profile file-id page-id]} (new-file)
+        {:keys [screens overlays]} (overlay-page! profile file-id page-id
+                                                  [[400 300 300 200] nil nil])
+        out    (similar profile file-id page-id {:min-shapes 3})
+        groups (:groups (:result out))]
+    (t/is (nil? (:error out)))
+    (t/is (= 1 (count groups)))
+    (t/is (= (set screens) (set (map :id (:boards (first groups))))))
+    (t/is (= [{:board-id (first screens) :shape-id (first overlays)}]
+             (:overlays (first groups))))))
+
+(t/deftest similar-boards-without-overlays-have-no-overlays-key
+  (let [{:keys [profile file-id page-id]} (new-file)
+        _      (overlay-page! profile file-id page-id [nil nil nil])
+        groups (:groups (:result (similar profile file-id page-id {:min-shapes 3})))]
+    (t/is (= 1 (count groups)))
+    (t/is (not (contains? (first groups) :overlays)))))
+(t/deftest sibling-overlay-reports-a-group-beside-the-screen
+  (let [{:keys [profile file-id page-id]} (new-file)
+        {:keys [screens wrappers]} (overlay-page! profile file-id page-id [nil nil nil])
+        w     (first wrappers)
+        modal (uuid/next)
+        rect  (uuid/next)
+        _     (apply-changes! profile file-id
+                              [(obj page-id modal w w :group "Modal" 300 200 400 300 {})
+                               (obj page-id rect modal w :rect "Card" 300 200 400 300 {})])
+        out   (lint profile file-id page-id {:rules [:sibling-overlay]})
+        fs    (:findings (:result out))]
+    (t/is (nil? (:error out)))
+    (t/is (= [[(first screens) modal "Modal"]]
+             (map (juxt :board-id :shape-id :shape-name) fs)))
+    (t/is (== 1.0 (:covered-fraction (:detail (first fs)))))
+    (t/is (= 3 (get-in out [:result :selection :boards])) "the group is not a board")))
+
+(t/deftest sibling-overlay-reports-a-small-toast-and-skips-a-hidden-group
+  (let [{:keys [profile file-id page-id]} (new-file)
+        {:keys [screens wrappers]} (overlay-page! profile file-id page-id [nil nil nil])
+        w     (first wrappers)
+        toast (uuid/next)
+        hid   (uuid/next)
+        hrect (uuid/next)
+        _     (apply-changes! profile file-id
+                              [(obj page-id toast w w :frame "Toast" 300 600 300 80 {})
+                               (obj page-id hid w w :group "Hidden modal" 300 200 400 300 {:hidden true})
+                               (obj page-id hrect hid w :rect "Card" 300 200 400 300 {})])
+        out   (lint profile file-id page-id {:rules [:sibling-overlay]})
+        fs    (:findings (:result out))]
+    (t/is (= [[(first screens) toast]] (map (juxt :board-id :shape-id) fs))
+          "a toast under 200 px is reported; a hidden group is not")
+    (t/is (= 3 (get-in out [:result :selection :boards])))))
+
+(t/deftest sibling-overlay-ignores-a-group-in-another-parent
+  (let [{:keys [profile file-id page-id]} (new-file)
+        {:keys [screens]} (overlay-page! profile file-id page-id [nil nil nil])
+        modal (uuid/next)
+        rect  (uuid/next)
+        _     (apply-changes! profile file-id
+                              [(obj page-id modal uuid/zero uuid/zero :group "Loose" 300 200 400 300 {})
+                               (obj page-id rect modal uuid/zero :rect "Card" 300 200 400 300 {})])
+        out   (lint profile file-id page-id {:rules [:sibling-overlay]})]
+    (t/is (= 3 (count screens)))
+    (t/is (empty? (:findings (:result out)))
+          "a group that is not a sibling of the screen in its wrapper is out of scope")))
+(t/deftest sibling-overlay-needs-a-wrapper-not-a-section-of-screens
+  (let [{:keys [profile file-id page-id]} (new-file)
+        section (uuid/next)
+        note    (uuid/next)
+        nrect   (uuid/next)
+        screens (vec (repeatedly 3 uuid/next))
+        _       (apply-changes!
+                 profile file-id
+                 (concat
+                  [(obj page-id section uuid/zero uuid/zero :frame "Section" 0 0 3000 1000 {})]
+                  (mapcat (fn [i sid]
+                            (cons (obj page-id sid section section :frame "Screen" (+ 100 (* i 900)) 100 800 600 {})
+                                  (map-indexed (fn [j s]
+                                                 (obj page-id (uuid/next) sid sid :text s
+                                                      (+ 120 (* i 900)) (+ 120 (* j 20)) 80 20
+                                                      {:content (text-content s)}))
+                                               ["One" "Two" "Three"])))
+                          (range) screens)
+                  [(obj page-id note section section :group "Sticky" 200 200 300 200 {})
+                   (obj page-id nrect note section :rect "Paper" 200 200 300 200 {})]))
+        out     (lint profile file-id page-id {:rules [:sibling-overlay]})]
+    (t/is (nil? (:error out)))
+    (t/is (= 3 (get-in out [:result :selection :boards])))
+    (t/is (empty? (:findings (:result out)))
+          "a section that holds screens is not a wrapper: the note is not an overlay")))
+
+;; --- SIBLING OVERLAYS: SCALE AND BUDGET
+
+(defn- overlay-objects
+  "A page map of one wrapper that holds `n` screens of 800 by 600 on a grid of
+  100 columns, 1000 px apart, and a group of 100 by 100 over each. Returns
+  `{:objects :wrapper :screens :groups}`."
+  [n]
+  (let [wrapper (uuid/next)
+        screens (vec (repeatedly n uuid/next))
+        groups  (vec (repeatedly n uuid/next))
+        shape   (fn [id type x y w h]
+                  {:id id :type type :parent-id wrapper :frame-id wrapper
+                   :x x :y y :width w :height h})
+        pos     (fn [i] [(* 1000 (mod i 100)) (* 1000 (quot i 100))])]
+    {:wrapper wrapper
+     :screens screens
+     :groups  groups
+     :objects (into {wrapper {:id wrapper :type :frame :parent-id uuid/zero :frame-id uuid/zero
+                              :shapes (vec (interleave screens groups))}}
+                    (mapcat (fn [i]
+                              (let [[x y] (pos i)]
+                                [[(screens i) (shape (screens i) :frame x y 800 600)]
+                                 [(groups i) (shape (groups i) :group (+ x 10) (+ y 10) 100 100)]]))
+                            (range n)))}))
+
+(t/deftest sibling-overlays-of-6000-screens-and-6000-groups-stay-inside-the-budget
+  (let [{:keys [objects wrapper screens groups]} (overlay-objects 6000)
+        t0   (System/nanoTime)
+        scan (mcp-lint/find-sibling-overlays objects screens #{wrapper}
+                                             (+ (System/nanoTime) (* 60 1000000000)))
+        ms   (/ (- (System/nanoTime) t0) 1e6)]
+    (t/is (false? (:timed-out? scan)))
+    (t/is (= (zipmap groups screens) (:overlays scan)))
+    (t/is (< ms 3000) (str "took " ms " ms"))))
+
+(t/deftest sibling-overlay-scan-stops-at-its-deadline
+  (let [{:keys [objects wrapper screens]} (overlay-objects 600)
+        scan (mcp-lint/find-sibling-overlays objects screens #{wrapper}
+                                             (- (System/nanoTime) 1))]
+    (t/is (true? (:timed-out? scan)))
+    (t/is (< (count (:overlays scan)) 600))
+    (t/is (empty? (:overlays (mcp-lint/find-sibling-overlays
+                              objects screens #{} (+ (System/nanoTime) 1000000000))))
+          "no wrapper, no overlays")))

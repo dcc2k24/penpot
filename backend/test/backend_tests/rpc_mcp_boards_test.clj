@@ -465,7 +465,8 @@
         a      (select flat {})
         b      (select nested {})]
     (t/is (= (level-1 flat) (:ids a)) "both tall screens are admitted as loose boards")
-    (t/is (= (named-many nested "Screen" "Section") (:ids b)))
+    (t/is (= (named nested "Screen") (:ids b))
+          "the section is larger than the screens in both directions, so it is not a board")
     (t/is (empty? (filter (set (named nested "Tall")) (:ids b))) "the nested tall screens are not boards")))
 
 (t/deftest large-equal-panels-inside-screens-are-not-the-screens
@@ -887,6 +888,253 @@
         auto (select page {})]
     (t/is (= [{:width 800 :height 660 :boards 6 :relation "wrapper"}]
              (get-in auto [:selection :other-sizes])))))
+
+;; --- WRAPPERS BY MARGIN, SECTIONS AND OVERLAYS
+
+(defn- at
+  "A frame spec named `name` at `x` `y` of the size `w` by `h` (page
+  coordinates) with the child specs `kids`."
+  [name x y w h & kids]
+  (apply fr+ name w h {:x x :y y} kids))
+
+(defn- margin-wrapper
+  "A 1000 by 800 wrapper at `x` `y` that holds one screen of 800 by 600 at the
+  offset `dx` `dy`, and the extra child specs `extra`."
+  [x y dx dy & extra]
+  (apply at "Wrapper" x y 1000 800 (at "Screen" (+ x dx) (+ y dy) 800 600) extra))
+
+(defn- margin-page
+  "The shape of the Kiosk page: three sections of 10600 by 5880, each with two
+  wrappers of 1000 by 800 around a screen of 800 by 600 (a margin of 100 px on
+  every side), an empty section of 9645 by 6924, four toast boards of 356 by
+  234 and one of 356 by 344, a wrapper of 1000 by 1024 around a settings
+  screen of 800 by 824, and an overlay of 480 by 460 beside the first
+  screen inside its wrapper. `dx` and `dy` are the offset of the screens."
+  [dx dy]
+  (build
+   (at "Section" 0 0 10600 5880
+       (margin-wrapper 100 100 dx dy (at "Overlay" 400 250 480 460))
+       (margin-wrapper 2000 100 dx dy))
+   (at "Section" 12000 0 10600 5880
+       (margin-wrapper 12100 100 dx dy)
+       (margin-wrapper 14000 100 dx dy))
+   (at "Section" 24000 0 10600 5880
+       (margin-wrapper 24100 100 dx dy)
+       (margin-wrapper 26000 100 dx dy))
+   (at "Empty Section" 0 20000 9645 6924)
+   (at "Toast" 40000 0 356 234 (at "Toast Inner" 40000 0 356 234))
+   (at "Toast" 40500 0 356 234 (at "Toast Inner" 40500 0 356 234))
+   (at "Toast" 41000 0 356 234 (at "Toast Inner" 41000 0 356 234))
+   (at "Toast" 41500 0 356 234 (at "Toast Inner" 41500 0 356 234))
+   (at "Panel" 42000 0 356 344 (at "Panel Inner" 42000 0 356 344))
+   (at "Settings Wrapper" 50000 0 1000 1024
+       (at "Settings" 50100 100 800 824))))
+
+(t/deftest margin-wrappers-are-wrappers-and-the-boards-are-the-screens
+  (let [page (margin-page 100 100)
+        auto (select page {})
+        sel  (:selection auto)]
+    (t/is (= (named-many page "Screen" "Settings") (:ids auto))
+          "the six screens and the settings screen, nothing else")
+    (t/is (= "standard-size" (:basis sel)))
+    (t/is (= [[800 600 6] [800 824 1]] (sizes-of auto)))
+    (t/is (= 7 (:boards sel)))
+    (t/is (some #{{:width 1000 :height 800 :boards 6 :relation "wrapper"}} (:other-sizes sel))
+          "the wrapper size is reported as a wrapper")))
+
+(t/deftest sections-and-component-sized-boards-are-not-boards
+  (let [page (margin-page 100 100)
+        auto (select page {})]
+    (doseq [n ["Section" "Empty Section" "Toast" "Panel" "Settings Wrapper" "Wrapper"]]
+      (t/is (empty? (filter (set (named page n)) (:ids auto))) (str n " is not a board")))))
+
+(t/deftest overlay-boards-are-not-boards-and-name-their-screen
+  (let [page    (margin-page 100 100)
+        auto    (select page {})
+        overlay (first (named page "Overlay"))
+        screen  (first (named page "Screen"))]
+    (t/is (empty? (filter #{overlay} (:ids auto))))
+    (t/is (= {overlay screen} (:overlays auto))
+          "the overlay is known with the screen it lies beside")))
+
+(t/deftest an-uneven-margin-is-not-a-wrapper
+  (let [page (margin-page 50 100)
+        auto (select page {})]
+    (t/is (some #{{:width 1000 :height 800 :boards 6 :relation "outside"}}
+                (get-in auto [:selection :other-sizes]))
+          "50 px on the left and 150 px on the right")))
+
+(t/deftest a-margin-over-two-hundred-is-not-a-wrapper
+  (let [page (apply build
+                    (for [i (range 6)]
+                      (at "Wrapper" (* i 2000) 0 1300 1000
+                          (at "Screen" (+ (* i 2000) 250) 200 800 600))))
+        auto (select page {})]
+    (t/is (= [{:width 1300 :height 1000 :boards 6 :relation "outside"}]
+             (get-in auto [:selection :other-sizes])))))
+
+(t/deftest a-genuine-other-screen-size-stays-a-loose-board
+  (let [page (apply build
+                    (concat (for [i (range 3)] (at "Screen" (* i 1000) 0 800 600))
+                            [(at "Narrow" 5000 0 700 500)
+                             (at "Phone" 6000 0 390 844)
+                             (at "Wide" 7000 0 1920 1080)]))
+        auto (select page {})]
+    (t/is (= (named-many page "Screen" "Narrow" "Phone" "Wide") (:ids auto))
+          "smaller, taller and larger standard sizes are screens too")))
+
+(t/deftest overlay-classes-and-annotation-pairs-are-not-boards
+  ;; The real page: 480 by 460 overlays beside three screens inside their
+  ;; wrappers form a class that is standard by the taller rule (over 480 by
+  ;; 320), and the notes of 356 by 234 ("Annotation" holding a "Widget" of the
+  ;; same size) are loose boards. Neither is a screen.
+  (let [wrap  (fn [i & extra]
+                (apply at "Wrapper" (* i 2000) 0 1000 800
+                       (at "Screen" (+ (* i 2000) 100) 100 800 600)
+                       extra))
+        page  (apply build
+                     (concat
+                      [(apply at "Section" 0 -10000 20000 6000
+                              (concat
+                               (for [i (range 3)]
+                                 (at "Annotation" (* i 500) -9000 356 234
+                                     (at "Widget" (* i 500) -9000 356 234)))
+                               (for [i (range 4)]
+                                 (at "Annotation" (* i 500) -8000 356 234
+                                     (at "Widget" (* i 500) -8000 356 234)))))]
+                      (for [i (range 3)]
+                        (wrap i (at "Overlay" (+ (* i 2000) 300) 150 480 460)))
+                      (for [i (range 3 8)] (wrap i))))
+        auto  (select page {})
+        overlays (named page "Overlay")]
+    (t/is (= (named page "Screen") (:ids auto)) "the eight screens, nothing else")
+    (t/is (= (set overlays) (set (keys (:overlays auto)))))
+    (t/is (= [[800 600 8]] (sizes-of auto)))))
+
+(t/deftest loose-screens-of-other-sizes-on-mixed-pages-stay-boards
+  (let [all (fn [page] (level-1 page))
+        phones (fn [] (for [_ (range 3)] (fr "Phone" 390 844)))]
+    (t/testing "phones with loose long desktop pages and a tablet"
+      (let [page (apply build (concat (phones) [(fr "Long" 1440 3000) (fr "Desk" 1440 960) (fr "Tablet" 834 1210)]))]
+        (t/is (= (all page) (:ids (select page {}))))))
+    (t/testing "desktops with a loose phone and a loose odd tablet"
+      (let [page (apply build (concat (for [_ (range 3)] (fr "Desk" 1920 1080))
+                                      [(fr "Phone" 393 873) (fr "Tablet" 900 1200)]))]
+        (t/is (= (all page) (:ids (select page {}))))))
+    (t/testing "a slightly larger loose screen"
+      (let [page (apply build (concat (for [_ (range 3)] (fr "Screen" 1000 700)) [(fr "Big" 1200 900)]))]
+        (t/is (= (all page) (:ids (select page {}))))))
+    (t/testing "phones and desktops with a loose landscape strip and a loose large desktop"
+      (let [page (apply build (concat (phones)
+                                      (for [_ (range 3)] (fr "Desk" 1440 900))
+                                      [(fr "Strip" 860 400) (fr "Huge" 2000 1200)]))]
+        (t/is (= (all page) (:ids (select page {}))))))))
+
+(t/deftest custom-phones-on-a-desktop-page-stay-boards
+  (let [page (apply build (concat (for [_ (range 3)] (fr "Desk" 1920 1080))
+                                  [(fr "Phone A" 380 800) (fr "Phone B" 400 860)]))]
+    (t/is (= (level-1 page) (:ids (select page {}))))))
+
+(t/deftest a-portrait-frame-holding-a-frame-of-its-size-is-not-an-annotation
+  (let [page (apply build (concat (for [_ (range 3)] (fr "Desk" 1920 1080))
+                                  [(fr "Phone" 380 800 (fr "Content" 380 800))]))]
+    (t/is (some #{(first (named page "Phone"))} (:ids (select page {}))))))
+
+(t/deftest many-loose-frames-are-weighed-in-linear-time
+  (let [page  (apply build (concat (for [_ (range 3)] (fr "Phone" 390 844))
+                                   (for [_ (range 8000)] (fr "Card" 300 300))))
+        start (System/nanoTime)
+        auto  (select page {})
+        ms    (/ (- (System/nanoTime) start) 1e6)]
+    (t/is (false? (:timed-out? auto)))
+    (t/is (= 8003 (count (:ids auto))))
+    (t/is (< ms 3000) (str "took " ms " ms"))))
+
+(t/deftest filtering-the-loose-boards-stops-at-the-deadline
+  (let [f #'boards/filter-until]
+    (t/is (= [1 3] (f odd? [1 2 3] nil)))
+    (t/is (nil? (f odd? [1 2 3] (- (System/nanoTime) 1000))) "an expired deadline gives nil")))
+
+(t/deftest wrappers-around-screens-of-two-standard-sizes-are-wrappers
+  ;; N4: 8 wrappers around 800 by 600 and 2 around 800 by 480.
+  (let [page (apply build
+                    (for [i (range 10)]
+                      (at "Wrapper" (* i 2000) 0 1000 800
+                          (at "Screen" (+ (* i 2000) 100) (if (< i 8) 100 160) 800 (if (< i 8) 600 480)))))
+        auto (select page {})]
+    (t/is (= (named page "Screen") (:ids auto)))
+    (t/is (= "standard-size" (get-in auto [:selection :basis])))
+    (t/is (some #{{:width 1000 :height 800 :boards 10 :relation "wrapper"}}
+                (get-in auto [:selection :other-sizes])))))
+
+(t/deftest overlays-are-found-in-wrappers-even-when-the-class-is-not-a-wrapper
+  ;; N5: 10 wrappers, 2 with the screen 4 px off center (80 % even), 3 overlays.
+  (let [page (apply build
+                    (for [i (range 10)]
+                      (apply at "Wrapper" (* i 2000) 0 1000 800
+                             (at "Screen" (+ (* i 2000) (if (>= i 8) 104 100)) 100 800 600)
+                             (when (< i 3)
+                               [(at "Overlay" (+ (* i 2000) 300) 150 480 460)]))))
+        auto (select page {})]
+    (t/is (= (named page "Screen") (:ids auto)) "the overlays are not boards")
+    (t/is (= (set (named page "Overlay")) (set (keys (:overlays auto)))))
+    (t/is (some #{{:width 1000 :height 800 :boards 10 :relation "outside"}}
+                (get-in auto [:selection :other-sizes]))
+          "the class is not reported as a wrapper below the share")))
+
+(t/deftest a-class-of-wrappers-needs-nearly-all-frames-to-hold-one-screen
+  ;; 20 frames of 1000 by 800, 11 of them hold a centered dialog of 800 by 600:
+  ;; the 20 frames are the screens and the dialogs are inside them.
+  (let [page (apply build
+                    (for [i (range 20)]
+                      (apply at "Screen" (* i 2000) 0 1000 800
+                             (when (< i 11)
+                               [(at "Dialog" (+ (* i 2000) 100) 100 800 600)]))))
+        auto (select page {})]
+    (t/is (= (named page "Screen") (:ids auto)))
+    (t/is (empty? (filter #(= "wrapper" (:relation %)) (get-in auto [:selection :other-sizes]))))))
+
+(t/deftest a-sibling-that-does-not-overlap-the-screen-is-not-an-overlay
+  ;; A phone screen beside the screen inside the same wrapper stays a board.
+  (let [page (apply build
+                    (for [i (range 6)]
+                      (apply at "Wrapper" (* i 3000) 0 1000 800
+                             (at "Screen" (+ (* i 3000) 100) 100 800 600)
+                             (when (zero? i)
+                               [(at "Phone" (+ (* i 3000) 920) 100 390 700)]))))
+        auto (select page {})]
+    (t/is (= (named-many page "Screen" "Phone") (:ids auto)))
+    (t/is (= {} (:overlays auto)))))
+
+(t/deftest an-overlay-belongs-to-the-screen-it-overlaps-most
+  (let [wrap (fn [i & kids]
+               (apply at "Wrapper" (* i 3000) 0 1000 800 kids))
+        page (apply build
+                    (concat
+                     (for [i (range 10)]
+                       (wrap i (at "Screen" (+ (* i 3000) 100) 100 800 600)))
+                     [(wrap 10
+                            (at "Screen A" 30000 0 800 600)
+                            (at "Screen B" 30200 200 800 600)
+                            (at "Panel" 30500 400 300 300))]))
+        auto (select page {})
+        [panel] (named page "Panel")
+        [b] (named page "Screen B")]
+    (t/is (= {panel b} (:overlays auto)))
+    (t/is (empty? (filter #{panel} (:ids auto))))))
+
+(t/deftest a-taller-sibling-class-stays-a-screen
+  ;; 800 by 1600 variants beside the 800 by 600 screens: 37 % of their own
+  ;; area lies over the screen, so they are no overlays.
+  (let [page (apply build
+                    (for [i (range 6)]
+                      (apply at "Wrapper" (* i 3000) 0 1000 800
+                             (at "Screen" (+ (* i 3000) 100) 100 800 600)
+                             (when (< i 3)
+                               [(at "Scroll" (+ (* i 3000) 100) 100 800 1600)]))))
+        auto (select page {})]
+    (t/is (= (named-many page "Screen" "Scroll") (:ids auto)))
+    (t/is (= {} (:overlays auto)))))
 
 ;; --- NESTED FRAMES OF ONE SIZE
 

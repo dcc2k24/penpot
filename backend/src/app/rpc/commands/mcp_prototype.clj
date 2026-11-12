@@ -1087,19 +1087,63 @@
   are visible frames that are neither selected nor inside a selected board.
   A frame that holds a selected board (a section, a journey group, a
   wrapper) is no target. `frames` are the Board records of the visible
-  frames in walk order and `selected` the set of the ids of the screens."
-  [frames selected]
-  (let [above (into #{} (comp (filter #(contains? selected (:id %)))
-                              (mapcat :ancestors))
-                    frames)]
-    (into []
-          (comp (map-indexed
-                 (fn [i board]
-                   (let [screen? (contains? selected (:id board))]
-                     (when (and (not (contains? above (:id board)))
-                                (or screen? (not-any? selected (:ancestors board))))
-                       {:board board :screen? screen? :order i}))))
-                (remove nil?))
+  frames in walk order and `selected` the set of the ids of the screens.
+  A screen has `:reach`, the boards that also make an end its own: its
+  wrapper by margin (`wrappers`, see `get-wrappers`) and its overlays
+  (`overlays`, `{overlay-id screen-id}` of the selection). The overlays and
+  the frames inside them are no targets: they belong to their screen."
+  ([frames selected]
+   (get-targets frames selected {} {}))
+  ([frames selected wrappers overlays]
+   (let [above   (into #{} (comp (filter #(contains? selected (:id %)))
+                                 (mapcat :ancestors))
+                       frames)
+         by-id   (into {} (map (juxt :id identity)) frames)
+         reaches (reduce-kv (fn [acc overlay-id screen-id]
+                              (cond-> acc
+                                (contains? by-id overlay-id)
+                                (update screen-id (fnil conj []) (get by-id overlay-id))))
+                            (into {} (map (fn [[k v]] [k [v]])) wrappers)
+                            overlays)]
+     (into []
+           (comp (map-indexed
+                  (fn [i board]
+                    (let [screen? (contains? selected (:id board))]
+                      (when (and (not (contains? above (:id board)))
+                                 (not (contains? overlays (:id board)))
+                                 (not-any? #(contains? overlays %) (:ancestors board))
+                                 (or screen? (not-any? selected (:ancestors board))))
+                        (cond-> {:board board :screen? screen? :order i}
+                          (and screen? (contains? reaches (:id board)))
+                          (assoc :reach (get reaches (:id board))
+                                 :wrapper-id (:id (get wrappers (:id board)))))))))
+                 (remove nil?))
+           frames))))
+
+(defn- board-box
+  "The box of the Board record `board` as `{:x0 :y0 :x1 :y1}`."
+  [^Board board]
+  {:x0 (:x1 board) :y0 (:y1 board) :x1 (:x2 board) :y1 (:y2 board)})
+
+(defn- get-wrappers
+  "The wrappers of the screens, as `{screen-id wrapper-board}`. The wrapper of
+  a selected screen is its parent frame when that frame holds no other
+  selected board and the screen lies in it centered (`boards/centered-margin?`:
+  the gaps on opposite sides within `boards/margin-tolerance` of each other,
+  at most `boards/max-centered-margin` px). `objects` are the
+  page objects, `frames` the Board records of the visible frames and
+  `selected` the set of the ids of the screens."
+  [objects frames selected]
+  (let [by-id (into {} (map (juxt :id identity)) frames)
+        held  (frequencies (mapcat :ancestors (filter #(contains? selected (:id %)) frames)))]
+    (into {}
+          (keep (fn [board]
+                  (when (contains? selected (:id board))
+                    (let [parent (get by-id (:parent-id (get objects (:id board))))]
+                      (when (and (some? parent)
+                                 (= 1 (get held (:id parent)))
+                                 (boards/centered-margin? (board-box parent) (board-box board)))
+                        [(:id board) parent])))))
           frames)))
 
 (defn- cell-index
@@ -1115,8 +1159,11 @@
   [targets max-distance]
   (let [md (double max-distance)]
     (reduce
-     (fn [index {:keys [board] :as target}]
-       (let [cx1 (cell-index (- (:x1 board) md))
+     (fn [index {:keys [board reach] :as target}]
+       (let [boxes (cons board reach)
+             board {:x1 (reduce min (map :x1 boxes)) :y1 (reduce min (map :y1 boxes))
+                    :x2 (reduce max (map :x2 boxes)) :y2 (reduce max (map :y2 boxes))}
+             cx1 (cell-index (- (:x1 board) md))
              cx2 (cell-index (+ (:x2 board) md))
              cy1 (cell-index (- (:y1 board) md))
              cy2 (cell-index (+ (:y2 board) md))]
@@ -1147,24 +1194,40 @@
         (< (:area (:board target)) (:area (:board other)))
         :else (< (:order target) (:order other))))))
 
+(defn- in-reach?
+  "Whether the point `p` is within `max2` (squared distance) of a board of
+  the `:reach` of `target`: its wrapper and its overlays."
+  [target p max2]
+  (some #(<= (board-dist2 % p) max2) (:reach target)))
+
 (defn- resolve-target
   "The target (see `get-targets`) of the end `p`: the nearest within
   `max-distance` by the distance of the snap (0 inside), as `{:id :name
-  :screen? :distance}`, or nil when there is none. `index` is from
-  `build-target-index`."
+  :screen? :distance}`, or nil when there is none. A screen whose wrapper or
+  overlay is within `max-distance` of `p` is a candidate too, but candidates
+  are ranked by their true distance to the screen, so a screen near the end
+  beats the screen inside a large wrapper that the end lies in. `:distance` is
+  that true distance and may exceed `max-distance` (the end lies in the
+  margin of a wrapper). `:wrapper-id` is set when the wrapper is nearer to `p`
+  than the screen is. `index` is from `build-target-index`."
   [index max-distance p]
   (let [max2 (* (double max-distance) max-distance)
         cell [(cell-index (:x p)) (cell-index (:y p))]
         best (reduce (fn [best target]
                        (let [d2 (board-dist2 (:board target) p)]
-                         (if (and (<= d2 max2) (nearer? d2 target best))
+                         (if (and (or (<= d2 max2) (in-reach? target p max2))
+                                  (nearer? d2 target best))
                            [d2 target]
                            best)))
                      nil
                      (concat (get-in index [:cells cell]) (:big index)))]
-    (when-let [[d2 {:keys [board screen?]}] best]
-      {:id (:id board) :name (:name board) :screen? screen?
-       :distance (Math/sqrt d2)})))
+    (when-let [[d2 {:keys [board screen? reach wrapper-id]}] best]
+      (cond-> {:id (:id board) :name (:name board) :screen? screen?
+               :distance (Math/sqrt d2)}
+        (and (some? reach) (some #(< (board-dist2 % p) d2) reach))
+        (assoc :reach-ids (into #{} (map :id) reach))
+        (and (some? wrapper-id) (some #(< (board-dist2 % p) d2) reach))
+        (assoc :wrapper-id wrapper-id)))))
 
 ;; --- FRAMES OF THE ENDS
 
@@ -1333,19 +1396,23 @@
   "The end map of the point `p` snapped to `board`, with its `target` (see
   `resolve-target`): `screen-id` and `screen-name` when the target is a
   screen, else `non-screen true` (a loose frame, or no target in reach).
-  Without a `board` (no frame to snap to) the target stands in for it."
+  Without a `board` (no frame to snap to) the target stands in for it. An
+  end that reached its screen through a wrapper by margin reports the
+  distance to the screen, and the screen in place of the wrapper."
   [p board target]
-  (cond-> {:board-id   (or (:id board) (:id target))
-           :board-name (or (:name board) (:name target))
-           :distance   (if (some? board) (:distance board) (:distance target))
-           :x          (:x p)
-           :y          (:y p)}
-    (:screen? target)
-    (assoc :screen-id   (:id target)
-           :screen-name (:name target))
+  (let [wrapped? (some? (:reach-ids target))
+        board    (if (and wrapped? (contains? (:reach-ids target) (:id board))) nil board)]
+    (cond-> {:board-id   (or (:id board) (:id target))
+             :board-name (or (:name board) (:name target))
+             :distance   (if (and (some? board) (not wrapped?)) (:distance board) (:distance target))
+             :x          (:x p)
+             :y          (:y p)}
+      (:screen? target)
+      (assoc :screen-id   (:id target)
+             :screen-name (:name target))
 
-    (not (:screen? target))
-    (assoc :non-screen true)))
+      (not (:screen? target))
+      (assoc :non-screen true))))
 
 (defn- inside-own-frame?
   "Whether both ends `a` and `b` lie inside `frame`, the nearest ancestor
@@ -1594,7 +1661,10 @@
   `deeper-boards` in the reply). Each end reports its frame (`board-id`)
   and its screen: the nearest of the screens and the loose frames (visible
   frames outside every screen, such as a decision frame; a frame that holds a
-  screen is neither) within `max-distance`. A screen gives `screen-id` and
+  screen is neither) within `max-distance`. A screen in a wrapper (a frame
+  that holds that one screen centered, with gaps of at most 400 px) is as
+  near as its wrapper is: an end that lands on the wrapper belongs to the
+  screen, and its `distance` is measured to the screen. A screen gives `screen-id` and
   `screen-name`; a loose frame, or nothing in reach, gives `non-screen true`.
   A connector whose ends lie in one screen is dropped and counted in
   `same-screen-skipped`; `include-same-screen` returns it with `same-screen
@@ -1650,7 +1720,10 @@
                                               frames)
                         candidates    (get-candidates objects entries within-id)
                         reach         (or max-distance default-max-distance)
-                        targets       (get-targets frames (set (:ids selected)))
+                        screens       (set (:ids selected))
+                        targets       (get-targets frames screens
+                                                   (get-wrappers objects frames screens)
+                                                   (:overlays selected))
                         ctx           {:objects              objects
                                        :board-index          (build-board-index frames reach)
                                        :frame-parents        frame-parents

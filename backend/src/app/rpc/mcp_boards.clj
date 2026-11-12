@@ -56,6 +56,48 @@
   844) does not."
   1.25)
 
+(def max-wrapper-margin
+  "A frame that holds exactly one screen is a wrapper by margin when the gap
+  between its edge and the screen is at most this many px on every side."
+  200)
+
+(def margin-tolerance
+  "The four gaps of a wrapper by margin differ by at most this many px."
+  2)
+
+(def max-centered-margin
+  "A frame that holds exactly one screen centered in it (the gaps on opposite
+  sides equal) takes the ends of connectors for that screen when the gaps
+  are at most this many px."
+  400)
+
+(def overlay-min-share
+  "A sibling frame is an overlay of a screen when at least this share of its
+  own area lies over the screen."
+  0.5)
+
+(def far-larger-ratio
+  "A loose board that is larger than the screens in both directions and has
+  at least this many times the area of the largest screen class is a section
+  or a wrapper, not a screen."
+  4)
+
+(def pair-area-ratio
+  "A loose board of a non-standard size that holds a frame of its own size or
+  sits in one (an annotation holding its widget) is not a screen when its
+  area is under this share of the area of the smallest screen class, unless
+  it is portrait (a phone is taller than wide by `portrait-ratio`)."
+  0.5)
+
+(def portrait-ratio
+  "A frame at least this many times taller than wide is portrait."
+  1.5)
+
+(def wrapper-share
+  "A class is a wrapper by margin only when at least this share of its frames
+  hold exactly one screen with an even margin."
+  0.9)
+
 (def min-screen-side
   "A candidate board is at least this many px wide and this many px high.
   List rows, buttons, chips and small cards stay under it, so they never
@@ -190,8 +232,9 @@
 
 (defn walk-frames
   "The visible frames of the page `objects` in pre-order, at any depth, as
-  entries `{:id :level :index :comp? :name :w :h :anc}`. `:level` is 1 for a child
-  of the page root, `:index` the position in this walk, `:comp?` whether the
+  entries `{:id :level :index :comp? :name :w :h :x0 :y0 :parent :anc}`. `:level`
+  is 1 for a child of the page root, `:x0` and `:y0` the corner of the box,
+  `:parent` the id of the parent shape, `:index` the position in this walk, `:comp?` whether the
   frame is, or lies inside, a component instance, `:w` and `:h` the size of
   its box (see `get-box`) and `:anc` the set of the ids of its frame
   ancestors. A hidden shape takes its subtree out of the walk, a missing
@@ -226,6 +269,9 @@
                               :name  (:name shape)
                               :w     (- (:x1 box) (:x0 box))
                               :h     (- (:y1 box) (:y0 box))
+                              :x0    (:x0 box)
+                              :y0    (:y0 box)
+                              :parent (:parent-id shape)
                               :anc   anc}))
                      (conj seen id)
                      (inc n))))))
@@ -390,18 +436,86 @@
                     (> h eh)))
              standard-sizes))))
 
+(defn even-margin?
+  "Whether the box `inner` lies inside the box `outer` with an even margin:
+  the four gaps are not negative, at most `max-wrapper-margin` and within
+  `margin-tolerance` of each other. Boxes are `{:x0 :y0 :x1 :y1}` (see
+  `get-box`)."
+  [outer inner]
+  (let [gaps [(- (:x0 inner) (:x0 outer))
+              (- (:y0 inner) (:y0 outer))
+              (- (:x1 outer) (:x1 inner))
+              (- (:y1 outer) (:y1 inner))]]
+    (and (every? #(and (>= % (- margin-tolerance)) (<= % max-wrapper-margin)) gaps)
+         (<= (- (reduce max gaps) (reduce min gaps)) margin-tolerance))))
+
+(defn centered-margin?
+  "Whether the box `inner` lies inside the box `outer` centered: the gaps on
+  opposite sides are not negative, within `margin-tolerance` of each other,
+  and at most `max-centered-margin`. A looser test than `even-margin?`: a
+  wrapper of 1480 by 1000 around 800 by 600 (340 px left and right, 200 px
+  above and below) passes."
+  ([outer inner]
+   (centered-margin? outer inner max-centered-margin))
+  ([outer inner max-gap]
+  (let [l (- (:x0 inner) (:x0 outer))
+        t (- (:y0 inner) (:y0 outer))
+        r (- (:x1 outer) (:x1 inner))
+        b (- (:y1 outer) (:y1 inner))]
+    (and (every? #(and (>= % (- margin-tolerance)) (<= % max-gap)) [l t r b])
+         (<= (Math/abs (double (- l r))) margin-tolerance)
+         (<= (Math/abs (double (- t b))) margin-tolerance)))))
+
+(defn- entry-box
+  "The box of a frame entry (see `walk-frames`) as `{:x0 :y0 :x1 :y1}`."
+  [m]
+  {:x0 (:x0 m) :y0 (:y0 m) :x1 (+ (:x0 m) (:w m)) :y1 (+ (:y0 m) (:h m))})
+
+(defn- wrapper-margin?
+  "Whether the entry `inner` lies in the entry `outer` with the margin of a
+  wrapper: centered (`centered-margin?`) with gaps of at most
+  `max-wrapper-margin`. A 1000 by 800 frame around a screen of 800 by 480 has
+  100 px at the sides and 160 px above and below."
+  [outer inner]
+  (and (> (:w outer) (+ (:w inner) size-tolerance))
+       (> (:h outer) (+ (:h inner) size-tolerance))
+       (centered-margin? (entry-box outer) (entry-box inner) max-wrapper-margin)))
+
+(defn- mostly-hold-one?
+  "Whether enough of the frames `outer-members` hold exactly one of the frames
+  `inner-members` (an ancestor counts at any depth) and that frame satisfies
+  `ok?` (a function of the outer and the inner entry). `enough?` is a
+  function of the number of such frames and of all the frames. With `direct?`
+  only the children of a frame count as held."
+  [outer-members inner-members ok? enough? direct?]
+  (let [by-outer (reduce (fn [acc m]
+                           (reduce (fn [acc id] (update acc id (fnil conj []) m))
+                                   acc
+                                   (if direct? [(:parent m)] (:anc m))))
+                         {}
+                         inner-members)
+        single   (count (filter (fn [o]
+                                  (let [held (get by-outer (:id o))]
+                                    (and (= 1 (count held)) (ok? o (first held)))))
+                                outer-members))]
+    (enough? single (count outer-members))))
+
 (defn- wrapper-classes
   "The classes of `qualifying` that are wrappers around screens, as a set. A
-  class `t` that is standard only by the taller rule is a wrapper class when
-  an exact standard class `e` (`exact-standard-size?`) of the same width
-  (within `size-tolerance`) exists such that:
+  class `t` is a wrapper class when an exact standard class `e`
+  (`exact-standard-size?`) exists such that more than half of the members of
+  `t` hold exactly one member of `e` (a member of `e` that has that member of
+  `t` among its ancestors; an ancestor counts at any depth, so a wrapper
+  around a wrapper around a screen holds that screen too), and one of:
 
-  1. `t` is only a little taller than `e`: its height is above that of `e`
-     and at most `wrapper-height-ratio` times it;
-  2. more than half of the members of `t` hold exactly one member of `e`: a
-     member of `e` that has that member of `t` among its ancestors. An
-     ancestor counts at any depth, so a wrapper around a wrapper around a
-     screen holds that screen too.
+  1. `t` is standard only by the taller rule, of the same width as `e`
+     (within `size-tolerance`), only a little taller: its height is above
+     that of `e` and at most `wrapper-height-ratio` times it;
+  2. `t` is not a standard size and at least `wrapper-share` of its frames
+     hold exactly one screen, of any exact standard size smaller than `t` in
+     both directions (800 by 600 and 800 by 480 count together), with a centered
+     margin (`wrapper-margin?`): centered, with gaps of at most
+     `max-wrapper-margin` px. Rule 1 needs more than half.
 
   A scrolling screen holds a dialog or panels, not one screen of its width
   in each frame, and is far taller than the screens in it, so it is not a
@@ -409,27 +523,45 @@
   [classes qualifying]
   (let [dims  (fn [i] (let [c (nth classes i)] [(:w c) (:h c)]))
         exact (into [] (filter #(apply exact-standard-size? (dims %))) (sort qualifying))
+        other (filterv #(not (apply standard-size? (dims %))) (sort qualifying))
         tall  (filterv #(and (not (apply exact-standard-size? (dims %)))
                              (apply standard-size? (dims %)))
-                       (sort qualifying))]
-    (into #{}
-          (filter
-           (fn [t]
-             (let [[tw th] (dims t)
-                   members (:members (nth classes t))]
-               (some (fn [e]
-                       (let [[ew eh] (dims e)]
-                         (and (<= (Math/abs (double (- ew tw))) size-tolerance)
-                              (> th eh)
-                              (<= th (* wrapper-height-ratio eh))
-                              (let [tids   (into #{} (map :id) members)
-                                    counts (frequencies
-                                            (mapcat (fn [m] (filter tids (:anc m)))
-                                                    (:members (nth classes e))))
-                                    single (count (filter #(= 1 (get counts (:id %) 0)) members))]
-                                (> (* 2 single) (count members))))))
-                     exact))))
-          tall)))
+                       (sort qualifying))
+        any   (constantly true)
+        by-ratio  (fn [t]
+                    (let [[tw th] (dims t)]
+                      (some (fn [e]
+                              (let [[ew eh] (dims e)]
+                                (and (<= (Math/abs (double (- ew tw))) size-tolerance)
+                                     (> th eh)
+                                     (<= th (* wrapper-height-ratio eh))
+                                     (mostly-hold-one? (:members (nth classes t))
+                                                       (:members (nth classes e))
+                                                       any
+                                                       (fn [single n] (> (* 2 single) n))
+                                                       false))))
+                            exact)))
+        ;; the screens held may be of several standard sizes: every class of
+        ;; an exact standard size counts, of any number of members
+        screens   (into [] (filter #(apply exact-standard-size? (dims %))) (range (count classes)))
+        by-margin (fn [t]
+                    (let [[tw th] (dims t)
+                          held    (into []
+                                        (comp (filter (fn [e]
+                                                        (let [[ew eh] (dims e)]
+                                                          (and (> tw (+ ew size-tolerance))
+                                                               (> th (+ eh size-tolerance))))))
+                                              (mapcat #(:members (nth classes %))))
+                                        screens)]
+                      (and (seq held)
+                           (mostly-hold-one? (:members (nth classes t))
+                                             held
+                                             wrapper-margin?
+                                             (fn [single n] (>= single (* wrapper-share n)))
+                                             true))))]
+    (into (into #{} (filter by-ratio) tall)
+          (filter by-margin)
+          other)))
 
 (defn- standard-classes
   "The classes of `qualifying` chosen by their standard size, minus the
@@ -595,6 +727,108 @@
          (take max-other-sizes)
          (mapv #(dissoc % :index)))))
 
+(defn overlap-share
+  "The share of the area of the box `inner` (`{:x0 :y0 :x1 :y1}`) that lies
+  inside the box `outer`; 0 for an empty `inner`. The lint rule
+  `sibling-overlay` uses the same test (`overlay-min-share`)."
+  [inner outer]
+  (let [area (fn [{:keys [x0 y0 x1 y1]}] (* (max 0 (- x1 x0)) (max 0 (- y1 y0))))
+        a    (area inner)]
+    (if (pos? a)
+      (/ (area {:x0 (max (:x0 inner) (:x0 outer)) :y0 (max (:y0 inner) (:y0 outer))
+                :x1 (min (:x1 inner) (:x1 outer)) :y1 (min (:y1 inner) (:y1 outer))})
+         a)
+      0)))
+
+(defn find-overlays
+  "The overlay boards among the frame entries `frames` (see `walk-frames`), as
+  a map `{overlay-id screen-id}`. An overlay is a frame outside component
+  instances that is a sibling of a screen inside its wrapper: it has the same
+  parent as the screen, that parent is in `wrapper-ids`, it is not a screen
+  itself (`screen-ids`) and at least `overlay-min-share` of its own area lies
+  over the screen. With several screens in the wrapper, the overlay belongs to
+  the one it overlaps most. This is the hook for the lint rule that reports
+  the overlays (a panel laid over a screen) and for the selection, which
+  leaves them out of the boards."
+  [frames screen-ids wrapper-ids]
+  (let [screens (group-by :parent
+                          (filter #(and (contains? screen-ids (:id %))
+                                        (contains? wrapper-ids (:parent %)))
+                                  frames))]
+    (into {}
+          (keep (fn [f]
+                  (when (and (not (:comp? f))
+                             (not (contains? screen-ids (:id f))))
+                    (when-let [ss (seq (get screens (:parent f)))]
+                      (let [box          (entry-box f)
+                            [share best] (reduce (fn [[bs b] sc]
+                                                   (let [sh (overlap-share box (entry-box sc))]
+                                                     (if (> sh bs) [sh sc] [bs b])))
+                                                 [0 nil]
+                                                 ss)]
+                        (when (and best (>= share overlay-min-share))
+                          [(:id f) (:id best)]))))))
+          frames)))
+
+(defn- screen-refs
+  "The sizes the loose boards are weighed against, from the screen classes
+  `kept`: `{:max-w :max-h :max-a :min-a}`."
+  [classes kept]
+  (let [cs (map #(nth classes %) kept)
+        as (map class-area cs)]
+    {:max-w (reduce max (map :w cs))
+     :max-h (reduce max (map :h cs))
+     :max-a (reduce max as)
+     :min-a (reduce min as)}))
+
+(defn- not-a-screen?
+  "Whether the loose board `c` (a frame entry in no screen class) is clearly
+  not a screen. `refs` are from `screen-refs`, `held` maps the id of a loose
+  board to the loose boards inside it, `children` the frame entries by parent
+  id and `by-id` the entries by id. A standard size (`standard-size?`, the
+  taller rule included) is always a screen size. Else it is not a screen
+  when:
+
+  - it is larger than the screen classes in both directions and has at
+    least `far-larger-ratio` times the area of the largest (a section, a
+    wrapper);
+  - it holds a frame of its own size or sits in one (an annotation and its
+    widget), is not portrait (`portrait-ratio`) and its area is under
+    `pair-area-ratio` of the smallest screen class;
+  - it holds exactly one other loose board with an even margin
+    (`wrapper-margin?`): a wrapper.
+
+  Every test is constant time per board and its children."
+  [refs held children by-id c]
+  (and (not (standard-size? (:w c) (:h c)))
+       (let [area  (* (:w c) (:h c))
+             same? (fn [d] (same-size? (:w c) (:h c) (:w d) (:h d)))
+             pair? (and (not (>= (:h c) (* portrait-ratio (:w c))))
+                        (or (some same? (get children (:id c)))
+                            (some-> (get by-id (:parent c)) same?)))
+             in    (get held (:id c))]
+         (boolean
+          (or (and (> (:w c) (+ (:max-w refs) size-tolerance))
+                   (> (:h c) (+ (:max-h refs) size-tolerance))
+                   (>= area (* far-larger-ratio (:max-a refs))))
+              (and pair? (< area (* pair-area-ratio (:min-a refs))))
+              (and (= 1 (count in))
+                   (wrapper-margin? c (first in))))))))
+
+(defn- filter-until
+  "The items of `coll` that satisfy `pred`, as a vector, or nil when
+  `deadline` (nanoTime) passes while it runs. The clock is read every
+  `check-every` items."
+  [pred coll deadline]
+  (loop [items (seq coll)
+         n     0
+         out   []]
+    (cond
+      (nil? items) out
+      (and (zero? (mod n check-every)) (expired? deadline)) nil
+      :else (recur (next items) (inc n)
+                   (cond-> out (pred (first items)) (conj (first items)))))))
+
 (defn select-auto
   "The boards of the visible frame entries `frames` (see `walk-frames`) found
   by size, in walk order. `deadline` (nanoTime, nil for none) bounds the
@@ -634,12 +868,16 @@
      boards of a chain that had other members.
   8. Loose boards join: candidates that are neither above nor below a
      board, at a level not deeper than the shallowest board, with an area
-     of at least `area-ratio` of the largest screen class.
+     of at least `area-ratio` of the largest screen class, that are not
+     clearly something else than a screen (`not-a-screen?`: a section or
+     wrapper, an annotation) and are not overlays (`find-overlays`). The
+     step checks the deadline; past it the result is the fallback.
   9. When nothing is selected, the boards are the frames at level 1,
      `:fallback?` is true and `:basis` is `\"depth-fallback\"`.
 
   Returns `{:entries [...] :fallback? bool :basis s :classes [...]
-  :class-of {...} :other-sizes [...] :nested #{ids} :timed-out? bool}`. `:other-sizes`
+  :class-of {...} :other-sizes [...] :nested #{ids} :overlays {overlay-id
+  screen-id} :timed-out? bool}`. `:other-sizes`
   lists the qualifying classes that have no selected board (see
   `get-other-sizes`)."
   ([frames]
@@ -660,6 +898,9 @@
                             (sort-by (fn [i] [(- (count (:members (nth classes i)))) i]) all-qual))
                       all-qual)
          wrappers   (wrapper-classes classes qualifying)
+         wrapper-ids (into #{}
+                           (comp (mapcat #(:members (nth classes %))) (map :id))
+                           wrappers)
          fallback   (fn [timed-out?]
                       (let [entries (filterv #(= 1 (:level %)) frames)]
                         {:entries     entries
@@ -679,22 +920,82 @@
                         (structural-classes classes inside qualifying deadline))]
          (if (nil? kept)
            (fallback true)
-           (let [max-area (reduce max 0 (map #(class-area (nth classes %)) kept))
-                 members  (into [] (mapcat #(:members (nth classes %))) kept)
+           (let [all-members (into [] (mapcat #(:members (nth classes %))) kept)
+                 ;; the overlays are known by the screens of exact size; a
+                 ;; class that is standard by the taller rule only (480 by 460
+                 ;; over 480 by 320) may hold nothing but overlays
+                 anchors     (let [exact (filterv #(apply exact-standard-size?
+                                                          ((juxt :w :h) (nth classes %)))
+                                                  kept)]
+                               (mapcat #(:members (nth classes %)) (if (seq exact) exact kept)))
+                 anchor-ids  (into #{} (map :id) anchors)
+                 ;; a frame that holds one screen with an even margin is a
+                 ;; wrapper for the overlays, whatever the share of its class
+                 held-count  (frequencies (mapcat :anc anchors))
+                 by-id0      (into {} (map (juxt :id identity)) candidates)
+                 own-wrapper-ids
+                 (into wrapper-ids
+                       (comp (keep (fn [a]
+                                     (let [p (get by-id0 (:parent a))]
+                                       (when (and (some? p)
+                                                  (= 1 (get held-count (:id p)))
+                                                  (wrapper-margin? p a))
+                                         (:id p)))))
+                             (distinct))
+                       anchors)
+                 overlays0   (find-overlays candidates anchor-ids own-wrapper-ids)
+                 ;; a taller class (800 by 1600 over 800 by 600) whose frames
+                 ;; mostly are no overlays holds screens
+                 overlays    (let [not-overlays
+                                   (into #{}
+                                         (comp (remove #(apply exact-standard-size?
+                                                               ((juxt :w :h) (nth classes %))))
+                                               (map #(:members (nth classes %)))
+                                               (filter (fn [ms]
+                                                         (<= (* 2 (count (filter #(contains? overlays0 (:id %)) ms)))
+                                                             (count ms))))
+                                               cat
+                                               (map :id))
+                                         kept)]
+                               (apply dissoc overlays0 not-overlays))
+                 members     (filterv #(not (contains? overlays (:id %))) all-members)
+                 kept        (filterv (fn [i] (some #(not (contains? overlays (:id %)))
+                                                    (:members (nth classes i))))
+                                      kept)
+                 max-area    (reduce max 0 (map #(class-area (nth classes %)) kept))
                  {inner :kept nested :nested} (drop-nested members class-of name-ok?)]
              (if (empty? inner)
                (fallback false)
                (let [ids       (into #{} (map :id) inner)
                      above     (into #{} (mapcat :anc) inner)
                      min-level (reduce min (map :level inner))
-                     loose     (filterv (fn [c]
-                                          (and (not (contains? ids (:id c)))
-                                               (not (contains? above (:id c)))
-                                               (not-any? ids (:anc c))
-                                               (<= (:level c) min-level)
-                                               (>= (* (:w c) (:h c)) (* area-ratio max-area))))
-                                        candidates)
-                     entries   (vec (sort-by :index (into inner loose)))]
+                     children  (group-by :parent candidates)
+                     pool      (filter-until (fn [c]
+                                               (and (not (contains? ids (:id c)))
+                                                    (not (contains? overlays (:id c)))
+                                                    (not (contains? above (:id c)))
+                                                    (not-any? ids (:anc c))
+                                                    (<= (:level c) min-level)
+                                                    (>= (* (:w c) (:h c)) (* area-ratio max-area))))
+                                             candidates deadline)
+                     pool-ids  (into #{} (map :id) pool)
+                     ;; the loose boards inside each loose board, one pass
+                     held      (reduce (fn [acc d]
+                                         (reduce (fn [acc id]
+                                                   (cond-> acc
+                                                     (contains? pool-ids id)
+                                                     (update id (fnil conj []) d)))
+                                                 acc
+                                                 (:anc d)))
+                                       {}
+                                       pool)
+                     refs      (screen-refs classes kept)
+                     loose     (when (some? pool)
+                                 (filter-until #(not (not-a-screen? refs held children by-id0 %))
+                                               pool deadline))
+                     entries   (when (some? loose) (vec (sort-by :index (into inner loose))))]
+                 (if (nil? entries)
+                   (fallback true)
                  {:entries     entries
                   :fallback?   false
                   :basis       basis
@@ -702,7 +1003,9 @@
                   :class-of    class-of
                   :other-sizes (get-other-sizes classes class-of all-qual wrappers entries)
                   :nested      nested
-                  :timed-out?  false})))))))))
+                  :overlays    overlays
+                  :wrapper-ids own-wrapper-ids
+                  :timed-out?  false}))))))))))
 
 ;; --- SELECTION
 
@@ -793,7 +1096,11 @@
   page root. Mode `:auto` takes the screens found by size (see
   `select-auto`), and then keeps those whose name matches.
 
-  Returns `{:ids [...] :timed-out? bool :deeper-boards n :selection {...}}`.
+  Returns `{:ids [...] :overlays {overlay-id screen-id} :wrapper-ids #{ids}
+  (mode auto: the wrapper frames the overlays are looked for in) :timed-out? bool
+  :deeper-boards n :selection {...}}`. `:overlays` (mode auto) maps the
+  overlay boards left out of the selection to the screen they lie beside
+  (see `find-overlays`).
   `:deeper-boards` (mode depth) counts the screen-sized frames (at least
   `min-screen-side` px on both sides, outside component instances) in a size
   class of at least `min-class-size` members that lie below the selected
@@ -823,6 +1130,8 @@
         sizes    (when auto (get-sizes (:classes auto) (:class-of auto) entries))
         nested-same-size (if auto (count (filter (set ids) (:nested auto))) 0)]
     {:ids           ids
+     :overlays      (or (:overlays auto) {})
+     :wrapper-ids   (or (:wrapper-ids auto) #{})
      :timed-out?    (boolean (or (:timed-out? walked) (:timed-out? filtered) (:timed-out? auto)))
      :deeper-boards (when-not auto (count-deeper frames (set ids)))
      :selection     (cond-> {:mode      (name (:mode resolved))
